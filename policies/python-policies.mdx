@@ -1,0 +1,213 @@
+---
+title: "Python policies"
+description: "The escape hatch for rules a JSON condition can't express: writing, loading and referencing @policy functions, what they receive, their limits, and how to keep them fast and safe."
+icon: "code"
+---
+
+JSON conditions cover the vast majority of access rules, and they have big advantages: they're readable in Studio, validated before saving, and planned into SQL. But some rules need a **language**: calling another service, walking a hierarchy, checking a rate or a feature flag, computing something. For those, register a **Python policy**.
+
+## When to reach for Python
+
+| Rule | JSON? | Python? |
+| --- | --- | --- |
+| Owner, role, tenant, published | ✅ | overkill |
+| Compare two record fields | ✅ | |
+| "Is the caller the record's manager's manager?" (a hierarchy) | | ✅ |
+| "Is this feature enabled for the caller's plan?" (an external service) | | ✅ |
+| "Has the caller made fewer than 5 of these today?" (a count) | | ✅, or a rate limit |
+| "Is the IP in our allowlist of CIDR ranges?" | | ✅ |
+
+<Warning>
+Python policies are opaque to the planner. On **list** requests they always run as a per-row residual: no SQL pushdown, and `total` is `null`. Use them for single-record operations and routes, or narrow lists with a JSON policy first.
+</Warning>
+
+## Writing one
+
+Create `policies.py` in your project's code folder, `code/<project-ref>/policies.py`:
+
+```python code/school/policies.py
+from ipaddress import ip_address, ip_network
+
+from pawabase_kit.policies import policy
+
+OFFICE_NETWORKS = [ip_network("10.20.0.0/16"), ip_network("41.58.12.0/24")]
+
+
+@policy("school_office_network", description="Requests from the school's office networks")
+def school_office_network(context):
+    ip = (context.get("request") or {}).get("ip")
+    if not ip:
+        return False
+    try:
+        return any(ip_address(ip) in net for net in OFFICE_NETWORKS)
+    except ValueError:
+        return False
+```
+
+The decorator takes:
+
+<ParamField path="name" type="string" required>
+  The name you'll reference. Use a project prefix to avoid collisions (see [naming](#naming-and-isolation)).
+</ParamField>
+<ParamField path="description" type="string">
+  Shown in Studio's pickers. Defaults to the function's docstring.
+</ParamField>
+
+The function receives the [evaluation context](/policies/context) as a plain `dict` and returns something truthy (allowed) or falsy (refused). It may be a regular function or `async def`.
+
+### Async policies
+
+```python
+import httpx
+
+from pawabase_kit.policies import policy
+
+
+@policy("plan_allows_exports", description="The caller's organization plan includes exports")
+async def plan_allows_exports(context):
+    org = context["auth"].get("org")
+    if not org:
+        return False
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        r = await client.get(f"https://billing.internal/orgs/{org}/features")
+    return r.status_code == 200 and "exports" in r.json().get("features", [])
+```
+
+Keep network calls short and **fail closed**: a timeout or error should return `False`, not raise.
+
+## Loading and reloading
+
+Project code lives at `<PAWABASE_CODE_PATH>/<project-ref>/`. In the Docker setup that's the `/code` mount (the repository's `examples/code` by default):
+
+```text
+code/
+  school/
+    policies.py        # @policy
+    transformers.py    # @transformer
+    routes.py          # router = Router(...)
+    functions/
+      billing.py       # @function
+```
+
+After changing code, reload it: **Studio → Project → Reload code**, or:
+
+```bash
+POST /platform/v1/projects/school/code/reload
+# {"modules": ["pawabase_code.school.policies", …], "errors": [], "router": false}
+```
+
+The response lists loaded modules and any import errors. Code is also loaded when the API starts.
+
+<Note>
+Project code runs **inside the API and worker processes**, with their permissions. Only mount code you trust, and review it like any server code.
+</Note>
+
+## Referencing it
+
+Once loaded, the name works like any policy reference:
+
+```json
+"operations": { "delete": { "enabled": true, "policy": "school_office_network" } }
+```
+
+```json
+{ "method": "POST", "path": "/exports/students", "policy": "plan_allows_exports", "…": "…" }
+```
+
+### Where Python policies can't be used
+
+| Place | Allowed? | Why |
+| --- | --- | --- |
+| Resource operations | ✅ | |
+| Custom routes, functions, flow HTTP triggers | ✅ | |
+| `policy.check` in flows | ✅ | |
+| **Lists of references** (`["mfa", "my_python_policy"]`) | ❌ | Lists merge conditions; a function isn't a condition |
+| **Storage buckets** | ❌ | Storage decisions are synchronous and condition-based |
+| Realtime channel rules | ❌ | Channel rules take conditions |
+
+To combine a Python policy with others, do it in Python:
+
+```python
+from pawabase_kit.policies import evaluate, policy
+
+
+@policy("finance_on_site", description="Finance staff on the office network, with 2FA")
+async def finance_on_site(context):
+    is_finance = evaluate({"role": ["bursar", "principal"]}, context)
+    has_mfa = evaluate({"aal": "aal2"}, context)
+    return is_finance and has_mfa and school_office_network(context)
+```
+
+`evaluate(condition, context)` runs any JSON condition against a context, so you can mix both styles.
+
+## What the context contains
+
+Exactly what JSON conditions see: `auth`, `credential`, `request`, `record`, `input`, `project`, `env`. On lists it's called **once per row** with that row as `record`.
+
+```python
+@policy("same_department")
+def same_department(context):
+    mine = context["auth"].get("claims", {}).get("app", {}).get("department_id")
+    theirs = (context.get("record") or {}).get("department_id")
+    return mine is not None and str(mine) == str(theirs)
+```
+
+Normalise ids with `str()` when comparing: tokens carry strings, databases return integers.
+
+## Naming and isolation
+
+Python policies are registered in a **process-wide** registry when project code loads. If two projects on the same installation register the same name, the last loaded wins for both. Prefix names with the project reference:
+
+```python
+@policy("school.office_network")
+```
+
+Stored (JSON) policies are per environment and never collide; this caveat applies only to Python policies.
+
+## Performance
+
+| Tip | Why |
+| --- | --- |
+| Return early on cheap checks | Most calls are decided by role or authentication |
+| Cache external lookups (`functools.lru_cache` for static data, the platform cache for shared data) | A list of 100 rows calls the policy 100 times |
+| Keep timeouts short (≤ 2 s) and fail closed | A slow policy slows every request it guards |
+| Don't use on big lists | Always a residual; prefer a JSON policy with an equality |
+
+## Testing
+
+Python policies are plain functions, so unit-test them directly:
+
+```python
+from policies import same_department
+
+
+def test_same_department():
+    ctx = {"auth": {"claims": {"department_id": 3}}, "record": {"department_id": "3"}}
+    assert same_department(ctx)
+    assert not same_department({"auth": {"claims": {}}, "record": {"department_id": 3}})
+```
+
+Then test end to end: call the endpoint as a user who should pass and one who shouldn't.
+
+## Errors
+
+If a Python policy **raises**, the request fails (a `500` with the error logged) rather than being silently allowed. That's fail-closed, but noisy: catch expected errors and return `False`.
+
+## Python policies vs flows
+
+Sometimes the right answer isn't a policy at all. If the rule is really part of a **workflow** ("refuse if the invoice is already paid"), express it in the flow that implements the workflow, with `control.if` and `error.raise`: the rule then lives next to the logic it protects and appears in run traces. Use policies for "may this caller do this at all", and flows for "is this action valid right now".
+
+## Compared with Supabase and Firebase
+
+| | Pawabase Python policies | Supabase | Firebase |
+| --- | --- | --- | --- |
+| Escape hatch | Python functions, any library | PL/pgSQL / SQL functions in `USING` clauses | Rules functions (no external calls); Cloud Functions for everything else |
+| External calls | Yes (keep them fast) | Via extensions like `http`, discouraged in RLS | No |
+| Applies to | Resources, routes, functions, flows | Tables | Documents |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Debugging policies" icon="bug" href="/policies/debugging">Finding out why a request was refused.</Card>
+  <Card title="Project code" icon="folder-code" href="/code/overview">Functions, routes and transformers in Python.</Card>
+</CardGroup>

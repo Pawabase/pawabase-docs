@@ -1,0 +1,190 @@
+---
+title: "Testing and debugging policies"
+description: "A systematic way to find out why a request was allowed or refused: reading status codes and messages, isolating the cause, tracing in Studio, testing with policy.check, and automating role-by-role checks."
+icon: "bug"
+---
+
+Access bugs come in two flavours: **someone is refused who should get in**, or, far worse, **someone gets in who shouldn't**. This page gives you a method for both: read the response, isolate the cause, trace it in Studio, and lock the fix in with an automated check.
+
+## Step 1: read the response
+
+The status code tells you which layer made the decision.
+
+| Status | Body (typical) | Layer | Meaning |
+| --- | --- | --- | --- |
+| `401` | `Send a valid project API key in the apikey header.` | Gateway | Missing, unknown, revoked or expired API key |
+| `401` | `Authentication required` / `invalid token` | API | No or bad user token where one is needed (including owner-field creates) |
+| `403` | `This API key lacks the 'resource:write' scope` | API | Key scopes |
+| `403` | `policy 'finance_staff' refused` | Policy | The named policy said no |
+| `404` | `Not found` | Policy or data | The row doesn't exist, **or** a read policy hides it |
+| `422` | `{"detail": [{"loc": ["body", "title"], …}]}` | Validation | The body is invalid; no policy ran |
+| `422` / `409` | `{"error": "overpayment", …}` | A flow | Business rule in the handler, not a policy |
+| `429` | rate-limit message + `x-ratelimit-*` headers | Gateway / route | Too many requests |
+
+<Tip>
+Refusal messages always include the **policy's name**, including merged lists (`policy 'mfa+role:bursar' refused`). Start there.
+</Tip>
+
+## Step 2: isolate the cause
+
+Work through these questions in order. Each one removes a layer.
+
+<Steps>
+  <Step title="Does the row exist?">
+    Repeat the request with a **secret key** (from a trusted machine). Secret keys bypass policies. If the row is found now, a policy is hiding it. If it's still missing, it doesn't exist, your filter excludes it, or you're in the wrong environment.
+  </Step>
+  <Step title="Is the caller who you think?">
+    Call `GET /auth/v1/user` with the same token. Check `roles`, `id` and the environment. Tokens are snapshots: roles granted after the token was issued aren't in it until the next refresh.
+  </Step>
+  <Step title="Which policy applies?">
+    Look at the resource or route definition in Studio. Is it the operation you think (`update` vs `create`)? Is it a named policy, a parameterised built-in, an inline condition, or `null` (secret keys only, on resources)?
+  </Step>
+  <Step title="What does the policy see?">
+    Reconstruct the context: `$auth` from the token, `$record` from the row (fetch it with a secret key), `$input` from your body. Walk the condition by hand, or run it in a flow with `policy.check` (below).
+  </Step>
+  <Step title="Is it a list?">
+    For lists, remember [planning](/policies/pushdown): role checks are decided before the query, and AND-ed equalities become SQL. A `total: null` tells you a residual remained.
+  </Step>
+</Steps>
+
+## Step 3: trace it in Studio
+
+### Observability
+
+**Operate → Observability** lists recent requests across services with:
+
+- request id, method, route and status;
+- project, environment, identity (user id or anonymous) and credential role;
+- duration and cache outcome;
+- **notes**: the resource and operation, the **policy** that planned a list, events emitted, jobs dispatched, the handler for custom routes;
+- the error, if any.
+
+Filter to the user's id or the path, find the request, and read the policy note. Every hop shares the request id (`X-Request-ID`), so you can follow it into flows and jobs.
+
+### Flow runs
+
+When a custom route refuses with a business error (`409 invoice_closed`), the logic is in a **flow**. **Events & runs → Flow runs** shows each run with its trace: every block, its output, the handle it took, and the error. Click a failed run to see exactly which `control.if` sent it to `error.raise`.
+
+### Auth events
+
+**Users & auth → Events** shows sign-ins, failures, lockouts and MFA challenges, which is useful when the problem is really "why does this user have no token?".
+
+## Step 4: test a condition in isolation with `policy.check`
+
+Build a scratch flow to evaluate any policy against any record without touching the endpoint:
+
+```json
+{
+  "nodes": [
+    { "id": "start", "data": { "block": "trigger.manual", "config": {} } },
+    { "id": "check", "data": { "block": "policy.check", "config": {
+        "policy": "report_access",
+        "record": { "published": false, "user_id": "11", "guardian_user_ids": ["8"] }
+    } } },
+    { "id": "yes", "data": { "block": "log.write", "config": { "message": "allowed" } } },
+    { "id": "no",  "data": { "block": "log.write", "config": { "message": "denied" } } }
+  ],
+  "edges": [
+    { "source": "start", "target": "check" },
+    { "source": "check", "target": "yes", "sourceHandle": "allowed" },
+    { "source": "check", "target": "no",  "sourceHandle": "denied" }
+  ]
+}
+```
+
+**Run** it from the flow editor. The trace shows `allowed` or `denied`. For HTTP-triggered test flows, `auth` is the caller, so you can call it as different users to compare. [Runs and testing →](/flows/runs-and-testing)
+
+## Step 5: lock it in with automated checks
+
+Every access bug you fix should become a test. A role-by-role check script is simple and catches regressions whenever policies change:
+
+```python checks.py
+import httpx
+
+GW, PK = "http://localhost:8080", "pb_pk_…"
+PASSWORD = "…"
+
+def as_user(email):
+    t = httpx.post(f"{GW}/auth/v1/token", params={"grant_type": "password"},
+                   headers={"apikey": PK}, json={"email": email, "password": PASSWORD}).json()
+    return httpx.Client(base_url=GW, headers={"apikey": PK, "Authorization": f"Bearer {t['access_token']}"})
+
+CASES = [
+    # (who, method, path, body, expected status)
+    ("guardian@example.com", "GET",  "/rest/v1/payments", None, 403),
+    ("teacher@school.example", "POST", "/rest/v1/finance/payments", {"invoice_id": 1, "amount": 1, "method": "cash"}, 403),
+    ("bursar@school.example", "GET", "/rest/v1/payments", None, 200),
+    ("guardian@example.com", "GET",  "/rest/v1/students/999", None, 404),
+]
+
+failures = 0
+for who, method, path, body, expected in CASES:
+    r = as_user(who).request(method, path, json=body)
+    ok = r.status_code == expected
+    failures += not ok
+    print(("PASS" if ok else "FAIL"), who, method, path, r.status_code, "expected", expected)
+raise SystemExit(failures)
+```
+
+Run it in CI against a staging environment after every promotion. The school tutorial's 33 checks follow this pattern.
+
+<Check>Assert **refusals** as carefully as permissions. The dangerous bugs are the ones where something that should fail succeeds.</Check>
+
+## Common causes, by symptom
+
+<AccordionGroup>
+  <Accordion title="Refused: a user just given a role">
+    Their access token predates the role. Refresh (sign in again), or revoke their sessions so the app re-authenticates.
+  </Accordion>
+  <Accordion title="Refused: a signed-in user gets 401 on create">
+    The resource has an **owner field** and the request has no valid user token. Check `Authorization` is sent and the token isn't expired.
+  </Accordion>
+  <Accordion title="Refused: 404 on a row that exists">
+    A read policy hides it. Compare with a secret key, then check the `get` policy against the row's fields.
+  </Accordion>
+  <Accordion title="Refused: everything, after editing a policy">
+    A typo in a field name makes a comparison resolve against `null`. `$record.ownerid` instead of `$record.owner_id` denies everyone. Check field names against the resource.
+  </Accordion>
+  <Accordion title="Refused: 403 on update for the owner">
+    The update policy checks `$input`, and the patch includes a protected field (for example the client sends the whole object back, including `author_id`). Send only changed fields.
+  </Accordion>
+  <Accordion title="Allowed: a user sees rows they shouldn't">
+    Check, in order: is a **secret key** in the client? Is the operation's policy `public` or `authenticated` when it should be stricter? Is data reaching them through **expand** of a relation (relations now respect the related resource's read policy; make sure that policy is right)? Is a **transformer** being relied on to hide data (it doesn't restrict access)?
+  </Accordion>
+  <Accordion title="Allowed: a list shows other users' rows">
+    The client filters (`filter[user_id]=…`) but the policy doesn't restrict. Filters narrow; they don't protect. Put the rule in the policy.
+  </Accordion>
+  <Accordion title="Slow: a list endpoint">
+    A residual remained (`total: null`) on a big table. Redesign so an AND-ed equality on an indexed column carries the weight. [Pushdown →](/policies/pushdown#designing-for-pushdown)
+  </Accordion>
+</AccordionGroup>
+
+## A debugging session, start to finish
+
+> *"Guardians say they can't see their child's report card."*
+
+1. **Reproduce.** Sign in as a guardian test account; `GET /rest/v1/report_cards` returns `data: []`.
+2. **Row exists?** With a secret key, `GET /rest/v1/report_cards?filter[student_id]=12` returns the card, `published: false`.
+3. **Policy?** `report_cards.list` → `report_access`: staff always, family only when `published = true`.
+4. **Conclusion.** Working as designed: the card isn't published. The fix is operational (the principal publishes), not a policy change.
+5. **Follow-up.** The portal shows "Not yet published" instead of an empty list, so guardians understand.
+
+> *"A teacher could read payments."*
+
+1. Reproduce: `GET /rest/v1/invoices?expand=payments` as a teacher returns payments.
+2. Check `payments.get`: it was `staff`, which includes teachers. The intended rule was `finance_staff`.
+3. Fix the policy, add a check `("teacher@…", "GET", "/rest/v1/payments", None, 403)` to the script, promote.
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can I log every policy decision?">
+    Refusals appear in responses and in Observability's error column; list plans record the policy used. Logging every allowed single-record decision would be very noisy, so it isn't done by default.
+  </Accordion>
+  <Accordion title="Why is the message 'Not found' and not the policy name for reads?">
+    To avoid confirming that a hidden row exists. Refusals on writes by signed-in users name the policy because the caller already knows the row exists.
+  </Accordion>
+  <Accordion title="Can I dry-run a policy change?">
+    Edit in development, run your checks, then promote. For a quick look, a scratch flow with `policy.check` evaluates a draft inline condition without saving it as a policy.
+  </Accordion>
+</AccordionGroup>

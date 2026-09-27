@@ -1,0 +1,256 @@
+---
+title: "Policy recipes"
+description: "Tested patterns for real access models: private data, teams and multi-tenancy, families, publishing workflows, field-level protection, approvals, time windows, storage layouts, integrations and more."
+icon: "chef-hat"
+---
+
+Each recipe states a requirement, gives the resource settings and policies, explains why they work, notes how they behave on lists, and lists the traps. Mix and match: real projects combine several.
+
+## Private data
+
+### Personal rows (notes, drafts, settings)
+
+**Requirement:** each user sees and edits only their own rows.
+
+```json
+{
+  "name": "notes",
+  "owner_field": "owner_id",
+  "operations": {
+    "list":   { "enabled": true, "policy": "owner" },
+    "get":    { "enabled": true, "policy": "owner" },
+    "create": { "enabled": true, "policy": "authenticated" },
+    "update": { "enabled": true, "policy": "owner" },
+    "delete": { "enabled": true, "policy": "owner" }
+  }
+}
+```
+
+- **Why it works:** the owner field is set by the server on create and dropped from update patches, so users can't create rows for someone else or give rows away. `owner` checks it.
+- **Lists:** `WHERE owner_id = '<you>'`, exact totals.
+- **Trap:** forgetting the owner field. Then clients choose `owner_id`, and anyone can plant rows in someone else's list.
+
+### One row per user (profiles)
+
+**Requirement:** each user has exactly one profile; everyone can read profiles; only the owner can edit.
+
+- Resource `profiles`, owner field `user_id`, `list`/`get` → `authenticated`, `update` → `owner:user_id`, `create` → `authenticated`, `delete` → disabled.
+- Uniqueness ("exactly one") isn't a policy concern: add a unique index on `user_id` in your database, or create profiles from a flow on `user.created` and disable client `create`.
+
+```json
+// flow: create_profile, trigger.event user.created
+{ "block": "resource.create", "config": { "resource": "profiles",
+  "data": { "user_id": "{{ input.event.payload.user_id }}", "display_name": "{{ input.event.payload.email }}" } } }
+```
+
+## Teams and multi-tenancy
+
+### Organization-scoped data (SaaS)
+
+**Requirement:** every row belongs to an organization; members of the active organization can read and write it.
+
+```json
+// tenant
+{ "all": [ { "authenticated": true }, { "eq": ["$record.org_id", "$auth.org"] } ] }
+```
+
+```json
+// tenant_create: new rows must be created in your active org
+{ "all": [ { "authenticated": true }, { "eq": ["$input.org_id", "$auth.org"] } ] }
+```
+
+| Operation | Policy |
+| --- | --- |
+| list, get, update, delete | `tenant` |
+| create | `tenant_create` |
+
+- **Lists:** `WHERE org_id = '<active org>'`, fully pushed down. Index `org_id`.
+- **Switching org:** the client requests a token for another organization; `$auth.org` changes and so does everything they see. See [organizations](/auth/organizations).
+- **Trap:** letting `update` change `org_id`. Add `{"not": {"exists": "$input.org_id"}}` to the update policy, or make `org_id` `read_only` after create.
+
+### Org roles on top of tenancy
+
+**Requirement:** viewers read, members edit, admins delete.
+
+Environment roles (`admin`, `member`, `viewer`) carried in the token make this a role check layered on the tenant equality:
+
+```json
+// tenant_editor
+{ "all": [ { "eq": ["$record.org_id", "$auth.org"] }, { "role": ["member", "admin"] } ] }
+```
+
+```json
+// tenant_admin
+{ "all": [ { "eq": ["$record.org_id", "$auth.org"] }, { "role": "admin" }, { "aal": "aal2" } ] }
+```
+
+### Project membership (explicit member lists)
+
+**Requirement:** rows belong to projects; users see projects they're members of.
+
+Model memberships as a resource and list **through** it:
+
+```text
+memberships (project_id, user_id [owner field], role)
+```
+
+- `GET /rest/v1/memberships?expand=project` with `memberships.list` → `owner:user_id` returns your projects, pushed down.
+- For per-project rows, denormalise `member_ids` onto the project and use `contains` for single-record access (`get`), or check membership in a flow for routes.
+
+<Tip>
+Don't reach for `contains($record.member_ids, $auth.user_id)` on large **lists**: it can't be pushed into SQL. List through the join resource instead.
+</Tip>
+
+## Families and dependants
+
+**Requirement:** guardians see their children's records; students see their own; staff see everything.
+
+```json
+// family_access
+{ "any": [
+  { "role": ["admin", "principal", "teacher", "bursar", "librarian"] },
+  { "owner": "user_id" },
+  { "contains": ["$record.guardian_user_ids", "$auth.user_id"] }
+] }
+```
+
+- **Data:** `guardian_user_ids` is copied onto students and onto the records guardians read (invoices, report cards).
+- **Lists:** staff get unrestricted plans; families get a residual (`total: null`), fine at school scale.
+- **Scaling:** use a `family_id` equality instead ([pushdown](/policies/pushdown#example-families-at-scale)).
+- **Trap:** making `guardians.user_id` an owner field. It's set by the office, so an owner field would stamp the admin's id.
+
+## Publishing workflows
+
+### Drafts and published content
+
+**Requirement:** the public sees published items; authors see their drafts; editors see everything.
+
+```json
+// readable
+{ "any": [ { "eq": ["$record.status", "published"] }, { "owner": "author_id" }, { "role": ["editor", "admin"] } ] }
+```
+
+```json
+// editable: authors edit drafts but can't publish; editors can do anything
+{ "any": [
+  { "role": ["editor", "admin"] },
+  { "all": [ { "owner": "author_id" }, { "eq": ["$record.status", "draft"] },
+             { "not": { "eq": ["$input.status", "published"] } } ] }
+] }
+```
+
+### Release on approval
+
+**Requirement:** a principal publishes report cards; publishing notifies families; published cards are frozen.
+
+- `report_cards.update` → `teaching_staff` **and** `{"eq": ["$record.published", false]}` (frozen once published).
+- A custom route `POST /report-cards/{id}/publish` with policy `permission:reports.publish` runs a flow that sets `published`, stamps `published_at` and emits `report_card.published`.
+- Reads: `{"any": [staff, {"all": [{"eq": ["$record.published", true]}, family]}]}`.
+
+Separating *publish* into a route gives it its own permission, its own audit trail in flow runs, and its own side effects.
+
+## Field-level protection
+
+### Fields only some roles may set
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [
+    { "not": { "exists": "$input.salary" } },
+    { "not": { "exists": "$input.role" } }
+  ] }
+] }
+```
+
+"Anyone who may update may do so, but only admins may touch `salary` and `role`." Combine with the rest of the update rule in an `all`.
+
+### Fields nobody may set through the API
+
+Mark them `read_only` in the resource: they're rejected in create and update bodies with `422`, and set only by flows, functions or the server (owner fields, timestamps, computed totals).
+
+### Fields nobody should read
+
+Mark them `write_only`: accepted on writes, never returned (a PIN, an external secret). For fields some roles may read and others not, use two resources over the same table, or shape responses per role in a custom route.
+
+## Approvals and limits
+
+### Spending limits by role
+
+```json
+{ "any": [
+  { "role": "principal" },
+  { "all": [ { "role": "bursar" }, { "lte": ["$input.amount", 500000] } ] }
+] }
+```
+
+### Two-person rule
+
+"A refund needs a request by one person and approval by another."
+
+- `refunds` resource with `requested_by` (owner field) and `status`.
+- `POST /refunds/{id}/approve` (policy `role:principal`) runs a flow that loads the refund and refuses with `409` if `requested_by == auth.user_id`, then approves.
+
+The "different person" check needs both the record and the caller, which a flow expresses clearly with `control.if` on `{"eq": ["$steps.refund.output.requested_by", "$auth.user_id"]}`.
+
+### Sensitive actions need MFA
+
+```json
+"policy": ["mfa", "finance_staff"]
+```
+
+## Time windows
+
+**Requirement:** homework is visible from its release date.
+
+Policies can't reliably compare stored datetimes with `$now`, so maintain a boolean:
+
+1. `assignments` has `release_at` (datetime) and `released` (boolean, `read_only`).
+2. A schedule flow runs every 10 minutes: `db.query` for rows where `released = false AND release_at <= ?` (pass the time from `time.now`), then `resource.update` each to `released = true`.
+3. Student read policy: `{"all": [ {"eq": ["$record.class_id", "$auth.claims.app.class_id"]}, {"eq": ["$record.released", true]} ]}`, fully pushed down.
+
+## Storage layouts
+
+| Layout | Read | Write |
+| --- | --- | --- |
+| Per-user folders `<user_id>/…` | `{"eq": ["$object.segments.0", "$auth.user_id"]}` | same |
+| Per-org folders `<org>/…` | `{"eq": ["$object.segments.0", "$auth.org"]}` | same, plus a role |
+| Public prefix `public/…` + private rest | `{"any": [{"starts_with": ["$object.key", "public/"]}, {"authenticated": true}]}` | `role:admin` |
+| Staff-only documents | `role:…staff` | `role:…staff` |
+
+Make genuinely public assets a **public bucket** instead of a policy; reads then need no key at all. [Storage access →](/storage/access)
+
+## Integrations
+
+### A partner reads through a scoped key
+
+- Mint a **secret** key with scopes `resource:read` only. It bypasses policies but can't write.
+- Or, for per-row limits, a **publishable** key with a custom scope and a service-account user:
+
+```json
+{ "all": [ { "scope": "partner:orders" }, { "role": "partner" }, { "eq": ["$record.partner_id", "$auth.claims.app.partner_id"] } ] }
+```
+
+### Webhooks from outside
+
+Inbound hooks aren't governed by caller policies; they're verified by signature. Treat their payloads as untrusted input in the flow they trigger. [Inbound hooks →](/webhooks/inbound)
+
+## Realtime
+
+| Channel pattern | Subscribe | Publish |
+| --- | --- | --- |
+| `user:{{ auth.user_id }}` | the template itself restricts it | `service` (servers only) |
+| `org:*` | `{"eq": ["…", "$auth.org"]}`-style rules via templates: `org:{{ auth.org }}` | members |
+| `resource:<name>` | a staff role, since change feeds carry full records | `deny` (the platform publishes) |
+
+[Channel rules →](/realtime/channel-rules)
+
+## Checklist before shipping a policy set
+
+<Check>Every enabled operation has an explicit policy; no accidental `null`s.</Check>
+<Check>Every private resource has an owner field or a tenant column set server-side.</Check>
+<Check>Update policies stop changes to ownership and tenancy columns.</Check>
+<Check>List policies on large tables rest on an AND-ed equality with an indexed column.</Check>
+<Check>Money, deletions and role changes need `mfa`.</Check>
+<Check>No secret key exists in any client build.</Check>
+<Check>A test asserts the expected status for each role on each sensitive endpoint.</Check>
