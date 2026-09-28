@@ -1,9 +1,370 @@
 ---
 title: "Configuration"
-description: "Authentication: this page is being written."
-tag: "Draft"
+description: "Every field under an environment's auth block: signup_enabled, password_policy, access_ttl, mfa_enabled, emails and the rest, with defaults and what each controls."
+icon: "sliders"
 ---
 
+Every Pawabase environment has an **auth configuration** — a single JSON block that controls how sign-in, sign-up, tokens, MFA and email verification behave for every user of that environment. Akountz reads it from the API, caches it briefly, and applies it to every request. This page is the complete reference for every field, its default, and what changing it actually does.
+
+<CardGroup cols={3}>
+  <Card title="One config per environment" icon="layer-group">Each environment (development, production…) has its own `auth` block. Change one without touching the others.</Card>
+  <Card title="Cached, not loaded on every request" icon="clock">Akountz caches the config for `config_ttl` seconds (default 10). Changes propagate within that window, not instantly.</Card>
+  <Card title="Platform config is separate" icon="cog">The `_platform` environment (Studio operators) is configured separately — it has no project-level auth settings.</Card>
+</CardGroup>
+
+## The full field list
+
+Every field lives in an environment's `auth` object, alongside the project's own `infra` and `settings` objects. Here they are, with defaults as Akountz applies them when the field is absent:
+
+| Field | Type | Default | What it controls |
+| --- | --- | --- | --- |
+| `signup_enabled` | boolean | `true` | Whether new accounts can be created via `POST /auth/v1/signup` and the magic-link flow. |
+| `require_email_verification` | boolean | `false` | Whether a new account must verify its email before a session is issued. |
+| `password_policy` | string | `"basic"` | The password strength policy: `"basic"` (length only) or `"strict"` (Sillo's `validate_password`). |
+| `password_min_length` | integer | `8` | Minimum password length enforced by both policies. |
+| `access_ttl` | integer | `900` | Lifetime of an access token, in seconds (15 minutes by default). |
+| `refresh_ttl` | integer | `2592000` | Lifetime of a refresh token, in seconds (30 days by default). |
+| `magic_link_enabled` | boolean | `true` | Whether the magic-link sign-in flow is available. |
+| `mfa_enabled` | boolean | `true` | Whether TOTP MFA is available and enforced when a user has enrolled a factor. |
+| `site_url` | string | `""` | The application's public URL, used to build redirect targets and magic-link/email-callback URLs. |
+| `redirect_urls` | list of strings | `[]` | Additional allowed origins for `redirect_to` on sign-in, sign-up and recovery requests. |
+| `providers` | object | `{}` | OAuth/OIDC provider configuration — see [Social login →](#social-login). |
+| `default_roles` | list of strings | `[]` | Roles assigned to every new account automatically, from the environment's RBAC. |
+| `emails` | object | `{}` | Per-message template overrides for verify, recovery, magic, invite and email_change — see below. |
+| `public_url` | string | `""` | The base URL Akountz uses for link pages and callbacks when `site_url` is not set. |
+
 <Note>
-This page is part of the **Authentication** section and is still being written. Check back soon.
+The `providers`, `default_roles` and `emails` fields have rich sub-structures that deserve their own sections. They are covered in [Social login →](/auth/social-login), [Organizations →](/auth/organizations) and [Email verification →](/auth/email-verification) respectively.
 </Note>
+
+## Loading and caching
+
+Akountz does not read the auth configuration from the database on every request — that would add a cache round trip to every sign-in. Instead:
+
+1. On a fresh load, Akountz calls the internal API endpoint `GET /internal/v1/environments/{project}/{env}/auth` to fetch the environment's full payload, then constructs an `AuthConfig` from the `auth` key.
+2. The result is cached under the key `authcfg:{project}:{env}` with a TTL of `config_ttl` seconds (default 10).
+3. Subsequent requests within the TTL window use the cached copy. After the TTL expires, the next request re-fetches from the API.
+
+```python
+async def load_config(akountz: Akountz, project: str, env: str) -> AuthConfig:
+    if (project, env) == (PLATFORM_PROJECT, PLATFORM_ENV):
+        return platform_config(akountz)
+    key = f"authcfg:{project}:{env}"
+    cached = await akountz.cache_get(key)
+    if cached is not None:
+        return AuthConfig(**cached)
+    payload = await akountz.api.get(f"/internal/v1/environments/{project}/{env}/auth")
+    config = AuthConfig.from_api(project, env, payload)
+    await akountz.cache.set(key, config.__dict__, ttl=akountz.settings.config_ttl)
+    return config
+```
+
+The platform configuration (`_platform` / `_platform`) is hard-coded in `platform_config()` rather than fetched, because the API does not host the `_platform` environment. Its settings are deliberately stricter than a typical project:
+
+```python
+def platform_config(akountz: Akountz) -> AuthConfig:
+    return AuthConfig(
+        project=PLATFORM_PROJECT,
+        env=PLATFORM_ENV,
+        project_name="Pawabase",
+        signup_enabled=False,
+        password_policy="strict",
+        password_min_length=10,
+        access_ttl=3600,
+        refresh_ttl=7 * 24 * 3600,
+        magic_link_enabled=False,
+        public_url=akountz.settings.public_url,
+    )
+```
+
+Operators sign in through Studio's browser session, not through the project-facing endpoints, which is why `signup_enabled` and `magic_link_enabled` are `false` by default and the access token lifetime is longer (1 hour).
+
+## Changing the configuration
+
+### Through Studio
+
+**Build → Settings → Authentication** exposes every field above in the Studio UI. Changes are saved to the environment definition and picked up by Akountz on the next cache refresh (within `config_ttl`, typically under 10 seconds).
+
+### Through the Platform API
+
+```bash
+curl -X PATCH "$STUDIO/studio/api/platform/projects/acme/envs/production" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{
+    "auth": {
+      "signup_enabled": false,
+      "require_email_verification": true,
+      "password_policy": "strict",
+      "password_min_length": 12,
+      "access_ttl": 1800,
+      "mfa_enabled": true
+    }
+  }'
+```
+
+<Warning>
+Changing `signup_enabled` from `true` to `false` does **not** disable sign-in for existing users — it only stops new accounts from being created. Existing users can still sign in with password, magic link, or social login. To fully block new registrations, you need both `signup_enabled: false` and to revoke any magic-link issuance logic in your own application if necessary.
+</Warning>
+
+## `password_policy`: `basic` vs `strict`
+
+Two policies are available, and the difference matters for compliance:
+
+| Policy | Enforcement | Use when |
+| --- | --- | --- |
+| `"basic"` | Only checks `password_min_length` (default 8). Passwords of any composition are accepted as long as they meet the length floor. | Internal tools, low-risk projects, or when your own front-end adds additional strength checks. |
+| `"strict"` | Runs Sillo's `validate_password` against the password. This enforces a mix of character classes (uppercase, lowercase, digits, symbols) beyond the length minimum. | Production applications handling sensitive data, or projects that must satisfy a compliance framework. |
+
+```python
+def check_password_policy(config: AuthConfig, password: str) -> None:
+    """Sillo's password validator for the strict policy, a length rule otherwise."""
+    if config.password_policy == "strict":
+        problems = validate_password(password, min_length=config.password_min_length)
+    else:
+        problems = (
+            [f"Password must be at least {config.password_min_length} characters."]
+            if len(password or "") < config.password_min_length
+            else []
+        )
+    if len(password or "") > 1024:
+        problems.append("Password is too long.")
+    if problems:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "the password does not meet the policy", "problems": problems},
+        )
+```
+
+Both policies reject passwords over 1024 characters. A policy violation returns `422` with a `problems` array describing every failed rule:
+
+```json
+{
+  "message": "the password does not meet the policy",
+  "problems": [
+    "Password must contain an uppercase letter.",
+    "Password must contain a digit.",
+    "Password must be at least 12 characters."
+  ]
+}
+```
+
+<Tip>
+`password_min_length` applies to *both* policies, even `strict`. The `strict` policy layers character-class requirements *on top of* the length check. Raising `password_min_length` to 12 while keeping `"strict"` gives you the full Sillo validation plus a longer minimum.
+</Tip>
+
+## `access_ttl` and `refresh_ttl`: token lifetimes
+
+These two fields directly determine how long a token is valid and how often the client must refresh:
+
+| Token | Config field | Default | Practical effect |
+| --- | --- | --- | --- |
+| Access token | `access_ttl` | `900` (15 min) | The client must send `Authorization: Bearer …` with every request. When it expires, the SDK uses the refresh token silently. |
+| Refresh token | `refresh_ttl` | `2592000` (30 days) | The client can request new access tokens for this window. After it expires, the user must sign in again. |
+
+Both are per-environment. A mobile app that expects long offline periods might set `refresh_ttl` to 90 days; a banking-grade environment might set `access_ttl` to 300 seconds (5 minutes) to minimize the exposure window of a leaked access token.
+
+```python
+@dataclass
+class AuthConfig:
+    access_ttl: int = 900          # 15 minutes
+    refresh_ttl: int = 30 * 24 * 3600  # 30 days
+```
+
+The `access_ttl` is passed through directly to `issue_user_token` as the `ttl` parameter when minting an access token during `start_session`. The `refresh_ttl` is passed to Sillo's `issue_token_pair`, which creates the underlying token family and the refresh JWT with that expiry. See [Tokens and sessions →](/auth/tokens-and-sessions) for how the rotation and theft-detection mechanics interact with these lifetimes.
+
+## `require_email_verification`
+
+When `true`, every new account must verify its email before a session is issued — even if the user signed up with a password, magic link, or social login. The behavior differs slightly by method:
+
+- **Password sign-up**: After `POST /auth/v1/signup`, the response includes `"verification_required": true` and no session. The user receives a verification email and must complete `POST /auth/v1/verify` before signing in.
+- **Magic link sign-up**: The magic link itself marks the email as verified on first use (the `complete` handler calls `user.mark_email_verified()`). This means a magic-link sign-up is effectively self-verifying — the flow only works if the user has access to the inbox.
+- **Social login**: If the provider reports `email_verified: true` in the profile, the account is marked verified immediately. If the provider does not report verification, the account is created unverified and the user must complete a separate verification flow.
+
+```python
+# In routes/auth.py, after signup:
+if config.require_email_verification:
+    token = await links.issue(akountz, config, "verify", user=user)
+    await emails.send(...)
+    return created({"user": await user_view(user), "session": None, "verification_required": True})
+```
+
+<Warning>
+With `require_email_verification: true`, a password sign-in where the user's email is unverified returns `403 confirm your email address first`. This check happens *after* the password is verified, so an attacker who knows a valid email and password still gets the "confirm your email" response rather than a different error — the endpoint does not reveal whether the account exists.
+</Warning>
+
+## `signup_enabled`
+
+Controls whether the `POST /auth/v1/signup` endpoint and the magic-link account-creation path are open:
+
+| Value | Effect on password sign-up | Effect on magic links | Effect on social login |
+| --- | --- | --- | --- |
+| `true` (default) | New accounts can be created. | New accounts are created automatically if `create_user: true` (the default). | New accounts are created if the provider's email is not already registered. |
+| `false` | `POST /auth/v1/signup` returns `403 sign-up is disabled`. | Magic link returns `403 signup_disabled` when no account exists. | Social login returns `403 signup_disabled` when no account exists. |
+
+Existing users are never affected — `signup_enabled: false` only gates account *creation*, not sign-in. This is the standard way to freeze registrations during a migration, a security incident, or a planned maintenance window while keeping the application usable for everyone already signed in.
+
+```python
+# In routes/auth.py:
+if not config.signup_enabled:
+    raise HTTPException(status_code=403, detail="sign-up is disabled")
+```
+
+## `emails`: customizing message templates
+
+Every email Akountz sends — verification, recovery, magic link, invitation, email change — can be customized per environment. The `emails` object maps a message kind to `{subject, text}` templates with `{...}` placeholders:
+
+| Kind | Placeholders |
+| --- | --- |
+| `verify` | `{project}`, `{link}`, `{email}` |
+| `recovery` | `{project}`, `{email}`, `{link}` |
+| `magic` | `{project}`, `{link}` |
+| `invite` | `{organization}`, `{project}`, `{role}`, `{link}` |
+| `email_change` | `{project}`, `{link}` |
+
+```json
+{
+  "emails": {
+    "verify": {
+      "subject": "Welcome to {project} — confirm your email",
+      "text": "Hi,\n\nThanks for signing up for {project}.\n\nClick here to confirm: {link}\n\nThe link expires in 24 hours."
+    },
+    "recovery": {
+      "subject": "Password reset for {project}",
+      "text": "Someone requested a reset for {email}.\n\nUse this link within 1 hour: {link}"
+    }
+  }
+}
+```
+
+Templates are merged with the built-in defaults at send time: the environment's override replaces the default for that kind; other kinds fall back to the built-in default verbatim. Any placeholder not provided in a custom template renders as `{placeholder_name}` literally.
+
+```python
+async def send(akountz: Akountz, config: AuthConfig, kind: str, to: str, **values: Any) -> None:
+    template = {**DEFAULTS[kind], **(config.emails.get(kind) or {})}
+    values = _Safe(project=config.project_name or config.project, email=to, **values)
+    subject = template["subject"].format_map(values)
+    text = template["text"].format_map(values)
+    ...
+```
+
+<Note>
+The `{project}` placeholder resolves to `project_name` if set, or `project` (the slug) otherwise. A `project_name` like `"Acme Corp"` renders as-is; the slug `acme` is what appears in the `site_url` and link paths.
+</Note>
+
+## `providers`: social login configuration
+
+The `providers` object configures which OAuth/OIDC providers are available for social sign-in. Each key is a provider name (e.g. `google`, `github`); the value is a provider configuration object. See [Social login →](/auth/social-login) for the full reference on each provider's fields, shipped providers, and adding a generic provider.
+
+## `default_roles`
+
+A list of role names that every newly created account automatically receives. These roles must already exist in the environment's RBAC (defined via the admin roles API). When a new account is created, `create_account` iterates `config.default_roles` and assigns each one:
+
+```python
+for role in config.default_roles:
+    await rbac.assign_role(user, role)
+```
+
+If a role name doesn't exist, the assignment is simply skipped silently — there's no error at account creation time for a missing default role. This makes `default_roles` a safe way to give every new user a baseline role (e.g. `["viewer"]`) without needing to modify sign-up logic.
+
+## `site_url`, `redirect_urls`, and `public_url`
+
+These three fields together control where Akountz redirects users after sign-in, sign-up and recovery flows, and what URL appears in emails:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `site_url` | `""` | The primary application URL. If set, `redirect_to` values must start with it or be in `redirect_urls`. Also used as the base for email links when `site_url` is configured. |
+| `redirect_urls` | `[]` | Additional allowed URL prefixes for `redirect_to`. Useful when the same auth configuration serves multiple frontend origins. |
+| `public_url` | `""` | Fallback base URL for Akountz's own link pages (`/auth/v1/links/...`) and callbacks when `site_url` is not set. |
+
+The `redirect_allowed` method checks whether a `redirect_to` URL is permitted:
+
+```python
+def redirect_allowed(self, url: str | None) -> bool:
+    if not url:
+        return True
+    allowed = [u for u in [self.site_url, *self.redirect_urls] if u]
+    return any(
+        url == base or url.startswith(base.rstrip("/") + "/") or url.startswith(base + "?")
+        for base in allowed
+    )
+```
+
+If `site_url` is `"https://app.example.com"`, then `redirect_to="https://app.example.com/dashboard"` is allowed, `redirect_to="https://evil.com"` is rejected with `400`, and `redirect_to="/some/path"` (relative) is allowed because an empty URL always passes.
+
+<Warning>
+A misconfigured `site_url` is the most common cause of "redirect_to is not an allowed URL" errors in production. If you add a new frontend origin, update `redirect_urls` (not `site_url`, unless that origin is the primary one). If `site_url` is empty, *every* absolute URL is allowed — which may be convenient during development but is a security risk in production if an attacker can supply a `redirect_to`.
+</Warning>
+
+## The `_platform` environment
+
+The platform environment (`_platform` / `_platform`) that Studio operators sign into has its own hard-coded configuration that is *not* editable through the project-level auth settings:
+
+```python
+def platform_config(akountz: Akountz) -> AuthConfig:
+    return AuthConfig(
+        project=PLATFORM_PROJECT,
+        env=PLATFORM_ENV,
+        project_name="Pawabase",
+        signup_enabled=False,
+        password_policy="strict",
+        password_min_length=10,
+        access_ttl=3600,
+        refresh_ttl=7 * 24 * 3600,
+        magic_link_enabled=False,
+        public_url=akountz.settings.public_url,
+    )
+```
+
+This is hard-coded because the platform environment is not managed through the API — it is configured via environment variables (`PAWABASE_ADMIN_EMAIL`, `PAWABASE_ADMIN_PASSWORD`) at platform startup. See [Overview → bootstrapping the first operator](/auth/overview#bootstrapping-the-first-operator). The longer `access_ttl` (1 hour) reflects the fact that operator sessions are typically longer-lived browser sessions managed by Studio.
+
+## Complete example: a secure production environment
+
+```json
+{
+  "auth": {
+    "signup_enabled": true,
+    "require_email_verification": true,
+    "password_policy": "strict",
+    "password_min_length": 12,
+    "access_ttl": 900,
+    "refresh_ttl": 2592000,
+    "magic_link_enabled": true,
+    "mfa_enabled": true,
+    "site_url": "https://app.example.com",
+    "redirect_urls": ["https://app.example.com", "https://staging.example.com"],
+    "default_roles": ["member"],
+    "providers": {
+      "google": { "client_id": "...", "client_secret": "secret://GOOGLE_SECRET", "enabled": true },
+      "github": { "client_id": "...", "client_secret": "secret://GITHUB_SECRET", "enabled": true }
+    },
+    "emails": {
+      "verify": {
+        "subject": "Confirm your email for {project}",
+        "text": "Welcome to {project}.\n\nConfirm here: {link}"
+      }
+    }
+  }
+}
+```
+
+This configuration requires email verification for every account, enforces strict password policy with a 12-character minimum, enables MFA, allows only two redirect origins, and ships only Google and GitHub as social providers.
+
+## Reading the current configuration
+
+The `GET /auth/v1/settings` endpoint returns the effective configuration for the calling environment, scoped to the API key's project and environment:
+
+```json
+{
+  "signup_enabled": true,
+  "email_verification_required": true,
+  "magic_link_enabled": true,
+  "mfa_enabled": true,
+  "providers": ["google", "github"],
+  "password_policy": {
+    "kind": "strict",
+    "min_length": 12
+  }
+}
+```
+
+This endpoint is useful for frontends that need to know what sign-in methods are available before rendering a sign-in form — for example, hiding the magic-link button when `magic_link_enabled` is `false`, or showing the MFA enrollment prompt when the user has not yet enrolled a factor.

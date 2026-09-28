@@ -1,9 +1,380 @@
 ---
 title: "Production checklist"
-description: "Self-hosting: this page is being written."
-tag: "Draft"
+description: "From a bare Linux host to a production-ready Pawabase deployment: systemd services, reverse proxy, TLS, monitoring, backups, hardening, and the verification steps before you open the door to real users."
+icon: "shield-check"
 ---
 
+Running `docker compose up -d` on a development laptop is trivial. Running Pawabase in production — where real users, real data, and real money depend on it — requires a checklist of steps that no documentation can make optional. This page is that checklist. Follow it in order. Each step builds on the ones before it, and skipping any of them creates a gap that will eventually be exploited, whether by an attacker, a disk failure, or a silent data corruption.
+
+This guide assumes a fresh Linux server (Ubuntu 22.04 LTS or later, Debian 12, or a cloud VM image of your choice) and Docker Engine 24.0+ already installed. If Docker is not yet installed on your host, install it first — see [Docker's official installation instructions](https://docs.docker.com/engine/install/).
+
+## 1. Prepare the host
+
+Before pulling the Pawabase image, harden the host itself. Every step here protects the containerized services indirectly — Docker inherits the host's security posture.
+
+<Steps>
+  <Step title="Create a dedicated non-root user for Docker">
+    Do not run `docker compose` as `root`. Create a dedicated user:
+    ```bash
+    sudo useradd -m -s /bin/bash pawabase
+    sudo usermod -aG docker pawabase
+    sudo su - pawabase
+    ```
+    Adding a user to the `docker` group grants them root-equivalent privileges (a container can escape to the host), so ensure this user is protected with a strong password and SSH key-only authentication.
+  </Step>
+  <Step title="Configure the firewall">
+    Open only the ports Pawabase requires: the gateway port (8080 by default) and optionally the Studio port (8090). Block everything else. If you use UFW:
+    ```bash
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    sudo ufw allow 80/tcp    # HTTP redirect to HTTPS
+    sudo ufw allow 443/tcp   # HTTPS
+    sudo ufw allow 22/tcp    # SSH
+    sudo ufw enable
+    ```
+    Postgres (5432), Redis (6379), and the internal Docker network must never be reachable from the internet. Docker's bridge network is isolated by default, but explicitly blocking these ports in the host firewall is defense in depth.
+  </Step>
+  <Step title="Set the file descriptor limit">
+    WebSocket connections to Angula and large file uploads through the gateway consume file descriptors. The default limit of 1024 is too low. Add to `/etc/security/limits.conf`:
+    ```
+    pawabase soft nofile 65536
+    pawabase hard nofile 65536
+    ```
+    Then log out and log back in, or reboot. Verify with `ulimit -n`.
+  </Step>
+  <Step title="Configure Docker storage">
+    Ensure Docker's data directory (`/var/lib/docker/`) has sufficient disk space. On a fresh server, `/var/lib/docker` is typically on the root partition. If the root partition is small, configure Docker to use a different data root by editing `/etc/docker/daemon.json`:
+    ```json
+    {
+      "data-root": "/mnt/data/docker"
+    }
+    ```
+    Then restart Docker: `sudo systemctl restart docker`.
+  </Step>
+</Steps>
+
+## 2. Deploy the application
+
+With the host prepared, deploy Pawabase. Clone the repository (or copy the project files) to a directory owned by the `pawabase` user.
+
+<Steps>
+  <Step title="Place the project files">
+    ```bash
+    mkdir -p /opt/pawabase
+    cd /opt/pawabase
+    # Clone or copy the project directory here
+    ```
+    The `docker-compose.yml`, `.env`, `docker/` directory, and `scripts/` directory must all be in this directory.
+  </Step>
+  <Step title="Create the .env file">
+    ```bash
+    cp .env.example .env
+    # Edit .env with your secrets — generate each with openssl rand -hex 32
+    nano .env
+    ```
+    Do not skip any required variable. Every blank secret will cause a failure at runtime, and the `docker-compose.yml` will either refuse to start (for `POSTGRES_PASSWORD`) or crash on first request (for the others).
+
+    <Tip>
+    For production, change `PAWABASE_APP_ENV` to `production` explicitly. The default in `.env.example` is already `production`, but confirm it. Set `PAWABASE_COOKIE_SECURE=true` — you will have TLS termination in front of the gateway, and session cookies must carry the `Secure` flag.
+    </Tip>
+  </Step>
+  <Step title="Build and start">
+    ```bash
+    docker compose build --no-cache
+    docker compose up -d
+    docker compose ps
+    ```
+    The `--no-cache` flag on the first build ensures no stale layer is reused. Verify every service shows `Up` and `healthy` with `docker compose ps`.
+  </Step>
+  <Step title="Verify the stack is responding">
+    ```bash
+    # Gateway health check
+    curl -s http://localhost:8080/health
+
+    # Studio should be reachable
+    curl -s http://localhost:8090/_health
+    ```
+    Check the logs for any errors:
+    ```bash
+    docker compose logs --tail=50
+    ```
+  </Step>
+</Steps>
+
+## 3. Configure the reverse proxy
+
+Pawabase expects a reverse proxy in front of the gateway. The gateway runs on `0.0.0.0:8080` inside the container, mapped to the host's gateway port. The reverse proxy handles TLS termination, HTTP→HTTPS redirects, and can add additional rate limiting and request filtering at the edge.
+
+<AccordionGroup>
+  <Accordion title="Caddy (recommended)">
+    Caddy is the simplest reverse proxy to configure for Pawabase. Its automatic HTTPS via Let's Encrypt requires zero manual certificate management. Create `/etc/caddy/Caddyfile`:
+
+    ```
+    api.your-app.example.com {
+        reverse_proxy localhost:8080 {
+            flush_interval -1
+        }
+    }
+
+    studio.your-app.example.com {
+        reverse_proxy localhost:8090 {
+            flush_interval -1
+        }
+    }
+    ```
+
+    Replace `api.your-app.example.com` and `studio.your-app.example.com` with your actual domains. Caddy automatically obtains and renews TLS certificates. Update `PAWABASE_PUBLIC_URL` in `.env` to `https://api.your-app.example.com` and restart the stack.
+
+    ```bash
+    sudo systemctl enable --now caddy
+    sudo systemctl restart pawabase  # after updating .env
+    ```
+
+    Note the `flush_interval -1` directive — it disables response buffering, which is essential for streaming responses through the gateway (large file uploads/downloads use this path).
+  </Accordion>
+  <Accordion title="Nginx">
+    If you prefer Nginx, the configuration is similar but requires manual TLS certificate management:
+
+    ```nginx
+    server {
+        listen 80;
+        server_name api.your-app.example.com;
+        return 301 https://$host$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name api.your-app.example.com;
+
+        ssl_certificate /etc/letsencrypt/live/api.your-app.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/api.your-app.example.com/privkey.pem;
+
+        location / {
+            proxy_pass http://127.0.0.1:8080;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            chunked_transfer_encoding on;
+        }
+    }
+    ```
+
+    Use `certbot` to obtain certificates: `sudo certbot certonly --nginx -d api.your-app.example.com`.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+The reverse proxy must forward the `X-Forwarded-Proto` header. Pawabase uses it to determine whether the original request was HTTPS, which affects `PAWABASE_COOKIE_SECURE`, CORS origin checks, and redirect URLs. Without this header, Pawabase thinks every request came over HTTP, which breaks the `Secure` cookie flag and causes CORS failures.
+</Warning>
+
+## 4. Create systemd services
+
+Running `docker compose up -d` manually means the stack does not survive a reboot. Create a systemd service to manage the Pawabase stack as a proper daemon.
+
+Create `/etc/systemd/system/pawabase.service`:
+
+```ini
+[Unit]
+Description=Pawabase Platform
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pawabase
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+User=pawabase
+Group=pawabase
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pawabase
+sudo systemctl start pawabase
+```
+
+Now Pawabase starts automatically on boot and stops cleanly on shutdown. Verify:
+
+```bash
+sudo systemctl status pawabase
+```
+
 <Note>
-This page is part of the **Self-hosting** section and is still being written. Check back soon.
+If you want to restart the stack after changing `.env` or `docker-compose.yml`, use:
+```bash
+sudo systemctl restart pawabase
+```
+This runs `docker compose down` followed by `docker compose up -d`, which recreates containers with the new configuration. For configuration changes that do not require rebuilding the image (environment variable changes), this is sufficient. For Dockerfile or dependency changes, run `docker compose build` first or add a `ExecStartPre` step.
 </Note>
+
+## 5. Set up TLS
+
+Pawabase does not terminate TLS itself — that is the reverse proxy's job. See [TLS](/self-hosting/tls) for the full guide on certificate management, HSTS headers, and the complete setup with Caddy or Nginx. The TL;DR: use a reverse proxy with automatic Let's Encrypt certificates, point `PAWABASE_PUBLIC_URL` at the HTTPS origin, and set `PAWABASE_COOKIE_SECURE=true`.
+
+## 6. Configure monitoring and logging
+
+A production deployment without monitoring is a deployment that discovers outages from users, not from alerts. Set up at minimum:
+
+<AccordionGroup>
+  <Accordion title="Container health monitoring">
+    Docker's built-in health checks (defined in `docker-compose.yml`) give you a baseline. Use `docker compose ps` or `docker stats` to check container health. For automated alerting, integrate with Prometheus and Grafana using `cAdvisor` or `docker-exporter`:
+    ```yaml
+    # Add to docker-compose.override.yml for monitoring
+    services:
+      cadvisor:
+        image: gcr.io/cadvisor/cadvisor:latest
+        ports: ["8081:8080"]
+        volumes:
+          - /:/rootfs:ro
+          - /var/run:/var/run:ro
+          - /sys:/sys:ro
+          - /var/lib/docker/:/var/lib/docker:ro
+    ```
+  </Accordion>
+  <Accordion title="Application logs">
+    Docker captures stdout/stderr from each container. By default, logs rotate and are stored in `/var/lib/docker/containers/*/*-json.log`. Configure log rotation in `/etc/docker/daemon.json`:
+    ```json
+    {
+      "log-driver": "json-file",
+      "log-opts": {
+        "max-size": "10m",
+        "max-file": "3"
+      }
+    }
+    ```
+    This prevents log files from consuming all available disk space. Restart Docker after changing the daemon config.
+  </Accordion>
+  <Accordion title="Studio status page">
+    Studio's built-in status page (`/studio/status`) shows the health of every service — API, Akountz, Angula, worker, scheduler — with heartbeat indicators. Bookmark it and check it regularly. The scheduler heartbeat is especially important because a silent scheduler failure produces no other signal.
+  </Accordion>
+</AccordionGroup>
+
+## 7. Set up backups
+
+A backup strategy is not optional — disk fails, containers are destroyed, and databases corrupt. Back up the three volumes (`postgres`, `redis`, `api-data`) on a regular schedule.
+
+<Steps>
+  <Step title="Back up Postgres">
+    ```bash
+    docker compose exec postgres pg_dump -U pawabase -d pawabase > /backup/pawabase_$(date +%Y%m%d).sql
+    docker compose exec postgres pg_dump -U pawabase -d akountz > /backup/akountz_$(date +%Y%m%d).sql
+    ```
+    For a consistent backup of both databases simultaneously, use `pg_dumpall`:
+    ```bash
+    docker compose exec postgres pg_dumpall -U pawabase > /backup/pawabase_full_$(date +%Y%m%d).sql
+    ```
+    Schedule this with cron:
+    ```cron
+    0 2 * * * docker compose -f /opt/pawabase/docker-compose.yml exec postgres pg_dumpall -U pawabase > /backup/pawabase_full_$(date +\%Y\%m\%d).sql && gzip /backup/pawabase_full_$(date +\%Y\%m\%d).sql
+    ```
+  </Step>
+  <Step title="Back up Redis">
+    ```bash
+    docker compose exec redis redis-cli BGSAVE
+    cp /var/lib/docker/volumes/redis/_data/*.rdb /backup/redis_$(date +%Y%m%d).rdb
+    ```
+    Or use the AOF file if AOF persistence is configured:
+    ```bash
+    cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/redis_aof_$(date +%Y%m%d).aof
+    ```
+  </Step>
+  <Step title="Back up api-data">
+    ```bash
+    docker compose exec api tar czf - -C /data . > /backup/api-data_$(date +%Y%m%d).tar.gz
+    ```
+    This captures compiled app caches, object storage files, and SQLite databases.
+  </Step>
+  <Step title="Test restoration">
+    A backup that has never been restored is not a backup. Periodically test the restore process on a staging host:
+    ```bash
+    # Restore Postgres
+    docker compose exec -T postgres psql -U pawabase -d pawabase < /backup/pawabase_full_YYYYMMDD.sql
+    # Restore Redis AOF
+    cp /backup/redis_aof_YYYYMMDD.aof /var/lib/docker/volumes/redis/_data/appendonly.aof
+    ```
+  </Step>
+</Steps>
+
+See [Backups](/self-hosting/backups) for a deeper discussion of backup strategies, point-in-time recovery, and disaster recovery procedures.
+
+## 8. Harden the deployment
+
+With the stack running and monitored, apply these hardening measures:
+
+<AccordionGroup>
+  <Accordion title="Rotate default admin credentials">
+    The first operator account is created with the credentials from `.env`. After the first login, change the password through Studio's account settings. Do not leave `PAWABASE_ADMIN_EMAIL` and `PAWABASE_ADMIN_PASSWORD` in `.env` with the initial password — rotate to a proper admin password and remove the plaintext from `.env` (the `.env` is read by Compose on startup, so the credentials are only needed for the first boot).
+  </Accordion>
+  <Accordion title="Restrict Studio access">
+    By default, Studio is exposed on port 8090. In production, you may want to restrict Studio access to internal networks or VPN-only access. Update the reverse proxy configuration to limit Studio's access:
+    ```
+    # Caddy example: only allow from internal network
+    studio.your-app.example.com {
+        @internal {
+            remote_ip 10.0.0.0/8, 192.168.0.0/16
+        }
+        handle @internal {
+            reverse_proxy localhost:8090
+        }
+        handle {
+            abort 403
+        }
+    }
+    ```
+  </Accordion>
+  <Accordion title="Enable Docker content trust">
+    Ensure that only verified images run on your host. Docker content trust (`DOCKER_CONTENT_TRUST=1`) verifies image signatures. For Pawabase, this means the build is reproducible and no unauthorized image has been substituted.
+  </Accordion>
+  <Accordion title="Set up log retention">
+    Configure Docker log rotation as described above. Also configure application-level log retention — the API and Studio emit structured logs that may be useful for debugging security incidents. Ensure logs are retained for at least 90 days to satisfy compliance requirements.
+  </Accordion>
+  <Accordion title="Review access regularly">
+    Periodically review who has access to the host (SSH keys, Docker group membership), who has access to Studio (operators and their roles), and which API keys are active. The audit trail (`AuditEntry` table) records every change — use it to verify that nothing unexpected has happened.
+  </Accordion>
+</AccordionGroup>
+
+## 9. Pre-launch verification
+
+Before opening the platform to real users, run through this verification list:
+
+- [ ] `docker compose ps` shows every service as `Up` and `healthy`
+- [ ] `curl https://api.your-app.example.com/health` returns a 200 from the public URL
+- [ ] `PAWABASE_PUBLIC_URL` matches the actual public domain
+- [ ] `PAWABASE_COOKIE_SECURE=true` (if behind HTTPS)
+- [ ] TLS certificate is valid and auto-renews
+- [ ] HTTP traffic redirects to HTTPS
+- [ ] Firewall blocks ports 5432, 6379, 8001, 8002, 8003, 8080, 8090 from the internet (only 443/80 open)
+- [ ] Postgres, Redis, and `api-data` volumes are backed up and tested
+- [ ] Systemd service is enabled and starts on boot
+- [ ] Admin credentials have been rotated from defaults
+- [ ] Studio is restricted to authorized operators (or behind VPN)
+- [ ] Monitoring and alerting is configured
+- [ ] Log rotation is configured with appropriate retention
+- [ ] The scheduler is running as exactly one instance
+- [ ] The worker is running as a separate service (not inline)
+- [ ] You can sign into Studio and create a test project
+- [ ] You can make an API call with a test key and see it reach the gateway
+- [ ] The reverse proxy correctly forwards `X-Forwarded-Proto`
+
+<Warning>
+The most common reason a production Pawabase deployment fails silently is a mismatch between `PAWABASE_PUBLIC_URL` and the actual URL users access. Every URL in emails, OAuth callbacks, signed storage URLs, and CORS headers is derived from this value. If it is wrong, nothing crashes — everything just silently fails in ways that are extremely hard to diagnose. Double-check this value above all else.
+</Warning>
+
+## After launch
+
+Once the platform is live, the operational rhythm shifts from setup to maintenance:
+
+- Check the Studio status page daily for any service that has gone down
+- Verify backups completed successfully (cron runs at 2 AM; check the backup directory)
+- Monitor disk usage — Postgres WAL and Docker logs can fill disks silently
+- Apply upgrades following [Upgrades](/self-hosting/upgrades)
+- Review the audit log weekly for unexpected changes
+
+The platform is designed to run with minimal intervention once configured correctly. The checklist above ensures that "correctly" means what it should.

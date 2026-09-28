@@ -1,9 +1,347 @@
 ---
 title: "Backups"
-description: "Self-hosting: this page is being written."
-tag: "Draft"
+description: "Protect your Pawabase data: backup strategies for Postgres, Redis, and api-data volumes, point-in-time recovery, disaster recovery procedures, and how to test that your backups actually work."
+icon: "save"
 ---
 
+Data loss is the only failure mode that is truly irreversible. A crashed container restarts. A failed node is replaced. A misconfigured deployment is rolled back. But corrupted or deleted data — project definitions, user accounts, API keys, environment secrets, event history — is gone unless you have a backup. Pawabase's data lives in three places: Postgres (platform state and Akountz identity), Redis (queues, events, realtime state), and the `api-data` volume (compiled app caches, object storage, SQLite fallback databases). Each requires a different backup strategy.
+
+This page covers the complete backup and recovery story: what to back up, how often, where to store the backups, how to restore, and how to verify that restoration works.
+
+## What to back up
+
+Every piece of Pawabase data falls into one of three categories, each with a different backup approach:
+
+<CardGroup cols={3}>
+  <Card title="Postgres — the platform database" icon="database">
+    The platform's entire state: projects, environments, definitions, API keys, secrets, audit entries, and Akountz's identity tables (users, sessions, MFA secrets, organizations). Every definition you build in Studio, every key you mint, every user who signs up — all of it lives here. Back this up frequently and verify restores regularly.
+  </Card>
+  <Card title="Redis — queues, events, and realtime state" icon="bolt">
+    Job queues waiting to be processed, event history, realtime channel state, presence data, and the scheduler's registered jobs. Losing Redis data means queued jobs are lost (they will be retried according to their retry policy), realtime connections are dropped, and the scheduler must re-register its jobs from Postgres on restart (it reconciles from Postgres every 15 seconds, so this is a brief disruption). Back this up for durability, but it is more recoverable than Postgres because the scheduler reconstructs its state from the database.
+  </Card>
+  <Card title="api-data — object storage and caches" icon="folder">
+    Compiled app caches (rebuildable, but expensive), object storage files uploaded by users (not rebuildable), and SQLite fallback databases for environments without a dedicated Postgres. The compiled app cache is the only truly expendable item — everything else is user data that must be preserved.
+  </Card>
+</CardGroup>
+
+## Backup strategy by component
+
+### Postgres backups
+
+Postgres offers two complementary backup strategies: logical dumps and physical snapshots. Use both — logical dumps for point-in-time recovery of individual databases, physical snapshots for full cluster recovery.
+
+#### Logical dumps with pg_dump
+
+The simplest backup method. `pg_dump` creates a SQL file that can recreate the database:
+
+```bash
+# Dump both databases
+docker compose exec postgres pg_dumpall -U pawabase > /backup/pawabase_full_$(date +%Y%m%d).sql
+
+# Dump individual databases for targeted restoration
+docker compose exec postgres pg_dump -U pawabase -d pawabase > /backup/pawabase_$(date +%Y%m%d).sql
+docker compose exec postgres pg_dump -U pawabase -d akountz > /backup/akountz_$(date +%Y%m%d).sql
+```
+
+Schedule daily dumps via cron:
+
+```cron
+# Run at 2 AM daily, compress, keep last 30 days
+0 2 * * * docker compose -f /opt/pawabase/docker-compose.yml exec postgres pg_dumpall -U pawabase > /backup/pawabase_full_$(date +\%Y\%m\%d).sql && gzip /backup/pawabase_full_$(date +\%Y\%m\%d).sql && find /backup -name "pawabase_full_*.sql.gz" -mtime +30 -delete
+```
+
+Store backups on a separate host or in object storage (S3, GCS, Azure Blob). Never store backups on the same host as the database — if the host fails, both the database and the backup go with it.
+
+#### Physical backups with pg_basebackup
+
+For large databases or fast restoration, use `pg_basebackup` for a physical copy of the entire data directory:
+
+```bash
+docker compose exec postgres pg_basebackup -U pawabase -D /backup/pg_data_$(date +%Y%m%d) -Ft -z -P
+```
+
+Physical backups restore faster than logical dumps because they copy the data files directly rather than replaying SQL. They also include WAL (Write-Ahead Log) files, which enable point-in-time recovery.
+
+#### Point-in-time recovery (PITR)
+
+With WAL archiving enabled, you can recover Postgres to any point in time. Configure WAL archiving in Postgres:
+
+```bash
+# Add to postgres configuration
+docker compose exec postgres bash -c "echo \"archive_mode = on\" >> /var/lib/postgresql/data/postgresql.conf && echo \"archive_command = 'cp %p /backup/wal/%f'\" >> /var/lib/postgresql/data/postgresql.conf && echo \"archive_timeout = 60\" >> /var/lib/postgresql/data/postgresql.conf"
+```
+
+With WAL archiving, you can recover to a specific timestamp:
+
+```bash
+# Stop Postgres, restore base backup, configure recovery
+# Then set recovery target:
+# recovery_target_time = '2026-09-28 14:30:00'
+```
+
+Point-in-time recovery is essential if a user accidentally drops a table or a corrupted transaction corrupts data — you can restore to the state just before the incident.
+
+### Redis backups
+
+Redis offers two persistence mechanisms: RDB snapshots and AOF (Append Only File). The `docker-compose.yml` configures AOF (`--appendonly yes`), which provides better durability (every write is appended to the log) at the cost of larger file sizes and slightly slower writes.
+
+#### Backing up Redis
+
+```bash
+# Trigger a manual BGSAVE to flush the dataset to disk
+docker compose exec redis redis-cli BGSAVE
+
+# Copy the AOF file
+cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/redis_aof_$(date +%Y%m%d).aof
+
+# Or copy the RDB snapshot
+cp /var/lib/docker/volumes/redis/_data/dump.rdb /backup/redis_rdb_$(date +%Y%m%d).rdb
+```
+
+For AOF backups, use `redis-cli` to create a clean copy:
+
+```bash
+# Create a clean copy of the AOF file
+docker compose exec redis redis-cli BGREWRITEAOF
+cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/redis_aof_clean_$(date +%Y%m%d).aof
+```
+
+Schedule Redis backups:
+
+```cron
+0 3 * * * docker compose -f /opt/pawabase/docker-compose.yml exec redis redis-cli BGSAVE && cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/redis_aof_$(date +\%Y\%m\%d).aof
+```
+
+#### Restoring Redis
+
+To restore from a backup, stop Redis, replace the data file, and restart:
+
+```bash
+docker compose stop redis
+cp /backup/redis_aof_YYYYMMDD.aof /var/lib/docker/volumes/redis/_data/appendonly.aof
+docker compose start redis
+```
+
+### api-data backups
+
+The `api-data` volume contains:
+
+- **Object storage files**: User-uploaded files for storage buckets. These are not stored in Postgres and must be backed up separately.
+- **Compiled app caches**: Rebuildable from the platform's definition data, but rebuilding is expensive. Back up to avoid slow cold starts after a restore.
+- **SQLite fallback databases**: For environments using `sqlite:///data/envs/{project}__{env}.db`. These are the entire data layer for those environments.
+
+```bash
+# Create a tarball of the api-data volume
+docker compose exec api tar czf - -C /data . > /backup/api-data_$(date +%Y%m%d).tar.gz
+```
+
+For large deployments, consider mounting the `api-data` volume to a host directory and backing that up directly:
+
+```yaml
+# In docker-compose.override.yml
+services:
+  api:
+    volumes:
+      - /host/data:/data
+```
+
+Then back up `/host/data` with your preferred backup tool (rsync, Borg, restic).
+
+## Backup storage
+
+Backups stored on the same host as the data they protect provide no real protection. Follow the 3-2-1 rule: **3** copies of your data, on **2** different media, with **1** offsite.
+
+### Local storage (copy 1)
+
+Keep a recent backup on the host for fast restoration:
+
+```bash
+mkdir -p /backup/pawabase
+# Store the last 7 days of backups locally
+```
+
+### Offsite storage (copy 2)
+
+Upload backups to object storage. The `aws cli` works with any S3-compatible provider:
+
+```bash
+aws s3 cp /backup/pawabase_full_$(date +%Y%m%d).sql.gz s3://your-backup-bucket/pawabase/
+```
+
+Or use `rclone` for multiple backends (S3, GCS, Azure, Backblaze, SCP, SFTP):
+
+```bash
+rclone copy /backup/pawabase remote:pawabase-backups/
+```
+
+### Encrypted backups
+
+Backup files contain sensitive data (API keys, secrets, user data). Encrypt them before uploading:
+
+```bash
+# Encrypt with GPG
+gpg --symmetric --cipher-algo AES256 /backup/pawabase_full_$(date +%Y%m%d).sql.gz
+# Upload the encrypted file
+aws s3 cp /backup/pawabase_full_$(date +%Y%m%d).sql.gz.gpg s3://your-backup-bucket/pawabase/
+```
+
+Or use `restic`, which handles encryption and deduplication automatically:
+
+```bash
+restic init --repo s3:your-backup-bucket/pawabase
+restic backup /backup/pawabase_full_$(date +%Y%m%d).sql.gz
+```
+
+## Restoration procedures
+
+A backup that has never been restored is not a backup. Test restoration regularly — at least monthly, ideally on a staging host that mirrors production.
+
+### Restoring Postgres
+
+```bash
+# 1. Stop the Pawabase stack
+cd /opt/pawabase
+docker compose down
+
+# 2. Start only Postgres
+docker compose up -d postgres
+
+# 3. Restore from the logical dump
+docker compose exec -T postgres psql -U pawabase -d postgres < /backup/pawabase_YYYYMMDD.sql
+docker compose exec -T postgres psql -U pawabase -d akountz < /backup/akountz_YYYYMMDD.sql
+
+# Or restore from a pg_basebackup physical backup:
+# 4. Stop Postgres, replace data directory, restart
+# docker compose stop postgres
+# rm -rf /var/lib/postgresql/data/*
+# cp -r /backup/pg_data_YYYYMMDD/* /var/lib/postgresql/data/
+# docker compose start postgres
+
+# 5. Restart the full stack
+docker compose up -d
+```
+
+<Warning>
+Restoring Postgres from a logical dump requires the databases to exist first. Create them before importing:
+```bash
+docker compose exec -T postgres psql -U pawabase -c "CREATE DATABASE pawabase;"
+docker compose exec -T postgres psql -U pawabase -c "CREATE DATABASE akountz;"
+```
+The `init.sql` script creates the `akountz` database, so if you are restoring from scratch, run `docker compose up postgres` first to trigger the initialization, then drop and recreate the databases before importing.
+</Warning>
+
+### Restoring Redis
+
+```bash
+# 1. Stop Redis
+docker compose stop redis
+
+# 2. Replace the AOF file
+cp /backup/redis_aof_YYYYMMDD.aof /var/lib/docker/volumes/redis/_data/appendonly.aof
+
+# 3. Start Redis
+docker compose start redis
+```
+
+### Restoring api-data
+
+```bash
+# 1. Stop the API container
+docker compose stop api
+
+# 2. Restore the tarball
+docker compose exec api sh -c "tar xzf - -C /data" < /backup/api-data_YYYYMMDD.tar.gz
+
+# 3. Start the API
+docker compose start api
+```
+
+### Full restoration (disaster recovery)
+
+If the entire host is lost, restore everything on a new host:
+
+<Steps>
+  <Step title="Set up the new host">
+    Install Docker Engine, create the `pawabase` user, configure the firewall, and set up the reverse proxy.
+  </Step>
+  <Step title="Clone the project files">
+    Copy the project directory (or clone from version control) to `/opt/pawabase` on the new host. Ensure `.env` is available — it should be in a secrets manager or securely transferred, not in version control.
+  </Step>
+  <Step title="Restore Postgres">
+    Follow the Postgres restoration procedure above.
+  </Step>
+  <Step title="Restore Redis">
+    Follow the Redis restoration procedure above.
+  </Step>
+  <Step title="Restore api-data">
+    Follow the api-data restoration procedure above.
+  </Step>
+  <Step title="Start the stack">
+    ```bash
+    cd /opt/pawabase
+    docker compose up -d
+    ```
+  </Step>
+  <Step title="Verify everything is working">
+    Check the gateway health, sign into Studio, make a test API call, and verify that realtime connections work. Confirm that the scheduler is firing (check the status page) and that the worker is consuming jobs from the queues.
+  </Step>
+</Steps>
+
+## Backup schedule
+
+A practical backup schedule for a production deployment:
+
+| Component | Frequency | Retention | Method |
+| --- | --- | --- | --- |
+| Postgres | Daily | 30 days | `pg_dumpall` + gzip + encrypted upload |
+| Postgres WAL | Continuous | 7 days | WAL archiving to object storage |
+| Redis | Daily | 14 days | AOF copy + upload |
+| api-data | Weekly | 4 weeks | Tarball + upload |
+| Object storage files | Real-time | Indefinite | Replicated to a secondary bucket (S3 versioning or cross-region replication) |
+
 <Note>
-This page is part of the **Self-hosting** section and is still being written. Check back soon.
+Object storage files (files uploaded by users to storage buckets) should be backed up through the storage driver's native replication mechanism, not through manual tarballs. If you use S3, enable versioning and cross-region replication. If you use a local storage driver, copy the `api-data/objects` directory to a separate storage location on a regular schedule.
 </Note>
+
+## Monitoring backup health
+
+Backups that fail silently are worse than no backups. Set up monitoring:
+
+- **Cron job output**: Capture the output of backup cron jobs and alert on non-zero exit codes
+- **Backup file existence**: Check that a new backup file was created today
+- **Backup file integrity**: Verify that the backup file can be decompressed and parsed
+- **Storage quota**: Monitor that the backup storage bucket is not filling up
+- **Restore test results**: Log the results of periodic restore tests and alert on failures
+
+A simple monitoring script:
+
+```bash
+#!/bin/bash
+# Check that today's backup exists
+if [ ! -f /backup/pawabase_full_$(date +%Y%m%d).sql.gz ]; then
+  echo "ALERT: Today's Postgres backup is missing" | mail -s "Backup failure" admin@example.com
+fi
+
+# Check that the backup file is valid
+if ! gzip -t /backup/pawabase_full_$(date +%Y%m%d).sql.gz 2>/dev/null; then
+  echo "ALERT: Today's Postgres backup is corrupted" | mail -s "Backup failure" admin@example.com
+fi
+```
+
+## Disaster recovery plan
+
+Beyond individual backups, maintain a documented disaster recovery plan that covers:
+
+1. **RTO (Recovery Time Objective)**: How quickly must the platform be restored? For most teams, 1-4 hours is acceptable. Plan for this by keeping the restoration procedure documented and tested.
+
+2. **RPO (Recovery Point Objective)**: How much data can you afford to lose? If you run daily Postgres backups, your RPO is 24 hours. For stricter RPO, increase backup frequency or enable continuous WAL archiving.
+
+3. **Communication**: Who gets notified when a disaster occurs? What is the escalation path? Document the contact list and the procedure for declaring a disaster.
+
+4. **Failover**: If the primary host is unavailable, can you run Pawabase on a secondary host? Maintain a warm standby with the latest backups and a pre-configured `docker-compose.yml` that can be started immediately.
+
+5. **Rollback**: If an upgrade causes data corruption, how do you roll back? See [Upgrades](/self-hosting/upgrades) for the upgrade strategy and rollback procedure.
+
+<Warning>
+The most common reason backup restoration fails is that the backup was created with a different version of Postgres or Redis than the one being restored to. Always test restoration on a host with the same versions, or use format-agnostic backup methods (logical dumps over physical snapshots).
+</Warning>

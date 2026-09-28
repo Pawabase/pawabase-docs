@@ -1,9 +1,203 @@
 ---
 title: "Email verification"
-description: "Authentication: this page is being written."
-tag: "Draft"
+description: "The verify flow, require_email_verification gating, resending, and how verification interacts with sign-up, magic links, and social login."
+icon: "mail-check"
 ---
 
+Email verification is the mechanism that confirms a user controls the email address on their account. When `require_email_verification` is enabled in an environment's auth configuration, every new account must complete verification before a session is issued. Even when it's disabled, verification remains available as an optional step, and it's always the prerequisite for changing an email address.
+
+<CardGroup cols={3}>
+  <Card title="One-time, single-use" icon="link">Every verification link is a single-use token that expires in 24 hours.</Card>
+  <Card title="No account enumeration" icon="eye">Requesting verification for an existing or non-existing email returns the same response.</Card>
+  <Card title="Self-verifying via magic link" icon="wand-2">A magic-link sign-up automatically marks the email as verified on first use.</Card>
+</CardGroup>
+
+## The verification lifecycle
+
+### Sending a verification link
+
+**Request**: `POST /auth/v1/verify/request`
+
+```bash
+curl -X POST "$GW/auth/v1/verify/request" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{ "email": "chioma@example.com" }'
+```
+
+The response is always `{"sent": true, "message": "If the address has an account, a message is on its way."}` — regardless of whether the email exists. This prevents enumeration: an attacker cannot learn which emails are registered by probing this endpoint.
+
+```python
+async def request_verification(ctx: HttpContext, body: EmailRequest):
+    config = await config_for(akountz, ctx)
+    user = await find_by_email(config.project, config.env, normalise_email(body.email))
+    if user is not None and user.email_verified_at is None:
+        token = await links.issue(akountz, config, "verify", user=user)
+        await emails.send(
+            akountz, config, "verify", user.email,
+            link=links.link(config, "verify", token, body.redirect_to),
+        )
+    return SENT
+```
+
+The link is constructed with `links.link(config, "verify", token, redirect_to)`. If `config.site_url` is set, the link points to the application's callback URL. Otherwise, it points to Akountz's own link page at `/auth/v1/links/{project}/{env}/verify`.
+
+The token is issued with a lifetime of **24 hours** (`LIFETIMES["verify"] = 24 * 3600`). It's a single-use `OneTimeToken` row in the database, signed with Sillo's `URLSafeTimedSerializer`. Once consumed or expired, it cannot be reused.
+
+### Confirming an email address
+
+**Request**: `POST /auth/v1/verify`
+
+```bash
+curl -X POST "$GW/auth/v1/verify" \
+  -H "content-type: application/json" \
+  -d '{ "token": "a1b2c3d4e5f6…" }'
+```
+
+The `complete` handler processes the token:
+
+```python
+if kind == "verify":
+    row = await links.consume(akountz, config, "verify", token)
+    user = row.user
+    if user.email_verified_at is None:
+        await user.mark_email_verified()
+        await akountz.emit(config.project, config.env, "user.verified", ...)
+    return await start_session(akountz, config, user, method="email_verification", ctx=ctx)
+```
+
+Three things happen:
+
+1. The token is consumed — marked as used in the database. If it was already used or expired, a `400 the link is invalid or has expired` error is returned.
+2. If the user's `email_verified_at` is still `None`, it's set to the current timestamp and a `user.verified` event is emitted.
+3. A **session is started** — the user is signed in immediately after verification. There is no separate "sign in after verifying" step; verification and sign-in are the same request.
+
+### Resending a verification link
+
+Calling `POST /auth/v1/verify/request` again with the same email issues a **new** token and sends a new email. The old token remains valid until it expires or is consumed, but only the most recently issued token matters — consuming any one of them marks the email verified and starts a session.
+
 <Note>
-This page is part of the **Authentication** section and is still being written. Check back soon.
+If the user has already verified their email, `request_verification` silently does nothing — no new email is sent. The check `user.email_verified_at is None` prevents unnecessary emails.
 </Note>
+
+## `require_email_verification` gating
+
+When `require_email_verification` is `true` (the default is `false`), the gating logic applies at two points:
+
+### During sign-up
+
+After creating the account, if the user hasn't verified their email, the response includes `"verification_required": true` and no session:
+
+```python
+if config.require_email_verification:
+    token = await links.issue(akountz, config, "verify", user=user)
+    await emails.send(...)
+    return created({"user": await user_view(user), "session": None, "verification_required": True})
+```
+
+The user receives the verification email and must complete `POST /auth/v1/verify` before they can sign in.
+
+### During sign-in
+
+Even for existing verified accounts, a sign-in attempt on an unverified account is blocked:
+
+```python
+if config.require_email_verification and user.email_verified_at is None:
+    raise HTTPException(status_code=403, detail="confirm your email address first")
+```
+
+This check happens after the password is verified (so an attacker can't learn whether the account exists from the error timing), and before MFA is checked. If the user passes MFA but hasn't verified their email, they still can't sign in.
+
+### Interaction with social login
+
+Social login providers that report `email_verified: true` in the profile create accounts that are immediately verified:
+
+```python
+user = await create_account(config, email=profile.email, verified=bool(profile.email_verified), ...)
+```
+
+If the provider does not report verification, the account is created unverified, and `require_email_verification` applies the same way it does for password sign-ups — the user must complete a separate verification flow.
+
+## Verification and magic links
+
+A magic-link sign-up is effectively self-verifying. When the `complete` handler processes a `kind == "magic"` token:
+
+```python
+if kind == "magic":
+    row = await links.consume(akountz, config, "magic", token)
+    user = row.user
+    if user.is_disabled:
+        raise HTTPException(status_code=403, detail="this account is disabled")
+    if user.email_verified_at is None:
+        await user.mark_email_verified()
+    ...
+```
+
+If the user is signing up for the first time (no existing account), the account is created and the email is immediately marked verified. This means a magic-link flow never produces an unverified account — the link itself proves email control, and verification and sign-in are combined.
+
+## Email verification and account security
+
+### Changing an email requires re-verification
+
+When a user changes their email through `PATCH /auth/v1/user`, the new email is not immediately applied. Instead, a verification link (`kind: "email_change"`) is sent to the **new** email address. Only after confirming it is the email updated.
+
+```python
+if body.email is not None:
+    if await find_by_email(user.project, user.env, email):
+        raise HTTPException(status_code=409, detail="that email is in use")
+    token = await links.issue(akountz, config, "email_change", user=user, email=email)
+    await emails.send(...)
+    changed.append("email (pending confirmation)")
+```
+
+The confirmation handler (`kind == "email_change"`) checks that the new email isn't already taken by another account, updates the email, marks it verified, and emits a `user.email_changed` event.
+
+### Verification prevents session issuance
+
+Even when `require_email_verification` is `false`, a user who has never verified their email and tries to sign in with a password will succeed — there's no gate on sign-in unless `require_email_verification` is `true`. However, any email change *always* requires verification of the new address, regardless of the `require_email_verification` setting.
+
+## Token lifetimes and limits
+
+| Property | Value |
+| --- | --- |
+| Token lifetime | **24 hours** (`LIFETIMES["verify"] = 86400`) |
+| Single-use | Yes — consumed on first successful verification |
+| Rate limit | 10 requests per 60 seconds per IP (`"akz:links"` middleware) |
+| Resend behavior | Issues a new token; the old one remains valid until it expires |
+
+<Warning>
+A verification link that has been sitting in an inbox for more than 24 hours is expired and cannot be used. The user must request a new one. If they've already verified (and a new token was issued by a second request), the old expired link will return `400 the link is invalid or has expired` — not a different error.
+</Warning>
+
+## The verification email
+
+The default email template for verification is:
+
+```
+Subject: Confirm your email for {project}
+
+Welcome to {project}.
+
+Confirm your email address by opening this link:
+
+{link}
+
+If you did not sign up, you can ignore this message.
+```
+
+This can be customized per environment through the `emails.verify` configuration field. See [Configuration → emails](/auth/configuration#emails-customizing-message-templates) for the template format and available placeholders.
+
+## The link page (without site_url)
+
+When `config.site_url` is not configured, verification links point to Akountz's own link page at `/auth/v1/links/{project}/{env}/verify?token=…`. This page renders a simple HTML response: if verification succeeds, the user is signed in and can close the window; if it fails, an error message is displayed. This is a fallback for applications that don't have their own callback endpoint configured.
+
+When `site_url` *is* configured, the link redirects to `{site_url}/auth/callback?token=…&type=verify`, and the application's frontend handles the completion — extracting the access token from the URL fragment and storing it.
+
+## Audit trail
+
+Every verification event is emitted as a platform event and recorded in the audit log:
+
+- `user.verified` — emitted when `mark_email_verified()` is called, containing the user id and email.
+- The login event table records sign-in events with `method: "email_verification"` when a session is started through the verification flow.
+
+These events appear in Studio's audit log and can be queried through the admin events API.

@@ -1,9 +1,335 @@
 ---
 title: "Tokens and sessions"
-description: "Authentication: this page is being written."
-tag: "Draft"
+description: "Access and refresh token claims, rotation, theft detection, revocation, operator sessions vs. project-user sessions, and switching organizations on refresh."
+icon: "key-round"
 ---
 
-<Note>
-This page is part of the **Authentication** section and is still being written. Check back soon.
-</Note>
+Every successful sign-in produces a **token pair**: a short-lived **access token** (`Bearer`) and a longer-lived **refresh token**. These are JWTs issued by Akountz, verified statelessly by every Pawabase service, and the mechanism behind every identity check in the system. This page covers what's inside them, how they rotate, how sessions are tracked and revoked, and the difference between operator sessions and project-user sessions.
+
+<CardGroup cols={3}>
+  <Card title="Stateless verification" icon="signature">Every service verifies tokens locally using a derived per-environment key — no network call to Akountz.</Card>
+  <Card title="Rotating refresh" icon="rotate">Every refresh issues a new access token *and* a new refresh token. The old one stops working.</Card>
+  <Card title="Theft detection" icon="alert-triangle">Refresh token reuse is detected and the entire token family is revoked.</Card>
+</CardGroup>
+
+## Token claims
+
+An access token is a JWT with these claims, minted by `issue_user_token`:
+
+```json
+{
+  "sub": "8",
+  "aud": "authenticated",
+  "iss": "pawabase:akountz:acme",
+  "prj": "acme",
+  "env": "production",
+  "sid": "f3f0c2f8b0f6c4a1a6f9c1d3f2a6e9b7",
+  "jti": "a1b2c3d4e5f6a7b8",
+  "iat": 1790611200,
+  "exp": 1790612100,
+  "typ": "access",
+  "aal": "aal1",
+  "email": "chioma@example.com",
+  "roles": ["guardian"],
+  "perms": ["family.read"],
+  "org": null,
+  "org_role": null,
+  "meta": { "tier": "starter" },
+  "app": { "onboarding_complete": true }
+}
+```
+
+| Claim | Type | Description |
+| --- | --- | --- |
+| `sub` | string | The user's numeric id (as a string). |
+| `aud` | string | Always `"authenticated"`. |
+| `iss` | string | `pawabase:akountz:{project}` — identifies the issuer. |
+| `prj` / `env` | string | The project and environment this token is valid for. |
+| `sid` | string | The **session id** — the token family. All tokens from one sign-in share this. |
+| `jti` | string | The JWT id, matching a `JWTToken` row in Sillo's token family tracking. |
+| `iat` / `exp` | integer | Issued-at and expiry timestamps. |
+| `typ` | string | Always `"access"`. |
+| `aal` | string | Authentication assurance level: `"aal1"` or `"aal2"`. |
+| `email` | string | The user's email. |
+| `roles` | list | Roles assigned via RBAC at sign-in time. |
+| `perms` | list | Direct permissions granted to the user. |
+| `org` | string/null | The organization slug the session is scoped to, if any. |
+| `org_role` | string/null | The user's role in that organization. |
+| `meta` | object | `user_metadata` — data the user can edit. **Policies must not trust this.** |
+| `app` | object | `app_metadata` — administrator-controlled claims. Policies *may* rely on these. |
+
+The `meta` and `app` distinction is critical. `meta` (mapped to `user_metadata`) can be edited by the user through `PATCH /auth/v1/user`, so any policy that gates on it is trusting the user's own input — a malicious user can set `meta.admin: true` and have it appear in their token. `app` (mapped to `app_metadata`) can only be changed by administrators or service keys, so policies can safely rely on it.
+
+```python
+# issue_user_token signature:
+def issue_user_token(
+    master: str, *, project: str, env: str, user_id: str, jti: str,
+    session_id: str, ttl: int = 900, email: str | None = None,
+    roles: list[str] | None = None, permissions: list[str] | None = None,
+    org: str | None = None, org_role: str | None = None, aal: str = "aal1",
+    extra: dict[str, Any] | None = None, app: dict[str, Any] | None = None,
+) -> str:
+```
+
+The `extra` parameter becomes `meta`, and `app` stays as `app`. Neither is mixed up — they are separate claim namespaces.
+
+## Access tokens
+
+An access token lives for `access_ttl` seconds (default 900, or 15 minutes). It is sent as `Authorization: Bearer <token>` on every request to the project's data plane. The token is signed with a key derived deterministically from the project and environment:
+
+```python
+def derive_env_secret(master: str, project: str, env: str) -> str:
+    message = f"pawabase:user-token:{project}:{env}".encode()
+    return hmac.new(master.encode(), message, hashlib.sha256).hexdigest()
+```
+
+This derivation has two consequences:
+
+1. **No per-environment key management.** Any service that holds the platform master secret can derive the right key for any environment on the fly — no table of environment signing keys to maintain.
+2. **A token literally cannot cross environments.** A token signed for `acme/development` cannot be verified against `acme/production` because the derived key is different. The signature itself fails, not just an environment field check.
+
+Every access token also contains the `sid` (session id), which ties it to one logical session. The `sid` is the `token_family` from Sillo's `JWTUserMixin.issue_token_pair` — the same family that the refresh token belongs to.
+
+## Refresh tokens
+
+A refresh token lives for `refresh_ttl` seconds (default 2,592,000, or 30 days). Unlike access tokens, refresh tokens are **rotating**: every successful refresh issues a new access token *and* a new refresh token, and the one that was just used stops working.
+
+```bash
+curl -X POST "$GW/auth/v1/token/refresh" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{ "refresh_token": "rft_8f2c…" }'
+```
+
+```json
+{
+  "access_token": "eyJhbGciOi…",
+  "refresh_token": "rft_d4e5…",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "session_id": "f3f0c2f8…",
+  "org": null,
+  "org_role": null,
+  "user": { "id": "8", "email": "chioma@example.com", "roles": ["guardian"] }
+}
+```
+
+### Why rotation matters
+
+Rotation is not just a security formality — it's the mechanism behind **theft detection**. If an attacker intercepts a refresh token, the legitimate client will have already used it and gotten a new one. When the attacker then tries to use the *old* copy, Sillo's `refresh_token_pair` detects the reuse and raises a `ValueError` containing `"theft"`. Akountz handles this by:
+
+1. Revoking the **entire token family** — every token issued from that sign-in, not just the stale refresh token.
+2. Emitting a `session.reuse_detected` event.
+3. Returning `401 invalid refresh token`.
+
+```python
+try:
+    pair = await user.refresh_token_pair(refresh_token, akountz.refresh_secret(config.project, config.env))
+except ValueError as exc:
+    if "theft" in str(exc):
+        row = await JWTToken.filter(token_jti=claims.get("jti") or "").first()
+        if row is not None:
+            await SessionInfo.filter(family=row.token_family).update(revoked_at=datetime.now(UTC))
+        await akountz.emit(config.project, config.env, "session.reuse_detected", ...)
+    raise HTTPException(status_code=401, detail="invalid refresh token") from exc
+```
+
+### The `KEEP` sentinel
+
+On refresh, the `org` parameter controls which organization the new tokens are issued for. The special value `KEEP` (sentinel) means "keep the session's current organization, don't change it." This is the default behavior when `org` is not provided in the refresh request body:
+
+```python
+org=body.org if "org" in body.model_fields_set else KEEP
+```
+
+If `org` is explicitly provided (including `null` or `""`), it replaces the session's organization — the new tokens carry the new org, and `org_role` is recalculated. If the user is not a member of the named org, `403 you are not a member of that organization`.
+
+## Switching or clearing the organization on refresh
+
+The organization a session is scoped to is not fixed at sign-in time — it changes on every refresh:
+
+| `org` on refresh | Effect |
+| --- | --- |
+| Omitted | `KEEP` — the session's current org is preserved. |
+| `"acme-hq"` | The session switches to that org. `org_role` is recalculated from the membership. |
+| `""` or `null` (explicit) | The session clears its organization. `org` and `org_role` become `null` in the new tokens. |
+
+This allows a single session to move between organizations without re-signing in — useful for multi-tenant dashboards where a user belongs to multiple teams. The membership check is enforced on every refresh.
+
+## Session tracking
+
+Every sign-in creates a `SessionInfo` row in Akountz's database:
+
+```python
+await SessionInfo.create(
+    family=pair["token_family"],
+    user=user,
+    project=config.project,
+    env=config.env,
+    method=method,
+    aal=aal,
+    org=org,
+    ip=ip,
+    user_agent=agent,
+)
+```
+
+A session is identified by its `family` (the `sid` / `token_family`). The `SessionInfo` row tracks:
+
+| Field | Description |
+| --- | --- |
+| `method` | How the session was created: `"password"`, `"magic_link"`, `"oauth:google"`, `"email_verification"`, `"recovery"`, `"mfa"`. |
+| `aal` | `"aal1"` or `"aal2"`. Updated when MFA is completed via `elevate`. |
+| `org` | The organization the session is scoped to. Updated on refresh when the org changes. |
+| `ip` | The client IP address at sign-in time. |
+| `user_agent` | The browser/device user-agent string. |
+| `last_refreshed_at` | When the session was last refreshed. |
+| `revoked_at` | Set when the session is explicitly revoked. |
+
+### Listing sessions
+
+`GET /auth/v1/sessions` returns all active sessions for the signed-in user, including the current one:
+
+```json
+{
+  "data": [
+    {
+      "id": "f3f0c2f8…",
+      "method": "password",
+      "aal": "aal1",
+      "ip": "203.0.113.42",
+      "user_agent": "Mozilla/5.0…",
+      "created_at": "2026-09-28T10:00:00Z",
+      "last_refreshed_at": "2026-09-28T11:30:00Z",
+      "current": true
+    },
+    {
+      "id": "a1b2c3d4…",
+      "method": "oauth:google",
+      "aal": "aal1",
+      "ip": "198.51.100.17",
+      "user_agent": "Mozilla/5.0 (iPhone)…",
+      "created_at": "2026-09-27T08:00:00Z",
+      "last_refreshed_at": "2026-09-28T06:00:00Z",
+      "current": false
+    }
+  ]
+}
+```
+
+Only sessions with active refresh tokens (not revoked, not consumed, not expired) are included.
+
+## Revocation
+
+### Sign out (local, global, others)
+
+`POST /auth/v1/logout` accepts a `scope`:
+
+| Scope | Effect |
+| --- | --- |
+| `"local"` (default) | Revoke the current session only. |
+| `"others"` | Revoke all sessions *except* the current one. |
+| `"global"` | Revoke **all** sessions for the user. |
+
+```bash
+curl -X POST "$GW/auth/v1/logout" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{ "scope": "global" }'
+```
+
+```json
+{ "signed_out": true, "scope": "global" }
+```
+
+Revocation works by revoking the token family via `JWTToken.revoke_family(family)`, which marks every JWT in that family as revoked. Because verification is stateless, a revoked access token still technically exists and won't expire until its natural `exp` — but the `JWTToken` row will show it as revoked, and `refresh_session` will also reject it. The practical window is bounded by the access token's `access_ttl`.
+
+### Sign out everywhere (admin)
+
+An administrator can sign a user out of all sessions via `POST /projects/{project}/envs/{env}/users/{user_id}/sessions/revoke`. This calls `revoke_all`, which iterates all active refresh tokens for the user and revokes each family:
+
+```python
+async def revoke_all(user: AuthUser) -> int:
+    count = await user.revoke_all_tokens()
+    await SessionInfo.filter(user=user, revoked_at=None).update(revoked_at=datetime.now(UTC))
+    return count
+```
+
+This is used when an administrator disables a user account, resets MFA, or when a security incident requires all sessions to be invalidated.
+
+### Password recovery revokes everything
+
+When a password is reset via the recovery flow, `revoke_all` is called automatically before the new session is started. This means a password reset **terminates every other session** — if a device was compromised and the legitimate user resets their password, the attacker's sessions are immediately killed.
+
+```python
+if kind == "recovery":
+    user.set_password(password)
+    user.failed_logins = 0
+    user.locked_until = None
+    await revoke_all(user)
+    return await start_session(akountz, config, user, method="recovery", ctx=ctx)
+```
+
+<Warning>
+A password reset ends all sessions across *all* devices. The user will need to sign in again on every device they use. This is deliberate — if an attacker knows your password, every active session is a potential entry point.
+</Warning>
+
+## Operator sessions vs. project-user sessions
+
+Both operators and project users are `AuthUser` rows in `akz_users`, and both get JWTs from the same token machinery. The difference is the **project and environment** they belong to:
+
+| | Project-user session | Operator session |
+| --- | --- | --- |
+| Project / env | One of your project's environments (e.g., `acme/production`) | The reserved `_platform` environment |
+| Issued via | `POST /auth/v1/token` with your project's API key | `POST /auth/v1/token` with the platform's publishable key |
+| Token claims | `prj: "acme"`, `env: "production"` | `prj: "_platform"`, `env: "_platform"` |
+| Verifiable by | Your project's services | Your project's services (via `OperatorBackend`) |
+| Bypasses policies | No | **Yes** — `is_service` is `True` for `role = "operator"` |
+| Where it's used | Your application | Studio's browser session, or direct Platform API automation |
+
+An operator token verified against `acme/production`'s derived key fails — just like any other cross-environment token. Operators and project users can never present each other's tokens to each other's services.
+
+### Studio session (cookie)
+
+When someone signs in to Studio in a browser, Akountz issues the standard access/refresh token pair for the `_platform` project. Studio holds it as a **Secure, HTTP-only session cookie** — never exposing the raw token to page JavaScript. Every action the operator takes in Studio goes through Studio's own backend, which relays it to the relevant service as a [service token](/auth/configuration#service-tokens) that names the operator.
+
+### Operator token (bearer)
+
+For direct automation against the Platform API — a CI pipeline that provisions environments, a script that promotes definitions — signing in through a browser isn't practical. `OperatorBackend` accepts a bearer token minted for `_platform`:
+
+```bash
+curl -X POST "$GW/auth/v1/token" \
+  -H "apikey: $PLATFORM_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{ "grant_type": "password", "email": "ci-bot@example.com", "password": "•••" }'
+```
+
+```bash
+curl "$STUDIO/studio/api/platform/projects" \
+  -H "Authorization: Bearer $OPERATOR_TOKEN"
+```
+
+This is a **platform-operator** credential, not a project-user credential — it must never be confused with or substituted for a project user's bearer token.
+
+## Security events
+
+Every significant auth event is recorded in `akz_login_events` and emitted as a platform event:
+
+| `kind` | `method` | When |
+| --- | --- | --- |
+| `sign_in` | `password`, `magic_link`, `oauth:{provider}`, `email_verification`, `recovery` | Successful sign-in. |
+| `sign_in` | `password`, `oauth:{provider}`, etc. | Failed sign-in (with `success: false` and `reason`). |
+| `refresh` | `refresh_token` | Token refresh (success or failure). |
+| `mfa_challenge` | `password`, `magic_link`, `oauth:{provider}` | MFA challenge issued. |
+| `mfa_verify` | `totp`, `recovery_code` | MFA verification attempt. |
+| `mfa_enrolled` | `totp` | TOTP factor enrolled. |
+| `user.mfa_enabled` | — | MFA enabled on account. |
+| `user.mfa_disabled` | — | MFA disabled on account. |
+| `session.revoked` | `local`, `global`, `others`, `admin` | Session revoked. |
+| `session.reuse_detected` | `refresh_token` | Refresh token reuse detected (potential theft). |
+| `password_reset` | `recovery` | Password reset completed. |
+| `user.password_changed` | — | User changed their own password. |
+| `sign_out` | `local`, `global`, `others` | Sign-out. |
+
+These events are queryable through the admin API (`GET /projects/{project}/envs/{env}/events`) and are also emitted as platform events that can be consumed by external systems. See [Audit log →](/operate/audit-log) for more.

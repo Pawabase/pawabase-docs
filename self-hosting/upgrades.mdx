@@ -1,9 +1,375 @@
 ---
 title: "Upgrades"
-description: "Self-hosting: this page is being written."
-tag: "Draft"
+description: "How to upgrade Pawabase safely: the upgrade path, what changes between versions, how to prepare, the actual upgrade steps, and how to roll back if something goes wrong."
+icon: "arrow-rotate-right"
 ---
 
+Upgrading a self-hosted platform requires care, because the upgrade touches every service, every database schema, and every cached configuration. Pawabase's architecture — one image, seven services, shared database — means an upgrade is a coordinated operation, not a series of independent updates. This page covers the complete upgrade lifecycle: preparing for the upgrade, executing it safely, verifying the result, and rolling back if anything goes wrong.
+
+## Understanding the upgrade model
+
+Pawabase uses a single `Dockerfile` to build one image that contains all seven services. When you upgrade, you pull a new image tag (or rebuild from the new source) and replace the running containers. The `docker-compose.yml` specifies the image via `${PAWABASE_IMAGE:-pawabase:local}`, which means:
+
+- **Default behavior**: Every `docker compose build` produces an image tagged `pawabase:local`, and `docker compose up` uses the latest built image.
+- **Tagged releases**: Production deployments should pin a specific image tag (e.g., `pawabase:1.2.0`) to ensure reproducibility and make rollbacks trivial.
+
+```yaml
+# In .env, pin the version for production
+PAWABASE_IMAGE=pawabase:1.2.0
+```
+
+The `restart: unless-stopped` policy ensures that containers restart automatically if the host reboots, but it does not automatically pull new images or recreate containers with new tags. An upgrade always requires explicit action.
+
+## Before you upgrade
+
+### Check the upgrade notes
+
+Every release should have an upgrade guide that documents breaking changes, database migrations, and any steps required beyond `docker compose up`. Read the release notes for the version you are upgrading to. If the release notes mention a database migration or a configuration change, follow those steps before proceeding.
+
+### Create a backup
+
+Before upgrading, take a backup of all three data stores. If the upgrade introduces a database migration that corrupts data, you need to be able to restore to the pre-upgrade state. See [Backups](/self-hosting/backups) for the backup procedures.
+
+```bash
+# Postgres
+docker compose exec postgres pg_dumpall -U pawabase > /backup/pre-upgrade_$(date +%Y%m%d).sql
+
+# Redis
+docker compose exec redis redis-cli BGSAVE
+cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/pre-upgrade_redis_$(date +%Y%m%d).aof
+
+# api-data
+docker compose exec api tar czf - -C /data . > /backup/pre-upgrade_api-data_$(date +%Y%m%d).tar.gz
+```
+
+### Review the .env file
+
+New versions may introduce new environment variables or deprecate old ones. Check the `.env.example` file for the new version and compare it with your current `.env`. Add any new required variables and update deprecated ones. Common changes include:
+
+- New secrets that must be generated
+- Changed default values for existing variables
+- New configuration options that affect behavior
+- Deprecated variables that will be removed in future versions
+
+### Test on a staging host
+
+If you have a staging environment, upgrade there first. Verify that:
+
+- All seven services start correctly
+- The database migrations apply without errors
+- Studio can create and modify projects
+- API calls work with existing test keys
+- Realtime connections work
+- Scheduled jobs fire correctly
+- Workers process queued jobs
+
+<Warning>
+Never upgrade production directly without testing on a staging host first. The database migration that works on a staging environment with 10 projects may behave differently on a production environment with 10,000 projects and millions of rows. The time to discover a migration bug is on staging, not in production at 2 AM.
+</Warning>
+
+## The upgrade procedure
+
+Once you have prepared, the actual upgrade is straightforward:
+
+<Steps>
+  <Step title="Pull or build the new image">
+    If using a tagged image:
+    ```bash
+    docker compose pull
+    ```
+    If building from source:
+    ```bash
+    docker compose build --no-cache
+    ```
+    The `--no-cache` flag ensures a clean build with no stale layers. If you are on a specific tag, `docker compose pull` downloads the pre-built image from the registry.
+  </Step>
+  <Step title="Stop the stack">
+    ```bash
+    docker compose down
+    ```
+    This stops all containers and removes them (but does not remove the named volumes). Stopping the stack ensures that no services are running with the old code while the new containers start.
+
+    <Note>
+    `docker compose down` does not remove named volumes (`postgres`, `redis`, `api-data`), so all your data is preserved. If you used `docker compose down -v`, the volumes would be removed and all data lost — never use `-v` for an upgrade, only for a fresh start.
+    </Note>
+  </Step>
+  <Step title="Run any database migrations">
+    If the new version includes database migrations, the migration runs automatically on startup. The `entrypoint.sh` script checks `PAWABASE_MIGRATE` (default `true`) and runs `python -m database.migrate` for the API and Akountz services.
+
+    You can run migrations explicitly before starting the stack:
+    ```bash
+    docker compose run --rm api migrate
+    docker compose run --rm akountz migrate
+    ```
+    This is useful if you want to verify that migrations apply cleanly before starting the full stack.
+
+    <Warning>
+    If a migration fails, do not start the stack. Investigate the error, check the backup, and determine whether the migration can be safely rolled back or whether you need to restore from the pre-upgrade backup. Never start services with a partially applied migration — the database schema and the code will be out of sync.
+    </Warning>
+  </Step>
+  <Step title="Start the stack">
+    ```bash
+    docker compose up -d
+    ```
+  </Step>
+  <Step title="Verify every service is healthy**:
+    ```bash
+    docker compose ps
+    ```
+    Every service should show `Up` and `healthy`. Check the logs for any errors:
+    ```bash
+    docker compose logs --tail=100
+    ```
+  </Step>
+  <Step title="Run smoke tests**:
+    Verify that the platform works correctly:
+    ```bash
+    # Gateway health
+    curl -s https://api.your-app.example.com/health
+
+    # Sign into Studio
+    # Create a test project
+    # Make an API call with a test key
+    # Verify a WebSocket connection
+    # Check the scheduler status
+    ```
+  </Step>
+</Steps>
+
+## Database migrations
+
+Database migrations are the most common source of upgrade failures. Pawabase uses a migration system (`python -m database.migrate`) that applies schema changes incrementally. Each migration is a one-way transformation of the database schema from one version to the next.
+
+### How migrations work
+
+When the API or Akountz starts, it checks the current database migration version against the latest migration available in the code. If the code is newer than the database, it runs all pending migrations in order. Each migration is designed to be applied atomically — either all changes in a migration succeed, or none do.
+
+### Safe migration practices
+
+- **Never skip migration versions**: Migrations are sequential by design. If you are upgrading from version 1.0 to 1.3, the code runs migrations for 1.1, 1.2, and 1.3 in order. Skipping is not possible because each migration references the previous state.
+- **Do not modify applied migrations**: Once a migration has been applied to a database, it is recorded in the migration history table. Modifying it (to fix a bug, for example) would cause the migration history to become inconsistent. If you need to fix a migration, create a new migration that corrects the issue.
+- **Test migrations on a copy of production data**: A migration that works on an empty database may behave differently on a database with 10 million rows. Test on a staging copy of production data before running on production.
+- **Monitor migration duration**: Large tables may take a long time to alter. A migration that adds a column to a table with millions of rows can take minutes or even hours, and it locks the table during the operation. Monitor the migration progress and plan for downtime if necessary.
+
+### Migration failures
+
+If a migration fails, the procedure depends on the nature of the failure:
+
+<AccordionGroup>
+  <Accordion title="Schema migration failed mid-execution">
+    The database is in an inconsistent state — some changes from the migration were applied, others were not. Do not attempt to start the stack. Restore from the pre-upgrade backup:
+    ```bash
+    docker compose down
+    docker compose up -d postgres
+    psql -U pawabase -d pawabase < /backup/pre-upgrade_YYYYMMDD.sql
+    psql -U pawabase -d akountz < /backup/pre-upgrade_YYYYMMDD.sql
+    docker compose up -d
+    ```
+    Investigate the migration failure, fix the migration or the database state, and retry.
+  </Accordion>
+  <Accordion title="Migration succeeded but the new code fails at runtime">
+    The database schema is updated but the new code has a bug. Roll back the image:
+    ```bash
+    docker compose down
+    # Revert to the previous image tag
+    # Set PAWABASE_IMAGE=pawabase:1.1.0 in .env
+    docker compose up -d
+    ```
+    The previous code works with the new schema because migrations are additive (they add tables, columns, and indexes). If a migration was destructive (dropped a column or table), you would need to restore from the backup instead.
+  </Accordion>
+  <Accordion title="Data migration produced bad data">
+    Some migrations include data transformations (e.g., migrating a setting from one format to another). If the transformation produces bad data, you may need to restore from the pre-upgrade backup and contact support for guidance on the correct migration path.
+  </Accordion>
+</AccordionGroup>
+
+## Rollback procedure
+
+If the upgrade fails and you need to revert, the procedure depends on the type of failure.
+
+### Code-only rollback (no schema changes)
+
+If the new version has the same database schema as the old version (or you have not started the new containers yet), rolling back is simple:
+
+```bash
+docker compose down
+# Set PAWABASE_IMAGE=pawabase:PREVIOUS_VERSION in .env
+docker compose up -d
+```
+
+The old containers start with the old code and the existing database. No migration is needed because the schema has not changed.
+
+### Schema change rollback
+
+If the new version introduced database migrations that changed the schema, rolling back the code is not sufficient — the database schema is incompatible with the old code. In this case:
+
+1. Restore the pre-upgrade database backup
+2. Start the old code
+3. Verify that the old code works with the restored database
+
+```bash
+docker compose down
+docker compose up -d postgres
+psql -U pawabase -d pawabase < /backup/pre-upgrade_YYYYMMDD.sql
+psql -U pawabase -d akountz < /backup/pre-upgrade_YYYYMMDD.sql
+# Set PAWABASE_IMAGE=pawabase:PREVIOUS_VERSION in .env
+docker compose up -d
+```
+
+<Warning>
+Rolling back by restoring the database undoes any data changes that the new code made before the failure. If users created accounts, uploaded files, or made API calls between the upgrade and the failure, that data is lost. This is why taking a pre-upgrade backup is essential — it gives you a known-good starting point.
+</Warning>
+
+### Partial rollback
+
+In rare cases, you may need to roll back only one service. For example, if the API upgrade introduces a bug but the gateway and Studio work fine with the old API:
+
+```bash
+docker compose stop api
+# Run the old API image manually or revert the image tag
+docker compose up -d api
+```
+
+Partial rollbacks are complex and should only be attempted if you understand the data compatibility between the old and new code versions. When in doubt, restore the full backup and start over.
+
+## Zero-downtime upgrades
+
+For production deployments that cannot tolerate downtime, you can perform a zero-downtime upgrade using the rolling restart pattern. This works because Pawabase services are stateless per request (except the scheduler).
+
+```bash
+# Upgrade the API with rolling restart
+docker compose up -d --no-deps --build api
+# The new API containers start before the old ones are stopped, because
+# the depends_on conditions in the gateway ensure the old API is still
+# serving while the new one initializes.
+```
+
+The rolling restart pattern:
+
+1. Start new API containers with the new image
+2. Wait for the new containers to be healthy
+3. Stop old API containers
+4. Repeat for each service
+
+<Warning>
+True zero-downtime upgrades are not possible for the scheduler. If the scheduler is upgraded, there is a brief window where the old scheduler is stopped and the new one has not yet registered its jobs. During this window, no schedules fire. Plan scheduler upgrades for low-traffic periods.
+
+Similarly, the scheduler must be upgraded on exactly one host. If you are running a multi-host deployment with Docker Swarm or Kubernetes, the scheduler must be placed on a single node, and the upgrade must be coordinated so that only one scheduler instance exists at any time.
+</Warning>
+
+## Upgrading Postgres and Redis
+
+The bundled Postgres and Redis versions in `docker-compose.yml` may lag behind the latest releases. Upgrading the database engines is a separate concern from upgrading Pawabase itself and requires additional care.
+
+### Upgrading Postgres
+
+Postgres upgrades require a dump and restore — there is no in-place upgrade path between major versions.
+
+```bash
+# 1. Dump the current database
+docker compose exec postgres pg_dumpall -U pawabase > /backup/pg_dump_before_$(date +%Y%m%d).sql
+
+# 2. Update the image in docker-compose.yml or .env
+# Change postgres:16-alpine to postgres:17-alpine (or whatever version)
+
+# 3. Stop the stack
+docker compose down
+
+# 4. Start only Postgres with the new version
+# The new data directory is initialized empty
+docker compose up -d postgres
+
+# 5. Restore the dump
+docker compose exec -T postgres psql -U pawabase -d postgres < /backup/pg_dump_before_YYYYMMDD.sql
+docker compose exec -T postgres psql -U pawabase -d akountz < /backup/pg_dump_before_YYYYMMDD.sql
+
+# 6. Start the full stack
+docker compose up -d
+```
+
 <Note>
-This page is part of the **Self-hosting** section and is still being written. Check back soon.
+Postgres handles minor version upgrades (e.g., 16.3 to 16.5) automatically — the `postgres:16-alpine` tag always points to the latest patch release of Postgres 16. Major version upgrades (e.g., 16 to 17) require the dump-and-restore procedure above. Check the Postgres version in `docker-compose.yml` before upgrading.
 </Note>
+
+### Upgrading Redis
+
+Redis also requires a dump and restore for major version upgrades. Minor version upgrades (e.g., 7.0 to 7.2) are generally backward-compatible with AOF files.
+
+```bash
+# 1. Save the current data
+docker compose exec redis redis-cli BGSAVE
+cp /var/lib/docker/volumes/redis/_data/appendonly.aof /backup/redis_aof_before_$(date +%Y%m%d).aof
+
+# 2. Update the image version in docker-compose.yml
+
+# 3. Stop the stack and start only Redis with the new version
+# Restore the AOF file and start
+```
+
+## Upgrade checklist
+
+Use this checklist before, during, and after every upgrade:
+
+<AccordionGroup>
+  <Accordion title="Before the upgrade">
+    - [ ] Read the release notes for the target version
+    - [ ] Note any breaking changes or new required configuration
+    - [ ] Generate any new secrets that the new version requires
+    - [ ] Update `.env` with any new or changed variables
+    - [ ] Test on a staging host
+    - [ ] Back up Postgres, Redis, and api-data
+    - [ ] Verify backups are valid (try restoring to a test host)
+    - [ ] Schedule the upgrade during a low-traffic window
+  </Accordion>
+  <Accordion title="During the upgrade">
+    - [ ] Pull or build the new image
+    - [ ] Stop the stack with `docker compose down` (not `-v`)
+    - [ ] Run migrations explicitly if desired: `docker compose run --rm api migrate`
+    - [ ] Start the stack with `docker compose up -d`
+    - [ ] Verify all services are `Up` and `healthy`
+    - [ ] Check logs for errors
+  </Accordion>
+  <Accordion title="After the upgrade">
+    - [ ] Run smoke tests (create project, make API call, WebSocket, scheduler)
+    - [ ] Verify Studio sign-in works
+    - [ ] Check that scheduled jobs fire correctly
+    - [ ] Verify that workers process queued jobs
+    - [ ] Check the Studio status page for any warnings
+    - [ ] Monitor for 24 hours (watch for memory leaks, connection issues, slow queries)
+    - [ ] Update the deployment documentation with the new version
+  </Accordion>
+  <Accordion title="If the upgrade fails">
+    - [ ] Do not panic — the pre-upgrade backup is your safety net
+    - [ ] Stop the stack: `docker compose down`
+    - [ ] Restore from backup: `psql < /backup/pre-upgrade_YYYYMMDD.sql`
+    - [ ] Revert the image tag in `.env`
+    - [ ] Restart: `docker compose up -d`
+    - [ ] Verify the old version works correctly
+    - [ ] Investigate the failure before attempting again
+  </Accordion>
+</AccordionGroup>
+
+## Version pinning and reproducibility
+
+For production deployments, always pin the image version:
+
+```bash
+# .env
+PAWABASE_IMAGE=pawabase:1.2.3
+```
+
+This ensures that:
+
+- Every `docker compose build` produces the exact same image
+- Every host in a multi-host deployment runs the same version
+- Rollbacks are a single-line change in `.env`
+- You can reproduce any deployment by checking out the `.env` and running `docker compose up`
+
+For development, the default `pawabase:local` is fine — it is rebuilt from source on every `docker compose build`.
+
+<Note>
+The `docker-compose.yml` uses `${PAWABASE_IMAGE:-pawabase:local}`, which means if `PAWABASE_IMAGE` is not set, it defaults to `pawabase:local`. If you are building from source and want to ensure the latest build is always used, do not set `PAWABASE_IMAGE`. If you are deploying a tagged release, set it explicitly.
+</Note>
+
+## Summary
+
+Upgrades follow a predictable pattern: back up, pull the new image, stop the stack, run migrations, start the stack, verify. The complexity lies not in the procedure but in the preparation — reading the release notes, testing on staging, and maintaining valid backups. Follow the checklist, and upgrades become routine. Skip the preparation, and upgrades become incidents.

@@ -1,9 +1,332 @@
 ---
 title: "Social login"
-description: "Authentication: this page is being written."
-tag: "Draft"
+description: "Which OAuth providers ship built-in, how the callback works, linking identities, adding a generic provider, and the configuration shape for each."
+icon: "chrome"
 ---
 
-<Note>
-This page is part of the **Authentication** section and is still being written. Check back soon.
-</Note>
+Social login lets users sign in with an existing OAuth/OIDC identity — Google, GitHub, Discord, Microsoft, or any custom provider. Pawabase ships with four providers and supports generic OAuth 2.0/OIDC providers through a single configuration. This page covers the full provider ecosystem, the callback mechanics, identity linking, and how to add a provider that isn't built in.
+
+<CardGroup cols={3}>
+  <Card title="Four shipped providers" icon="package">Google, GitHub, Discord, and Microsoft — configured with a single key each.</Card>
+  <Card title="Any OAuth 2.0/OIDC provider" icon="globe">Add a generic provider with `authorize_endpoint`, `token_endpoint`, and `userinfo_endpoint`.</Card>
+  <Card title="Identity linking" icon="link">A signed-in user can link additional identities without changing their account.</Card>
+</CardGroup>
+
+## Shipped providers
+
+Four providers are built into Pawabase through `sillo-oauth`. Each is configured as a key in the environment's `providers` object:
+
+```json
+{
+  "providers": {
+    "google": { "client_id": "...", "client_secret": "secret://GOOGLE_SECRET", "enabled": true },
+    "github": { "client_id": "...", "client_secret": "secret://GITHUB_SECRET", "enabled": true },
+    "discord": { "client_id": "...", "client_secret": "secret://DISCORD_SECRET", "enabled": true },
+    "microsoft": { "client_id": "...", "client_secret": "secret://MS_SECRET", "tenant": "common", "enabled": true }
+  }
+}
+```
+
+| Provider | Class | Special parameters |
+| --- | --- | --- |
+| `google` | `GoogleOAuthProvider` | None beyond the standard fields. |
+| `github` | `GithubOAuthProvider` | None beyond the standard fields. |
+| `discord` | `DiscordOAuthProvider` | None beyond the standard fields. |
+| `microsoft` | `MicrosoftOAuthProvider` | `tenant` — the Azure AD tenant (`"common"`, a tenant ID, or `"organizations"`). |
+
+Each provider requires `client_id` and `client_secret`. The `client_secret` can reference a Pawabase secret via `secret://NAME` syntax — the platform resolves it at runtime, so plaintext secrets never appear in configuration files.
+
+The `enabled` field controls whether the provider appears in the `/auth/v1/settings` response and can be toggled without removing the configuration. A provider with `enabled: false` or without a `client_id` is invisible to users.
+
+## Adding a generic OAuth/OIDC provider
+
+Any OAuth 2.0 or OIDC provider can be added by specifying its endpoints in the `providers` object:
+
+```json
+{
+  "providers": {
+    "gitlab": {
+      "client_id": "…",
+      "client_secret": "…",
+      "authorize_endpoint": "https://gitlab.com/oauth/authorize",
+      "token_endpoint": "https://gitlab.com/oauth/token",
+      "userinfo_endpoint": "https://gitlab.com/api/v4/user",
+      "scopes": ["read_user"],
+      "authorize_params": { "access_type": "offline" },
+      "enabled": true
+    }
+  }
+}
+```
+
+The generic provider is built as an `OAuthProvider` when all three endpoint fields (`authorize_endpoint`, `token_endpoint`, `userinfo_endpoint`) are present. If `openid` is in the `scopes`, it's treated as OIDC — the `sillo-oauth` library adds the `openid` scope and processes the ID token accordingly.
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `client_id` | Yes | The OAuth client ID registered with the provider. |
+| `client_secret` | Yes | The client secret. Can use `secret://NAME`. |
+| `authorize_endpoint` | Yes (generic) | The authorization URL. |
+| `token_endpoint` | Yes (generic) | The token exchange URL. |
+| `userinfo_endpoint` | Yes (generic) | The user profile URL. |
+| `scopes` | No | OAuth scopes. Defaults are provider-specific. |
+| `authorize_params` | No | Additional parameters sent to the authorization endpoint. |
+| `tenant` | No | Microsoft-specific Azure AD tenant. |
+| `enabled` | No | Whether the provider is active. |
+
+## The social login flow
+
+### Step 1: Start the sign-in
+
+**Request**: `GET /auth/v1/authorize/{project}/{env}/{provider}`
+
+This endpoint is designed for browser navigations — it takes the project and environment from the URL path (not from an API key or header). It returns a redirect to the provider's authorization URL:
+
+```python
+async def start(ctx: HttpContext, project: str, env: str, provider: str):
+    config = await load_config(akountz, project, env)
+    redirect_to = ctx.query_params.get("redirect_to") or config.site_url or None
+    if redirect_to and not config.redirect_allowed(redirect_to):
+        raise HTTPException(status_code=400, detail="redirect_to is not an allowed URL")
+    link_token = ctx.query_params.get("link_token")
+    state = {"redirect_to": redirect_to, "link": link_token} if link_token else {"redirect_to": redirect_to}
+    provider_obj = oauth.build_provider(akountz, config, provider)
+    authorize = authorize_url(provider_obj, return_to=json.dumps(state))
+    secure = (config.public_url or akountz.settings.public_url).startswith("https://")
+    return redirect(authorize.url).set_cookie(**authorize.cookie_kwargs(secure=secure))
+```
+
+The `state` parameter carries the `redirect_to` URL and an optional `link_token` (for identity linking). This state is returned to the callback after the provider's authorization.
+
+PKCE and state management are handled by `sillo-oauth`. The `state_secret` is derived from `akountz.state_secret(config.project, config.env)`, so state tokens are signed with a per-environment secret.
+
+### Step 2: Provider redirects back
+
+The provider redirects back to `GET /auth/v1/callback/{project}/{env}/{provider}` with the authorization code.
+
+### Step 3: Exchange and process
+
+**Request**: `GET /auth/v1/callback/{project}/{env}/{provider}`
+
+```python
+async def callback(ctx: HttpContext, project: str, env: str, provider: str):
+    config = await load_config(akountz, project, env)
+    provider_obj = oauth.build_provider(akountz, config, provider)
+    profile = await exchange(provider_obj, ctx)
+    ...
+```
+
+The `exchange` function in `sillo-oauth` handles the code-to-token exchange, PKCE verification, and state validation. If the exchange fails (invalid code, state mismatch, network error), the error is logged and the user is redirected back to the site URL with an `error` parameter in the fragment.
+
+The `profile` object returned by `exchange` contains:
+
+| Field | Description |
+| --- | --- |
+| `subject` | The provider's unique identifier for the user. |
+| `email` | The user's email address from the provider. |
+| `email_verified` | Whether the provider verified the email. |
+| `username` | The provider's username or login handle. |
+| `name` | The user's display name. |
+| `avatar_url` | The user's profile picture URL. |
+| `raw` | The raw profile data from the provider. |
+| `return_to` | The JSON state string passed back from the authorization request. |
+
+### Step 4: Account resolution
+
+The callback resolves which Pawabase account the identity belongs to, in this order:
+
+1. **Existing identity**: An `Identity` row matching `(project, env, provider, subject)` is looked up. If found, the associated user signs in.
+2. **Linking mode**: If `state.link` is present (identity linking flow), the `link_token` is consumed and the identity is attached to the linked account.
+3. **Email match**: If no identity exists but the profile has a verified email, `find_by_email` searches for an existing account with that email.
+4. **New account**: If no account is found and `signup_enabled` is `true`, a new account is created. The account is created with `verified: bool(profile.email_verified)` and `password: None` (no usable password).
+
+```python
+identity = await Identity.filter(project=project, env=env, provider=provider, subject=profile.subject).first()
+user = identity.user if identity else None
+if state.get("link"):
+    row = await links.consume(akountz, config, "link", state["link"])
+    user = row.user
+if user is None and profile.email and profile.email_verified:
+    user = await find_by_email(project, env, profile.email)
+if user is None:
+    user = await create_account(config, email=profile.email, password=None, ...)
+```
+
+### Step 5: Session issuance
+
+If the user has MFA enabled and the environment has MFA enabled, an MFA challenge is issued. Otherwise, a session is started:
+
+```python
+if user.mfa_enabled and config.mfa_enabled:
+    challenge = await links.issue(akountz, config, "mfa", user=user, data={"method": f"oauth:{provider}"})
+    payload = {"mfa_required": "true", "mfa_token": challenge}
+else:
+    session = await start_session(akountz, config, user, method=f"oauth:{provider}", ctx=ctx)
+    payload = {k: session[k] for k in ("access_token", "refresh_token", "expires_in", "token_type")}
+```
+
+If `state.redirect_to` is present and allowed, the session tokens (or `mfa_required`) are returned as a redirect fragment:
+
+```python
+if target:
+    return redirect(f"{target}#{urlencode(payload)}")
+```
+
+## Identity linking
+
+A signed-in user can link additional OAuth identities to their account — for example, signing in with Google first, then linking a GitHub account. This is a two-step process:
+
+### Step 1: Get a linking URL
+
+**Request**: `GET /auth/v1/identities/link?provider=github`
+
+The response includes a URL that the user navigates to in their browser:
+
+```json
+{
+  "url": "https://app.example.com/auth/v1/authorize/acme/production/github?link_token=…"
+}
+```
+
+The `link_token` is a single-use token (`kind: "link"`, lifetime 600 seconds) that carries the target account's user id. When the OAuth callback returns with this `link_token` in the state, the handler attaches the new identity to the linked account:
+
+```python
+if state.get("link"):
+    row = await links.consume(akountz, config, "link", state["link"])
+    if identity is not None and identity.user_id != row.user_id:
+        return _error_redirect(target, "identity_already_linked")
+    user = row.user
+```
+
+### Step 2: Navigate to the linking URL
+
+The user clicks the URL, which starts the OAuth flow with `link_token` in the state. After the provider authorizes, the identity is linked to the account and the user is redirected back with `linked=github` in the fragment.
+
+### Unlinking an identity
+
+**Request**: `DELETE /auth/v1/identities/{identity_id}`
+
+An identity can be removed from an account. If it's the user's only sign-in method *and* they have no usable password, the unlink is blocked (`409 set a password before removing your only sign-in method`). This prevents a user from locking themselves out by removing their last identity without setting a password first.
+
+## Unlinking protection
+
+The unlink endpoint checks whether removing the identity would leave the user with no viable sign-in method:
+
+```python
+if not user.has_usable_password() and await Identity.filter(user=user).count() <= 1:
+    raise HTTPException(
+        status_code=409, detail="set a password before removing your only sign-in method"
+    )
+```
+
+This means:
+- A user with a password and one linked identity can unlink that identity — the password still works.
+- A user with two linked identities and no password can unlink one — the other still works.
+- A user with one linked identity and no password cannot unlink it — they'd be locked out.
+
+## Identity data model
+
+Each linked identity is stored in the `akz_identities` table:
+
+| Field | Description |
+| --- | --- |
+| `provider` | The provider name (e.g., `"google"`, `"github"`). |
+| `subject` | The provider's unique user identifier. |
+| `email` | The email from the provider's profile. |
+| `email_verified` | Whether the provider verified the email. |
+| `data` | The raw profile data from the provider. |
+| `last_sign_in_at` | Updated on every successful sign-in through this identity. |
+
+The unique constraint is `(project, env, provider, subject)` — a user can link at most one identity per provider per environment.
+
+## Managing identities from the admin API
+
+Administrators can search, create, update, and manage identities through the admin routes. The `GET /projects/{project}/envs/{env}/users/{user_id}` endpoint returns a user's full identity list in the `identities` field.
+
+## Common provider configurations
+
+### Google
+
+```json
+{
+  "google": {
+    "client_id": "123456789-abc.apps.googleusercontent.com",
+    "client_secret": "secret://GOOGLE_SECRET",
+    "enabled": true
+  }
+}
+```
+
+Google uses the standard OAuth 2.0 endpoints built into `GoogleOAuthProvider`. The profile includes `email`, `email_verified`, `name`, `picture` (mapped to `avatar_url`), and `sub`.
+
+### GitHub
+
+```json
+{
+  "github": {
+    "client_id": "Iv1.abc123...",
+    "client_secret": "secret://GITHUB_SECRET",
+    "enabled": true
+  }
+}
+```
+
+GitHub's OAuth flow returns `login` (username), `email`, `name`, and `avatar_url`. Note that GitHub emails may be private — if the user has set their email to private, the profile's `email` field may be `null`. In that case, the account is created with `email: null` unless a verified email is available from another source.
+
+### Microsoft
+
+```json
+{
+  "microsoft": {
+    "client_id": "00000000-0000-0000-0000-000000000000",
+    "client_secret": "secret://MS_SECRET",
+    "tenant": "common",
+    "enabled": true
+  }
+}
+```
+
+The `tenant` parameter controls which Azure AD tenants can sign in. `"common"` allows any Microsoft account (personal or work). A specific tenant ID restricts sign-in to that organization's accounts.
+
+### Discord
+
+```json
+{
+  "discord": {
+    "client_id": "123456789012345678",
+    "client_secret": "secret://DISCORD_SECRET",
+    "enabled": true
+  }
+}
+```
+
+Discord profiles include `username`, `email` (if the user has verified their email), `avatar_url`, and `id` as the subject.
+
+## Security considerations
+
+### Verified emails only
+
+A social identity is only attached to an existing account if `profile.email_verified` is `true`, or if the email doesn't already exist in the system. This prevents an attacker from claiming ownership of another user's account by signing in with a provider that reports a different email than the account owner's.
+
+### No password fallback
+
+A social-only account (no usable password) cannot sign in with a password. If all linked identities are removed and no password has been set, the account is locked. Users should always have at least one sign-in method available.
+
+### Provider outages
+
+If a provider's token endpoint is unavailable during the callback, the exchange fails and the user is redirected back to the site URL with an error. There is no fallback mechanism — the user must retry after the provider is available.
+
+### Account merging
+
+If a user signs in with a provider whose email matches an existing account, the identity is attached to the existing account — it is **not** merged or duplicated. The existing account gains a new identity, and the user can now sign in through either the original method and the new provider.
+
+## Audit trail
+
+Social login events are recorded with `method: "oauth:{provider}"`:
+
+- `identity.linked` — when a new identity is linked to an account.
+- `identity.unlinked` — when an identity is removed.
+- `user.created` with `method: "oauth:{provider}"` — when a new account is created through social login.
+- `sign_in` with `method: "oauth:{provider}"` — on successful sign-in.
+- `sign_in` with `method: "oauth:{provider}"` and `success: false` — on failure, with `reason` set to the OAuth error code.
+
+These events appear in Studio's audit log and can be queried through the admin events API.

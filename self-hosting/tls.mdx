@@ -1,9 +1,320 @@
 ---
-title: "Tls"
-description: "Self-hosting: this page is being written."
-tag: "Draft"
+title: "TLS"
+description: "Configure TLS termination for Pawabase: certificates, automatic renewal, HSTS, and how the reverse proxy and Pawabase cooperate for end-to-end encrypted connections."
+icon: "lock"
 ---
 
+Pawabase does not terminate TLS itself. The gateway and Studio expose plain HTTP on their respective ports, and a reverse proxy (Caddy, Nginx, Traefik) in front of them handles certificate management, TLS negotiation, and HTTPS redirects. This separation of concerns is deliberate: the reverse proxy is purpose-built for TLS, can handle certificate rotation transparently, and can add HTTP/2, OCSP stapling, and HSTS headers without any change to Pawabase's code.
+
+This page walks through the complete TLS setup — from certificate acquisition through to the headers Pawabase needs from the proxy — and covers the edge cases that arise in self-hosted deployments.
+
+## Why a reverse proxy
+
+The gateway runs on port 8080 and Studio on port 8090 inside the Docker network. Neither speaks TLS. This is not a limitation — it is a design choice. Running TLS in every service would require distributing certificates, handling renewal, and managing cipher suites across seven containers. A single reverse proxy consolidates all of this into one configuration point.
+
+Additionally, the reverse proxy can enforce security policies that benefit the entire platform:
+
+- **Rate limiting at the edge** — before a request even reaches the gateway, the proxy can reject brute-force attempts on the authentication endpoints.
+- **Request filtering** — block known malicious user agents, restrict methods, or drop oversized requests before they consume gateway resources.
+- **HTTP/2** — multiplexes requests over a single connection, which benefits WebSocket connections and parallel API calls from browsers.
+- **Compression** — offloads gzip/brotli compression from the gateway, saving CPU.
+
+## Caddy: the simplest path
+
+Caddy is the recommended reverse proxy because its automatic HTTPS via Let's Encrypt requires zero manual certificate management. A single `Caddyfile` handles certificate issuance, renewal, and HTTP→HTTPS redirects.
+
+### Minimal Caddyfile
+
+```
+api.your-app.example.com {
+    reverse_proxy localhost:8080 {
+        flush_interval -1
+    }
+}
+
+studio.your-app.example.com {
+    reverse_proxy localhost:8090 {
+        flush_interval -1
+    }
+}
+```
+
+Replace the domain names with your actual Pawabase origins. Caddy automatically:
+
+1. Obtains a Let's Encrypt certificate for each domain on first request
+2. Stores the certificate in `/root/.local/share/caddy/` (or `/etc/caddy/` if running as a service)
+3. Renews certificates automatically before expiry (typically 30 days before expiry)
+4. Redirects all HTTP requests to HTTPS
+5. Adds the `Strict-Transport-Security` header (configurable)
+
+Place this file at `/etc/caddy/Caddyfile` and start Caddy:
+
+```bash
+sudo systemctl enable --now caddy
+```
+
+### The flush_interval directive
+
+The `flush_interval -1` setting disables response buffering in Caddy. This is essential for Pawabase because the gateway streams request and response bodies without fully buffering them — this is how large file uploads and downloads work through the gateway (see [Architecture](/concepts/architecture) for the streaming walkthrough). If Caddy buffers the response, a 300 MB file upload would fill Caddy's memory before being forwarded to the gateway, defeating the purpose of streaming.
+
+### Caddy as a service
+
+When running Caddy as a systemd service, ensure it can access the Docker socket or the forwarded ports. The simplest configuration is to let Caddy run on the host and reverse-proxy to `localhost:8080` and `localhost:8090`:
+
+```ini
+# /etc/systemd/system/caddy.service (Caddy ships its own; verify it exists)
+[Service]
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile
+```
+
+### Custom certificate paths
+
+If you have your own certificates (from an internal PKI, a managed certificate provider, or a manual Let's Encrypt issuance), tell Caddy where they are:
+
+```
+api.your-app.example.com {
+    tls /etc/ssl/certs/api.crt /etc/ssl/private/api.key
+    reverse_proxy localhost:8080 {
+        flush_interval -1
+    }
+}
+```
+
+With manual certificates, Caddy will not attempt Let's Encrypt issuance — it will use the provided certificate and key. You are responsible for renewal.
+
+## Nginx configuration
+
+If you prefer Nginx, the configuration requires more manual steps, particularly for certificate management and HTTP→HTTPS redirects.
+
+### Nginx with Let's Encrypt (certbot)
+
+```bash
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d api.your-app.example.com -d studio.your-app.example.com
+```
+
+Certbot automatically generates and configures the Nginx server blocks with TLS certificates and HTTP→HTTPS redirects. The resulting configuration includes:
+
+```nginx
+server {
+    listen 80;
+    server_name api.your-app.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.your-app.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/api.your-app.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.your-app.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        chunked_transfer_encoding on;
+    }
+}
+```
+
+The `chunked_transfer_encoding on` directive is important — it ensures that chunked transfer encoding from the gateway is preserved through the proxy, which is necessary for streaming responses.
+
+### Nginx with manual certificates
+
+```nginx
+server {
+    listen 80;
+    server_name api.your-app.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.your-app.example.com;
+
+    ssl_certificate /etc/ssl/certs/api.fullchain.pem;
+    ssl_certificate_key /etc/ssl/private/api.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+
+    # Enable OCSP stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 1.1.1.1 8.8.8.8 valid=300s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        chunked_transfer_encoding on;
+    }
+}
+```
+
+## The X-Forwarded-Proto header
+
+This is the single most important header the reverse proxy must send to Pawabase. Pawabase reads it to determine whether the original client request arrived over HTTPS or HTTP. It affects:
+
+- **`PAWABASE_COOKIE_SECURE`**: When `true`, the session cookie carries the `Secure` flag, meaning browsers only send it over HTTPS. If `X-Forwarded-Proto` says `http`, Pawabase may treat the connection as insecure even though the client connected via TLS to the proxy.
+- **CORS origin checks**: Pawabase compares the request origin against the environment's configured allowed origins. If the origin is `https://api.your-app.example.com` but `X-Forwarded-Proto` is missing or wrong, the CORS check may fail.
+- **Redirect URLs**: OAuth callbacks, password reset links, and email links are constructed with the protocol from `X-Forwarded-Proto`. Without it, links in emails would point to `http://` instead of `https://`.
+
+<Warning>
+If you configure Caddy or Nginx and forget to forward `X-Forwarded-Proto`, the most common symptom is that signed storage URLs in emails point to `http://` instead of `https://`, causing browsers to block them as mixed content. The fix is to add the `proxy_set_header X-Forwarded-Proto $scheme;` directive (Nginx) or ensure Caddy passes it automatically (Caddy does this by default).
+</Warning>
+
+## HSTS headers
+
+HTTP Strict Transport Security tells browsers to only connect to your site over HTTPS for a specified period, even if the user types `http://` in the address bar. This prevents SSL stripping attacks.
+
+### Caddy
+
+Caddy adds the `Strict-Transport-Security` header automatically when it serves HTTPS. Configure the max-age:
+
+```
+api.your-app.example.com {
+    tls {
+        strict_transport_security {
+            max_age 31536000
+            include_subdomains
+            preload
+        }
+    }
+    reverse_proxy localhost:8080 {
+        flush_interval -1
+    }
+}
+```
+
+### Nginx
+
+Add to each `server` block that serves HTTPS:
+
+```nginx
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload" always;
+```
+
 <Note>
-This page is part of the **Self-hosting** section and is still being written. Check back soon.
+Once you enable HSTS with a long `max-age`, browsers will refuse to connect over HTTP to your domain for that duration. Make sure HTTPS works correctly before enabling HSTS. If you set `preload`, you submit your domain to the browser's hardcoded HSTS preload list, which cannot be easily reversed. Only enable `preload` if you are certain you will never serve HTTP again.
 </Note>
+
+## WebSocket TLS
+
+Angula handles WebSocket connections through the gateway, and WebSocket connections upgrade from HTTP. The reverse proxy must support WebSocket proxying — most modern reverse proxies do automatically, but configuration details matter.
+
+### Caddy
+
+Caddy handles WebSocket upgrades automatically — no additional configuration is needed. The `reverse_proxy` directive detects WebSocket upgrade headers and forwards them correctly.
+
+### Nginx
+
+Nginx requires explicit WebSocket proxying headers:
+
+```nginx
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+location /realtime/v1/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 86400;  # WebSocket connections can stay open for a long time
+}
+```
+
+The `proxy_read_timeout 86400` directive prevents Nginx from closing idle WebSocket connections after the default 60-second timeout. Adjust as needed for your use case.
+
+## Certificate renewal monitoring
+
+Automatic certificate renewal should not be a set-and-forget operation. Monitor it:
+
+- **Caddy**: Check the Caddy logs for renewal errors: `journalctl -u caddy -e`. Caddy logs renewal failures to stderr.
+- **Nginx with certbot**: Certbot sets up its own timer (`certbot.timer`). Verify it is active: `systemctl status certbot.timer`. Check the timer's output: `journalctl -u certbot`.
+
+Configure an alert (email, Slack, PagerDuty) for renewal failures. An expired certificate means all TLS connections fail, and your platform goes offline from the outside even though every container is running.
+
+## mTLS for internal services (optional)
+
+For deployments where internal network traffic must also be encrypted, you can configure mutual TLS between Pawabase services. This is an advanced setup and requires generating certificates for every service.
+
+<AccordionGroup>
+  <Accordion title="How it works">
+    Each Pawabase service presents a client certificate when connecting to another service. The receiving service verifies the certificate against a trusted CA. This prevents an attacker on the Docker network from impersonating another service — even if they can intercept traffic on the bridge network.
+  </Accordion>
+  <Accordion title="Implementation">
+    Generate a CA, then a certificate for each service, and configure each service's HTTP client to present the certificate and verify the peer's certificate against the CA. This requires modifying the service configurations that create `ServiceClient` instances and the gateway's upstream connections. See [Trust between services](/concepts/architecture) for how internal service communication currently works without mTLS.
+
+    This is an advanced configuration and is not covered by the default deployment. If you need mTLS, you likely already have the infrastructure to manage it, and the implementation details are specific to your certificate management system.
+  </Accordion>
+  <Accordion title="When it is worth it">
+    mTLS for internal Docker network traffic is rarely necessary. The Docker bridge network is isolated from the internet by default, and Docker's network namespace provides a reasonable security boundary. The primary threat model for a self-hosted deployment is external access (hence TLS on the public ports), not internal network sniffing. However, if you are running Pawabase in a shared hosting environment or on a compromised host, mTLS adds a meaningful layer of defense.
+  </Accordion>
+</AccordionGroup>
+
+## Complete deployment sequence
+
+Putting it all together, the TLS setup sequence for a new production deployment:
+
+<Steps>
+  <Step title="Configure the reverse proxy">
+    Install Caddy or Nginx. Create the configuration with the correct domain names and `flush_interval -1` (Caddy) or `chunked_transfer_encoding on` (Nginx).
+  </Step>
+  <Step title="Start the reverse proxy">
+    Enable and start the service. Verify the domain resolves to your server's IP and that the certificate is obtained.
+  </Step>
+  <Step title="Update .env">
+    Set `PAWABASE_PUBLIC_URL=https://api.your-app.example.com` and `PAWABASE_COOKIE_SECURE=true`.
+  </Step>
+  <Step title="Restart the Pawabase stack">
+    ```bash
+    cd /opt/pawabase
+    docker compose down
+    docker compose up -d
+    ```
+    The restart is necessary because the `.env` changes affect every container's environment.
+  </Step>
+  <Step title="Verify TLS">
+    ```bash
+    curl -v https://api.your-app.example.com/health
+    # Check that the connection uses TLS and returns 200
+
+    curl -v http://api.your-app.example.com/health
+    # Should redirect to https:// or refuse the connection
+    ```
+  </Step>
+  <Step title="Verify WebSocket connections">
+    Open a WebSocket connection to `wss://api.your-app.example.com/realtime/v1/socket?apikey=...` and confirm it upgrades successfully and receives messages.
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Certificate not obtained">
+    If Caddy cannot obtain a certificate, check DNS: the domain must resolve to your server's public IP. Let's Encrypt validates domain ownership via HTTP-01 or TLS-ALPN challenges, which require the domain to be reachable on port 80 (for HTTP-01) or 443 (for TLS-ALPN). If a firewall blocks port 80, Caddy falls back to TLS-ALPN on port 443 — but ensure the firewall allows inbound connections on 443 from Let's Encrypt's IP ranges.
+  </Accordion>
+  <Accordion title="Mixed content warnings">
+    Browsers block `http://` resources loaded from an `https://` page. If your Studio page loads `http://` resources, check: `X-Forwarded-Proto` is being forwarded correctly by the reverse proxy, and `PAWABASE_PUBLIC_URL` starts with `https://`.
+  </Accordion>
+  <Accordion title="WebSocket fails over WSS">
+    WebSocket connections over TLS (`wss://`) require the reverse proxy to forward the `Upgrade` and `Connection` headers. If the WebSocket fails with a 403 or connection reset, verify the proxy configuration handles WebSocket upgrades. See [WebSocket TLS](#websocket-tls) for the Nginx configuration.
+  </Accordion>
+  <Accordion title="Certificate expired but auto-renewal should work">
+    Check the renewal logs. Common causes: the system clock is wrong, DNS changed, the certificate was revoked, or the Let's Encrypt rate limit was hit. You can force a renewal with `certbot renew --force-renewal` or `caddy reload --force`.
+  </Accordion>
+</AccordionGroup>

@@ -1,9 +1,264 @@
 ---
 title: "Magic links"
-description: "Authentication: this page is being written."
-tag: "Draft"
+description: "Passwordless sign-in with magic links, how magic link sign-up works, MFA interaction, and the configuration that controls the flow."
+icon: "wand-2"
 ---
 
+Magic links are Pawabase's passwordless sign-in method. Instead of typing a password, a user enters their email address and receives a link that signs them in when clicked. It's the simplest possible sign-in experience — no password to remember, no password policy to satisfy, no password hashing to worry about.
+
+<CardGroup cols={3}>
+  <Card title="No password required" icon="link">The user only provides an email. The link itself is the authentication factor.</Card>
+  <Card title="15-minute TTL" icon="clock">Every magic link expires in 15 minutes — short enough that a leaked link is a minor exposure.</Card>
+  <Card title="Account creation on first use" icon="plus">If the email doesn't have an account, one is created automatically — if `signup_enabled` is `true`.</Card>
+</CardGroup>
+
+## How magic links work
+
+### Step 1: Request a magic link
+
+**Request**: `POST /auth/v1/magic-link`
+
+```bash
+curl -X POST "$GW/auth/v1/magic-link" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{ "email": "chioma@example.com" }'
+```
+
+The request body is a `MagicLinkRequest`:
+
+```json
+{
+  "email": "chioma@example.com",
+  "create_user": true,
+  "redirect_to": "https://app.example.com/dashboard"
+}
+```
+
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `email` | Yes | — | The email address to send the link to. Normalized to lowercase. |
+| `create_user` | No | `true` | Whether to create an account if one doesn't exist. |
+| `redirect_to` | No | — | URL to redirect to after sign-in. Must be allowed by the environment's `site_url` or `redirect_urls`. |
+
+The response is always `{"sent": true, "message": "If the address has an account, a message is on its way."}` — regardless of whether the email exists. This prevents enumeration.
+
+Behind the scenes, the handler checks:
+
+1. **Magic links enabled**: If `config.magic_link_enabled` is `false`, returns `403 magic links are disabled`.
+2. **`redirect_to` validation**: If provided and not allowed, returns `400 redirect_to is not an allowed URL`.
+3. **Account lookup**: `find_by_email` searches for an existing account with this email in the project environment.
+4. **Account creation** (if `create_user: true` and `signup_enabled: true`): If no account exists, one is created with no password (`set_unusable_password`). The account is created with `verified: false`, but the magic link itself marks the email as verified on first use.
+5. **Disabled check**: If the account exists but is disabled (`is_disabled == true`), no link is sent — a disabled account cannot sign in through magic links.
+6. **Token issuance**: A magic link token is issued with a lifetime of **900 seconds** (15 minutes).
+7. **Email sent**: The magic link email is sent with the configured template.
+
+```python
+async def magic_link(ctx: HttpContext, body: MagicLinkRequest):
+    config = await config_for(akountz, ctx)
+    if not config.magic_link_enabled:
+        raise HTTPException(status_code=403, detail="magic links are disabled")
+    if body.redirect_to and not config.redirect_allowed(body.redirect_to):
+        raise HTTPException(status_code=400, detail="redirect_to is not an allowed URL")
+    email = normalise_email(body.email)
+    user = await find_by_email(config.project, config.env, email)
+    if user is None and body.create_user and config.signup_enabled:
+        user = await create_account(config, email=email, password=None)
+    if user is not None and not user.is_disabled:
+        token = await links.issue(akountz, config, "magic", user=user)
+        await emails.send(...)
+    return SENT
+```
+
+### Step 2: Click the magic link
+
+When the user clicks the link in their email, one of two things happens:
+
+1. **With `site_url` configured**: The link redirects to `{site_url}/auth/callback?token=…&type=magic`, and the application handles completion.
+2. **Without `site_url`**: The link opens Akountz's own verification page at `/auth/v1/links/{project}/{env}/magic?token=…`.
+
+The link page calls `POST /auth/v1/magic-link/verify` with the token:
+
+```bash
+curl -X POST "$GW/auth/v1/magic-link/verify" \
+  -H "content-type: application/json" \
+  -d '{ "token": "a1b2c3d4e5f6…" }'
+```
+
+The `complete` handler processes the magic link token:
+
+```python
+if kind == "magic":
+    row = await links.consume(akountz, config, "magic", token)
+    user = row.user
+    if user.is_disabled:
+        raise HTTPException(status_code=403, detail="this account is disabled")
+    if user.email_verified_at is None:
+        await user.mark_email_verified()
+    if user.mfa_enabled and config.mfa_enabled:
+        challenge = await links.issue(akountz, config, "mfa", user=user, data={"method": "magic_link"})
+        return {"mfa_required": True, "mfa_token": challenge}
+    return await start_session(akountz, config, user, method="magic_link", ctx=ctx)
+```
+
+Three things happen:
+
+1. **The token is consumed** — marked as used in the database. It cannot be reused.
+2. **Email is marked verified** — if the account was just created (and thus unverified), `mark_email_verified()` is called. This means a magic-link sign-up never produces an unverified account — the link itself proves email control.
+3. **Session is started** — or, if MFA is enabled, a TOTP challenge is issued instead.
+
+The response either contains the session tokens (access/refresh) or an `mfa_required` challenge. If `redirect_to` was provided and `site_url` is configured, the tokens are returned in the URL fragment for the frontend to pick up.
+
+## Magic link sign-up: creating accounts without a password
+
+When `create_user: true` (the default) and the email has no existing account, the magic link creates a new account. This is the passwordless sign-up flow — the user never sets a password at all.
+
+```python
+user = await create_account(config, email=email, password=None)
+await user.save()  # with set_unusable_password() already called
+```
+
+The account is created with:
+- `has_usable_password() == false` — they cannot sign in with a password.
+- `email_verified_at == None` — until the magic link is clicked, at which point it's set to now.
+- Default roles assigned from `config.default_roles`.
+- `user_metadata` and `app_metadata` are empty.
+
+After the magic link is verified, the account is fully functional — it just has no password. The user can later set a password through `PATCH /auth/v1/user` if they want to add password-based sign-in as an alternative.
+
 <Note>
-This page is part of the **Authentication** section and is still being written. Check back soon.
+If `signup_enabled` is `false` and `create_user: true`, a magic-link sign-up for a non-existent email returns `{"sent": true}` — the email is *not* sent, and no account is created. This is the same silent behavior as the request endpoint: the response never reveals whether an account was created or an email was sent.
 </Note>
+
+## Magic links and MFA
+
+When MFA is enabled and the user has enrolled a TOTP factor, a magic-link sign-in does not immediately issue a session. Instead, it issues an MFA challenge:
+
+```python
+if user.mfa_enabled and config.mfa_enabled:
+    challenge = await links.issue(akountz, config, "mfa", user=user, data={"method": "magic_link"})
+    return {"mfa_required": True, "mfa_token": challenge}
+```
+
+The client receives `{"mfa_required": true, "mfa_token": "…"}` and must complete the TOTP challenge with `POST /auth/v1/token` using `grant_type: "mfa"`. The `mfa_token` is consumed in the MFA completion handler, and the resulting session has `aal: "aal2"`.
+
+```bash
+curl -X POST "$GW/auth/v1/token" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "grant_type": "mfa",
+    "mfa_token": "mfa_token_from_magic_link",
+    "code": "123456"
+  }'
+```
+
+Without MFA, the magic link flows directly to a session — the user is signed in with `aal1`.
+
+## Magic links vs. password sign-in
+
+| Aspect | Magic link | Password sign-in |
+| --- | --- | --- |
+| User provides | Email only | Email + password |
+| Account creation | Automatic (if `create_user: true`) | Explicit via `POST /auth/v1/signup` |
+| Email verification | Automatic on link click | Separate step if `require_email_verification: true` |
+| MFA support | Yes — TOTP challenge after link click | Yes — TOTP challenge after password verification |
+| Session AAL | `aal1` (or `aal2` with MFA) | `aal1` (or `aal2` with MFA) |
+| Token lifetime | Same `access_ttl` and `refresh_ttl` | Same |
+| Password required | No | Yes |
+| Account can have a password later | Yes — via `PATCH /auth/v1/user` | Already has one |
+
+## Magic link configuration
+
+Magic links are controlled by the `magic_link_enabled` field in the environment's auth configuration:
+
+| `magic_link_enabled` | Effect |
+| --- | --- |
+| `true` (default) | Magic link flow is available. `POST /auth/v1/magic-link` and `POST /auth/v1/magic-link/verify` work. |
+| `false` | `POST /auth/v1/magic-link` returns `403 magic links are disabled`. The `magic-link` option is not shown to users. |
+
+Even with `magic_link_enabled: false`, a user who already has an account created through magic links can still sign in with a password or social login — disabling magic links only prevents *new* magic-link flows.
+
+## The magic link email
+
+The default email template for magic links is:
+
+```
+Subject: Your {project} sign-in link
+
+Sign in to {project} with this link. It works once, for 15 minutes:
+
+{link}
+```
+
+This can be customized through the `emails.magic` configuration field. See [Configuration → emails](/auth/configuration#emails-customizing-message-templates).
+
+The link itself is constructed by `links.link(config, "magic", token, redirect_to)`, which produces either a `{site_url}/auth/callback?token=…&type=magic&redirect_to=…` URL or a `{public_url}/auth/v1/links/{project}/{env}/magic?token=…&redirect_to=…` URL.
+
+## Security considerations
+
+### The magic link is a session token
+
+A magic link is functionally equivalent to a password — possession of the link grants access to the account. The security model relies on:
+
+1. **Email secrecy**: Only the account owner should have access to their inbox.
+2. **Short TTL**: 15 minutes limits the window of exposure.
+3. **Single-use**: Once consumed, the link cannot be reused.
+4. **No enumeration**: The request endpoint always returns `{"sent": true}`, regardless of whether the email exists.
+
+### Magic link vs. password for the same account
+
+If an account has both a password and a magic link, both methods work independently. The user can sign in either way. Changing the password does not invalidate the magic link mechanism, and vice versa. However, if a password is reset through the recovery flow, the magic link still works — they are independent sign-in methods for the same account.
+
+### Shared email across environments
+
+A magic link for `acme/development` creates an account in that environment only. A magic link for `acme/production` creates a *separate* account in the production environment, even for the same email address. This is the same per-environment scoping that applies to all account operations.
+
+## Rate limiting
+
+The magic link endpoint is rate-limited at **10 requests per 60 seconds per IP** (the `"akz:links"` middleware). This prevents spamming magic links to arbitrary email addresses. Combined with the 15-minute TTL, this makes mass magic-link flooding impractical.
+
+## What the magic link response looks like
+
+### Without MFA
+
+```json
+{
+  "access_token": "eyJhbGciOi…",
+  "refresh_token": "rft_8f2c…",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "session_id": "f3f0c2f8…",
+  "org": null,
+  "org_role": null,
+  "user": {
+    "id": "12",
+    "email": "newuser@example.com",
+    "username": "newuser4821",
+    "name": "",
+    "roles": ["member"]
+  }
+}
+```
+
+### With MFA required
+
+```json
+{
+  "mfa_required": true,
+  "mfa_token": "mfa_token_hex_string",
+  "factors": ["totp", "recovery_code"]
+}
+```
+
+The `factors` array indicates which MFA methods are available — currently always `["totp", "recovery_code"]`.
+
+## Audit trail
+
+Magic link events are recorded and emitted:
+
+- `user.created` with `method: "magic_link"` — when a new account is created via magic link.
+- `sign_in` with `method: "magic_link"` — when a magic link sign-in succeeds.
+- The login event table records these with `method: "magic_link"` and `kind: "sign_in"`.
+
+These events appear in Studio's audit log and can be queried through the admin events API.

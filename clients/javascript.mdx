@@ -1,9 +1,473 @@
 ---
-title: "Javascript"
-description: "Calling Pawabase: this page is being written."
-tag: "Draft"
+title: "JavaScript"
+description: "Calling Pawabase from JavaScript and TypeScript: the HTTP client patterns, typed wrappers, authentication flows, token refresh, and realtime subscriptions — using only fetch, axios, or your preferred HTTP library."
+icon: "javascript"
 ---
 
+Pawabase's API surface is plain REST and JSON. There is no published `pawabase-js` or `@pawabase/client` SDK — and this page is honest about that rather than inventing package names that don't exist. Every JavaScript client guide on this site shows you how to call the REST API directly with the HTTP client your platform already has (`fetch`, `axios`, `undici`, `ky`), plus a small, honest, hand-rolled wrapper you own and can read top to bottom. Pawabase's surface is plain REST precisely so this works well: you are not missing a "real" way to do it.
+
+<CardGroup cols={3}>
+  <Card title="No SDK" icon="shield-off">No first-party JavaScript SDK exists. Use `fetch`, `axios`, or any HTTP library you already trust.</Card>
+  <Card title="Hand-rolled wrapper" icon="wrench">A typed wrapper pattern you own — write `pawabase.list("posts", { sort: "-created_at" })` once, and it's exactly as typed as you make its return value.</Card>
+  <Card title="Token refresh" icon="rotate">Every client catches a `401`, exchanges a refresh token for a new pair, and retries the original request once.</Card>
+</CardGroup>
+
+## The two-credential model
+
+Every JavaScript request carries up to two credentials, and they answer different questions:
+
+| Header | Answers | Who sets it |
+| --- | --- | --- |
+| `apikey` (or `x-api-key`, or `?apikey=`) | Which project and environment is this? Also carries the key's role (`publishable`/`secret`) and scopes. | Your client, once, from config — the same value for every user of your app. |
+| `Authorization: Bearer <access_token>` | Who, specifically, is calling? | Set per request, after the user signs in, from the token Akountz issued them. |
+
+`apikey` is **always required** — every gateway route needs it to resolve a project environment, even fully public, anonymous reads. `Authorization` is **only required when a policy needs to know who's calling** — for example `owner:user_id`, `authenticated`, or a role check.
+
+```js
+// A public read — publishable key only, no bearer token
+const res = await fetch(`${GW}/rest/v1/posts?filter[status]=published`, {
+  headers: { "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY }
+});
+
+// A signed-in user's request — both credentials
+const res = await fetch(`${GW}/rest/v1/orders?filter[store_id]=acme`, {
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "Authorization": `Bearer ${accessToken}`
+  }
+});
+```
+
+## The typed wrapper pattern
+
+Because Pawabase resources are user-defined (you can add a `posts` resource today and a `payments` resource next week), any generated SDK would either need code generation tied to your project's schema or be a thin wrapper around the same REST calls. The wrapper pattern below gives you typed, ergonomic call sites without the code-generation step. Write `pawabase.list("posts", { sort: "-created_at" })` once, and it's exactly as typed as you make its return value.
+
+```typescript
+// pawabase.ts — your hand-rolled wrapper, one file, owned by you
+type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+interface PawabaseConfig {
+  baseUrl: string;
+  apiKey: string;
+}
+
+interface PawabaseClient {
+  list: <T>(resource: string, params?: Record<string, unknown>) => Promise<T[]>;
+  get: <T>(resource: string, id: string, params?: Record<string, unknown>) => Promise<T>;
+  create: <T>(resource: string, data: Record<string, unknown>) => Promise<T>;
+  update: <T>(resource: string, id: string, data: Record<string, unknown>) => Promise<T>;
+  del: <T>(resource: string, id: string) => Promise<void>;
+  auth: {
+    signup: (email: string, password: string) => Promise<AuthResponse>;
+    signin: (email: string, password: string) => Promise<AuthResponse>;
+    signout: () => Promise<void>;
+    refresh: () => Promise<AuthResponse>;
+  };
+  realtime: (channel: string) => RealtimeChannel;
+}
+
+function createPawabaseClient(config: PawabaseClientConfig): PawabaseClient {
+  const { baseUrl, apiKey } = config;
+  let currentToken: string | null = null;
+  let refreshPromise: Promise<AuthResponse> | null = null;
+
+  async function request<T>(
+    method: HttpMethod,
+    path: string,
+    body?: Record<string, unknown>
+  ): Promise<T> {
+    const headers: Record<string, string> = {
+      "apikey": apiKey,
+      "content-type": "application/json",
+    };
+    if (currentToken) {
+      headers["Authorization"] = `Bearer ${currentToken}`;
+    }
+
+    const res = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    if (res.status === 401 && method !== "POST") {
+      // Token likely expired — try to refresh and retry once
+      await ensureToken();
+      headers["Authorization"] = `Bearer ${currentToken}`;
+      const retry = await fetch(`${baseUrl}${path}`, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!retry.ok) throw await parseError(retry);
+      return retry.json();
+    }
+
+    if (!res.ok) throw await parseError(res);
+    return res.json();
+  }
+
+  async function ensureToken() {
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+      const stored = localStorage.getItem("refresh_token");
+      const data = await request<AuthResponse>("POST", "/auth/v1/token/refresh", {
+        refresh_token: stored,
+      });
+      currentToken = data.access_token;
+      localStorage.setItem("access_token", data.access_token);
+      localStorage.setItem("refresh_token", data.refresh_token);
+      return data;
+    })();
+    refreshPromise.then(() => { refreshPromise = null; }).catch(() => {
+      refreshPromise = null;
+      currentToken = null;
+      localStorage.removeItem("access_token");
+      localStorage.removeItem("refresh_token");
+      window.location.href = "/signin";
+    });
+    return refreshPromise;
+  }
+
+  return {
+    list: <T>(resource: string, params?: Record<string, unknown>) => {
+      const qs = new URLSearchParams(params as Record<string, string>).toString();
+      return request<T>("GET", `/rest/v1/${resource}${qs ? "?" + qs : ""}`);
+    },
+    get: <T>(resource: string, id: string, params?: Record<string, unknown>) => {
+      const qs = params ? "?" + new URLSearchParams(params as Record<string, string>).toString() : "";
+      return request<T>("GET", `/rest/v1/${resource}/${id}${qs}`);
+    },
+    create: <T>(resource: string, data: Record<string, unknown>) =>
+      request<T>("POST", `/rest/v1/${resource}`, data),
+    update: <T>(resource: string, id: string, data: Record<string, unknown>) =>
+      request<T>("PUT", `/rest/v1/${resource}/${id}`, data),
+    del: <T>(resource: string, id: string) => request<T>("DELETE", `/rest/v1/${resource}/${id}`),
+    auth: {
+      signup: (email, password) => request<AuthResponse>("POST", "/auth/v1/signup", { email, password }),
+      signin: (email, password) => request<AuthResponse>("POST", "/auth/v1/token", {
+        grant_type: "password", email, password,
+      }).then(data => {
+        currentToken = data.access_token;
+        localStorage.setItem("access_token", data.access_token);
+        localStorage.setItem("refresh_token", data.refresh_token);
+        return data;
+      }),
+      signout: () => fetch(`${baseUrl}/auth/v1/logout`, {
+        method: "POST",
+        headers: { "apikey": apiKey, "Authorization": `Bearer ${currentToken}` },
+        body: JSON.stringify({ scope: "local" }),
+      }).then(() => {
+        currentToken = null;
+        localStorage.removeItem("access_token");
+        localStorage.removeItem("refresh_token");
+      }),
+      refresh: () => ensureToken(),
+    },
+    realtime: (channel) => new RealtimeChannel(baseUrl, apiKey, channel),
+  };
+}
+```
+
+This wrapper is deliberately simple. It does three things every JavaScript client needs: attach the two credentials, catch `401` and refresh once, and parse errors. Everything else — filtering, sorting, pagination, flows, storage, realtime — is just HTTP calls you make through this client or alongside it.
+
+<Warning>
+Never hardcode your publishable key in a bundle that also contains your secret key, and never put a secret key in any client-side JavaScript at all. The gateway can't tell where a valid key came from, so a secret key in browser JavaScript means every policy in your project is irrelevant for as long as that key is valid. Keep the secret key on your own server and the publishable key wherever is convenient for your client build.
+</Warning>
+
+## Authentication
+
+### Sign up
+
+```typescript
+const res = await fetch(`${GW}/auth/v1/signup`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ email: "ada@example.com", password: "correct horse battery staple" }),
+});
+
+if (!res.ok) {
+  const err = await res.json();
+  // err.code: "signup_disabled", "email_already_exists", "weak_password", ...
+  throw new Error(err.message);
+}
+
+const data = await res.json();
+// data: { access_token, refresh_token, token_type, expires_in, expires_at, session_id, user: { id, email, name, … } }
+```
+
+### Sign in
+
+```typescript
+const res = await fetch(`${GW}/auth/v1/token`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ grant_type: "password", email: "ada@example.com", password: "correct horse battery staple" }),
+});
+
+const { access_token, refresh_token, expires_in, user } = await res.json();
+```
+
+### Token refresh
+
+The access token is short-lived (`expires_in` seconds, typically one hour). When it expires, exchange the refresh token for a new pair:
+
+```typescript
+const res = await fetch(`${GW}/auth/v1/token/refresh`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ refresh_token }),
+});
+
+const { access_token, refresh_token, expires_in } = await res.json();
+```
+
 <Note>
-This page is part of the **Calling Pawabase** section and is still being written. Check back soon.
+Refresh tokens are **rotating**: every use issues a new access token *and* a new refresh token, and the one just used stops working. If two requests race and both try to refresh the same token, one will succeed and the other will get `refresh_token_revoked`. That's why the wrapper above deduplicates concurrent refreshes with `refreshPromise`. See [Refreshing and revocation](/concepts/credentials#refreshing-and-revocation).
 </Note>
+
+### Sign out
+
+```typescript
+await fetch(`${GW}/auth/v1/logout`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "Authorization": `Bearer ${accessToken}`,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ scope: "local" }), // "local" (this session), "others", or "global"
+});
+```
+
+## Resource operations
+
+Once authenticated, every resource operation follows the same pattern. See [REST conventions](/clients/rest-conventions) for the complete filter/sort/pagination syntax.
+
+```typescript
+// List with filtering, sorting, and pagination
+const orders = await fetch(`${GW}/rest/v1/orders?filter[store_id]=acme&sort=-placed_at&limit=20&offset=0`, {
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "Authorization": `Bearer ${accessToken}`,
+  },
+}).then(r => r.json());
+// { data: [...], total: <int>, limit: 20, offset: 0 }
+
+// Create
+const order = await fetch(`${GW}/rest/v1/orders`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "Authorization": `Bearer ${accessToken}`,
+    "content-type": "application/json",
+    "Idempotency-Key": "order-42-create-2026-09-28",
+  },
+  body: JSON.stringify({ store_id: "acme", total_minor: 2999, currency: "usd" }),
+}).then(r => r.json());
+
+// Get a single record
+const order = await fetch(`${GW}/rest/v1/orders/42?expand=customer`, {
+  headers: { "apikey": PK, "Authorization": `Bearer ${accessToken}` },
+}).then(r => r.json());
+
+// Update (full replacement)
+await fetch(`${GW}/rest/v1/orders/42`, {
+  method: "PUT",
+  headers: { /* … */ },
+  body: JSON.stringify({ status: "paid", total_minor: 2999 }),
+});
+
+// Update (partial)
+await fetch(`${GW}/rest/v1/orders/42`, {
+  method: "PATCH",
+  headers: { /* … */ },
+  body: JSON.stringify({ status: "paid" }),
+});
+
+// Delete
+await fetch(`${GW}/rest/v1/orders/42`, {
+  method: "DELETE",
+  headers: { "apikey": PK, "Authorization": `Bearer ${accessToken}` },
+});
+```
+
+### Expanding relations
+
+Pawabase supports fetching related records in a single request with `?expand=`:
+
+```typescript
+// Get an order with its customer and line items, one round trip
+const order = await fetch(`${GW}/rest/v1/orders/42?expand=customer,line_items`, {
+  headers: { "apikey": PK, "Authorization": `Bearer ${accessToken}` },
+}).then(r => r.json());
+```
+
+## Calling flows
+
+Flows are invoked through their HTTP trigger endpoint at `/flows/v1/<name>`:
+
+```typescript
+// Trigger a flow via HTTP
+const res = await fetch(`${GW}/flows/v1/pay-order`, {
+  method: "POST",
+  headers: {
+    "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY,
+    "Authorization": `Bearer ${accessToken}`,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({ params: { id: "order_42" } }),
+});
+
+const result = await res.json();
+```
+
+Flows can also be triggered by events, schedules, webhooks, and manually from Studio — see [Flows overview](/flows/overview) for the full trigger taxonomy.
+
+## Realtime subscriptions
+
+Angula's WebSocket endpoint is reached the same way as every other gateway path. Because browsers can't set custom headers on a WebSocket handshake, the key goes in the query string:
+
+```typescript
+class RealtimeChannel {
+  private ws: WebSocket | null = null;
+  private listeners: Record<string, Set<(payload: unknown) => void>> = {};
+
+  constructor(private baseUrl: string, private apiKey: string, private channel: string) {}
+
+  connect() {
+    const url = `${this.baseUrl.replace(/^http/, "ws")}/realtime/v1/socket?apikey=${this.apiKey}`;
+    this.ws = new WebSocket(url);
+
+    this.ws.onopen = () => {
+      // Subscribe to the channel
+      this.ws!.send(JSON.stringify({
+        action: "subscribe",
+        channel: this.channel,
+      }));
+    };
+
+    this.ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "message" && msg.event) {
+        const handlers = this.listeners[msg.event];
+        handlers?.forEach(h => h(msg.payload));
+      }
+    };
+
+    this.ws.onclose = () => { /* reconnect logic */ };
+  }
+
+  on(event: string, handler: (payload: unknown) => void) {
+    if (!this.listeners[event]) this.listeners[event] = new Set();
+    this.listeners[event].add(handler);
+  }
+
+  publish(event: string, payload: unknown) {
+    this.ws!.send(JSON.stringify({ action: "publish", channel: this.channel, event, payload }));
+  }
+
+  disconnect() {
+    this.ws?.close();
+  }
+}
+```
+
+See [WebSocket protocol](/clients/mobile#realtime-over-websocket) for the full message protocol (`subscribe`, `publish`, `presence`, `history`, `auth`) — it's identical across web, mobile, and server clients, so it's documented once there.
+
+## Storage
+
+```typescript
+// Generate a signed URL for upload
+const signedUrl = await fetch(`${GW}/storage/v1/signed/receipts/receipt.pdf`, {
+  headers: { "apikey": import.meta.env.VITE_PAWABASE_PUBLISHABLE_KEY },
+}).then(r => r.json());
+// { url: "https://…", fields: { … } }
+
+// Upload directly to the signed URL
+await fetch(signedUrl.url, {
+  method: "PUT",
+  body: file,
+  headers: signedUrl.fields,
+});
+
+// Generate a signed URL for download
+const downloadUrl = await fetch(`${GW}/storage/v1/signed/receipts/receipt.pdf?action=read`, {
+  headers: { "apikey": PK, "Authorization": `Bearer ${accessToken}` },
+}).then(r => r.json());
+```
+
+Storage operations are proxied through the gateway (see [A streaming request/response](/concepts/architecture#a-streaming-requestresponse-gateway-to-api)) — large file uploads and downloads stream through without being fully buffered.
+
+## Error handling in practice
+
+```typescript
+async function apiRequest<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${GW}${path}`, {
+    method,
+    headers: { "apikey": PK, "content-type": "application/json", … },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ message: res.statusText, code: "unknown" }));
+    const error = new Error(err.message) as Error & { code: string; status: number; details?: unknown[] };
+    error.code = err.code;
+    error.status = res.status;
+    error.details = err.details;
+    throw error;
+  }
+  return res.json();
+}
+
+// Usage with full error classification
+try {
+  const orders = await apiRequest("GET", "/rest/v1/orders?filter[status]=paid");
+} catch (error) {
+  if (error.status === 422) {
+    (error.details || []).forEach(d => console.error(`${d.field}: ${d.message}`));
+  } else if (error.status === 401) {
+    // Refresh token and retry — handled by the wrapper
+  } else if (error.status === 403) {
+    console.error("Not authorized:", error.message);
+  } else if (error.status === 429) {
+    const retryAfter = error.retry_after || 3;
+    setTimeout(() => retry(), retryAfter * 1000);
+  } else if (error.status >= 500) {
+    console.error("Server error — will retry:", error.message);
+  }
+}
+```
+
+## CORS considerations
+
+CORS only applies to **publishable** keys used from a browser. If your environment has an allowed-origins list configured, the browser's `Origin` header must be on it or the gateway answers `403 origin_not_allowed` before your backend ever sees the request. There is nothing to configure client-side — the browser sends `Origin` automatically.
+
+If your local dev server runs on an unusual port (e.g., `http://localhost:5173` for Vite or `http://localhost:3000` for Create React App), add it to the environment's allowed-origins list rather than disabling the check. See [CORS](/clients/overview#cors).
+
+## Security summary for JavaScript
+
+| Safe to ship in your bundle | Never ship in your bundle |
+| --- | --- |
+| The **publishable** key | The **secret** key, in any form |
+| The gateway URL | A refresh token in `localStorage` on any site with XSS risk |
+| A user's own **access token** (in memory, not `localStorage` where possible) | Another user's token, ever |
+
+The access token belongs in memory (a module-level variable or React context). If you need it to survive a page reload, an httpOnly cookie your own backend set is stronger than `localStorage`. The refresh token is long-lived and is a bigger prize — prefer setting it as an httpOnly, `Secure`, `SameSite=Lax` cookie from your own domain. See [Tokens and storage](/clients/overview#tokens-and-storage) for the full trade-off.
+
+## Next
+
+- [REST conventions](/clients/rest-conventions) — every resource operation, the exact filter/sort/pagination/expand syntax, and the response envelopes
+- [Errors](/clients/errors) — the full status code table and a recommended client-side error-handling pattern
+- [Credentials: keys and tokens](/concepts/credentials) — what each credential proves and how policies see it
+- [Mobile](/clients/mobile) — the realtime WebSocket protocol, identical across platforms
+- [Calling Pawabase from a client](/clients/overview) — the gateway, the two kinds of key, and what's safe to ship

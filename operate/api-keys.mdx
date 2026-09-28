@@ -1,9 +1,249 @@
 ---
-title: "Api keys"
-description: "Running a project: this page is being written."
-tag: "Draft"
+title: "API keys"
+description: "Creating, managing, scoping, and rotating API keys. Publishable vs secret keys, key prefixes, scopes, rate limits, and the key lifecycle."
+icon: "key"
 ---
 
+Every request into a Pawabase project environment carries exactly one API key. That key determines the project, the environment, the role, and — if scoped — the set of operations the caller is permitted to attempt before any policy is evaluated. The gateway resolves the key into a signed platform context in milliseconds, and that context travels with the request through every subsequent stage of the [request lifecycle](/concepts/request-lifecycle).
+
+This page covers the full operational picture: what the key types are, how to create and manage them in Studio and via the Platform API, how scopes narrow a key's power, how to rotate or revoke, and how to read the key-related fields in Studio.
+
+<CardGroup cols={3}>
+  <Card title="Two roles" icon="scale">Publishable keys (`pb_pk_…`) are safe for browsers and mobile apps. Secret keys (`pb_sk_…`) are server-side only and bypass policies — treat them as root credentials.</Card>
+  <Card title="Scopable" icon="funnel">Even a secret key can be narrowed to specific scopes (e.g. `resource:read`). Scoping is opt-in and only ever removes capability.</Card>
+  <Card title="Hash-stored" icon="shield">Only a SHA-256 hash is persisted. The plaintext is shown once at creation and is never retrievable — lost keys must be replaced, not looked up.</Card>
+</CardGroup>
+
+## Key roles
+
+Every key has a `role` that sets the ceiling on what it can do before any user token, policy, or scope is considered.
+
+| Role | Prefix | Where it lives | What policies see | Gateway enforcement |
+| --- | --- | --- | --- | --- |
+| **Publishable** | `pb_pk_…` | Browsers, mobile apps, public JavaScript | `credential.role = "publishable"`, `is_service = false` — every policy applies | CORS origin check on `Origin` header |
+| **Secret** | `pb_sk_…` | Servers, CI scripts, backend tooling | `credential.role = "secret"`, `is_service = true` — **policies bypassed** | No origin restriction |
+
+A publishable key is safe to ship in a client bundle because it is subject to every policy you write, restricted to the origin you configure, and rate-limited per key. A secret key is functionally equivalent to root access to that environment's data — it bypasses every policy, and the only thing standing between it and a malicious actor is the gateway's key-based rate limit (which is shared across every caller of that one key).
+
+<Warning>
+A secret key should structurally never be reachable from a place a browser or app bundle can read it. If one ends up in a client-side JavaScript bundle, a mobile app binary, a public repository, or a `.env` file committed to version control, treat it as a security incident and rotate immediately. See [Security guidance](/operate/security) for the full runbook.
+</Warning>
+
+## Creating a key
+
+### In Studio
+
+Studio is the primary interface for key management:
+
+1. Navigate to the project and environment (**Build → Settings → API keys**).
+2. Click **New key**.
+3. Choose a **name** (e.g. `mobile-app`, `ci-import`).
+4. Select the **role**: Publishable or Secret.
+5. Optionally add **scopes** (see below).
+6. Optionally set an **expiry**.
+7. Click **Create**.
+
+The plaintext key is shown exactly once. You can copy it at this point — after dismissing the dialog, the UI shows only the key `prefix` (the first characters, e.g. `pb_pk_abc123`) for identification. Pawabase never stores or displays the full key again.
+
+### Via the Platform API
+
+```bash Create a publishable key
+curl -X POST "$STUDIO/studio/api/platform/projects/acme/envs/production/keys" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{
+    "name": "mobile-app",
+    "role": "publishable",
+    "scopes": ["resource:read", "resource:write"],
+    "expires_at": "2027-09-28T00:00:00Z"
+  }'
+```
+
+```json 201 Created
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "mobile-app",
+  "prefix": "pb_pk_a1b2c3",
+  "role": "publishable",
+  "scopes": ["resource:read", "resource:write"],
+  "expires_at": "2027-09-28T00:00:00Z",
+  "created_at": "2026-09-28T12:00:00Z"
+}
+```
+
+The response includes the full plaintext key exactly once in the body. It is not stored by the API for retrieval — only the `prefix` and `key_hash` persist.
+
+## Key prefixes and identification
+
+Every key starts with a prefix that identifies the role and is safe to share:
+
+| Prefix | Role | Safe to share? |
+| --- | --- | --- |
+| `pb_pk_…` | Publishable | Yes — it's designed to be public |
+| `pb_sk_…` | Secret | **No** — treat it like a password |
+
+The prefix is stored on the `ProjectKey` row and shown in Studio's key list so operators can distinguish keys without ever seeing the full value. The prefix is also what you grep for in your deployment configs when you need to rotate a key — never grep for the full plaintext, which you shouldn't have retained.
+
+## Scopes: narrowing a key's power
+
+A key — publishable or secret — can be limited to **scopes**, an optional JSON list stored on the `ProjectKey` row. Scopes are a separate mechanism from policies: they are enforced by the gateway *before* a policy ever runs, and they apply even to secret keys, which is the one place a secret key's power can be deliberately narrowed.
+
+The scoping logic is simple and worth internalizing:
+
+```python
+def allows_scope(self, scope: str) -> bool:
+    """Whether the key's scopes permit *scope*."""
+    if not self.scopes:
+        return True              # empty list = unrestricted
+    family = scope.split(":", 1)[0]
+    return scope in self.scopes or f"{family}:*" in self.scopes or "*" in self.scopes
+```
+
+Three things follow:
+
+1. **An empty scopes list means unrestricted**, not "no access." A key created without specifying scopes can do everything its role allows.
+2. **Scopes are checked by family.** `resource:write` is granted if the key's list contains `resource:write` verbatim, `resource:*` (the whole family), or `*` (everything).
+3. **The family is everything before the first colon.** `reports:export` and `reports:schedule` are both in the `reports` family.
+
+### Available scopes
+
+| Scope | Allows |
+| --- | --- |
+| `resource:read` | Resource `list` and `get` |
+| `resource:write` | Resource `create`, `update`, `delete` |
+| `routes:invoke` | Custom routes |
+| `storage:read` | Bucket reads and listings |
+| `storage:write` | Bucket writes and uploads |
+| `resource:*` | Every scope in the `resource` family |
+| `*` | Every scope, any family |
+
+A request whose key lacks the scope its operation needs is refused with `403 This API key lacks the 'resource:write' scope` — before any policy is evaluated, and before the request even reaches a table or route handler.
+
+### Worked example: a scoped secret key for CI
+
+Suppose a nightly job imports a CSV of new students into a school's database, and nothing else. Rather than handing the job an unrestricted secret key — which could also delete payment records, invoke every custom route, and read every bucket — scope it down:
+
+```bash Create a scoped key for CI
+curl -X POST "$STUDIO/studio/api/platform/projects/school/envs/production/keys" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{
+    "name": "ci-student-import",
+    "role": "secret",
+    "scopes": ["resource:read", "resource:write"]
+  }'
+```
+
+With this key, the import job can `POST /rest/v1/students` and `PATCH /rest/v1/guardians/:id`, but a call to `POST /flows/v1/send-refund` or `GET /storage/v1/buckets/report-cards/…` fails with the scope error *before* it does anything — even though the key is `secret` and would otherwise bypass every policy.
+
 <Note>
-This page is part of the **Running a project** section and is still being written. Check back soon.
+Scopes narrow what an entry point will *consider*; they do not grant anything a role doesn't already have. A `publishable` key scoped to `resource:write` still can't bypass a resource's policies — policies still run for publishable-key requests exactly as if no scope had been set. Scoping only ever *removes* capability, never adds it.
 </Note>
+
+## Origins and publishable keys
+
+For publishable keys, the gateway enforces the environment's allowed origins (`cors_origins` in environment settings) against the request's `Origin` header. A publishable key copied out of your app's network tab into someone else's website fails its CORS preflight rather than quietly working from anywhere.
+
+This check happens at the gateway, before the request reaches any service, and it applies only to the `anon` role (publishable keys). Secret keys aren't expected to arrive with a browser `Origin` header, so there's nothing to check.
+
+Keep the origin list tight: list your actual app origins (`https://app.example.com`, `http://localhost:3000` for local dev), not a wildcard, unless the environment is genuinely meant to be embeddable anywhere. See [rate limits and CORS](/operate/rate-limits-and-cors) for configuration details.
+
+## Key lifecycle
+
+### Expiry
+
+Keys can have an `expires_at` timestamp set at creation or updated later. Once past `expires_at`, the key is treated as invalid — the gateway's key resolver rejects it exactly as it would a revoked key, with `401 invalid_api_key`. There is no partial-trust state for an expired key.
+
+Setting a deliberate expiry — even a generous one — forces a periodic "does this still need to exist, and at this scope" review, which catches over-privileged and orphaned integrations long before they'd otherwise be noticed.
+
+```bash Set or clear an expiry
+curl -X PATCH "$STUDIO/studio/api/platform/projects/acme/envs/production/keys/$KEY_ID" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{"expires_at": "2027-09-28T00:00:00Z"}'
+
+# To remove expiry entirely:
+curl -X PATCH "$STUDIO/studio/api/platform/projects/acme/envs/production/keys/$KEY_ID" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{"expires_at": null}'
+```
+
+### Revocation
+
+Revocation is immediate and irreversible. Setting `revoked_at` on a `ProjectKey` row means the gateway's key-resolution path rejects the key on the very next request. There is no propagation delay to wait out — the key is checked on every request, always.
+
+```bash Revoke a key
+curl -X DELETE "$STUDIO/studio/api/platform/projects/acme/envs/production/keys/$KEY_ID" \
+  -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt
+```
+
+After revocation, the key's `revoked_at` is set and the key behaves identically to an unknown key (`401 invalid_api_key`). The `prefix` remains in Studio's key list so you can identify which key was revoked, but the `key_hash` no longer matches anything — a client holding the old plaintext cannot authenticate.
+
+### What Pawabase tracks per key
+
+The `ProjectKey` model backs every operational view of a key in Studio:
+
+| Field | What it's for |
+| --- | --- |
+| `role` | `publishable` or `secret` — sets the policy-bypass ceiling |
+| `prefix` | The first characters, shown in Studio for identification |
+| `key_hash` | SHA-256 of the plaintext — the only thing actually stored |
+| `scopes` | The JSON list; empty means unrestricted within the role |
+| `expires_at` | Optional hard cutoff; `null` means the key doesn't expire |
+| `revoked_at` | Set on revocation; key stops resolving immediately |
+| `last_used_at` | Updated on successful resolution — fastest way to tell if a key is in use |
+| `use_count` | Running total of successful resolutions |
+| `created_by` | Who created the key |
+
+<Tip>
+Before revoking a key you're not sure is still in use, check `last_used_at` and `use_count` in Studio first. A key with recent, heavy use that you revoke unannounced is an outage; a key untouched for months is a safe cleanup.
+</Tip>
+
+## Rotating a leaked secret key: a runbook
+
+A leaked secret key is a "drop everything" situation because it bypasses policies exactly as thoroughly as an operator would. Here is the sequence to follow, in order:
+
+<Steps>
+  <Step title="Revoke immediately">
+    In Studio, find the key by its `prefix`, and revoke it. Or via the Platform API. Revocation is checked on every request — the very next call using the leaked key fails with `401 invalid_api_key`.
+  </Step>
+  <Step title="Create a replacement with tighter scopes">
+    Don't just recreate an unrestricted secret key out of habit. This is the natural moment to add scopes if the integration's actual needs are narrower than "everything."
+  </Step>
+  <Step title="Update every place the old key was configured">
+    CI secrets, server environment variables, scheduled job configs. Grep your infrastructure-as-code and deployment configs for the key's `prefix` to make sure nothing still references the old one.
+  </Step>
+  <Step title="Check audit logs for the exposure window">
+    The [audit log](/operate/audit-log) records writes made through the Platform API. Look for activity between when the key leaked and when you revoked it — that's your actual blast radius, not a guess.
+  </Step>
+  <Step title="Assess data written during the exposure window">
+    Because a secret key bypasses every policy, anything written with it could include rows a normal user could never have created. Reconcile against what your application logic expects.
+  </Step>
+  <Step title="Fix the underlying pattern">
+    If the leak came from a client bundle, a server-rendered page echoing a config object, or a debug endpoint — find the pattern and fix it, not just this one key.
+  </Step>
+</Steps>
+
+## Key management checklist
+
+<AccordionGroup>
+  <Accordion title="Routine key rotation">
+    Set an `expires_at` on every key (a year out is reasonable), and put a calendar reminder to review it. When the reminder fires, decide: extend, scope down, or replace. A key with no `expires_at` and years of continuous use is a key nobody remembers exists.
+  </Accordion>
+  <Accordion title="Offboarding a contractor's CI access">
+    1. Revoke their key via Studio or the Platform API.
+    2. Remove it from their CI configuration.
+    3. Check `last_used_at` to confirm it wasn't accessed after their departure date.
+    4. If the key was scoped broadly, check whether the scopes they had access to revealed anything beyond what their role required.
+  </Accordion>
+  <Accordion title="Auditing key usage">
+    In Studio's API keys panel, sort by `last_used_at` and `use_count`. Keys with high `use_count` and recent `last_used_at` are active and need review. Keys with `last_used_at` null were never used — remove them. Keys with `last_used_at` far in the past may be orphaned.
+  </Accordion>
+</AccordionGroup>
+
+## Comparing with other platforms
+
+| | Supabase | Clerk | Pawabase |
+| --- | --- | --- | --- |
+| Public key type | `anon` key (JWT, one per project) | Publishable key | `pb_pk_…` (one per **environment**) |
+| Privileged key | `service_role` (all-or-nothing) | Secret key | `pb_sk_…` (revocable and scopable individually) |
+| Per-key scoping | Not built in | Limited | Full scopes (`resource:read`, `resource:*`, …) |
+| Revocation | Rotating project JWT secret invalidates everything | Per-token revocation | Individual keys (`revoked_at`); per-session token revocation |
+| Origin enforcement | CORS headers only | Origin allow-list | Gateway-enforced per environment (`cors_origins`) |

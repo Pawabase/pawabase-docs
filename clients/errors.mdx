@@ -1,9 +1,295 @@
 ---
 title: "Errors"
-description: "Calling Pawabase: this page is being written."
-tag: "Draft"
+description: "Every error a Pawabase client can encounter: HTTP status codes, structured error bodies, how to distinguish validation failures from server errors, transient vs permanent failures, and how to retry safely."
+icon: "triangle-alert"
 ---
 
+Every request to a Pawabase project returns either a successful response or a structured error. Understanding the error shapes — and how to distinguish a validation failure from a server error, or a transient failure from a permanent one — is essential for building resilient clients. This page covers the full error taxonomy, the HTTP status codes the gateway and internal services return, the structured JSON body every error conforms to, and a recommended client-side error-handling pattern you can drop into any language guide.
+
+<CardGroup cols={3}>
+  <Card title="Status codes" icon="globe">The standard HTTP response classification, from the gateway down through your resources and flows.</Card>
+  <Card title="Error body" icon="file-json">The consistent JSON structure every error returns, including validation failure details.</Card>
+  <Card title="Retrying" icon="rotate">Which errors are safe to retry, which are not, and the strategies that work.</Card>
+</CardGroup>
+
+## Error body shape
+
+All errors return `application/json` with a consistent structure. The gateway — which handles the majority of errors a client will see — always returns this shape:
+
+```json
+{
+  "message": "a human-readable description",
+  "code": "machine_readable_code"
+}
+```
+
+For validation failures, the shape differs slightly: the `message` is generic and a `details` array carries the per-field problems:
+
+```json
+{
+  "message": "the request body is invalid",
+  "details": [
+    {"field": "email", "message": "must be a valid email address"},
+    {"field": "quantity", "message": "must be at least 1"}
+  ]
+}
+```
+
+The `code` field is the single most reliable way to distinguish errors programmatically. It is always present on non-validation errors and `null` or absent on `422` responses where `details` carries the specifics instead.
+
 <Note>
-This page is part of the **Calling Pawabase** section and is still being written. Check back soon.
+Errors from the gateway (`missing_api_key`, `invalid_api_key`, `origin_not_allowed`, `rate_limit_exceeded`) always have a `code`. Errors from your own resources, flows, and functions may also carry a `code` — Pawabase's built-in errors follow a consistent naming convention (`snake_case`) — but a custom Python function that raises an unhandled exception may return a generic `500` with `code: "internal_error"` instead. See [Errors and retries](/flows/errors-and-retries) for how to control what your flow returns when something goes wrong.
 </Note>
+
+## Status codes
+
+The following table covers every status code a well-behaved Pawabase client is likely to encounter, grouped by category. Codes marked "gateway" originate from the gateway itself — before the request reaches any service — and codes marked "service" come from the API, Akountz, or Angula.
+
+| Code | Category | Meaning | When |
+| --- | --- | --- | --- |
+| `200`–`299` | Success | Normal operation | `200` for reads and updates, `201` for creates, `204` for deletes |
+| `400` | Client error | Bad request | Malformed JSON body, unknown fields, invalid types, a block config that fails validation |
+| `401` | Client error | Unauthenticated | Missing API key, invalid API key, expired access token, a user token for the wrong environment |
+| `403` | Client error | Forbidden | Authenticated but not authorized — policy refused, `sign-up is disabled`, `missing_role`, `confirm your email address first`, `origin_not_allowed`, `rate_limit_exceeded` (gateway-enforced), or a scoped key lacking the required scope |
+| `404` | Client error | Not found | Resource, flow, project, or environment doesn't exist |
+| `409` | Client error | Conflict | Resource already exists, a flow is disabled, an idempotency conflict |
+| `422` | Client error | Validation | Field-level validation failure — the `details` array is present |
+| `429` | Client error | Rate limited | Too many requests from this key or client IP — always includes a `Retry-After` header |
+| `500` | Server error | Internal failure | Unexpected failure in the API, Akountz, or Angula |
+| `502` | Server error | Bad gateway | Upstream service unreachable from the gateway |
+| `504` | Server error | Timeout | A flow exceeded its `timeout` setting, or an upstream call timed out |
+
+<Warning>
+A `401` or `403` from the gateway is not the same thing as a `401` or `403` from a policy. The gateway's `401` means the request never reached any service — the key was missing, invalid, revoked, or expired. A policy's `403` means the key was valid, the environment was resolved, and the policy engine made an access-control decision to refuse. Distinguishing the two matters for retry logic: a gateway `401` might mean you need to refresh a token or check your key configuration, while a policy `403` is a deliberate authorization decision that retrying will not change.
+</Warning>
+
+## Distinguishing error types
+
+The `code` field is the most reliable way to distinguish errors programmatically. Here is the taxonomy you'll encounter:
+
+**Validation errors** — `422` status, `code` is `null` or absent, `details` array present. Each entry has a `field` and `message`:
+
+```json
+{
+  "message": "the request body is invalid",
+  "details": [
+    {"field": "email", "message": "must be a valid email address"},
+    {"field": "quantity", "message": "must be at least 1 and at most 99"}
+  ]
+}
+```
+
+**Auth errors** — `401` or `403` with codes like `unauthenticated`, `invalid_api_key`, `missing_role`, `signup_disabled`, `origin_not_allowed`, `rate_limit_exceeded`.
+
+**Not found** — `404` with codes like `order_not_found`, `variant_not_found`, `cart_not_found`, `unknown_environment`.
+
+**Flow errors** — `400`, `504`, or `409` with codes like `timeout`, `too_many_items`, `unknown_block`, `missing_trigger`, `flow_disabled`, `invalid_edge`.
+
+**Resource errors** — codes like `write_refused` (from `db.query` when the statement isn't read-only), `missing_secret` (from `crypto.hash` when a referenced secret doesn't exist), `already_exists` (when creating a duplicate).
+
+**Policy errors** — `403` with the policy's refusal reason visible in the response body. See [From decision to HTTP response](/policies/overview#from-decision-to-http-response) for the full mapping from `Decision` objects to HTTP responses.
+
+<Tip>
+When you're debugging "why did this request behave unexpectedly," check the `code` before the `message`. The `code` is stable across language and version; the `message` is human-readable text that may change. Log the `code` in your error tracking system and surface the `message` to your users.
+</Tip>
+
+## Common validation errors
+
+A `422` response includes a `details` array. Each entry has a `field` and `message`. Clients should surface each `detail.message` to the user, ideally next to the corresponding form field.
+
+The `field` values correspond to the declared fields in the resource's schema. If a resource defines:
+
+```json
+{
+  "name": "orders",
+  "fields": [
+    {"name": "email", "type": "string", "required": true, "pattern": "^[^@]+@[^@]+$"},
+    {"name": "quantity", "type": "integer", "minimum": 1, "maximum": 99}
+  ]
+}
+```
+
+then a `POST` with `email: "not-an-email"` and `quantity: 0` returns:
+
+```json
+{
+  "message": "the request body is invalid",
+  "details": [
+    {"field": "email", "message": "must match pattern ^[^@]+@[^@]+$"},
+    {"field": "quantity", "message": "must be at least 1 and at most 99"}
+  ]
+}
+```
+
+The `pattern` field produces a message referencing the regex — useful for building inline form validation without duplicating the constraint client-side.
+
+## Retry behavior
+
+Not all errors are safe to retry. The table below covers every status code and whether retrying makes sense, along with the recommended strategy:
+
+| Status | Retry? | Strategy | Notes |
+| --- | --- | --- | --- |
+| `500` | Yes | Exponential backoff with jitter | The failure is on the server side and may be transient |
+| `502` | Yes | Exponential backoff with jitter | Upstream service may be temporarily unreachable |
+| `504` | Yes | Retry the flow or request | A flow that timed out may succeed on a subsequent attempt |
+| `429` | Yes | Respect `Retry-After` header | The header and response body both carry `retry_after` in seconds |
+| `400` | No | Fix the request before retrying | The request is malformed — changing nothing and sending the same body again will produce the same error |
+| `401` | No (re-authenticate) | Refresh the token or check the key | A `401` from a gateway key check means the key is invalid/revoked/expired; a `401` from a bearer check means the access token expired — refresh it, don't retry the same request |
+| `403` | No | The caller isn't authorized | Retrying will not help unless the policy or scope changes |
+| `404` | No | The resource doesn't exist | Unless the creation is idempotent (see below) |
+| `409` | Sometimes | If the conflict is a duplicate creation, consider merging instead | An `Idempotency-Key` header can turn a `409` into a `200` with the original response |
+| `422` | No | Fix the input before retrying | The data itself is wrong |
+
+### The `429` rate limit response
+
+When you hit a rate limit, the gateway returns `429` with both a `Retry-After` header and a `retry_after` field in the JSON body, both in seconds:
+
+```json
+{
+  "message": "rate limit exceeded",
+  "code": "rate_limit_exceeded",
+  "retry_after": 3
+}
+```
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 3
+content-type: application/json
+
+{
+  "message": "rate limit exceeded",
+  "code": "rate_limit_exceeded",
+  "retry_after": 3
+}
+```
+
+The `Retry-After` header is the standard HTTP mechanism; the `retry_after` field in the body is there for clients that parse JSON but don't inspect headers. Honor whichever is present — they should agree. A client that retries immediately without waiting will hit the rate limit again and likely get a longer `retry_after` value on the next attempt.
+
+<Note>
+Rate limits are enforced per key (or per client IP for requests with no key) with a sliding window. A key that is being hammered by multiple clients sharing the same key — for example, a mobile app bundled with a single publishable key — shares one rate limit across all of them. If your mobile app has many users, consider issuing different publishable keys per environment or using a short-lived token pattern for high-frequency operations. See [CORS and rate limits](/operate/rate-limits-and-cors).
+</Note>
+
+### Idempotency and duplicate creation
+
+`POST` requests that create resources accept an `Idempotency-Key` header. Replaying a request with the same key returns the original response instead of creating a duplicate. This is the correct way to handle `409` conflicts on create:
+
+```bash
+curl -X POST "$GW/rest/v1/orders" \
+  -H "apikey: $PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -H "Idempotency-Key: order-42-create-2026-09-28" \
+  -d '{"store_id": "acme", "total_minor": 2999}'
+```
+
+If the request succeeds, the `Idempotency-Key` is stored and the response is cached. If the same key is replayed (e.g., a network retry after a timeout), the cached response is returned — the order is not duplicated. If the original request failed with a `5xx` or `429`, the replay creates a new order (the key was never stored because the original request never completed).
+
+<Warning>
+Idempotency keys are only effective for *successful* completions within the key's TTL (typically one hour). A request that fails with a `500` and is retried with the same key may create a duplicate if the original request actually succeeded but the response was lost in transit — the gateway can't tell the difference. For critical operations, combine idempotency keys with your own reconciliation logic.
+</Warning>
+
+## Recommended client-side error-handling pattern
+
+Here is a generic pattern that works in any language:
+
+<Steps>
+  <Step title="Classify the error">
+    Inspect the HTTP status code and the `code` field in the response body. `4xx` statuses are client errors; `5xx` statuses are server errors. The `code` field tells you *which* client or server error it is.
+  </Step>
+  <Step title="Handle auth errors by refreshing">
+    On `401`, attempt to refresh the access token using the refresh token. If the refresh also returns `401`, redirect to sign-in. Don't retry the original request until you have a fresh token.
+  </Step>
+  <Step title="Handle rate limits by waiting">
+    On `429`, sleep for `retry_after` seconds (or whatever the `Retry-After` header says), then retry once. If you hit `429` again, back off further.
+  </Step>
+  <Step title="Handle validation errors by surfacing details">
+    On `422`, extract `details` and present each `detail.message` next to the corresponding field. Don't try to re-send the same body — it will produce the same error.
+  </Step>
+  <Step title="Handle server errors with backoff">
+    On `5xx`, retry with exponential backoff and jitter. Cap the number of retries (3–5 is typical) and log the failure if all retries exhaust.
+  </Step>
+  <Step title="Handle everything else as unrecoverable">
+    `400`, `403`, `404`, and `409` without an idempotency key are unlikely to succeed on retry. Surface the error to the user and log it for investigation.
+  </Step>
+</Steps>
+
+## Gateway errors vs service errors
+
+A useful distinction for debugging: errors that originate from the gateway never reach your services, and errors that reach your services never originate from the gateway. The table below maps the two:
+
+| Origin | Error codes | What it means |
+| --- | --- | --- |
+| Gateway | `missing_api_key`, `invalid_api_key`, `origin_not_allowed`, `rate_limit_exceeded`, `payload_too_large`, `upstream_timeout`, `upstream_unavailable` | The request was rejected before reaching any service. Check your key, origin list, rate limit configuration, or network connectivity. |
+| API service | `unknown_environment`, `resource_not_found`, `flow_disabled`, `operation_not_enabled`, `write_refused` | The request reached the API but the environment, resource, or operation doesn't exist or isn't enabled. |
+| Akountz | `unauthenticated`, `signup_disabled`, `email_not_verified`, `mfa_required`, `token_expired`, `refresh_token_revoked` | An authentication or identity operation failed. |
+| Angula | `channel_not_found`, `subscribe_denied`, `publish_denied` | A realtime operation was denied by a channel policy. |
+| Your resources/flows | Custom codes like `order_not_found`, `insufficient_balance`, `payment_failed` | Your own business logic refused the operation. |
+
+<Tip>
+If a `401` or `403` appears with no `code` you recognize, or the `message` doesn't match any of the categories above, the error is likely coming from a custom block or function in your project. Check the run trace in Studio's **Events & runs** page for the full step-by-step detail.
+</Tip>
+
+## Error codes reference
+
+This is the complete machine-readable code reference. Codes are grouped by the component that emits them.
+
+<AccordionGroup>
+  <Accordion title="Gateway error codes">
+    | Code | Status | Meaning |
+    | --- | --- | --- |
+    | `missing_api_key` | `401` | No `apikey`, `x-api-key`, or `?apikey=` found on the request |
+    | `invalid_api_key` | `401` | The key doesn't match any stored key hash, or is revoked or expired |
+    | `origin_not_allowed` | `403` | A publishable key's `Origin` isn't in the environment's allowed-origins list |
+    | `rate_limit_exceeded` | `429` | The key or client IP has exceeded the sliding-window rate limit |
+    | `payload_too_large` | `413` | The request body exceeds `max_body_bytes` (default 100 MB) |
+    | `upstream_timeout` | `504` | An internal service took too long to respond |
+    | `upstream_unavailable` | `502` | An internal service refused the connection or was unreachable |
+    | `websocket_rejected` | `1000`/`4001`/`4003` | A WebSocket upgrade was refused by the gateway or upstream |
+  </Accordion>
+  <Accordion title="API and resource error codes">
+    | Code | Status | Meaning |
+    | --- | --- | --- |
+    | `unknown_environment` | `401`/`404` | The project or environment named in the resolved key doesn't exist |
+    | `resource_not_found` | `404` | A `resource.get` call found no record |
+    | `operation_not_enabled` | `403` | The resource operation (list/get/create/update/delete) is disabled for this environment |
+    | `write_refused` | `400` | A `db.query` block attempted a write statement |
+    | `missing_secret` | `400` | A `secret.get` block referenced a secret that doesn't exist |
+    | `already_exists` | `409` | A create operation produced a duplicate |
+    | `flow_disabled` | `409` | A flow's `enabled` is `false` |
+    | `flow_not_found` | `404` | The flow name doesn't exist in this environment |
+  </Accordion>
+  <Accordion title="Auth error codes">
+    | Code | Status | Meaning |
+    | --- | --- | --- |
+    | `unauthenticated` | `401` | The access token is missing, expired, or invalid for this environment |
+    | `signup_disabled` | `403` | Sign-up is disabled for this environment |
+    | `email_not_verified` | `403` | The user hasn't verified their email and the operation requires it |
+    | `mfa_required` | `403` | The operation requires MFA and the session hasn't completed an MFA challenge |
+    | `token_expired` | `401` | The access token has passed its `expires_in` window |
+    | `refresh_token_revoked` | `401` | The refresh token has been revoked (e.g., by signing out) |
+    | `wrong_password` | `401` | The password doesn't match the account |
+    | `account_locked` | `403` | Too many failed sign-in attempts |
+  </Accordion>
+  <Accordion title="Flow error codes">
+    | Code | Status | Meaning |
+    | --- | --- | --- |
+    | `timeout` | `504` | The flow exceeded its `timeout` setting |
+    | `too_many_items` | `400` | A `control.foreach` exceeded 10,000 items |
+    | `unknown_block` | `400` | A flow references a block key that doesn't exist in the registry |
+    | `missing_trigger` | `400` | A flow definition has no trigger node |
+    | `invalid_edge` | `400` | An edge references a handle a block doesn't declare |
+    | `dangling_edge` | `400` | An edge's source or target node doesn't exist |
+    | `max_steps_exceeded` | `504` | A flow ran past 10,000 steps |
+  </Accordion>
+</AccordionGroup>
+
+## Summary
+
+Every Pawabase error follows the same two-field shape (`message`, `code`) with `details` for validation failures. The `code` is the machine-readable identifier you should use for programmatic handling; the `message` is for humans. Gateway errors (`missing_api_key`, `invalid_api_key`, `origin_not_allowed`, `rate_limit_exceeded`) arrive before any service is reached, which means they're always fixable by the client without touching your own code — check the key, the origin, or the rate limit configuration first. Service errors mean the request made it through the gateway and into your project's logic; those are where the policy engine, resource definitions, and flow definitions matter.
+
+## Further reading
+
+- [Calling Pawabase from a client](/clients/overview) — the gateway, the two kinds of key, and what's safe to ship
+- [REST conventions](/clients/rest-conventions) — every resource operation and the exact filter/sort/pagination syntax
+- [Credentials: keys and tokens](/concepts/credentials) — what each credential proves and how the gateway resolves it
+- [Policies overview](/policies/overview) — the policy engine that decides `403` responses
+- [Errors and retries in flows](/flows/errors-and-retries) — how to handle errors inside a flow graph

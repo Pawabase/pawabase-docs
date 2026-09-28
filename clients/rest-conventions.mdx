@@ -1,9 +1,297 @@
 ---
-title: "Rest conventions"
-description: "Calling Pawabase: this page is being written."
-tag: "Draft"
+title: "REST conventions"
+description: "How Pawabase's REST API works: URL patterns, query parameters, request/response shapes, filtering, sorting, pagination, expand, idempotency, and the conventions every client should follow."
+icon: "link"
 ---
 
+Pawabase exposes a RESTful API for every resource, flow, and platform operation. This page documents the URL conventions, query parameters, request/response shapes, and the patterns every client should follow to integrate reliably. Whether you're writing a browser app with `fetch`, a Python script with `requests`, or a mobile client with `URLSession` or `OkHttp`, the same conventions apply. See the language-specific guides ([JavaScript](/clients/javascript), [React](/clients/react), [Python](/clients/python), [Mobile](/clients/mobile)) for worked examples.
+
+<CardGroup cols={2}>
+  <Card title="Resources" icon="database">`/rest/v1/<resource>` — the standard REST endpoint for every resource.</Card>
+  <Card title="Flows" icon="waypoints">`/flows/v1/<name>` — HTTP-triggered flows respond at routes bound to their `trigger.http` config.</Card>
+</CardGroup>
+
+## URL patterns
+
+Every resource gets a REST endpoint automatically based on its `name`. The gateway resolves the resource definition at compile time, so the route only exists if the resource is defined and its operations are enabled for that environment.
+
+| Pattern | Method | Description |
+| --- | --- | --- |
+| `/rest/v1/<resource>` | `GET`, `POST` | List records (with filtering, sorting, pagination) or create a new one |
+| `/rest/v1/<resource>/<id>` | `GET`, `PUT`, `PATCH`, `DELETE` | Get, update, or delete a specific record |
+| `/rest/v1/<resource>/<id>/<relation>` | `GET` | Load a related resource (belongs_to or has_many) |
+| `/flows/v1/<name>` | `POST` | Invoke a flow by its name, triggered by HTTP |
+| `/functions/v1/<name>` | `POST` | Directly invoke a function |
+| `/hooks/v1/<name>` | `POST` | An inbound webhook — no API key required, signed by the hook's own secret |
+
+The `<resource>` name is the `name` field from your resource definition, not a pluralized or camel-cased variant of your table name. If your resource is defined as `name: "invoice"`, the endpoint is `/rest/v1/invoice`, not `/rest/v1/invoices`.
+
+## Request and response shapes
+
+### Creating
+
+`POST /rest/v1/<resource>` with a JSON body containing the fields to set. The request body must include all required fields defined in the resource schema. Optional fields may be omitted. Fields with `default` values are populated automatically if not provided.
+
+```bash
+curl -X POST "$GW/rest/v1/orders" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"store_id": "acme", "total_minor": 2999, "currency": "usd"}'
+```
+
+**Response** (`201 Created`): the created record with server-assigned fields (`id`, `created_at`, `updated_at`). The response body is the full record object, not a wrapper.
+
+```json
+{
+  "id": "order_42",
+  "store_id": "acme",
+  "total_minor": 2999,
+  "currency": "usd",
+  "status": "created",
+  "created_at": 1790000000,
+  "updated_at": 1790000000
+}
+```
+
+Fields that aren't provided in the request and don't have defaults are set to `null`. Fields with validation constraints (`pattern`, `minimum`, `maximum`, `enum`) are validated against the schema before the record is written. A `422` response with a `details` array lists every validation failure.
+
+### Listing
+
+`GET /rest/v1/<resource>` with query parameters for filtering, sorting, and pagination:
+
+```bash
+curl "$GW/rest/v1/orders?filter[store_id]=acme&sort=-placed_at&limit=20&offset=0&expand=customer" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response** (`200 OK`):
+
+```json
+{
+  "data": [...],
+  "total": 142,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+The `total` field reflects the number of records the caller's policy permits — not the total number of rows in the table. Pawabase's policy engine **plans** the policy into the query: anything that doesn't depend on the row is checked before any SQL runs, AND-ed equalities become `WHERE` clauses, and anything left over is checked per row as it's read. The practical effect is that a paginated list is correct — the right rows, the right total — not "20 rows, 3 of which turned out to be visible." See [Policies → how policies plan lists](/policies/overview#planning) for the full mechanism.
+
+### Updating
+
+`PUT /rest/v1/<resource>/<id>` replaces the entire record. `PATCH /rest/v1/<resource>/<id>` updates only the named fields. Both accept the same field types as `POST`.
+
+**Response**: the updated record with the server-assigned `updated_at` field refreshed.
+
+```bash
+curl -X PATCH "$GW/rest/v1/orders/42" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status": "paid"}'
+```
+
+A `404` is returned if the record doesn't exist. A `422` is returned if the updated fields fail validation. A `403` is returned if the caller's policy doesn't permit the update.
+
+### Deleting
+
+`DELETE /rest/v1/<resource>/<id>`.
+
+**Response** (`204 No Content`). The record is removed. If the operation is disabled for this resource in this environment, a `403 operation_not_enabled` is returned instead.
+
+```bash
+curl -X DELETE "$GW/rest/v1/orders/42" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+## Filtering, sorting, and pagination
+
+| Parameter | Format | Description |
+| --- | --- | --- |
+| `filter[<field>]` | `?filter[status]=paid` | Equality filter — every pair is AND-ed |
+| `sort` | `?sort=-placed_at` | Prefix with `-` for descending; omit or use `+` for ascending |
+| `limit` | `?limit=20` | Page size (default 50, maximum 100) |
+| `offset` | `?offset=0` | Rows to skip for pagination |
+| `expand` | `?expand=author,comments` | Comma-separated list of relation names to embed in the response |
+
+Filters are equality-only — use `db.query` in a flow for richer queries (`>`, `<`, `OR`, `JOIN`, `LIKE`). Multiple `filter` parameters are AND-ed together:
+
+```bash
+# status is "paid" AND store_id is "acme"
+curl "$GW/rest/v1/orders?filter[status]=paid&filter[store_id]=acme"
+```
+
+The `sort` parameter supports any field on the resource:
+
+```bash
+# Sort by created_at descending, then by total_minor ascending
+curl "$GW/rest/v1/orders?sort=-created_at&sort=total_minor"
+```
+
+When `expand` is used, the related records are embedded inline rather than returned as separate objects:
+
+```json
+{
+  "data": [{
+    "id": "42",
+    "total_minor": 2999,
+    "customer": { "id": "8", "email": "ada@example.com", "name": "Ada Lovelace" },
+    "line_items": [
+      { "id": "li_1", "product": "Widget", "quantity": 2 }
+    ]
+  }]
+}
+```
+
 <Note>
-This page is part of the **Calling Pawabase** section and is still being written. Check back soon.
+`?expand=` only works for relations defined on the resource (`belongs_to` and `has_many`). You cannot expand arbitrary fields or join against tables not declared as relations in the resource definition. For complex joins, use a flow with `db.query`.
 </Note>
+
+## Authentication
+
+Every request requires an API key. See [The two-credential model](/clients/overview) for the full explanation of `apikey` and `Authorization: Bearer <access_token>`.
+
+```http
+GET /rest/v1/invoices/44?expand=student HTTP/1.1
+Host: api.yourapp.com
+apikey: pk_live_9f2c3d1a...
+Authorization: Bearer eyJhbGciOi...
+```
+
+The `apikey` header is always required — even for fully public, anonymous reads. The gateway uses it to resolve the project and environment before anything else happens. `Authorization` is only required when a policy needs to know who's calling.
+
+### Cookie-based auth for browser sessions
+
+For browser sessions that use cookie-based auth (the `X-XSRF-TOKEN` cookie pattern), include the cookie in requests. The gateway resolves the API key from the header or query string, and the session cookie carries the user identity. This pattern is used by Studio's bridge and is available for any SPAs that want to avoid putting bearer tokens in JavaScript at all:
+
+```bash
+curl "$GW/rest/v1/orders?page=2&page_size=20" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "X-XSRF-TOKEN: $XSRF" \
+  -b cookies.txt
+```
+
+## Idempotency
+
+`POST` requests that create resources accept an `Idempotency-Key` header. Replaying a request with the same key returns the original response instead of creating a duplicate. This is essential for network retries: if a `POST` succeeds but the response is lost in transit, replaying with the same idempotency key returns the original `201` response rather than creating a second record.
+
+```bash
+curl -X POST "$GW/rest/v1/orders" \
+  -H "apikey: $PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -H "Idempotency-Key: order-42-create-2026-09-28" \
+  -d '{"store_id": "acme", "total_minor": 2999}'
+```
+
+Idempotency keys are effective for successful completions within the key's TTL (typically one hour). A request that failed with a `5xx` or `429` and is retried with the same key may create a duplicate if the original request actually succeeded but the response was lost. For critical operations, combine idempotency keys with your own reconciliation logic. See [Retry behavior](/clients/errors#idempotency-and-duplicate-creation).
+
+## Response headers
+
+Every response includes a set of standard headers that provide metadata about the request:
+
+| Header | Description |
+| --- | --- |
+| `X-Request-ID` | A unique identifier for the request, useful for debugging and tracing in [Observability](/operate/observability) |
+| `X-Pawabase-Context` | (Internal only, stripped from client responses) The signed platform context the gateway resolved |
+| `Retry-After` | On `429` responses, the number of seconds to wait before retrying |
+| `X-RateLimit-Remaining` | The number of requests remaining in the current rate-limit window |
+| `X-RateLimit-Limit` | The total requests allowed in the current window |
+| `X-RateLimit-Reset` | The Unix timestamp when the rate-limit window resets |
+
+These headers are visible on responses from the gateway and from services that propagate them. They're invaluable for building clients that gracefully handle rate limits without guessing.
+
+## Error response shapes
+
+Every error response is `application/json`. See [Errors](/clients/errors) for the complete error catalog. The two shapes are:
+
+**Standard error:**
+
+```json
+{
+  "message": "a human-readable description",
+  "code": "machine_readable_code"
+}
+```
+
+**Validation error (`422`):**
+
+```json
+{
+  "message": "the request body is invalid",
+  "details": [
+    {"field": "email", "message": "must be a valid email address"},
+    {"field": "quantity", "message": "must be at least 1"}
+  ]
+}
+```
+
+## Pagination best practices
+
+Pagination uses offset-based cursors (`limit` and `offset`). This is simple and works well for most use cases, but keep these guidelines in mind:
+
+1. **Always specify `limit`.** The default is 50, but the maximum is 100. Fetching all records at once is inefficient and may hit the gateway's body size limit.
+2. **Use `offset` for sequential pages.** `offset=0` is the first page, `offset=20` is the second (with `limit=20`). Don't use large offsets for deep pagination — they become slow. If you need deep pagination, consider cursor-based pagination with a `sort` field and a `since` parameter.
+3. **Use `total` to know if there are more pages.** `total` reflects the count after policy filtering, so it's the authoritative count of what the caller can see.
+4. **Combine `sort` with `offset` for deterministic ordering.** Without `sort`, the database may return rows in an unpredictable order, causing records to appear on multiple pages or be skipped entirely.
+
+## Resource operation visibility
+
+A resource declares which operations are enabled via its `operations` field. An operation you never enable simply doesn't exist as a route and never appears in the generated API docs:
+
+```json
+{
+  "name": "invoices",
+  "operations": {
+    "list":   { "enabled": true, "policy": "family_access" },
+    "get":    { "enabled": true, "policy": "family_access" },
+    "create": { "enabled": true, "policy": "finance_staff" },
+    "update": { "enabled": true, "policy": "finance_staff" },
+    "delete": { "enabled": true, "policy": "school_admin" }
+  }
+}
+```
+
+If `delete` is not enabled, a `DELETE /rest/v1/invoices/42` request returns `404` or `403` — the route doesn't exist at all. This is an **opt-in** model. Unlike PostgREST's opt-out exposure (where every table is world-readable until you add RLS), nothing is exposed until you enable it.
+
+## Full request/response example
+
+Here's a complete end-to-end example: create an order, list it with filters, expand a relation, update it, and delete it.
+
+```bash
+# Create
+ORDER=$(curl -s -X POST "$GW/rest/v1/orders" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"store_id": "acme", "total_minor": 2999, "currency": "usd"}')
+echo "Created: $ORDER"
+# {"id":"order_42","store_id":"acme","total_minor":2999,"currency":"usd","status":"created",…}
+
+ID=$(echo "$ORDER" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+# List with filtering and pagination
+curl "$GW/rest/v1/orders?filter[store_id]=acme&sort=-created_at&limit=10&offset=0" \
+  -H "Authorization: Bearer $TOKEN"
+# {"data":[…],"total":142,"limit":10,"offset":0}
+
+# Get with expanded relations
+curl "$GW/rest/v1/orders/$ID?expand=customer,line_items" \
+  -H "Authorization: Bearer $TOKEN"
+# {"id":"order_42",…,"customer":{…},"line_items":[…]}
+
+# Update status
+curl -X PATCH "$GW/rest/v1/orders/$ID" \
+  -H "content-type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"status": "paid"}'
+# {"id":"order_42",…,"status":"paid","updated_at":…}
+
+# Delete
+curl -X DELETE "$GW/rest/v1/orders/$ID" \
+  -H "Authorization: Bearer $TOKEN"
+# (204 No Content, empty body)
+```
+
+## Next
+
+- [Calling Pawabase from a client](/clients/overview) — the gateway, the two kinds of key, and what's safe to ship
+- [Errors](/clients/errors) — the full status code table and a recommended client-side error-handling pattern
+- [Credentials: keys and tokens](/concepts/credentials) — what each credential proves and how the gateway resolves it
+- [REST API reference for a specific resource — generated per environment](/docs/v1/*) — if your environment has `public_docs` on, the full API reference is available at `/docs/v1/*`
