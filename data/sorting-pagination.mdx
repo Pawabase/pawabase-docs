@@ -4,20 +4,89 @@ description: "Order results, page through them with exact totals, and return onl
 icon: "arrow-down-up"
 ---
 
+Every list endpoint Pawabase compiles for a resource — `GET /rest/v1/<resource>` — accepts the same three independent, composable query mechanisms: **sort** (order), **pagination** (`page`/`per_page`, which page of that order you get), and **select** (which columns come back). None of the three depends on the others, and all three compose with [filtering](/data/filtering) and `expand`. This page covers all three in depth, with the exact validation rules, the exact response envelope, and the edge cases that matter once you're building an admin table, an infinite-scroll feed, or an export job on top of them.
+
+<CardGroup cols={3}>
+  <Card title="Sort" icon="arrow-down-up">`?sort=last_name,-created_at` — comma-separated fields, `-` for descending.</Card>
+  <Card title="Paginate" icon="layout-list">`?page=2&per_page=50` — offset pagination with an exact `total` when possible.</Card>
+  <Card title="Select" icon="columns-3">`?select=id,title,status` — read and return only the columns you need.</Card>
+</CardGroup>
+
 ## Sorting
 
 ```text
 ?sort=<field>[,<field>…]
 ```
 
-Prefix a field with `-` for descending. Multiple fields sort in order:
+Prefix a field with `-` to sort descending. A bare field name, or one prefixed with `+`, sorts ascending — `+name` and `name` are equivalent. Multiple fields are separated by commas and applied **in the order you list them**, each one breaking ties left over by the field before it:
 
 ```bash
 GET /rest/v1/students?sort=last_name,first_name
 GET /rest/v1/announcements?sort=-pinned,-created_at
 ```
 
-Only declared fields (plus `id`, `created_at`, `updated_at`) can be used. Without `sort`, order is the database's and not guaranteed; always sort when paginating.
+The first example sorts alphabetically by last name, and for students who share a last name, by first name. The second sorts pinned announcements first (`-pinned` — `true` sorts before `false` when descending, since Pawabase encodes booleans as 1/0 for ordering purposes on the database side), then within each pinned-status group, newest first.
+
+### What can be sorted on
+
+Only fields that are part of the resource's declared schema can be used in `sort` — this means every field you added in the resource's `fields` list, plus the primary key and the two automatic timestamp columns (`created_at`, `updated_at`) that every resource gets unless `timestamps` is disabled. Internally this check runs in `parse_sort()`, which validates every column name you pass against the compiled resource's `field_map` before it ever reaches SQL:
+
+```python
+def parse_sort(value, spec):
+    """"-created_at,title" into [("created_at", True), ("title", False)]."""
+    if not value:
+        return []
+    result = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        descending = part.startswith("-")
+        column = part.lstrip("-+")
+        if column not in spec.field_map:
+            raise SqlError(f"cannot sort on unknown field {column!r}")
+        result.append((column, descending))
+    return result
+```
+
+Two details worth internalizing from that function directly:
+
+- **Whitespace around a field name is tolerated.** `?sort= last_name , first_name` works the same as `?sort=last_name,first_name`, because each comma-separated part is `.strip()`ped before anything else happens.
+- **A leading `+` is stripped along with `-`.** `part.lstrip("-+")` removes any leading run of `+` or `-` characters, so `sort=+name` behaves identically to `sort=name`. This matters if you're generating query strings from a UI toolkit that always emits an explicit sign (some data-grid libraries do).
+- **Empty parts are skipped, not errors.** A stray trailing comma (`sort=name,`) or a doubled comma (`sort=name,,status`) doesn't fail; the empty segment is simply ignored. Don't rely on this to mean "an empty sort field is fine" for anything other than accidental trailing commas — it's a parsing leniency, not a feature.
+
+An unknown field raises immediately, before any query runs, and surfaces as a `400`:
+
+```bash
+curl "$GW/rest/v1/students?sort=gpa_average" -H "apikey: $PK"
+```
+
+```json
+{
+  "error": "bad_request",
+  "message": "cannot sort on unknown field 'gpa_average'"
+}
+```
+
+(If the field is really called `gpa`, not `gpa_average`, the fix is just spelling it correctly — but the same error is what you'll see if you try to sort by a *relation's* field directly, like `sort=class.name`. Sorting only works on the resource's own columns; if you need to order by something on a related resource, either denormalize that value onto the resource itself, or sort client-side after fetching with `expand`.)
+
+<Warning>
+Without `sort`, row order is whatever the underlying database engine happens to return, which is **not guaranteed to be stable across requests** — it can change between two calls with identical filters, especially as rows are inserted, updated, or as the query planner picks a different execution plan. Always add an explicit `sort` when you're paginating; otherwise the same row can appear on two different pages, or never appear at all, as the underlying order shifts underneath you between requests.
+</Warning>
+
+### Making sort deterministic
+
+Sorting by a single field that isn't unique (like `status` or `class_id`) still leaves ties resolved arbitrarily — two students in the same class can flip order between page loads even with `sort=class_id`, because the database doesn't guarantee a stable tie-break on its own. If you need byte-for-byte stable ordering across requests (important for reliable pagination — see below), add the primary key as a final tie-breaker:
+
+```bash
+GET /rest/v1/students?sort=class_id,id
+```
+
+Now every row's position is fully determined: first by `class_id`, then, for ties, by `id` — and since `id` is unique, there's never a tie left over. This single addition is the difference between pagination that's occasionally flaky under concurrent writes and pagination that's provably correct.
+
+### Sorting cost
+
+A `sort` on an unindexed column forces the database to read and sort the full matching row set in memory (or spill to disk on a huge table) before it can return even the first page. This is invisible on a resource with a few thousand rows and very noticeable on one with millions. If you have a field you sort by constantly — a `created_at` feed, a `priority` queue, a `due_on` date — mark it `indexed: true` in the resource definition and run [migrate](/data/migrations) to add the index. Pagination itself (`LIMIT`/`OFFSET`) doesn't need an index to be *correct*, but it needs the sort to be index-backed to stay *fast* as the table grows, because the database still has to walk (or fully sort) every row up to the requested offset before it can hand back your slice.
 
 ## Pagination
 
@@ -25,12 +94,29 @@ Only declared fields (plus `id`, `created_at`, `updated_at`) can be used. Withou
 ?page=<n>&per_page=<m>
 ```
 
-| Parameter | Default | Limits |
-| --- | --- | --- |
-| `page` | 1 | ≥ 1 |
-| `per_page` | 20 | 1–200 |
+| Parameter | Type | Default | Limits |
+| --- | --- | --- | --- |
+| `page` | integer | `1` | `≥ 1` |
+| `per_page` | integer | `20` | `1`–`200` |
 
-Every list response has the same envelope:
+Both are validated at the HTTP layer before the handler runs — `page=0`, `page=-1`, or `per_page=500` are all refused with a `422` before any query executes:
+
+```bash
+curl "$GW/rest/v1/students?per_page=500" -H "apikey: $PK"
+```
+
+```json
+{
+  "error": "validation_error",
+  "message": "per_page: ensure this value is less than or equal to 200"
+}
+```
+
+The hard ceiling on `per_page` is **200** rows per page. There's no way to raise it per-request or per-resource — if you need more than 200 rows in one shot (a bulk export, a full-table sync), page through in a loop (see "Reading everything" below) rather than asking for a bigger page.
+
+### The response envelope
+
+Every list response — for every resource, with no exceptions — has the same shape:
 
 ```json
 {
@@ -41,9 +127,107 @@ Every list response has the same envelope:
 }
 ```
 
-`total` counts every row matching your filters **and** the policy. When a policy has a residual condition that can't run in SQL (for example array membership), `total` may be `null`, because counting it would mean reading the whole table. Page until a short page instead.
+| Field | Meaning |
+| --- | --- |
+| `data` | The rows for this page, after filtering, sorting, policy evaluation, `expand`, and the resource's transformer. |
+| `page` | Echoes the `page` you requested (or the default, `1`). |
+| `per_page` | Echoes the `per_page` you requested (or the default, `20`). |
+| `total` | The exact count of rows matching your filters **and** the caller's policy — or `null` (see below). |
 
-### Reading everything
+### Offset math
+
+Internally, `page` and `per_page` are converted to a `LIMIT`/`OFFSET` pair before hitting the database:
+
+```text
+limit  = per_page
+offset = (page - 1) * per_page
+```
+
+So `?page=3&per_page=50` becomes `LIMIT 50 OFFSET 100` — it skips the first 100 matching rows (pages 1 and 2) and returns the next 50. This is worth knowing explicitly because it explains why very deep pages get slower: the database still has to walk past every skipped row (or at least count past it via an index) before it can start returning your slice. Page 3 of a 200-per-page listing is cheap; page 3,000 of the same listing is not, because the engine is skipping 599,800 rows to get there.
+
+### Computing total pages
+
+Given `total` and `per_page`, the number of pages is a ceiling division:
+
+```js
+const totalPages = total == null ? null : Math.ceil(total / per_page);
+```
+
+```js
+// total: 431, per_page: 50 → 9 pages (the last one has 31 rows)
+const totalPages = Math.ceil(431 / 50); // 9
+```
+
+### When `total` is `null`
+
+`total` counts every row matching your filters **and** the caller's policy. Most of the time that count can be computed with a single indexed `SELECT COUNT(*)` alongside the main query, because the policy engine can turn AND-ed equality conditions (`$record.user_id == "8"`) into `WHERE` clauses that participate in the count the same way your own filters do. But some policies can't be reduced to SQL at all — specifically, an `any` (OR) condition whose branches touch different record fields. When that happens, the policy engine falls back to a **residual**: it runs the unrestricted-enough query and then checks each row against the policy in application code, row by row, after the fact. Once that's happening, a database-level `COUNT(*)` would no longer match what the caller can actually see, so instead of returning a wrong number, the API returns `total: null`.
+
+A concrete example — this policy on `posts.list` can't be fully pushed into SQL:
+
+```json
+{
+  "any": [
+    { "eq": ["$record.status", "published"] },
+    { "owner": "author_id" }
+  ]
+}
+```
+
+"Published OR I own it" mixes two different fields (`status`, `author_id`) inside an `any`, so it can't collapse into a single `WHERE` clause the way an `all` of equalities can. Every list request evaluated under this policy comes back with `total: null`:
+
+```bash
+curl "$GW/rest/v1/posts?sort=-created_at" -H "apikey: $PK" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "data": [ /* up to 20 rows */ ],
+  "page": 1,
+  "per_page": 20,
+  "total": null
+}
+```
+
+<Note>
+`total: null` is not an error and not a bug in your policy — it's the API being honest that counting would mean reading (and policy-checking) the entire table, which it won't do implicitly on your behalf. See [pushdown](/policies/pushdown) for exactly which condition shapes push into SQL and which fall back to a residual, and design record-scoped policies as AND-ed equalities wherever you can to keep `total` exact.
+</Note>
+
+When `total` is `null`, don't try to compute "page 9 of ?" in a UI — instead, page forward and stop when a page comes back shorter than `per_page`, or empty:
+
+```js
+async function paginateUntilShort(path, params = {}) {
+  const pages = [];
+  for (let page = 1; ; page++) {
+    const r = await get(path, { ...params, per_page: 50, page });
+    pages.push(r);
+    if (r.data.length < 50) break; // last page reached
+  }
+  return pages;
+}
+```
+
+### Offset pagination vs. cursor pagination
+
+Pawabase's list endpoint is **offset-based** (`page`/`per_page`), not cursor-based. Offset pagination is simple to reason about and lets you jump to an arbitrary page number, but it has two well-known costs:
+
+1. **Deep pages get slower** as the offset grows, because the database has to walk past every skipped row (see "Offset math" above).
+2. **Pages can shift under concurrent writes.** If a row is inserted or deleted between two page requests, rows can shift by one position, and you can see a duplicate row across two pages or skip one entirely — this is a property of offset pagination generally, not specific to Pawabase.
+
+For most admin UIs and dashboards, neither of these matters: result sets are small enough that deep pages are rare, and occasional duplicate/skipped rows during a live edit session are a minor cosmetic issue. For a **large, append-mostly table** (an activity log, a message history, an export job walking millions of rows), switch to **keyset (seek) pagination** using a filter instead of `page`:
+
+```bash
+# first page
+GET /rest/v1/audit_events?sort=id&per_page=200
+
+# remember the last id you saw (say, 4213), then:
+GET /rest/v1/audit_events?sort=id&per_page=200&filter[id]=gt.4213
+```
+
+Each request asks for "the next 200 rows after the last id I saw," sorted by that same id. Because the `WHERE id > ?` condition is a single indexed equality-style comparison, this stays fast no matter how deep you go — there's no offset to walk past, only an index seek to the starting point. The tradeoff is that you lose the ability to jump straight to "page 500"; you can only walk forward (or backward, with `lt.`) from a known position. For anything you'd call "infinite scroll" or "export everything," keyset pagination on an indexed, unique, monotonically-increasing column (`id`, or `created_at` plus `id` as a tie-breaker) is the right tool; for a bounded admin table with a page-number control, offset pagination is simpler and entirely adequate.
+
+## Reading everything
+
+The most common pagination task is "give me every row, I don't care about pages." Here's a page-until-short loop in JavaScript:
 
 ```js
 async function all(path, params = {}) {
@@ -56,22 +240,252 @@ async function all(path, params = {}) {
 }
 ```
 
+It uses the largest allowed `per_page` (200) to minimize round trips, and stops either when a page comes back short (fewer than 200 rows — the last page) or, when `total` is known, once it's collected that many rows. Both checks are there because `total` can be `null` under a residual policy (see above), in which case only the "short page" check applies.
+
+The same loop in Python, using `httpx` as an illustrative HTTP client:
+
+```python
+import httpx
+
+async def read_all(client: httpx.AsyncClient, path: str, params: dict | None = None) -> list[dict]:
+    rows: list[dict] = []
+    page = 1
+    params = dict(params or {})
+    while True:
+        params.update({"per_page": 200, "page": page})
+        response = await client.get(path, params=params)
+        response.raise_for_status()
+        body = response.json()
+        rows.extend(body["data"])
+        if len(body["data"]) < 200 or (body["total"] is not None and len(rows) >= body["total"]):
+            return rows
+        page += 1
+```
+
+For very large tables, prefer the keyset approach from the previous section over a naive page-until-short loop — walking to page 5,000 with `page=5000&per_page=200` means the database re-walks a million skipped rows on every single request, while a keyset loop (`filter[id]=gt.<last>`) does a fast index seek every time regardless of how far in you are:
+
+```js
+async function allKeyset(path, params = {}) {
+  const rows = [];
+  let lastId = 0;
+  for (;;) {
+    const r = await get(path, { ...params, sort: "id", per_page: 200, filter: { id: `gt.${lastId}` } });
+    if (r.data.length === 0) return rows;
+    rows.push(...r.data);
+    lastId = r.data[r.data.length - 1].id;
+    if (r.data.length < 200) return rows;
+  }
+}
+```
+
+<Warning>
+Whichever loop you use, respect [rate limits](/data/custom-routes#rate-limiting) on the endpoints you're paging through. A tight loop with no delay against a resource with a low `rate_limit` will start getting `429`s partway through a large export — back off and retry on `429` rather than hammering the endpoint, and prefer running large exports with a secret key from a server context (which typically isn't subject to the same per-caller limits public keys are) rather than from a browser tab.
+</Warning>
+
 ## Selecting fields
 
 ```text
 ?select=<field>[,<field>…]
 ```
 
-Return only some fields. The query reads fewer columns, and responses shrink:
+Return only the fields you list, instead of every declared field on the resource. `select` is a real column projection at the database layer — it changes what's actually read from the table, not just what's trimmed from an already-fetched row — so a narrower `select` genuinely reduces query and network cost, which matters on wide tables (dozens of columns, some of them large text/JSON blobs) or high-frequency polling endpoints.
 
 ```bash
 GET /rest/v1/students?select=id,first_name,last_name,class_id&per_page=200
 ```
 
-`select` runs before the transformer; if the transformer adds computed fields, they're added to the selected set.
+```json
+{
+  "data": [
+    { "id": 12, "first_name": "Ada", "last_name": "Chukwu", "class_id": 7 }
+  ],
+  "page": 1,
+  "per_page": 200,
+  "total": 812
+}
+```
+
+Only the listed columns come back — every other declared field (`admission_no`, `date_of_birth`, `photo_url`, whatever else `students` has) is absent from the response entirely, not merely `null`.
+
+### The primary key is always included
+
+If you pass `select` and forget the primary key, Pawabase adds it back for you — a selected list without `id` (or whatever the resource's primary key field is named) would be nearly useless for any client that needs to reference a row afterward (to fetch it individually, to update it, to use it as a React list `key`), so the compiler force-includes it:
+
+```bash
+GET /rest/v1/students?select=first_name,last_name
+```
+
+```json
+{ "data": [ { "id": 12, "first_name": "Ada", "last_name": "Chukwu" } ], "page": 1, "per_page": 20, "total": 812 }
+```
+
+Notice `id` is present even though it wasn't in `select`.
+
+### `select` and the transformer
+
+`select` narrows what's read from the database, and it runs **before** the resource's [transformer](/data/transformers). If the transformer's `set` step computes a field, that field is added *after* selection, so it appears in the response even if it wasn't (and couldn't have been, since it doesn't exist as a column) named in `select`:
+
+```json
+// transformer: report_card_view
+{ "omit": ["guardian_user_ids"], "set": { "pdf_url": "https://school.example/reports/{{ record.id }}.pdf" } }
+```
+
+```bash
+GET /rest/v1/report_cards?select=id,term,average&per_page=10
+```
+
+```json
+{
+  "data": [
+    { "id": 91, "term": "2026-T2", "average": 78.4, "pdf_url": "https://school.example/reports/91.pdf" }
+  ],
+  "page": 1, "per_page": 10, "total": 214
+}
+```
+
+`pdf_url` shows up even though it was never in `select` and isn't a real column — it's synthesized by the `set` step from the record's `id`, which *was* implicitly available to the transformer regardless of what `select` narrowed the response to (the transformer's `set` step templates against the full record read from the database, not the trimmed one — see [transformers](/data/transformers#set-sees-the-original-record) for exactly what's visible at each step). Conversely, if the transformer's `pick` step names a field that wasn't in your `select`, it simply won't be there to pick — `pick` can't resurrect a column you didn't read.
+
+### `select` and `expand`
+
+`select` only affects the resource's own columns; it has no effect on what an `expand`ed relation returns, since expansion is a separate lookup against the related resource entirely. You can combine both freely:
+
+```bash
+GET /rest/v1/invoices?select=id,invoice_no,balance,due_on&expand=student&sort=-due_on
+```
+
+```json
+{
+  "data": [
+    {
+      "id": 44, "invoice_no": "INV-202600001", "balance": 0, "due_on": "2026-09-15",
+      "student": { "id": 12, "first_name": "Ada", "last_name": "Chukwu" }
+    }
+  ],
+  "page": 1, "per_page": 20, "total": 431
+}
+```
+
+The invoice's own fields are narrowed by `select`; the expanded `student` object comes back in full (or shaped by *its own* resource's transformer, if it has one — `select` on the parent request doesn't reach into the expansion).
+
+### Why narrow the response
+
+- **Smaller payloads.** A mobile client rendering a list row that only shows a name and a status doesn't need to download every declared field on every row.
+- **Fewer bytes scanned.** On a table with large `TEXT`/`JSON` columns (a `body`, a `notes` field, an embedded document), selecting them out of a list view avoids reading and serializing content you're about to discard.
+- **Cheaper caching.** If the resource has `cache_ttl` set, the cache key includes the full query string — a narrower `select` isn't itself required for caching to work, but a smaller cached payload is cheaper to store and to transmit on a hit. See [caching](/data/caching#how-its-keyed) for exactly how the cache key is built from your identity, key role, and the full query (page, per_page, sort, select, expand, filters all included).
 
 ## Putting it together
+
+### An admin dashboard table
+
+A paginated, sortable table of overdue invoices, showing only the columns the grid renders:
 
 ```bash
 GET /rest/v1/invoices?filter[status]=in.issued,overdue&sort=-due_on&select=id,invoice_no,balance,due_on&expand=student&per_page=50&page=1
 ```
+
+The UI's "next page" button just increments `page`; its column sort click handlers set `sort` to the clicked column (toggling the `-` prefix on repeated clicks); `total` (when not `null` — this resource's policy is normally a clean owner/role-based `all`, so it usually is exact) drives the "showing 1–50 of 431" label and page-count control.
+
+### An infinite-scroll mobile feed
+
+A social-style feed doesn't need page numbers — it needs "give me the next batch below what I've already shown," which maps cleanly onto keyset pagination:
+
+```bash
+# first load
+GET /rest/v1/announcements?sort=-created_at&per_page=20&select=id,title,pinned,created_at
+
+# scrolled to the bottom, last item's created_at was "2026-09-20T08:00:00Z", id 903
+GET /rest/v1/announcements?sort=-created_at,-id&per_page=20&filter[created_at]=lte.2026-09-20T08:00:00Z&filter[id]=lt.903
+```
+
+The second `filter` on `id` breaks ties for announcements created in the same instant, matching the `-created_at,-id` sort exactly.
+
+### A CSV export job
+
+A background job exporting an entire resource to CSV should page through the full ID range with a large `per_page` and no `expand` (fewer joins, faster reads), streaming each page straight to the file rather than holding everything in memory:
+
+```python
+import csv
+import httpx
+
+async def export_csv(client: httpx.AsyncClient, path: str, fields: list[str], out_path: str) -> None:
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(fields)
+        last_id = 0
+        while True:
+            params = {"select": ",".join(fields), "sort": "id", "per_page": 200, "filter[id]": f"gt.{last_id}"}
+            response = await client.get(path, params=params)
+            body = response.json()
+            if not body["data"]:
+                break
+            for row in body["data"]:
+                writer.writerow([row.get(field, "") for field in fields])
+            last_id = body["data"][-1]["id"]
+            if len(body["data"]) < 200:
+                break
+```
+
+### A typeahead search
+
+A search-as-you-type field wants a *small*, fast, narrowly-selected result set, sorted by relevance-adjacent fields (usually just a name field, ascending, combined with a `filter[name]=ilike.*query*` — see [filtering](/data/filtering)):
+
+```bash
+GET /rest/v1/students?filter[last_name]=ilike.*chuk*&select=id,first_name,last_name,class_id&sort=last_name&per_page=8
+```
+
+`per_page=8` keeps the dropdown short and the request cheap; `select` keeps the payload to exactly what the dropdown renders; no `expand` is needed since the dropdown doesn't show relation data.
+
+## Troubleshooting and common mistakes
+
+<AccordionGroup>
+  <Accordion title="Rows appear twice, or go missing, across pages">
+    This almost always means pagination without a fully deterministic `sort` — either no `sort` at all, or one that doesn't uniquely order every row (see "Making sort deterministic" above). Add the primary key as a final tie-breaker: `sort=<your field>,id`. If rows are shifting because of concurrent writes to a large, actively-changing table, consider switching that specific listing to keyset pagination, which is far less sensitive to concurrent inserts near the pages you've already fetched.
+  </Accordion>
+  <Accordion title="A sorted list is slow, especially on later pages">
+    Two separate causes, often combined: (1) the sort field isn't indexed, so the database has to sort the whole matching set before returning any page — mark the field `indexed: true` and [migrate](/data/migrations); (2) the page is deep, so `OFFSET` is skipping a large number of rows even with an index on the sort field — switch that access pattern to keyset pagination (see above), which doesn't have this cost at any depth.
+  </Accordion>
+  <Accordion title="total comes back null and the UI's page-count control breaks">
+    The caller's policy on this operation has a residual condition that can't be pushed into SQL — typically an `any` (OR) across different record fields. This isn't a bug to "fix" in the request; it's a property of the policy. Either accept it and switch that UI to a "load more" pattern instead of a page-number control, or, if you control the policy, see whether it can be restructured as an AND-ed equality (for example, denormalizing a computed "visible to" field onto the record and comparing that with a single `eq`) so it pushes down. See [pushdown](/policies/pushdown).
+  </Accordion>
+  <Accordion title="Sorting by a relation's field doesn't work">
+    `sort` only accepts fields declared directly on the resource being listed — it can't reach into an `expand`ed relation. If you need to order primarily by something that lives on a related resource, either denormalize a copy of that value onto this resource (common for a `class_name` cache column alongside `class_id`) or fetch with `expand` and sort client-side.
+  </Accordion>
+  <Accordion title="An unknown field in sort or filter returns 400 instead of silently ignoring it">
+    This is intentional — both `parse_sort` and `parse_filters` validate every field name against the resource's declared `field_map` and raise immediately rather than silently dropping a typo'd field, which would otherwise produce a confusingly "correct-looking but wrong" response (a filter that silently does nothing is much harder to debug than one that 400s).
+  </Accordion>
+  <Accordion title="per_page above 200 is rejected even though I only need it once">
+    There's no override for the 200-row ceiling, by design — it bounds worst-case response size and query cost per request regardless of caller. Loop instead (see "Reading everything"); for genuinely bulk needs (a full export), keyset pagination at `per_page=200` is not meaningfully slower in aggregate than a single giant page would have been, and it doesn't risk timing out a single huge request.
+  </Accordion>
+</AccordionGroup>
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can I sort ascending and descending on different fields in the same request?">
+    Yes — the `-` prefix is per-field: `sort=-pinned,title` sorts by `pinned` descending, then by `title` ascending among rows with the same `pinned` value.
+  </Accordion>
+  <Accordion title="Does select affect what a flow or policy sees?">
+    No. `select` only narrows the HTTP response of a list/get request. Flows, policies, and everything else that reads a record internally always see the full stored row, regardless of what any particular client's `select` asked for. See [transformers](/data/transformers) for the equally important related point that transformers likewise only shape responses, not what policies or flows see.
+  </Accordion>
+  <Accordion title="Is per_page's default (20) configurable per resource?">
+    No — the default is fixed platform-wide at 20, with a ceiling of 200. If a particular client consistently wants a different default, have that client always pass an explicit `per_page` rather than relying on the server default.
+  </Accordion>
+  <Accordion title="Can I combine select with a computed transformer field that reads an omitted column?">
+    Yes, and this is a deliberately useful pattern: `select` can omit a raw column from the response entirely while a transformer's `set` step still computes a *derived* field from it, because `set` templates against the full record read from the database (see "select and the transformer" above), not the already-narrowed response. This lets you expose `is_overdue: true` without ever returning the raw `due_on` timestamp, for example.
+  </Accordion>
+  <Accordion title="Does sort=id,id (a duplicate field) error?">
+    No — duplicate fields in `sort` aren't specially rejected; the second occurrence is just a redundant, no-op tie-breaker on a value that's already been fully applied. It's harmless but pointless; there's no need to write it.
+  </Accordion>
+  <Accordion title="What happens if I request a page far beyond the last one?">
+    You get a `200` with an empty `data` array (not a `404`) — `page: 40, per_page: 20` against a 200-row table simply returns `{"data": [], "page": 40, "per_page": 20, "total": 200}`. Treat an empty `data` array, not a specific page number, as your "no more results" signal.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Filtering" icon="filter" href="/data/filtering">The full `filter[field]=op.value` syntax that composes with everything on this page.</Card>
+  <Card title="Caching" icon="gauge" href="/data/caching">How cache_ttl keys a cached list response on the exact query, including sort/page/select.</Card>
+  <Card title="Transformers" icon="shuffle" href="/data/transformers">Shape what a list response looks like after select and pagination have run.</Card>
+  <Card title="Pushdown" icon="arrow-down-to-line" href="/policies/pushdown">Why some policies keep total exact and others force it to null.</Card>
+</CardGroup>

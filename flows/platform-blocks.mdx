@@ -1,9 +1,804 @@
 ---
 title: "Platform blocks"
-description: "Flows: this page is being written."
-tag: "Draft"
+description: "Everything a flow can do besides touch a resource: auth checks, policies, cache, events, jobs, realtime, storage, mail, outbound HTTP, secrets, functions, logging, metrics, and responses."
+icon: "plug"
 ---
 
+Blocks never import a service directly. Every platform block is a thin call into a `Runtime` — a protocol defined once in `pawabase_kit.flows.runtime` — and the host process supplies the real implementation. In the API, that's `ApiRuntime` (`services/api/app/runtime.py`): its methods land on Sillo capabilities (`sillo.cache`, `sillo.events`, `sillo.work.queue`, `sillo.storage`, `sillo.mail`, Sillo's HTTP client) or on sibling services (Akountz for identity, Angula for realtime). In tests, a fake runtime stands in, so a flow's logic can be exercised without any of those services running.
+
+This page documents every block registered under the `auth`, `resources` *(policy check only — see [Resource blocks](/flows/resource-blocks) for `resource.*`)*, `cache`, `events`, `jobs`, `realtime`, `storage`, `mail`, `integrations`, `code`, `observability`, and `responses` categories, in `pawabase_kit.flows.blocks.platform`.
+
 <Note>
-This page is part of the **Flows** section and is still being written. Check back soon.
+Like [resource blocks](/flows/resource-blocks#resource-blocks-run-with-service-rights), platform blocks run with the flow's own service rights, not the calling user's. `auth.require` and `policy.check` are the two blocks on this page whose entire purpose is to reintroduce an explicit rights check inside that trusted context — reach for them whenever a flow's behaviour should depend on who is calling, not just on what triggered it.
 </Note>
+
+## Quick reference
+
+| Category | Blocks |
+| --- | --- |
+| Auth & policy | [`auth.require`](#auth-require), [`auth.user`](#auth-user), [`auth.lookup`](#auth-lookup), [`policy.check`](#policy-check) |
+| Cache | [`cache.get`](#cache-get), [`cache.set`](#cache-set), [`cache.delete`](#cache-delete), [`cache.invalidate`](#cache-invalidate) |
+| Events, jobs, realtime | [`event.emit`](#event-emit), [`queue.flow`](#queue-flow), [`queue.function`](#queue-function), [`realtime.publish`](#realtime-publish) |
+| Storage & mail | [`storage.put`](#storage-put), [`storage.read`](#storage-read), [`storage.signed_url`](#storage-signed-url), [`storage.delete`](#storage-delete), [`mail.send`](#mail-send) |
+| Outbound & code | [`http.request`](#http-request), [`webhook.send`](#webhook-send), [`secret.get`](#secret-get), [`function.call`](#function-call) |
+| Observability | [`log.write`](#log-write), [`metric.increment`](#metric-increment) |
+| Responses & errors | [`response.return`](#response-return), [`error.raise`](#error-raise) |
+
+---
+
+## Auth and policy
+
+### auth.require — Require sign-in
+
+Fails the run with `401` unless the caller is signed in, optionally also requiring a role or a permission.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `role` | `string` | no | The caller must hold this role |
+| `permission` | `string` | no | The caller must hold this permission, or the wildcard `*` |
+
+**Output:** the `auth` object (`run.state["auth"]`) on success.
+
+```json
+{ "id": "gate", "data": { "block": "auth.require", "config": { "role": "admin" } } }
+```
+
+`auth.require` is the flow equivalent of a route's `policy: "authenticated"` — except it's a mid-flow checkpoint rather than a gate at the door. Put it right after a trigger that has no policy of its own (an [event trigger](/flows/triggers#trigger-event), a [schedule](/flows/triggers#trigger-schedule)) to guard a *manual* re-run of the same flow, or partway through a flow to require sign-in only past a certain branch.
+
+<Warning>
+Errors: `Authentication required` (`401`, code `unauthenticated`) when nobody is signed in; `Forbidden` (`403`, code `missing_role`) when a `role` was required and the caller doesn't hold it; `Forbidden` (`403`, code `missing_permission`) when a `permission` was required and neither that permission nor `*` is present.
+</Warning>
+
+### auth.user — Current user
+
+Loads the calling user's full profile from Akountz (name, email, custom claims — everything the [Identity](/auth/overview) service stores, beyond what's already in the token).
+
+**Handles:** `next` (signed in), `anonymous` (not signed in — the block does not raise).
+
+**Output:** the user profile (on `next`), or `null` (on `anonymous`).
+
+```json
+{ "id": "me", "data": { "block": "auth.user", "config": {} } }
+```
+
+Use `auth.user` when a flow needs data about the caller beyond what's already in `auth` (`user_id`, `roles`, `permissions`, `org` — see [Policies → What a policy can see](/policies/overview#what-a-policy-can-see)) — their display name for a receipt email, say. If the flow only needs to *know* the caller is signed in, `run.state["auth"]["authenticated"]` (readable in a template as `{{ auth.authenticated }}`) is cheaper than a round trip to Akountz.
+
+### auth.lookup — Look up user
+
+Loads *any* user of this project by id — not necessarily the caller.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `user_id` | `string` | yes | The user's id |
+
+**Handles:** `next` (found), `missing` (no such user).
+
+**Output:** the user profile (on `next`), or `null` (on `missing`).
+
+```json
+{ "id": "recipient", "data": { "block": "auth.lookup", "config": { "user_id": "{{ steps.order.output.user_id }}" } } }
+```
+
+A common pairing: a flow triggered by a resource change loads the record's owner to notify them —
+
+```json
+[
+  { "id": "recipient", "data": { "block": "auth.lookup", "config": { "user_id": "{{ input.event.payload.record.user_id }}" } } },
+  { "id": "notify", "data": { "block": "mail.send", "config": { "to": "{{ steps.recipient.output.email }}", "template": "status_update" } } }
+]
+```
+
+### policy.check — Check policy
+
+Evaluates a [policy](/policies/overview) — by name, or an inline condition — against an explicit context, and branches on the result. This is the block form of the exact same engine every resource operation, route, and channel uses; see [Policies → Where policies apply](/policies/overview#where-policies-apply), which lists "inside a flow" as one of its seven enforcement points.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `policy` | `json` | yes | A stored policy name, a built-in reference (`"role:librarian"`), or an inline condition object |
+| `record` | `json` | no | The `$record` the condition may reference |
+| `input` | `json` | no | The `$input` the condition may reference |
+
+**Handles:** `allowed`, `denied`.
+
+**Output:** a boolean.
+
+The context the block builds and evaluates against is:
+
+```json
+{
+  "auth": "run.state.auth",
+  "credential": "run.state.credential, or {\"is_service\": false}",
+  "project": "run.state.project",
+  "env": "run.state.env",
+  "record": "config.record",
+  "input": "config.input"
+}
+```
+
+```json
+{
+  "id": "may_publish",
+  "data": {
+    "block": "policy.check",
+    "config": {
+      "policy": "report_publisher",
+      "record": "{{ steps.report.output }}"
+    }
+  }
+}
+```
+
+```json
+{
+  "id": "may_publish",
+  "data": {
+    "block": "policy.check",
+    "config": {
+      "policy": { "role": ["editor", "admin"] }
+    }
+  }
+}
+```
+Edges: `may_publish → publish` on `allowed`, `may_publish → refuse` on `denied`, where `refuse` is an `error.raise` with `status: 403`.
+
+<Tip>
+`policy.check` is what lets a flow behave differently for different callers even though the resource writes it performs don't re-check policies themselves (see the note at the top of [Resource blocks](/flows/resource-blocks#resource-blocks)). A flow triggered by `trigger.http` with no `policy` on the trigger runs for *any* caller who reaches its route; put a `policy.check` right after the trigger, branching `denied` into an `error.raise` with `status: 403`, to enforce something finer than the trigger's own `policy` — for instance "editors may call this route at all, but only the report's own author or an admin may publish *this particular* report," where the second half needs the loaded record.
+</Tip>
+
+---
+
+## Cache
+
+Four blocks around `run.runtime.cache_*`, backed by `sillo.cache` in the API. Every key a flow uses is automatically namespaced (`ApiRuntime` prefixes with `user:`) so flow-level cache keys never collide with the platform's own internal caches.
+
+### cache.get — Cache get
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `key` | `string` | yes |
+
+**Handles:** `hit`, `miss`.
+
+**Output:** the cached value (on `hit`), or `null` (on `miss`).
+
+```json
+{ "id": "read", "data": { "block": "cache.get", "config": { "key": "product:{{ input.params.id }}:price" } } }
+```
+
+### cache.set — Cache set
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `key` | `string` | yes | — | |
+| `value` | `json` | yes | — | |
+| `ttl` | `integer` | no | `300` | Seconds until the entry expires |
+| `tags` | `array` of `string` | no | — | Tags for bulk invalidation with `cache.invalidate` |
+
+**Output:** the value that was stored.
+
+```json
+{
+  "id": "write",
+  "data": {
+    "block": "cache.set",
+    "config": {
+      "key": "product:{{ steps.product.output.id }}:price",
+      "value": "{{ steps.product.output.price_minor }}",
+      "ttl": 600,
+      "tags": ["product:{{ steps.product.output.id }}", "store:{{ auth.org }}"]
+    }
+  }
+}
+```
+
+### cache.delete — Cache delete
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `key` | `string` | yes |
+
+**Output:** a boolean — whether a key was actually removed.
+
+### cache.invalidate — Cache invalidate tags
+
+Removes every cached entry carrying **any** of the given tags — the bulk counterpart to `cache.delete`'s single key.
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `tags` | `array` of `string` | yes |
+
+**Output:** the number of entries removed.
+
+```json
+{ "id": "bust", "data": { "block": "cache.invalidate", "config": { "tags": ["product:{{ steps.product.output.id }}"] } } }
+```
+
+<Tip>
+Resources already invalidate their own cache automatically on every write through `after_write` (see [Resource blocks → resource.create](/flows/resource-blocks#resource-create-create-record)). Reach for `cache.set`/`cache.get`/`cache.invalidate` directly inside a flow for values that *aren't* a resource's own response cache — a computed aggregate, an external API's rate-limited response, a value that's expensive to recompute but doesn't map to one resource's cache tags.
+</Tip>
+
+---
+
+## Events, jobs, and realtime
+
+### event.emit — Emit event
+
+Publishes a platform event, exactly like a resource write or an auth action would, so any [subscription](/events/overview) — another flow's `trigger.event`, a function, a realtime channel, an outbound webhook — can react to it.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `event` | `string` | yes | The event name, e.g. `order.paid` |
+| `payload` | `json` | no | The event's payload |
+
+**Output:** the event id.
+
+```json
+{
+  "id": "announce",
+  "data": {
+    "block": "event.emit",
+    "config": {
+      "event": "order.paid",
+      "payload": { "order_id": "{{ steps.order.output.id }}", "store_id": "{{ steps.order.output.store_id }}" }
+    }
+  }
+}
+```
+
+This is how flows compose with each other without calling one another directly — the `capture_payment` flow in the commerce blueprint ends by emitting `order.paid`, and a separate `order_paid` flow subscribes to it with `trigger.event`, keeping stock-commitment, customer lifetime value, and receipt-sending logic in its own flow rather than one enormous one. See [Recipes → Order fulfilment pipeline](/flows/recipes#order-fulfilment-pipeline) for the full chain, and [Studio's events graph](/events/overview#the-events-graph) for how `event.emit` nodes are discovered and drawn as producers.
+
+<Note>
+`event.emit` fires immediately, synchronously, as part of the current run — it doesn't wait for consumers to finish. Consumption (another flow, a function, a webhook delivery) happens through the durable event queue described in [The mental model → 5. Everything emits events](/concepts/mental-model#5-everything-emits-events); a slow or failing consumer never blocks the flow that emitted the event.
+</Note>
+
+### queue.flow — Queue flow
+
+Runs another flow as a background job rather than inline — for work that shouldn't hold up the current run (an HTTP-triggered flow that must answer quickly), or that should run later.
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `flow` | `string` | yes | — | The target flow's name |
+| `input` | `json` | no | — | The input the dispatched run receives |
+| `delay` | `integer` | no | `0` | Seconds to wait before running |
+| `queue` | `string` | no | — | Which named queue to dispatch onto |
+
+**Output:** `{"job_id": "<id>"}`.
+
+```json
+{
+  "id": "background_export",
+  "data": {
+    "block": "queue.flow",
+    "config": { "flow": "export_orders", "input": { "store_id": "{{ auth.org }}" }, "delay": 0 }
+  }
+}
+```
+
+<Tip>
+`queue.flow` is also the right tool for a delay longer than [`control.delay`](/flows/control-flow#control-delay)'s 300-second cap — the control block's own docstring says exactly this: "long waits belong in a delayed job instead." Dispatch the *rest* of the work as a separate flow with `delay` set to however long you actually need to wait.
+</Tip>
+
+The dispatched run shows up in [flow runs](/flows/runs-and-testing#the-flow-runs-list) with `trigger: "job"` and the same `auth` context as the flow that dispatched it (`ApiRuntime.dispatch_flow` forwards `self.auth`).
+
+### queue.function — Queue function
+
+The same idea, for a Python [function](/functions/overview) instead of a flow.
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `function` | `string` | yes | — | The target function's name |
+| `input` | `json` | no | — | The input the dispatched call receives |
+| `delay` | `integer` | no | `0` | Seconds to wait before running |
+| `queue` | `string` | no | — | Which named queue to dispatch onto |
+
+**Output:** `{"job_id": "<id>"}`.
+
+```json
+{ "id": "recalc", "data": { "block": "queue.function", "config": { "function": "recompute_rankings", "delay": 30 } } }
+```
+
+Both dispatch blocks fail the run immediately (before the job is even enqueued) if the named flow or function doesn't exist in this environment — `unknown_flow`/`unknown_function` — so a typo is caught at run time, not silently swallowed as a job that never does anything.
+
+### realtime.publish — Publish to channel
+
+Publishes a message to a [realtime channel](/realtime/overview) through Angula — for pushing something to connected clients that isn't already covered by a resource's own `realtime: true` broadcasting.
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `channel` | `string` | yes | — | The channel name |
+| `event` | `string` | no | `"message"` | The event name within the channel |
+| `payload` | `json` | no | — | The message payload |
+
+**Output:** whatever Angula's publish call returns (delivery acknowledgement metadata).
+
+```json
+{
+  "id": "live",
+  "data": {
+    "block": "realtime.publish",
+    "config": {
+      "channel": "store:{{ steps.order.output.store_id }}",
+      "event": "order.paid",
+      "payload": { "order_id": "{{ steps.order.output.id }}", "number": "{{ steps.order.output.number }}" }
+    }
+  }
+}
+```
+
+Used throughout the commerce blueprint for staff dashboards — a `low_stock_alert` flow publishes to `store:<id>` on `inventory.low`, an `order_paid` flow publishes on `order.paid`, and a support-ticket flow publishes on `ticket.opened`/`ticket.message` — so a staff UI subscribed to its store's channel updates without polling. See [Realtime](/realtime/overview) for how clients subscribe and how channel policies (`subscribe`/`publish`) are configured.
+
+---
+
+## Storage and mail
+
+### storage.put — Store file
+
+Writes text or JSON to a [bucket](/storage/overview).
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `bucket` | `string` | yes | — | The bucket's name |
+| `key` | `string` | yes | — | The object key |
+| `content` | `json` | yes | — | Text is written as-is; anything else is JSON-serialised first (`default=str`) |
+| `content_type` | `string` | no | `"text/plain"` | The stored content type |
+
+**Output:** `{"bucket": ..., "key": ..., "size": ..., "content_type": ...}`.
+
+```json
+{
+  "id": "archive",
+  "data": {
+    "block": "storage.put",
+    "config": {
+      "bucket": "exports",
+      "key": "orders/{{ steps.day.output }}.json",
+      "content": "{{ steps.rows.output }}",
+      "content_type": "application/json"
+    }
+  }
+}
+```
+
+`storage.put` writes with a service credential (`{"is_service": True, "role": "service", "scopes": []}`), so it bypasses the bucket's own `write_policy` the same way resource blocks bypass resource policies — a flow can always write to any bucket in its project regardless of who's calling.
+
+### storage.read — Read file
+
+Reads a **small** file back as text.
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `bucket` | `string` | yes |
+| `key` | `string` | yes |
+
+**Output:** the file's content, decoded as UTF-8 (`errors="replace"` — invalid bytes become the replacement character rather than raising).
+
+```json
+{ "id": "load", "data": { "block": "storage.read", "config": { "bucket": "config", "key": "pricing.json" } } }
+```
+
+<Warning>
+`storage.read` is for small, text-like objects — a config file, a template, a CSV a partner dropped for reconciliation. It reads the whole object into memory (capped at ~1 MB by the runtime's default `limit`, not exposed as block config). For large binaries, generate a `storage.signed_url` instead and let the consumer fetch it directly.
+</Warning>
+
+### storage.signed_url — Signed URL
+
+Creates a time-limited signed URL for downloading (or uploading) one object, without exposing the bucket's actual credentials.
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `bucket` | `string` | yes | — | |
+| `key` | `string` | yes | — | |
+| `method` | `string` (`GET` \| `PUT`) | no | `GET` | Whether the link is for downloading or uploading |
+| `expires_in` | `integer` | no | `300` | Seconds until the link stops working |
+
+**Output:** the signed URL string.
+
+```json
+{
+  "id": "link",
+  "data": {
+    "block": "storage.signed_url",
+    "config": { "bucket": "receipts", "key": "{{ steps.order.output.id }}.pdf", "expires_in": 3600 }
+  }
+}
+```
+
+A common pairing: generate a signed download link and hand it to `mail.send`'s template data, so the email body can include a working link without the bucket ever being public. See [Storage → Signed URLs](/storage/overview#signed-urls) for how the signature itself is verified on the way in.
+
+### storage.delete — Delete file
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `bucket` | `string` | yes |
+| `key` | `string` | yes |
+
+**Output:** a boolean.
+
+```json
+{ "id": "cleanup", "data": { "block": "storage.delete", "config": { "bucket": "exports", "key": "{{ steps.archive.output.key }}" } } }
+```
+
+### mail.send — Send email
+
+Sends an email through the environment's configured mail settings — either raw `text`/`html`, or a stored [mail template](/mail/templates) filled with `data`.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `to` | `json` | yes | An address, or a list of addresses |
+| `subject` | `string` | no | Required when not using `template` |
+| `text` | `text` | no | Plain-text body |
+| `html` | `text` | no | HTML body |
+| `template` | `string` | no | A stored mail template's name |
+| `data` | `json` | no | Values the template's placeholders read |
+
+**Output:** `{"queued": true, "job_id": "<id>"}` — `mail.send` doesn't send synchronously; it dispatches a `SendMailJob` and returns immediately.
+
+Using a stored template (the pattern used throughout the commerce blueprint — `order_confirmation`, `shipping_update`, `order_cancelled`, `refund_issued`, `low_stock`, `cart_recovery`, `payout_initiated`, `ticket_received`, `support_reply`, `store_welcome` are all template names referenced this way):
+
+```json
+{
+  "id": "receipt",
+  "data": {
+    "block": "mail.send",
+    "config": {
+      "to": "{{ steps.order.output.email }}",
+      "template": "order_confirmation",
+      "data": {
+        "order": "{{ steps.order.output }}",
+        "items": "{{ steps.items.output }}"
+      }
+    }
+  }
+}
+```
+
+Sending directly without a stored template:
+
+```json
+{
+  "id": "notify",
+  "data": {
+    "block": "mail.send",
+    "config": {
+      "to": ["ops@example.com", "on-call@example.com"],
+      "subject": "Payout run finished with {{ steps.errors.output | length }} errors",
+      "text": "See the flow run trace for details: {{ steps.link.output }}"
+    }
+  }
+}
+```
+
+<Tip>
+Prefer stored templates over inline `text`/`html` for anything a non-developer might want to tweak — subject lines, copy, branding — since a template can be edited in Studio without touching the flow. Reach for inline `text`/`html` for internal, developer-facing notifications where a template would be overkill. See [Mail → Templates](/mail/templates).
+</Tip>
+
+---
+
+## Outbound integrations
+
+### http.request — HTTP request
+
+Calls an external HTTP API through Sillo's HTTP client — the only way a flow talks to the outside world beyond `mail.send` and `webhook.send`.
+
+| Config | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `method` | `string` (`GET`\|`POST`\|`PUT`\|`PATCH`\|`DELETE`) | no | `GET` | |
+| `url` | `url` | yes | — | |
+| `headers` | `json` | no | — | Request headers |
+| `params` | `json` | no | — | Query-string parameters |
+| `body` | `json` | no | — | Request body, sent as JSON |
+| `timeout` | `number` | no | `30` | Seconds |
+| `retries` | `integer` | no | `0` (max `5`) | Automatic retries on failure |
+
+**Handles:** `next` (status `200`–`399`), `failed` (anything else, including a network error the client turned into a non-2xx/3xx response).
+
+**Output:** `{"status": <int>, "headers": {...}, "body": ...}` (the exact shape returned by `run.runtime.http_request`, which wraps Sillo's client and its own retry helper).
+
+```json
+{
+  "id": "geocode",
+  "data": {
+    "block": "http.request",
+    "config": {
+      "method": "GET",
+      "url": "https://api.geocode.example.com/v1/lookup",
+      "params": { "address": "{{ input.body.address }}" },
+      "headers": { "Authorization": "Bearer {{ vars.GEOCODE_KEY }}" },
+      "timeout": 10
+    }
+  }
+}
+```
+
+POSTing a JSON body to a payment provider, with retries and a branch on failure:
+
+```json
+{
+  "id": "charge",
+  "data": {
+    "block": "http.request",
+    "config": {
+      "method": "POST",
+      "url": "https://api.paymentprovider.example.com/charges",
+      "headers": { "Authorization": "Bearer {{ vars.PROVIDER_KEY }}", "Idempotency-Key": "{{ steps.idem.output }}" },
+      "body": { "amount": "{{ steps.order.output.total_minor }}", "currency": "{{ steps.order.output.currency }}" },
+      "timeout": 15,
+      "retries": 2
+    }
+  }
+}
+```
+Edge `charge → charge_failed` on `failed`, wired to a `log.write`/`error.raise` pair.
+
+<Warning>
+An API key or bearer token belongs in a [secret](/operate/secrets), loaded with [`secret.get`](#secret-get) into `vars`, and referenced from a template (`{{ vars.PROVIDER_KEY }}`) — never hard-coded into the `headers` config directly, which would put it in plain text in the stored flow definition and in every run's trace.
+</Warning>
+
+<Note>
+`retries` here is a small, fixed retry budget applied inside the block's single call — distinct from wrapping the node in a [`control.retry`](/flows/control-flow#control-retry) branch, which re-runs an entire sub-graph (useful when the retry should also redo steps *before* the HTTP call, like re-fetching a token that might have expired). For a call that's safe to retry on its own, `retries` on the block is simpler; for a retry that needs surrounding context, use `control.retry`.
+</Note>
+
+### webhook.send — Send webhook
+
+Delivers an event to every **outbound webhook endpoint** subscribed to it — the same delivery pipeline that fires automatically for resource writes (see [Events → Webhooks](/events/webhooks)), triggered manually from inside a flow.
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `event` | `string` | yes |
+| `payload` | `json` | no |
+
+**Output:** `{"deliveries": <int>}` — how many endpoint deliveries were queued.
+
+```json
+{
+  "id": "notify_partners",
+  "data": {
+    "block": "webhook.send",
+    "config": { "event": "order.exported", "payload": { "order_id": "{{ steps.order.output.id }}" } }
+  }
+}
+```
+
+<Tip>
+`webhook.send` and `event.emit` are not the same thing. `event.emit` publishes a platform event that *any* subscription type (flows, functions, realtime, webhooks) can react to; `webhook.send` goes straight to webhook endpoints only, without touching the rest of the subscription system, and without the event being recorded the way `event.emit`'s events are. Reach for `event.emit` when other parts of the platform (including future subscriptions someone adds later) should be able to react; reach for `webhook.send` when you specifically mean "tell the webhook endpoints, right now."
+</Tip>
+
+### secret.get — Read secret
+
+Reads a [secret](/operate/secrets) into the run's `vars`, for use in later templates. The secret's value never appears in the run's trace.
+
+| Config | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | `string` | yes | The secret's name |
+| `as` | `string` | no | Store it as `vars.<as>` instead of `vars.<name>` |
+
+**Output:** `{"name": "<name>", "loaded": true}` — the block's own trace entry never shows the value.
+
+```json
+{ "id": "key", "data": { "block": "secret.get", "config": { "name": "PROVIDER_API_KEY", "as": "provider_key" } } }
+```
+Then reference it as `{{ vars.provider_key }}` in a later `http.request` node's `headers`.
+
+<Warning>
+A secret loaded into `vars` **is** visible if a later block writes it somewhere observable — a `log.write` with `"data": "{{ vars.provider_key }}"`, or a `response.return` body that echoes it back. `secret.get` protects the secret from appearing in its *own* trace entry; it doesn't stop you from leaking it yourself two nodes later. Never log or return a value loaded this way.
+</Warning>
+
+An unset secret fails the run immediately: `secret {name!r} is not set` / code `missing_secret`, rather than loading `null` and letting a broken API call fail confusingly three nodes later.
+
+### function.call — Call function
+
+Calls a Python [function](/functions/overview) inline, synchronously, and continues with its result — as opposed to `queue.function`, which runs it as a separate background job.
+
+| Config | Type | Required |
+| --- | --- | --- |
+| `function` | `string` | yes |
+| `input` | `json` | no |
+
+**Output:** whatever the function returns.
+
+```json
+{ "id": "price", "data": { "block": "function.call", "config": { "function": "quote", "input": { "items": "{{ input.body.items }}" } } } }
+```
+
+Use `function.call` when a flow needs logic that's genuinely easier to write as Python than to assemble from blocks — a complex pricing rule, a third-party SDK a `code/` function already wraps — but the result is needed *within* this run, not later. `call_function` enforces a nesting depth limit (functions calling functions calling functions) of 8 to guard against runaway recursion.
+
+---
+
+## Observability
+
+### log.write — Log
+
+Writes a structured line to the run's log, visible in [Studio's trace view](/flows/runs-and-testing#the-trace-view).
+
+| Config | Type | Required | Default |
+| --- | --- | --- | --- |
+| `level` | `string` (`debug`\|`info`\|`warning`\|`error`) | no | `info` |
+| `message` | `string` | yes | — |
+| `data` | `json` | no | — |
+
+**Output:** the log entry `{"level": ..., "message": ..., "data": ...}`.
+
+```json
+{
+  "id": "unknown",
+  "data": {
+    "block": "log.write",
+    "config": { "level": "warning", "message": "gateway charge for an unknown payment", "data": "{{ input.body.data }}" }
+  }
+}
+```
+
+`log.write` both appends to `run.logs` (returned from the flow-run API — see [Runs and testing](/flows/runs-and-testing)) and forwards to the runtime's own `log()`, so entries also reach whatever structured logging the API process is configured with. Reach for it on branches that are unusual but not actually an error — a duplicate webhook notification, a fallback path being taken, a value defaulting — exactly the way `payment_gateway` in the commerce blueprint logs a `warning` for an unrecognised charge and an `info` for a duplicate, rather than failing the run for either.
+
+### metric.increment — Metric
+
+Increments a named metric — a lightweight counter for dashboards and alerts, independent of the full event/webhook pipeline.
+
+| Config | Type | Required | Default |
+| --- | --- | --- | --- |
+| `name` | `string` | yes | — |
+| `value` | `number` | no | `1` |
+| `tags` | `json` | no | — |
+
+**Output:** the numeric value recorded.
+
+```json
+{ "id": "count", "data": { "block": "metric.increment", "config": { "name": "commerce.abandoned_carts", "value": "{{ steps.idle.output | length }}" } } }
+```
+
+```json
+{ "id": "metric", "data": { "block": "metric.increment", "config": { "name": "orders.paid" } } }
+```
+
+Metrics recorded this way are queryable through the Platform API's `/metrics` endpoint and surfaced in Studio's observability views. Unlike `event.emit`, a metric has no consumers to fan out to — it's purely a number going up.
+
+---
+
+## Responses and errors
+
+### response.return — Respond
+
+Answers the HTTP request that triggered the run (a flow reached through `trigger.http`, directly or via a custom route) and **ends the run**. This is the only block with an empty `handles` list — nothing can follow it, because there's nothing left to run after the response has been sent.
+
+| Config | Type | Required | Default | Range |
+| --- | --- | --- | --- | --- |
+| `status` | `integer` | no | `200` | `100`–`599` |
+| `body` | `json` | no | — | — |
+| `headers` | `json` | no | — | — |
+
+**Output:** `config.body`, with `stop: true` — the run terminates immediately after this block, whatever else is connected to it in the graph.
+
+```json
+{
+  "id": "reply",
+  "data": {
+    "block": "response.return",
+    "config": {
+      "status": 200,
+      "body": { "paid": true, "order": "{{ steps.paid.output }}", "by": "{{ auth.user_id }}" }
+    }
+  }
+}
+```
+
+A `201` with a `Location` header:
+
+```json
+{
+  "id": "reply",
+  "data": {
+    "block": "response.return",
+    "config": {
+      "status": 201,
+      "body": "{{ steps.review.output }}",
+      "headers": { "Location": "/reviews/{{ steps.review.output.id }}" }
+    }
+  }
+}
+```
+
+<Warning>
+A flow triggered any other way (an event, a schedule, a job, a webhook, realtime) can still contain a `response.return` node, but nothing is listening for it — there's no HTTP response to write. The block still runs (setting `run.response` and stopping the run), it's just discarded by the host once the run finishes. Use `control.stop` (see [Control flow](/flows/control-flow#control-stop)) instead when a non-HTTP flow just needs to end early without implying a response was sent.
+</Warning>
+
+A flow with no `response.return` reached on an HTTP-triggered path still answers — with an empty `200` — once every reachable node finishes; explicit `response.return` nodes exist so you can control the status and body, not because omitting one leaves the request hanging.
+
+### error.raise — Fail
+
+Fails the run deliberately with a chosen HTTP status and message — the block form of raising a `FlowError` directly, used for every "this request is invalid" branch throughout a flow (`order_not_found`, `negative_stock`, `already_cancelled`, and so on, throughout the recipes in this section).
+
+| Config | Type | Required | Default | Range |
+| --- | --- | --- | --- | --- |
+| `status` | `integer` | no | `400` | `400`–`599` |
+| `message` | `string` | yes | — | — |
+| `code` | `string` | no | `"error"` | — |
+
+**Handles:** none — like `response.return`, nothing follows it.
+
+```json
+{
+  "id": "already",
+  "data": {
+    "block": "error.raise",
+    "config": { "status": 409, "code": "already_cancelled", "message": "This order is already cancelled" }
+  }
+}
+```
+
+The resulting error's `status`/`code`/`message` are exactly what an HTTP-triggered flow's caller sees, in the shape [Errors and retries](/flows/errors-and-retries) documents in full — this page only covers the block's own configuration. For a full catalogue of what other blocks raise on their own (`db.query`'s `write_refused`, `math.calculate`'s `division_by_zero`, `crypto.hash`'s `missing_secret`, and more), see the per-block tables throughout this page and [Data blocks](/flows/data-blocks).
+
+---
+
+## Everything a runtime provides, at a glance
+
+The table below is the `Runtime` protocol itself (`pawabase_kit.flows.runtime.Runtime`) — every capability a block, and a Python function, can call through `run.runtime`/`ctx.runtime`. Most rows map to exactly one block on this page or [Resource blocks](/flows/resource-blocks); a few (`resource_list`/`get`/`create`/`update`/`delete`, `db_query`, `db_transaction`) are documented on those other pages.
+
+| Runtime method | Block(s) | API implementation lands on |
+| --- | --- | --- |
+| `resource_list`/`get`/`create`/`update`/`delete` | `resource.*` | Resource stores |
+| `db_query` | `db.query` | The environment's SQL source, read-only enforced |
+| `db_transaction` | `db.transaction` | The environment's SQL source, one transaction |
+| `cache_get`/`set`/`delete`/`invalidate` | `cache.*` | `sillo.cache` |
+| `emit` | `event.emit` | `platform.emit` (event log + fan-out) |
+| `dispatch_flow`/`dispatch_function` | `queue.flow`/`queue.function` | `sillo.work.queue` via `RunFlowJob`/`RunFunctionJob` |
+| `publish` | `realtime.publish` | Angula |
+| `storage_put`/`read`/`signed_url`/`delete` | `storage.*` | `sillo.storage` buckets, service credential |
+| `send_mail` | `mail.send` | `sillo.mail`, dispatched as `SendMailJob` |
+| `http_request` | `http.request` | Sillo's HTTP client, with retry |
+| `webhook_send` | `webhook.send` | Outbound webhook delivery queue |
+| `secret` | `secret.get`, and `crypto.hash`'s HMAC mode | The environment's secret store |
+| `call_function` | `function.call` | In-process function call, depth-limited |
+| `identity_user` | `auth.user`, `auth.lookup` | Akountz |
+| `check_policy` | `policy.check` | The policy engine |
+| `log` | `log.write` | Structured logging + `run.logs` |
+| `metric` | `metric.increment` | The metrics store |
+
+<Note>
+A runtime that doesn't provide some capability (a lighter-weight host, a test double) doesn't crash with an `AttributeError` — `BaseRuntime.__getattr__` returns an async function that raises `NotAvailable(f"{name} is not available in this runtime")` for anything unimplemented, so a block using a missing capability fails with a clear message naming exactly what's missing.
+</Note>
+
+## Common mistakes
+
+<AccordionGroup>
+  <Accordion title="Putting a secret's literal value in a block's config">
+    Anything typed directly into `headers`, `body`, or any other config field is stored as part of the flow definition and shown in the trace. Load it with `secret.get` and reference `vars.<name>` instead.
+  </Accordion>
+  <Accordion title="Expecting mail.send to have finished by the time the next block runs">
+    `mail.send` dispatches a background job and returns `{"queued": true, "job_id": ...}` immediately — the send itself hasn't happened yet. Don't branch on "did the email arrive" in the same run; if you need to know delivery succeeded, that's visible in the job's own record, not in this block's output.
+  </Accordion>
+  <Accordion title="Using event.emit when you mean webhook.send, or vice versa">
+    `event.emit` fans out to every kind of subscription and is recorded as an event; `webhook.send` goes straight to webhook endpoints and isn't recorded the same way. Default to `event.emit` unless you specifically need to bypass the rest of the subscription system.
+  </Accordion>
+  <Accordion title="Forgetting response.return and error.raise have no outgoing handles">
+    Any edge drawn out of one of these two nodes in Studio is unreachable — the run always stops there. If you need to do something conditionally *before* responding, put the branching upstream of the `response.return`/`error.raise` node, not after it.
+  </Accordion>
+  <Accordion title="Relying on http.request's retries for a call that isn't idempotent">
+    `retries` re-sends the exact same request on failure. A `POST` that creates something (a charge, an order on a partner system) without an idempotency key can be double-submitted by a retry. Pass an idempotency key in `headers` when the provider supports one, as in the `charge` example above.
+  </Accordion>
+</AccordionGroup>
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can a flow call another project's API?">
+    Yes, with `http.request` — it's an ordinary outbound HTTP call. There's no special cross-project mechanism; if the target is another Pawabase project, call its `/rest/v1/...` or `/flows/v1/...` endpoints with an appropriate key, exactly as any other external client would.
+  </Accordion>
+  <Accordion title="Does auth.require work on a flow triggered by a schedule or an event?">
+    It checks `run.state["auth"]`, whatever that run was given. A scheduled or event-triggered run typically has no signed-in caller (`authenticated: false`), so `auth.require` on such a flow will always fail — it's meant for flows reachable via `trigger.http`, or ones that might be re-run manually "as" a specific user from Studio (see [Runs and testing → Run as](/flows/runs-and-testing#run-as)).
+  </Accordion>
+  <Accordion title="What happens if two response.return nodes are reachable in the same run?">
+    Only the first one reached executes fully — `stop: true` ends the run right there, so any node after it (including a second `response.return` on a different branch that never got taken) simply never runs.
+  </Accordion>
+  <Accordion title="Is there a block for reading request headers or cookies directly?">
+    Not a dedicated one — an HTTP-triggered run's raw request is available through `input` (see [State](/flows/state) and [Triggers → trigger.http](/flows/triggers#trigger-http)), so a template like `{{ input.headers['x-forwarded-for'] }}` reads a header without a separate block.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Data blocks" icon="shapes" href="/flows/data-blocks">Transform, validate, compute, and query.</Card>
+  <Card title="Resource blocks" icon="database" href="/flows/resource-blocks">The five CRUD blocks.</Card>
+  <Card title="Block reference" icon="list" href="/flows/block-reference">Every block, every config key, in one page.</Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/flows/errors-and-retries">What happens when a block fails, and how to recover.</Card>
+</CardGroup>
