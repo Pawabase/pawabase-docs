@@ -1,260 +1,413 @@
 ---
 title: "Security model"
-description: "The layered security architecture: per-environment signing keys, brute-force protection, token theft detection, credential isolation, and the defense-in-depth model behind every authentication decision."
+description: "The Pawabase threat model, credential hygiene, token rotation and security properties by authentication method, production validation checklist, and common security vulnerabilities."
 icon: "shield-check"
 ---
 
-Pawabase's authentication security is not a single mechanism — it is a **defense-in-depth architecture** where every layer is independent and every failure is bounded. This page explains the security model in full: how signing keys are derived, how brute-force attacks are mitigated, how token theft is detected, how credentials are isolated by environment, and what happens when a layer fails.
+Pawabase is designed with security as a first-class concern. Every component of the authentication system — from credential storage to token issuance to session management — follows strict security principles. Understanding the threat model and the security properties of each authentication method is essential for building secure applications with Pawabase.
+
+This page covers the complete security model: the threat model, credential hygiene practices, token rotation security, security properties by authentication method, the production validation checklist, and common security vulnerabilities to avoid.
 
 <CardGroup cols={3}>
-  <Card title="Bounded blast radius" icon="shield">A compromised key for `acme/development` cannot touch `acme/production` — the keys are derived differently.</Card>
-  <Card title="Independent layers" icon="layers">The API key layer, the token layer, and the policy layer each fail independently and safely.</Card>
-  <Card title="No single point of failure" icon="blocks">Compromising the master secret alone is not enough — each environment derives its own signing key.</Card>
+  <Card title="Threat model" icon="search">Credential stuffing, brute-force, token theft, session hijacking, account enumeration, CSRF, and MITM attacks.</Card>
+  <Card title="Credential hygiene" icon="lock">Password hashing, secure transmission, memory handling, token storage, and service key hygiene.</Card>
+  <Card title="Production checklist" icon="check-circle">Validate all security configurations before deploying to production.</Card>
 </CardGroup>
 
-## The per-environment signing key derivation
+## Threat model
 
-The most important security property of the entire authentication system is that **a token from one environment cannot be used in another**. This is not enforced by convention or configuration — it is enforced by the mathematics of the key derivation.
+Pawabase identifies and mitigates the following threat vectors:
 
-Every environment's user tokens are signed with a key derived deterministically from the platform master secret and the `project:env` pair:
+### Credential stuffing
 
-```python
-def derive_env_secret(master: str, project: str, env: str) -> str:
-    """The signing key for one project environment's user tokens."""
-    message = f"pawabase:user-token:{project}:{env}".encode()
-    return hmac.new(master.encode(), message, hashlib.sha256).hexdigest()
-```
+Credential stuffing attacks use lists of known username/password pairs to gain unauthorized access. Pawabase mitigates this through:
 
-This has three security properties:
+1. **Password hashing**: All passwords are hashed with bcrypt (cost factor 12). Bcrypt is designed to be computationally expensive, making brute-force attacks impractical.
+2. **Rate limiting**: The `/auth/v1/token` endpoint limits sign-in attempts to 5 per 60 seconds per IP address. After 5 failed attempts, the endpoint returns `429 rate limit exceeded`.
+3. **Account lockout**: After `mfa_failed_attempts_lockout` (default: 5) failed attempts, the account is locked for a configurable period.
+4. **Failed login tracking**: The `failed_logins` counter tracks failed sign-in attempts. The counter resets on successful sign-in or password change.
 
-1. **One-way**: Given a derived key, it is computationally infeasible to recover the master secret or derive the key for any other environment. HMAC-SHA256 is a pseudorandom function — the output reveals nothing about the input.
-2. **Deterministic**: Every service can independently compute the correct key for any environment, without storing or exchanging per-environment keys. This means verification is fully local — no network call to Akountz on every request.
-3. **Environment-isolated**: The key for `acme/development` is a completely different pseudorandom string from the key for `acme/production`. A token signed with one cannot be verified with the other — the signature check fails at the HMAC verification stage.
+### Brute-force attacks
 
-```python
-def verify_user_token(token: str, master: str, *, project: str, env: str) -> dict[str, Any]:
-    """Verify a user access token for *project*/*env*. Raises :class:`TokenInvalid`."""
-    claims = _decode(token, derive_env_secret(master, project, env), audience=USER_AUDIENCE)
-    if claims.get("typ") != "access":
-        raise TokenInvalid("not an access token")
-    if claims.get("prj") != project or claims.get("env") != env:
-        raise TokenInvalid("token belongs to another environment")
-    return claims
-```
+Brute-force attacks systematically try every possible password or token. Pawabase mitigates this through:
 
-Note that the environment check is **doubled**: the signature verification itself fails (because the wrong key is used), *and* the `prj`/`env` claims are checked independently. This means even if a theoretical weakness in HMAC-SHA256 ever emerged, the claim-level check would still reject cross-environment tokens.
+1. **Rate limiting**: Per-IP and per-user rate limits on all authentication endpoints (`/auth/v1/token`, `/auth/v1/recover`, `/auth/v1/magic-link`).
+2. **Account lockout**: Temporary lockout after too many failed attempts.
+3. **Token entropy**: Recovery tokens, magic link tokens, and verification codes are cryptographically random (32+ characters), making brute-forcing computationally infeasible.
+4. **Password complexity requirements**: Pawabase enforces minimum password length and complexity.
+
+### Token theft
+
+Token theft occurs when an attacker obtains a valid access token or refresh token. Pawabase mitigates this through:
+
+1. **Short-lived access tokens**: Access tokens expire in 900 seconds (15 minutes). Even if stolen, the token is only valid for a short window.
+2. **Refresh token rotation**: When `refresh_token_rotation` is enabled, refresh tokens are rotated on every use. A stolen refresh token can only be used once before it is invalidated.
+3. **Theft detection**: The `theft_detected` flag on `SessionInfo` indicates that a token was used unexpectedly, signaling possible compromise.
+4. **Revocation**: Stolen tokens can be revoked through the admin `POST .../sessions/revoke` endpoint.
 
 <Warning>
-This means the **platform master secret** is the root of trust for the entire authentication system. If the master secret is compromised, every environment's tokens can be forged. The master secret must be protected with the same rigor as a root CA private key — hardware security modules, restricted access, and audit logging for every use. It is never stored in the application codebase; it is injected through environment variables or a secrets manager.
+Refresh token theft is the most dangerous form of token compromise because refresh tokens are long-lived. Even with rotation, there is a window where the attacker's token is valid. Monitor for unexpected token rotation events.
 </Warning>
 
-## Credential isolation: the three-layer model
+### Session hijacking
 
-Every request to a Pawabase backend passes through three independent security layers, each of which can fail without affecting the others:
+Session hijacking occurs when an attacker takes over a user's active session by obtaining their session ID or refresh token. Pawabase mitigates this through:
 
-```mermaid
-graph TD
-    A[Request arrives] --> B[Layer 1: API Key]
-    B -->|Valid| C[Layer 2: User Token]
-    B -->|Invalid| Z[401 invalid_api_key]
-    C -->|Valid| D[Layer 3: Policy Engine]
-    C -->|Invalid| Z2[401 or anonymous]
-    D -->|Allowed| E[200 Response]
-    D -->|Denied| F[403 Forbidden]
-```
+1. **Session binding**: Refresh tokens are cryptographically bound to the session through the `refresh_jti` field. A token cannot be used with a different session.
+2. **IP address tracking**: The `SessionInfo` row stores the `ip_address` of the device that created the session. Unusual IP changes can signal session hijacking.
+3. **User agent tracking**: The `SessionInfo` row stores the `user_agent` string. Changes in user agent can signal session hijacking.
+4. **Device info tracking**: The `SessionInfo` row stores `device_info` for additional fingerprinting.
 
-### Layer 1: API key resolution (the gateway)
+### Account enumeration
 
-The gateway resolves the API key — hashes it, looks it up, checks revocation and expiry, enforces CORS, builds a `PlatformContext`, and strips the raw key. This layer answers **"which project, which environment, what baseline privilege?"**
+Account enumeration occurs when an attacker discovers valid email addresses by observing different responses from authentication endpoints. Pawabase mitigates this through:
 
-The API key layer is **completely independent** of the user token layer. A request with a valid API key but an expired user token still has its environment context intact. The `PlatformContext` (project, env, role, key_id, scopes) is fully resolved before the user token is even inspected.
+1. **Uniform responses**: The `/recover`, `/magic-link`, and `/verify` endpoints always return the same success response regardless of whether the email exists. This prevents attackers from discovering valid email addresses.
+2. **No timing differences**: All endpoints return responses in approximately the same time regardless of whether the email exists, preventing timing-based enumeration.
+3. **Rate limiting**: Per-IP and per-email rate limits prevent bulk enumeration attacks.
 
-```python
-# The gateway's key resolver flow:
-# 1. Locate raw key (apikey header, x-api-key, or ?apikey=)
-# 2. Hash and look up (SHA-256, ProjectKey row)
-# 3. Check revocation and expiry
-# 4. Build PlatformContext
-# 5. Enforce CORS for publishable keys
-# 6. Strip raw key, sign context → X-Pawabase-Context
-```
+### CSRF attacks
 
-### Layer 2: User token verification (every service)
+Cross-site request forgery (CSRF) attacks trick a user into submitting unintended requests to the application. Pawabase mitigates this through:
 
-Each service verifies the user token independently, using the derived per-environment key. This layer answers **"which person, with what identity claims, within the environment the API key selected?"**
+1. **State parameter**: The OAuth2 flow includes a random `state` parameter that is validated in the callback. This prevents CSRF in social login flows.
+2. **PKCE**: The Proof Key for Code Exchange (PKCE) mechanism prevents authorization code interception attacks.
+3. **CORS validation**: The `cors_origins` configuration restricts which origins can make requests to the API. Requests from unauthorized origins are rejected.
+4. **Token-based authentication**: All requests require an access token or service key in the `Authorization` header, making CSRF attacks impractical.
 
-The verification is stateless — every service does it on every request without calling Akountz. The `ProjectUserBackend.authenticate` method:
+### Man-in-the-middle (MITM) attacks
 
-```python
-async def authenticate(self, ctx) -> AuthResult:
-    token = _bearer(ctx.headers)
-    context = ctx.scope.get(SCOPE_KEY)
-    if not token or context is None:
-        return _FAIL
-    try:
-        claims = verify_user_token(token, self.master_secret, project=context.project, env=context.env)
-    except TokenInvalid:
-        return _FAIL
-    return AuthResult(success=True, identity=encode_identity("user", claims), scope="user")
-```
+MITM attacks intercept communication between the client and server. Pawabase mitigates this through:
 
-The `context.project` and `context.env` come from the **already-resolved API key** — not from anything the token itself claims. This is critical: even if an attacker crafts a token with `"prj": "acme", "env": "production"` in its payload, the verification still fails if the API key is for `acme/development`, because the derived key used to check the signature is different.
+1. **HTTPS enforcement**: All authentication endpoints require HTTPS. Pawabase enforces TLS on all connections.
+2. **Token signing**: Access tokens are signed with the environment's secret key. Even if intercepted, tokens cannot be forged.
+3. **Token expiration**: Short-lived access tokens (15 minutes) limit the window of exposure for intercepted tokens.
+4. **Refresh token binding**: Refresh tokens are bound to the session through cryptographic signatures, preventing token substitution.
 
-### Layer 3: Policy engine (the authorization gate)
+<Warning>
+Never disable HTTPS in production. All authentication traffic must be encrypted. Pawabase enforces HTTPS at the gateway level — if you're behind a reverse proxy, ensure TLS is terminated at the proxy and the connection between the proxy and Pawabase is also encrypted.
+</Warning>
 
-The policy engine evaluates every request against the policies configured for the resource. It sees the full `auth` context (claims, roles, permissions, org, AAL) and the `credential` context (project, env, role, scopes). It is the only layer that makes an authorization decision.
+## Credential hygiene
 
-The policy engine is the last stop. Nothing upstream of it makes an authorization decision — the gateway's checks are about the key and the environment, not about what the caller may *do*.
+Credential hygiene refers to how credentials (passwords, tokens, service keys) are stored, transmitted, and handled:
 
-## Brute-force protection
+### Password storage
 
-Two independent layers of brute-force protection exist:
-
-### Per-IP rate limiting
-
-Every authentication endpoint is wrapped with `rate_limit_middleware`:
-
-| Endpoint | Limit | Window | Middleware key |
-| --- | --- | --- | --- |
-| `POST /auth/v1/token` | 30 requests | 60 seconds | `"akz:auth"` |
-| `POST /auth/v1/verify/request`, `/recover`, `/magic-link` | 10 requests | 60 seconds | `"akz:links"` |
-| `POST /auth/v1/mfa/totp/verify`, `/mfa/disable`, `/mfa/recovery-codes` | 10 requests | 60 seconds | `"akz:mfa"` |
-
-Rate limiting is enforced at the gateway level using a Redis-backed sliding window. A client that exceeds the limit receives `429 too many failed attempts; try again later`.
-
-### Per-account lockout
-
-After `lockout_threshold` (default 10) failed password attempts within `lockout_minutes` (default 15) minutes, the account is locked:
+Passwords are stored as bcrypt hashes in the `AuthUser` table:
 
 ```python
-async def record_failure(user: AuthUser, threshold: int, minutes: int) -> None:
-    user.failed_logins += 1
-    if user.failed_logins >= threshold:
-        user.locked_until = datetime.now(UTC) + timedelta(minutes=minutes)
-        user.failed_logins = 0
-    await user.save(update_fields=["failed_logins", "locked_until"])
+password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12))
 ```
 
-Lockout applies per-environment — a user locked out in `acme/development` is not locked in `acme/production`. A successful sign-in resets both counters to 0.
+- **Bcrypt cost factor**: 12 rounds. This makes bcrypt computationally expensive — each hash takes approximately 250ms to compute on modern hardware.
+- **Salt**: Bcrypt automatically generates a unique salt for each password. The salt is embedded in the hash string.
+- **No plaintext storage**: Passwords are never stored in plaintext. The `password_hash` field contains only the bcrypt hash.
+- **Verification**: Passwords are verified by comparing the hash of the submitted password against the stored hash using `bcrypt.checkpw()`.
 
-**Lockout does not block recovery**: a locked-out user can still request a recovery link and reset their password. The `/recover` endpoint does not check `is_locked`. Recovery codes also bypass the lockout check — a locked-out user with MFA recovery codes can still sign in.
+<Warning>
+Never log passwords, password hashes, or password reset tokens. Never include passwords in error messages, audit logs, or debugging output. Always treat passwords as sensitive data that must never leave the authentication flow.
+</Warning>
 
-<Note>
-The lockout threshold and duration are configured per environment via `AkountzSettings` (`lockout_threshold: int = 10`, `lockout_minutes: int = 15`). These can be adjusted for environments with higher traffic — a development environment might use a higher threshold to avoid locking out developers who mistype their password repeatedly.
-</Note>
+### Password transmission
 
-## Token theft detection
+Passwords must be transmitted securely:
 
-The rotating refresh token mechanism provides automatic theft detection:
+1. **HTTPS only**: Passwords are sent over HTTPS connections only. Never send passwords over plain HTTP.
+2. **Request body only**: Passwords are sent in the request body (`-d` in curl), never in URL parameters or query strings.
+3. **No cookies**: Passwords are never stored in cookies — they are transmitted only during the sign-in request.
+4. **Client-side handling**: Frontend applications should never store passwords in localStorage, sessionStorage, or JavaScript variables. Passwords should be sent directly to the backend and immediately cleared from memory.
 
-1. Every refresh token is part of a **token family** tracked by Sillo's `JWTToken` rows.
-2. When a refresh token is used, `refresh_token_pair` rotates the family — issuing a new access token and a new refresh token, and marking the old refresh token as consumed.
-3. If the *same* refresh token is used twice (because an attacker intercepted it and the legitimate client already refreshed), `refresh_token_pair` raises a `ValueError` containing `"theft"`.
-4. Akountz handles this by revoking the **entire token family** and emitting a `session.reuse_detected` event.
+### Memory handling
+
+After password verification, the password must be cleared from memory:
 
 ```python
-try:
-    pair = await user.refresh_token_pair(refresh_token, akountz.refresh_secret(config.project, config.env))
-except ValueError as exc:
-    if "theft" in str(exc):
-        row = await JWTToken.filter(token_jti=claims.get("jti") or "").first()
-        if row is not None:
-            await SessionInfo.filter(family=row.token_family).update(revoked_at=datetime.now(UTC))
-        await akountz.emit(config.project, config.env, "session.reuse_detected", ...)
-    raise HTTPException(status_code=401, detail="invalid refresh token") from exc
+# Verify the password
+if not bcrypt.checkpw(password.encode(), stored_hash):
+    raise PrincipalException("invalid password")
+# Clear the password from memory
+del password
 ```
 
-This means:
-- An attacker who intercepts a refresh token has a very narrow window — the legitimate client will refresh first, and when the attacker tries to use the stolen token, the entire session is revoked.
-- The theft detection is automatic — no manual intervention is required.
-- The `session.reuse_detected` event allows monitoring systems to alert on potential compromise.
+In Python, `del` removes the reference to the string, but the string may still exist in memory until garbage collection. For higher security, use `secrets.token_bytes` or overwrite the string buffer before deletion.
 
-## Compromise scenarios and bounded blast radius
+### Token storage on clients
 
-### Scenario 1: A publishable key is leaked
+Where tokens are stored on clients depends on the client type:
 
-A publishable key (`pb_pk_…`) is designed to be public. It can only do what `publishable`-role actions allow, and only within its environment. CORS enforcement adds another layer — the key only works from allowed origins.
-
-**Bounded exposure**: The attacker can read public data and perform publishable-scoped operations from an allowed origin. They cannot access secret data, bypass policies, or act in other environments.
-
-### Scenario 2: A secret key is leaked
-
-A secret key (`pb_sk_…`) bypasses all policies — it is equivalent to root access to that environment. This is the most dangerous credential leak scenario.
-
-**Bounded exposure**: The attacker has full access to *one* environment only. They cannot access other environments, and they cannot bypass the gateway's rate limiting. The response is immediate: revoke the key and rotate (see [Configuration → rotating a leaked secret key](/auth/configuration#rotating-a-leaked-secret-key-a-runbook)).
-
-### Scenario 3: An access token is leaked
-
-An access token is valid for `access_ttl` seconds (default 15 minutes). After expiry, it cannot be used. The refresh token is not a bearer token — it can only be submitted to the refresh endpoint and is rotating.
-
-**Bounded exposure**: The attacker has at most 15 minutes of access. After that, the token expires naturally. If the refresh token was also leaked, the attacker can refresh until the refresh token's TTL expires — but rotation means the legitimate client will detect the theft and revoke the family.
-
-### Scenario 4: The platform master secret is compromised
-
-This is the most catastrophic scenario. The master secret is the root from which every environment's signing key is derived. With it, an attacker can forge valid tokens for any project, any environment, any user.
-
-**Response**: The only effective mitigation is to rotate the master secret and re-issue all tokens. This requires a platform-wide operation — every service must be updated with the new secret, and every user must re-authenticate. This is why the master secret is never stored in code, never logged, and is only available through the platform's secrets management system.
-
-## Session security
-
-### Session data at rest
-
-`SessionInfo` rows store `ip`, `user_agent`, `org`, `aal`, `method`, `last_refreshed_at`, and `revoked_at`. This metadata is used for:
-
-- **Session listing**: `GET /auth/v1/sessions` shows the user all active sessions with device information.
-- **Theft detection**: `SessionInfo` rows are updated when theft is detected — `revoked_at` is set on the entire family.
-- **Audit**: Session metadata is included in the admin events API and audit logs.
-
-### Session metadata is never in the token
-
-The access token's claims (`prj`, `env`, `sid`, `jti`, `sub`, `roles`, etc.) are the *only* data a service can trust. Session metadata like `ip`, `user_agent`, and `method` are stored in the database and never encoded in the token. This means a service cannot learn the user's IP or device from the token alone — it must query the session info separately if needed.
-
-## Cryptographic details
-
-### Token encoding
-
-All tokens are JWTs encoded with `sillo.helpers.jwt`. The encoding uses the HMAC-SHA256 algorithm (`HS256`), with the derived per-environment secret for user tokens and the installation master secret for service and context tokens.
-
-### Token identifiers
-
-Every token has a unique `jti` (JWT ID), which maps to a `JWTToken` row in Sillo's token tracking system. The `jti` is generated with `secrets.token_hex(8)` — a cryptographically random 16-byte hex string. This means:
-
-- Token IDs are unpredictable — an attacker cannot guess a valid `jti`.
-- Token IDs are unique — the probability of collision is negligible.
-- Token IDs are tracked — every token in a family is linked to its `jti`, enabling precise revocation.
-
-### One-time tokens
-
-Verification, recovery, magic-link, and invitation tokens are signed with Sillo's `URLSafeTimedSerializer` and backed by `OneTimeToken` rows. The token string itself is a signed payload containing the row `id`. Verification checks:
-
-1. The signature is valid (using the per-project, per-environment serializer secret).
-2. The `max_age` has not expired (lifetimes vary by purpose: 24h for verify, 1h for recovery, 15min for magic, 10min for link, 5min for MFA).
-3. The corresponding `OneTimeToken` row exists, has not been used (`used_at is None`), and has not expired (`expires_at > now`).
-4. On consumption, `used_at` is set atomically — concurrent requests are handled by the database update returning 0 rows affected.
-
-```python
-row = await OneTimeToken.filter(id=row.id, used_at=None).update(used_at=datetime.now(UTC))
-if not updated:  # a concurrent request used it first
-    raise invalid
-```
-
-## Defense summary
-
-| Threat | Mitigation | Layer |
+| Client Type | Recommended Storage | Risk |
 | --- | --- | --- |
-| Cross-environment token replay | Per-environment derived signing keys | Cryptographic |
-| Token theft | Rotating refresh tokens + theft detection | Token lifecycle |
-| Brute-force password guessing | Per-IP rate limiting + per-account lockout | Rate limiting |
-| Credential enumeration | Identical error responses for unknown/wrong credentials | Error handling |
-| Secret key leak | Revocation + rotation; scoping limits exposure | Key management |
-| MFA bypass | Recovery codes as fallback; admin MFA reset | MFA |
-| Identity takeover via social login | `email_verified` requirement for account matching | Social login |
-| Session fixation | New session ID on every sign-in and refresh | Session management |
-| Master secret compromise | Per-environment key derivation limits blast radius; rotation procedure | Cryptographic |
-| CSRF on social login | State parameter + PKCE via `sillo-oauth` | OAuth protocol |
-| One-time token reuse | Single-use rows with atomic `used_at` update | Token lifecycle |
-| Locked account recovery | Recovery links bypass lockout; admin can re-enable | Account recovery |
+| **Browser (web app)** | httpOnly cookies | localStorage is vulnerable to XSS. httpOnly cookies are not accessible to JavaScript. |
+| **Mobile (iOS)** | iOS Keychain | Keychain is encrypted and protected by the device's biometric authentication. |
+| **Mobile (Android)** | Android Keystore | Keystore is hardware-backed and encrypted. |
+| **Backend service** | Environment variables or secret manager | Never hardcode tokens in source code. Use a secret manager (AWS Secrets Manager, HashiCorp Vault, etc.). |
 
-<Note>
-No single defense is sufficient on its own — the security model works because the layers are independent. If rate limiting fails, the per-account lockout still protects. If the lockout is misconfigured, the short access token lifetime still bounds exposure. If a token is stolen, rotation and theft detection still catch it. Defense-in-depth is not a theoretical ideal — it is the operational reality of the system.
-</Note>
+### Service key hygiene
+
+Service keys (publishable and secret keys) are the most sensitive credentials in Pawabase:
+
+1. **Never expose service keys in client-side code**: Publishable keys are meant for client-side use, but secret keys must always be kept on the backend.
+2. **Rotate service keys regularly**: Service keys should be rotated periodically (e.g., every 90 days) to limit the exposure window.
+3. **Use the principle of least privilege**: Each service key should have only the permissions needed for its task.
+4. **Store in a secret manager**: Service keys should be stored in a secret manager (AWS Secrets Manager, HashiCorp Vault, etc.), not in environment variables or configuration files.
+5. **Audit service key usage**: Monitor which service keys are being used, from which IPs, and for which operations.
+
+<Warning>
+A leaked secret key gives the attacker full administrative access to the environment — they can create, update, and delete any user, manage all sessions, and modify roles and permissions. Treat secret keys with the same security as root passwords.
+</Warning>
+
+## Token rotation and security
+
+Token rotation is a core security feature of Pawabase's authentication system:
+
+### The `RevokedToken` table
+
+The `RevokedToken` table provides an additional revocation mechanism:
+
+```sql
+CREATE TABLE auth_revoked_token (
+    id UUID PRIMARY KEY,
+    session_id UUID NOT NULL REFERENCES auth_session(id),
+    jti VARCHAR(255) NOT NULL,
+    revoked_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+Every time a session is revoked, the `jti` of the refresh token is recorded in the `RevokedToken` table. On every refresh attempt, the server checks whether the refresh token's `jti` appears in the `RevokedToken` table. If it does, the token is rejected even if the session hasn't been explicitly marked as revoked.
+
+### How token rotation prevents replay attacks
+
+Token rotation prevents replay attacks by ensuring that each refresh token can only be used once:
+
+1. **User A** has refresh token `rft_A` for session `S1`.
+2. **Attacker** steals `rft_A` and sends it to `/auth/v1/token`.
+3. **Server** validates `rft_A`, issues new tokens, and rotates — `rft_A` is now invalid.
+4. **User A** later sends `rft_A` to `/auth/v1/token`.
+5. **Server** rejects `rft_A` because it was already used (it was rotated in step 3).
+6. **Attacker** also sent `rft_A` in step 3, so the attacker's token is also now invalid.
+7. Both User A and the attacker have new valid tokens — but the legitimate user can detect the theft because their token was unexpectedly rotated.
+
+### Token expiration vs session expiration
+
+Access tokens and sessions have independent expiration:
+
+- **Access token**: Expires after `access_token_ttl` (default: 900 seconds). The `exp` claim determines this.
+- **Session**: May have an `expires_at` timestamp. If set, the session expires at this time regardless of the token TTL.
+- **Refresh token**: May have a `refresh_token_ttl`. If `null`, the refresh token does not expire based on time.
+
+When an access token expires, the client uses the refresh token to get a new one. If the session's `expires_at` has passed, the refresh is rejected even if the refresh token is still valid.
+
+## Security properties by authentication method
+
+Each sign-in method has different security properties:
+
+### Password sign-in
+
+| Property | Value |
+| --- | --- |
+| **AAL** | `aal1` (without MFA), `aal2` (with MFA) |
+| **Factor count** | 1 (password), 2 (password + TOTP) |
+| **Phishing resistance** | Low — users can be tricked into entering their password on a fake site. |
+| **Brute-force resistance** | Medium — bcrypt hashing makes offline brute-force impractical, but online brute-force is possible without rate limiting. |
+| **Credential stuffing resistance** | Medium — rate limiting and account lockout mitigate credential stuffing. |
+| **Session security** | Medium — access tokens are short-lived, but refresh tokens are long-lived and can be stolen. |
+
+### Magic link sign-in
+
+| Property | Value |
+| --- | --- |
+| **AAL** | `aal1` |
+| **Factor count** | 1 (email access) |
+| **Phishing resistance** | Low — clicking a link is susceptible to phishing. |
+| **Brute-force resistance** | High — tokens are cryptographically random and single-use. |
+| **Credential stuffing resistance** | High — no password to stuff. |
+| **Session security** | Medium — same token rotation and revocation as password sign-in. |
+
+### Social login
+
+| Property | Value |
+| --- | --- |
+| **AAL** | `aal1` (without MFA), `aal2` (with MFA) |
+| **Factor count** | 1 (provider authentication), 2 (provider + TOTP) |
+| **Phishing resistance** | Medium — depends on the provider's phishing resistance. |
+| **Brute-force resistance** | High — tokens are issued by the provider, not guessable. |
+| **Credential stuffing resistance** | High — no password to stuff. |
+| **Session security** | Medium — same token rotation and revocation as other methods. |
+
+### MFA sign-in
+
+| Property | Value |
+| --- | --- |
+| **AAL** | `aal2` (TOTP), future `aal3` (hardware keys) |
+| **Factor count** | 2 (password + TOTP, magic link + TOTP, social + TOTP) |
+| **Phishing resistance** | Medium — TOTP codes can be phished. Hardware keys (future) are phishing-resistant. |
+| **Brute-force resistance** | High — TOTP codes change every 30 seconds and are 6 digits (1,000,000 combinations). |
+| **Credential stuffing resistance** | High — even with the password, the attacker needs the TOTP code. |
+| **Session security** | High — `aal2` sessions are more secure and can be enforced through `require_aal`. |
+
+### Recovery sign-in
+
+| Property | Value |
+| --- | --- |
+| **AAL** | `aal2` |
+| **Factor count** | 2 (email + recovery code) |
+| **Phishing resistance** | Low — recovery codes can be phished if the user is tricked into revealing them. |
+| **Brute-force resistance** | High — recovery codes are 8-character hex strings (16^8 = 4.3 billion combinations). |
+| **Credential stuffing resistance** | High — no password to stuff. |
+| **Session security** | High — recovery sign-in revokes all existing sessions and requires re-enrollment of MFA. |
+
+## Production validation checklist
+
+Before deploying to production, validate the following security configurations:
+
+<AccordionGroup>
+  <Accordion title="Environment configuration">
+    1. `require_email_verification` is `true` — all users must verify their email before accessing the application.
+    2. `min_aal` is set appropriately — at least `"aal2"` for applications handling sensitive data.
+    3. `refresh_token_rotation` is `true` — refresh tokens are rotated on every use.
+    4. `recovery_token_ttl` is 15 minutes or less — recovery tokens expire quickly.
+    5. `magic_link_ttl` is 15 minutes or less — magic link tokens expire quickly.
+  </Accordion>
+  <Accordion title="Rate limiting">
+    1. Per-IP rate limiting is enabled on `/auth/v1/token` (30 requests per 60 seconds).
+    2. Per-IP rate limiting is enabled on `/auth/v1/recover` (5 requests per 60 seconds).
+    3. Per-IP rate limiting is enabled on `/auth/v1/magic-link` (5 requests per 60 seconds).
+    4. Per-IP rate limiting is enabled on `/auth/v1/verify` (30 requests per 60 seconds).
+    5. Per-user rate limiting is enabled on all authentication endpoints.
+  </Accordion>
+  <Accordion title="Token security">
+    1. Access token TTL is 900 seconds (15 minutes) or less.
+    2. Refresh token TTL is configured and appropriate for the application.
+    3. `refresh_token_rotation` is `true`.
+    4. The `RevokedToken` table is configured and maintained.
+    5. Session expiration is configured through `expires_at` if needed.
+  </Accordion>
+  <Accordion title="Password security">
+    1. Password complexity requirements are enforced (minimum length, character variety).
+    2. Bcrypt cost factor is 12 or higher.
+    3. Account lockout threshold (`mfa_failed_attempts_lockout`) is configured.
+    4. `failed_logins` is reset on successful sign-in and password change.
+    5. Password reset (recovery) is properly rate-limited.
+  </Accordion>
+  <Accordion title="CORS and CSRF">
+    1. `cors_origins` is configured with only the allowed origins.
+    2. The OAuth2 flow uses PKCE.
+    3. The OAuth2 flow uses the `state` parameter.
+    4. Redirect URIs are validated against a pre-registered list.
+    5. No wildcard redirect URIs are allowed.
+  </Accordion>
+  <Accordion title="Service key hygiene">
+    1. Secret keys are stored in a secret manager, not in environment variables or configuration files.
+    2. Service keys have the minimum permissions needed.
+    3. Publishable keys are the only keys exposed to client-side code.
+    4. Service key rotation is scheduled (every 90 days).
+    5. Service key usage is monitored and audited.
+  </Accordion>
+  <Accordion title="MFA">
+    1. `require_mfa` is enabled if the application handles sensitive data.
+    2. `min_aal` is `"aal2"` or higher.
+    3. MFA recovery codes are generated (10 per user) and securely distributed.
+    4. Admin MFA reset is available for locked-out users.
+    5. Failed MFA attempts are tracked and lockout is configured.
+  </Accordion>
+  <Accordion title="HTTPS and encryption">
+    1. HTTPS is enforced on all authentication endpoints.
+    2. TLS certificates are valid and not self-signed.
+    3. TLS 1.2 or higher is enforced.
+    4. HSTS headers are set.
+    5. Token signing keys are rotated periodically.
+  </Accordion>
+  <Accordion title="Monitoring and logging">
+    1. Audit logging is enabled for all authentication events.
+    2. Failed sign-in attempts are logged and monitored.
+    3. Token rotation events are monitored for theft detection.
+    4. Policy overrides (`force`) are logged for audit purposes.
+    5. Rate limit violations are logged and monitored.
+  </Accordion>
+  <Accordion title="Session management">
+    1. All sessions are stored in the `SessionInfo` table.
+    2. `revoked` and `revoked_at` are properly set on revoked sessions.
+    3. The `RevokedToken` table is maintained.
+    4. Session enumeration is available through the admin API.
+    5. Session revocation (`POST .../sessions/revoke`) is tested and working.
+  </Accordion>
+  <Accordion title="Email verification">
+    1. `require_email_verification` is `true` for production applications.
+    2. The verification email template uses `{{verify_url}}` correctly.
+    3. The `verify` endpoint is rate-limited.
+    4. The `complete` handler properly validates `ttl`, `used`, and `code_hash`.
+    5. Admin-initiated verification is available for edge cases.
+  </Accordion>
+</AccordionGroup>
+
+## Common security vulnerabilities
+
+### LocalStorage token storage
+
+**Vulnerability**: Storing refresh tokens in localStorage makes them accessible to JavaScript running in the browser. Any XSS vulnerability in the application can steal the tokens.
+
+**Mitigation**: Use httpOnly cookies for token storage. httpOnly cookies are not accessible to JavaScript and are protected against XSS attacks.
+
+### Exposed service keys
+
+**Vulnerability**: Service keys embedded in client-side code or configuration files are visible to anyone who can access the codebase or browser developer tools.
+
+**Mitigation**: Keep service keys on the backend only. Use a secret manager for storage. Rotate keys regularly.
+
+### No CORS configuration
+
+**Vulnerability**: Without CORS configuration, any origin can make requests to the API. This allows cross-site request forgery (CSRF) and data exfiltration.
+
+**Mitigation**: Configure `cors_origins` with only the allowed origins. Reject requests from unauthorized origins.
+
+### Weak password policies
+
+**Vulnerability**: Allowing weak passwords (e.g., "123456", "password") makes brute-force attacks easy.
+
+**Mitigation**: Enforce minimum password length (at least 8 characters), character variety (uppercase, lowercase, numbers, symbols), and common password blacklists.
+
+### Missing rate limiting
+
+**Vulnerability**: Without rate limiting, an attacker can make unlimited sign-in attempts, recovery requests, or verification requests.
+
+**Mitigation**: Implement rate limiting on all authentication endpoints. Use per-IP, per-user, and per-email rate limits.
+
+### Not revoking sessions after password change
+
+**Vulnerability**: If existing sessions are not revoked after a password change, an attacker who obtained the old password can continue to access the account.
+
+**Mitigation**: Always revoke all sessions after a password change using `revoke_all`.
+
+<Warning>
+The most common security vulnerability is storing refresh tokens in localStorage. This single mistake can expose all authenticated users to XSS attacks. Always use httpOnly cookies or a secure token store.
+</Warning>
+
+## Security audit trail
+
+All security-relevant events are logged in the audit trail:
+
+- **`user.signed_in`**: User signed in (method, AAL, IP address).
+- **`user.signed_out`**: User signed out.
+- **`token.issued`**: Access and refresh tokens were issued.
+- **`token.refreshed`**: Tokens were refreshed.
+- **`token.revoked`**: Tokens were revoked.
+- **`user.password_changed`**: User changed their password.
+- **`user.email_verified`**: User verified their email.
+- **`user.mfa_reset`**: MFA was reset.
+- **`role.assigned`**: A role was assigned to a user.
+- **`role.revoked`**: A role was revoked from a user.
+- **`org.member_added`**: A member was added to an organization.
+- **`policy.override`**: A policy was overridden with `force`.
+- **`rate_limit_exceeded`**: A rate limit was exceeded.
+
+The audit trail provides a complete record of all security-relevant events, enabling administrators to detect, investigate, and respond to security incidents.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Client integration" icon="code" href="/auth/client-integration">SDK and backend integration patterns.</Card>
+  <Card title="Managing users" icon="users" href="/auth/managing-users">Admin API for user management.</Card>
+  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth` in policy expressions.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">Access and refresh token claims, rotation, theft detection, revocation.</Card>
+</CardGroup>

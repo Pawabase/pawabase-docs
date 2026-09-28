@@ -25,6 +25,8 @@ Comparisons have the form `{"operator": [left, right]}`. Either operand may be a
 
 Comparing types that can't be ordered (a number with a string in `gt`) is **false**, never an error. A policy never crashes a request because a field had an unexpected type; it just doesn't match.
 
+The `_compare` function in the engine wraps every comparison in a try/except that catches `TypeError`. This is a deliberate design choice: when a policy encounters a type mismatch (for example comparing a number to a string), it returns `false` rather than raising an exception. This means that even if your data is inconsistent — perhaps a field that should be a number contains a string — your policy doesn't crash. It simply doesn't match, which is the safe default.
+
 ## Equality: `eq` and `ne`
 
 ```json
@@ -49,6 +51,8 @@ Integers are compared as strings in `eq` and `ne`, because ids come from databas
 `null == null` is **true**. Comparing `$record.owner_id` with `$auth.user_id` for an anonymous caller on a row with no owner would pass. Always combine ownership comparisons with `{"authenticated": true}`, or use the `owner` shorthand, which does that for you.
 </Warning>
 
+The id normalisation is implemented by the `_norm` function, which converts integers to strings while leaving booleans, null, and floats unchanged. This normalisation applies only to `eq` and `ne` — ordering operators (`gt`, `gte`, `lt`, `lte`) do not normalise. The reason is that normalisation is specifically designed to handle the id mismatch between database integers and token strings. For ordering, the types must be compatible (both numbers, or both ISO date strings) for a meaningful comparison.
+
 ### Pushdown
 
 `eq` between a **single-level** record path and a value known before the query (a literal, or an `$auth`/`$credential`/`$request` path) becomes a SQL equality when it's part of an AND:
@@ -58,6 +62,30 @@ Integers are compared as strings in `eq` and `ne`, because ids come from databas
 ```
 
 → `WHERE org_id = 'acme' AND archived = false`. Nested paths like `$record.address.city` aren't pushed down.
+
+The pushdown check requires the record path to be exactly one level deep (`$record.field` not `$record.nested.field`). The reason is database-specific: different databases handle JSON column queries differently, and a simple `column = value` equality is the most portable and indexable form. For nested paths, the value would need to be extracted from a JSON column, which varies by database.
+
+The pushdown code in the engine checks this explicitly:
+
+```python
+if _mentions_record(left) and not _deferred(right) and left.count(".") == 1:
+    column = left.split(".", 1)[1]
+    value = resolve(right, {})
+```
+
+The `left.count(".") == 1` check ensures exactly one dot, meaning the path is `$record.field` and not `$record.nested.field` (which would have two dots) or `$auth.user_id` (which has a dot but doesn't mention `$record`).
+
+### List equality
+
+`eq` also works with lists, comparing them element-wise with id normalisation:
+
+| Left | Right | `eq` |
+| --- | --- | --- |
+| `[1, 2]` | `[1, 2]` | true |
+| `[1, 2]` | `[2, 1]` | false (order matters) |
+| `["a"]` | `["a", "b"]` | false |
+
+This means you can check if a list field exactly matches an expected value. For "does this list contain this element," use `contains` instead.
 
 ## Ordering: `gt`, `gte`, `lt`, `lte`
 
@@ -82,6 +110,22 @@ Integers are compared as strings in `eq` and `ne`, because ids come from databas
 
 "Bursars can record payments up to ₦500,000; larger ones need the principal."
 
+### The null problem with ordering
+
+One of the most common pitfalls with ordering operators is the null behavior. If `$record.amount` is `null` for any row (perhaps the field is optional and wasn't set), `gte($record.amount, 50)` returns `false` for that row. The row is excluded from the results. This is semantically correct (a null amount is not ≥ 50), but it can be surprising if you expect null rows to be included.
+
+If you want to include rows with null amounts, you need an explicit condition: `{"any": [{"gte": ["$record.amount", 50]}, {"exists": false, "$record.amount"]}` — but this doesn't work because `exists` with `false` means "the field doesn't exist," not "the field is null." Instead, use `{"ne": ["$record.amount", null]}` in an `any` to include rows where the field is set and ≥ 50, or handle it differently based on your business logic.
+
+### ISO date comparisons
+
+ISO 8601 date strings compare correctly as strings because the format is lexicographically ordered: `"2026-09-28"` > `"2026-09-27"` > `"2026-01-01"`. This works for:
+
+- Dates: `"YYYY-MM-DD"`
+- Datetimes: `"YYYY-MM-DDTHH:MM:SSZ"`
+- With timezone offsets: `"2026-09-28T10:00:00+00:00"`
+
+However, the comparison is **string-based**, so `"2026-09-28"` > `"2026-10-1"` because `"1"` < `"8"` in string comparison. Always use zero-padded ISO format consistently. Pawabase's `date` field type produces zero-padded ISO strings, so this works correctly for fields declared as dates.
+
 ## Sets: `in` and `not_in`
 
 ```json
@@ -99,7 +143,23 @@ The right side can itself be a path to a list on the record:
 { "in": ["$auth.user_id", "$record.editor_ids"] }
 ```
 
-That's equivalent to `contains` with the operands swapped.
+That's equivalent to `contains` with the operands swapped. This pattern is useful when the set of allowed values lives on the record rather than as a fixed literal. The pushdown mechanism doesn't apply here because the right side is a `$record` path, which is deferred.
+
+### `in` with a `$record` path
+
+When the right side of `in` is a `$record` path (a list stored on the record), the comparison can't be pushed down because the list is unknown at plan time. Each row's list must be checked individually. This is fine for small lists, but can be slow on large tables with large list fields.
+
+If you find yourself using `in` with a `$record` path frequently, consider denormalising the data. For example, if you often check `{"in": ["$auth.user_id", "$record.editor_ids"]}`, consider maintaining a `viewer_user_ids` list or using a separate membership resource.
+
+### `not_in` semantics
+
+`not_in` with a `null` list returns `true`. This means `{"not_in": ["$record.status", null]}` is `true` when the list is missing, which could accidentally allow access. If the list might be null, add an existence check:
+
+```json
+{ "all": [ { "exists": "$record.blocked_ids" }, { "not_in": ["$request.ip", "$record.blocked_ids"] } ] }
+```
+
+This ensures the blocked list exists before checking membership. The `exists` check guarantees that `blocked_ids` is not null, and only then does the `not_in` comparison execute.
 
 ## Membership: `contains`
 
@@ -118,7 +178,24 @@ This is the workhorse for **user-id lists** and **roles**:
 { "contains": ["$credential.scopes", "reports:export"] }
 ```
 
-The second example is particularly useful: an announcement whose `audience` is `"guardian"` is visible to callers whose roles include `guardian`.
+The second example is particularly useful: an announcement whose `audience` is `"guardian"` is visible to callers whose roles include `guardian`. This creates a bidirectional relationship between the record's audience field and the caller's roles.
+
+### List vs string containment
+
+The behavior depends entirely on the left operand's type at runtime:
+
+- If `$record.tags` is stored as a list `["bug", "feature"]`, `{"contains": ["$record.tags", "bug"]}` checks list membership.
+- If `$record.tags` is stored as a string `"bug,feature"`, the same condition checks substring containment: is `"bug"` a substring of `"bug,feature"`? Yes.
+
+This type-dependent behavior is a source of bugs. Declare list fields with the `array` type in your resource definition so they always arrive as lists. If you're unsure whether a field is a list or a string, use `exists` to check first, or use `contains` with a string literal on both sides.
+
+The `contains` implementation checks the type explicitly: if the left operand is a list, tuple, or set, it checks membership. Otherwise, it converts both operands to strings and checks for substring containment.
+
+### `contains` with null
+
+`contains` returns `false` when the left operand is `null`. It does not raise. This means that if a record has a null value for a field you're checking with `contains`, the condition simply fails — the row is not visible. This is the safe default.
+
+For `contains` where the left is a list and the right is `null`, the behavior is: `{"contains": [[], null]}` is `false` (an empty list doesn't contain null). `{"contains": [[null], null]}` is `true` (the list `[null]` contains `null`). This follows from the id-normalised membership check.
 
 ## Strings: `starts_with`, `ends_with`, `matches`
 
@@ -136,6 +213,40 @@ The second example is particularly useful: an announcement whose `audience` is `
 Email-domain rules are tempting but weak: anyone who controls an address at that domain passes, including departed staff whose accounts weren't closed. Prefer roles for authorization, and use domains only to decide default roles at sign-up.
 </Tip>
 
+### `starts_with` and `ends_with` on numbers
+
+When the left operand is a number, `starts_with` and `ends_with` convert it to a string first:
+
+| left | right | result |
+| --- | --- | --- |
+| `42` | `"4"` | starts_with: true |
+| `42` | `"2"` | ends_with: true |
+| `42` | `"5"` | starts_with: false |
+
+This is occasionally useful (for example, checking that a numeric code starts with a specific digit), but it's usually clearer to use `eq` with a numeric literal.
+
+### `matches` with Python regex
+
+The `matches` operator uses Python's `re.search`, which means the pattern is searched anywhere in the string. To match the entire string, anchor with `^` and `$`:
+
+```json
+{ "matches": ["$auth.email", "^[a-z]+@school\\.example\\.com$"] }
+```
+
+Without anchors, `@school.example` matches `evil@school.example.attacker.com`. Always anchor regex patterns unless you intentionally want a partial match.
+
+Python regex features like lookaheads, backreferences, and named groups are all available because `re.search` supports the full Python regex dialect. However, complex regex patterns can be slow, so keep them simple. A regex like `^[A-Z]{3}\\d{3}$` is fast; a pattern with nested quantifiers on long strings could cause catastrophic backtracking.
+
+### Inline regex flags
+
+You can add inline flags with `(?i)` for case-insensitive matching:
+
+```json
+{ "matches": ["$auth.email", "(?i)^ada@example\\.com$"] }
+```
+
+This is useful when you need case-insensitive matching but don't want to normalize the data. However, the recommended approach is to normalize data at storage time (store emails lowercase) and use `eq` — it's faster and more predictable.
+
 ## Null handling
 
 Missing paths resolve to `null`. Here is every operator's behaviour when one side is null:
@@ -152,23 +263,45 @@ Missing paths resolve to `null`. Here is every operator's behaviour when one sid
 
 To test for null explicitly, use the checks: `{"exists": "$record.returned_on"}` or `{"not": {"exists": "$record.returned_on"}}`.
 
+### The `null` edge case in `eq`
+
+The most dangerous null behavior is `eq(null, null) → true`. This means that if both `$record.owner_id` and `$auth.user_id` are null, the equality passes. An anonymous caller on a row with no owner would be treated as the owner. This is why the `owner` shorthand always includes `{"authenticated": true}` in its expansion, and why you should always combine ownership checks with an authentication requirement.
+
+The `ne` operator has the opposite edge case: `ne(null, null)` is `false`. So `{"ne": ["$record.owner_id", "$auth.user_id"]}` is `false` when both are null, which means it doesn't pass — this is actually safe for exclusion checks.
+
+### Null in `in` and `not_in`
+
+When the right side of `in` is a list that contains `null`:
+
+```json
+{"in": [null, [null, "a"]]}  // true
+{"not_in": [null, [null, "a"]]}  // false
+```
+
+`in` returns `true` if the list contains `null` and the left operand is `null`. `not_in` returns `false` in the same case. This means that a null left operand is treated as "is null in the list." If you want to exclude null values from consideration, add an explicit `{"exists": "$field"}` check.
+
+When the right side is `null` (not a list containing null, but the value `null` itself):
+
+```json
+{"in": ["$record.status", null]}  // false
+{"not_in": ["$record.status", null]}  // true
+```
+
+This is consistent: `in` with a null list is always `false` (nothing is an element of nothing), and `not_in` with a null list is always `true` (nothing is excluded from nothing).
+
 ## Time
 
 `$now` is the current time as a timezone-aware UTC datetime. Stored datetimes arrive in records as ISO strings. Comparing a datetime with a string is false, so `{"lt": ["$record.publish_at", "$now"]}` does **not** work as you might hope.
 
 Reliable patterns:
 
-<Steps>
-  <Step title="Maintain a boolean">
-    A scheduled flow sets `published = true` when `publish_at` passes. The policy checks `{"eq": ["$record.published", true]}`, which also pushes down into SQL.
-  </Step>
-  <Step title="Compare ISO strings of the same format">
-    If both sides are ISO dates you control (for example `$record.due_on` and a date passed in `$input`), string ordering matches chronological ordering.
-  </Step>
-  <Step title="Decide in a flow">
-    For complex windows, guard a custom route with a simple policy and let the flow compare with `time.now` before acting.
-  </Step>
-</Steps>
+1. **Maintain a boolean.** A scheduled flow sets `published = true` when `publish_at` passes. The policy checks `{"eq": ["$record.published", true]}`, which also pushes down into SQL.
+2. **Compare ISO strings of the same format.** If both sides are ISO dates you control (for example `$record.due_on` and a date passed in `$input`), string ordering matches chronological ordering.
+3. **Decide in a flow.** For complex windows, guard a custom route with a simple policy and let the flow compare with `time.now` before acting.
+
+The reason this matters is that `_compare` for ordering operators uses Python's native comparison operators. Comparing a `datetime` object with a string raises `TypeError`, which `_compare` catches and returns `false`. The result is that every time-based ordering comparison returns `false`, silently denying access. This is the most common time-related pitfall in policy writing.
+
+For `eq` comparisons with datetimes, the same issue applies: `eq(datetime_obj, "2026-09-28")` returns `false` because they're different types. The solution is always to maintain a boolean flag or store dates as strings consistently.
 
 ## Choosing operators for performance
 
@@ -179,6 +312,10 @@ On `get`, `create`, `update` and `delete`, all operators cost about the same: on
 | Family members can read | `contains($record.guardian_user_ids, $auth.user_id)` | `eq($record.family_id, $auth.claims.app.family_id)` |
 | Visible statuses | `in($record.status, [...])` for guests | a boolean `visible` maintained by the platform |
 | Recent rows only | `gte($record.created_at, …)` | a client filter `filter[created_at]=gte.…` (it's SQL) plus a simple policy |
+
+The key insight is that on lists, only `eq` can become SQL, and only when comparing a single-level record field against a known value. Everything else — `contains`, `in`, `gt`, `any` — is evaluated per row. This doesn't mean those operators are bad; it means they're appropriate for different scenarios. For small tables (thousands of rows), per-row evaluation is perfectly fine. For large tables (millions of rows), restructure so the heavy lifting is done by an AND-ed equality.
+
+The `total: null` signal is your indicator that a residual remains. When you see it, you know the query is being filtered client-side, and you should consider whether the policy could be restructured for pushdown.
 
 ## Examples by task
 
@@ -208,6 +345,8 @@ On `get`, `create`, `update` and `delete`, all operators cost about the same: on
 { "all": [ { "service": true }, { "scope": "exports:read" } ] }
 ```
 </CodeGroup>
+
+Each of these examples represents a common authorization pattern. The tenancy example is the most frequently used pattern in multi-tenant applications, and it's fully pushdown-compatible — it becomes a SQL WHERE clause on lists. The per-user storage folder example shows how the `$object` variable works for bucket policies.
 
 ## Truth tables
 
@@ -337,6 +476,12 @@ Values typed into the builder are interpreted like JSON literals: `42` becomes a
   <Accordion title="role shorthand vs contains on $auth.roles">
     `{"role": "admin"}` and `{"contains": ["$auth.roles", "admin"]}` are equivalent. Use the shorthand for fixed roles, and `contains` when the role comes from the record (`$record.audience`).
   </Accordion>
+  <Accordion title="in with path on right">
+    `{"in": ["$auth.user_id", "$record.editor_ids"]}` is equivalent to `{"contains": ["$record.editor_ids", "$auth.user_id"]}`. Choose based on readability: `in` reads as "is the user in the editors list," `contains` reads as "does the editors list contain the user."
+  </Accordion>
+  <Accordion title="gt vs gte on boundaries">
+    `{"gt": ["$record.score", 50]}` excludes 50; `{"gte": ["$record.score", 50]}` includes it. Be explicit about whether the boundary is inclusive or exclusive.
+  </Accordion>
 </AccordionGroup>
 
 ## Pitfalls
@@ -357,7 +502,34 @@ Values typed into the builder are interpreted like JSON literals: `42` becomes a
   <Accordion title="Expecting not_in to deny when the list is missing">
     `not_in` with a `null` list is **true**. If the list might be missing, add `{"exists": "$record.blocked_ids"}` to the condition.
   </Accordion>
+  <Accordion title="Case-sensitive comparisons">
+    `eq` is case-sensitive. `"Published"` ≠ `"published"`. Normalize data at storage time or use `matches` with `(?i)`.
+  </Accordion>
+  <Accordion title="Floating point comparisons">
+    `eq` does not normalize floats. `1.5` ≠ `"1.5"`. If you need to compare floats across type boundaries, use `matches` with a regex or normalize at storage time.
+  </Accordion>
+  <Accordion title="String vs number in ordering">
+    `gt` between a number and a string is always `false`, not an error. Make sure both sides are the same type before using ordering operators.
+  </Accordion>
 </AccordionGroup>
+
+## Performance notes
+
+Each operator has a specific performance characteristic that matters when evaluating thousands or millions of conditions:
+
+**`eq` and `ne`** are the fastest comparisons: a single equality check, O(1). They're also the only operators that can be pushed into SQL on lists, which means they avoid per-row evaluation entirely. This is why AND-ed equalities are the gold standard for list policies.
+
+**`contains`** on lists requires scanning the list, which is O(n) where n is the list length. For short lists (a few roles, a handful of IDs), this is negligible. For long lists (hundreds of IDs), it adds up. If a list field grows large, consider indexing or denormalizing.
+
+**`matches`** requires regex compilation and matching, which is the most expensive operator. Python's `re.search` uses backtracking, which can be slow on complex patterns or long strings. Avoid `matches` in high-throughput list policies. If you need pattern matching on lists, consider maintaining a boolean flag that's set by a flow when a pattern match is detected.
+
+**`in` and `not_in`** require building a set from the right operand and doing membership checks, which is O(m) where m is the right operand length. For small literal lists, this is fast. For path-to-list comparisons, it requires resolving the path first, which adds overhead.
+
+**`starts_with` and `ends_with`** are simple string operations, O(k) where k is the prefix/suffix length. They're fast and predictable.
+
+**Ordering operators** (`gt`, `gte`, `lt`, `lte`) require type checking and comparison. They're fast for compatible types but return `false` immediately for incompatible types.
+
+On list requests, all non-`eq` operators contribute to the per-row residual check. The residual is evaluated for every row the query returns, so if the query returns 10,000 rows and the residual involves three `contains` checks, that's 30,000 containment checks. This is fine for moderate row counts but can become a bottleneck for large tables. The `total: null` response field is your signal that a residual exists, and you should investigate whether the policy could be restructured for pushdown.
 
 ## FAQ
 
@@ -372,7 +544,16 @@ Values typed into the builder are interpreted like JSON literals: `42` becomes a
     No. The language compares values; it doesn't compute them. Compute in a flow (`math.calculate`) or store the derived value on the record.
   </Accordion>
   <Accordion title="What's the difference between in and contains?">
-    `in` asks "is left one of the values in right?" and `contains` asks "does left (a list) include right?". They're mirror images: `{"in": ["$auth.user_id", "$record.editors"]}` equals `{"contains": ["$record.editors", "$auth.user_id"]}`.
+    `in` asks "is left one of the values in right?" and `contains` asks "does left (a list) include right?" They're mirror images: `{"in": ["$auth.user_id", "$record.editors"]}` equals `{"contains": ["$record.editors", "$auth.user_id"]}`.
+  </Accordion>
+  <Accordion title="Does `eq` on lists use set semantics?">
+    No. `eq` on lists compares element-by-element in order. `[1, 2]` ≠ `[2, 1]`. Use `contains` for set membership checks.
+  </Accordion>
+  <Accordion title="Can I use `matches` for exact string matching?">
+    Yes, anchor the pattern: `{"matches": ["$record.code", "^ABCD$"]}`. But `eq` is faster and more readable for exact matches.
+  </Accordion>
+  <Accordion title="Why does `contains` with a string check substrings?">
+    The operator is type-aware. If the left operand is a list, it checks membership. If it's a string, it checks substring containment. This dual behavior is intentional: the same `contains` operator handles both "is this role in the list?" and "does this title contain the word?" Use the builder to see which mode applies.
   </Accordion>
 </AccordionGroup>
 
@@ -382,3 +563,45 @@ Values typed into the builder are interpreted like JSON literals: `42` becomes a
   <Card title="Shorthands" icon="zap" href="/policies/shorthands">`role`, `owner`, `permission` and the rest.</Card>
   <Card title="Pushdown" icon="arrow-down-to-line" href="/policies/pushdown">Which conditions become SQL, and why it matters.</Card>
 </CardGroup>
+
+## Operator implementation details
+
+For teams who want to understand exactly how each operator works under the hood, this section traces through the engine's `_compare` function. Every comparison goes through the same code path in `pawabase_kit/policies/engine.py`:
+
+```python
+def _compare(op: str, left: Any, right: Any) -> bool:
+    try:
+        if op == "eq":
+            return _norm(left) == _norm(right)
+        if op == "ne":
+            return _norm(left) != _norm(right)
+        if op == "gt":
+            return left is not None and right is not None and left > right
+        ...
+    except TypeError:
+        return False
+    raise PolicyError(f"unknown operator {op!r}")
+```
+
+The `try/except TypeError` wrapper is the safety net. If any comparison raises a `TypeError` — for example, comparing a list with a string using `>`, or comparing a datetime with a string — the function catches it and returns `false`. This means that type mismatches never propagate to the caller as exceptions. A policy never crashes a request because a field had an unexpected type; it just doesn't match.
+
+The `_norm` function is specific to `eq` and `ne`. For all other operators, values are compared as-is. This means that `gt(42, "42")` is `false` (number vs string), while `eq(42, "42")` is `true` (ids normalised). The asymmetry is deliberate: normalisation is a convenience for id comparison, not a general type coercion mechanism.
+
+For `matches`, the implementation uses `re.search(str(right), str(left))`. This means the pattern (`right`) is compiled as a regex and searched within the stringified left operand. The `re.search` semantics mean the pattern can match anywhere, so unanchored patterns match substrings. The `PolicyError` for invalid regex patterns is raised during validation (`validate_condition`), not during evaluation, so invalid patterns are caught at save time.
+
+The `contains` operator has the most complex implementation because it's type-aware:
+
+```python
+if op == "contains":
+    return (
+        left is not None and _norm(right) in [_norm(v) for v in left]
+        if isinstance(left, (list, tuple, set))
+        else (left is not None and str(right) in str(left))
+    )
+```
+
+For list-like left operands, it converts both sides through `_norm` and checks membership. For other left operands, it converts both to strings and checks for substring containment. This dual behavior is the source of the most common `contains` bugs — declaring a list field without the `array` type causes it to arrive as a string, which silently switches the semantics.
+
+The `starts_with` and `ends_with` implementations are straightforward string method calls on the stringified left operand, with a null guard that returns `false`. These are O(k) operations where k is the prefix/suffix length, making them very fast even on large strings.
+
+The `in` and `not_in` implementations convert the right operand to a list of normalized values and check membership. `not_in` with a `null` right operand returns `true` — this is because `not_in` asks "is the left operand not in the right list?" and when the right list is null, there's nothing to be in, so the answer is true. This semantic is consistent with SQL's `NOT IN` behavior with NULL.

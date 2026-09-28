@@ -6,7 +6,7 @@ icon: "brackets"
 
 A policy's **condition** is a small expression language written in JSON. It has no variables, no loops and no functions. That's a feature: every condition can be read by a person, rendered by Studio as a form, validated before saving, and partially evaluated so it can be turned into SQL.
 
-This page defines the whole language. If you only read one reference page about policies, read this one.
+This page defines the whole language. If you only read one reference page about policies, read this one. The condition language is the foundation on which every other policy concept rests: shorthands expand into conditions, the engine evaluates conditions, the planner partially evaluates conditions, and stored policies are just named conditions. Understanding this language is understanding Pawabase policies.
 
 ## The five forms
 
@@ -22,10 +22,12 @@ Every condition is exactly one of these:
 
 Two rules keep the grammar unambiguous:
 
-1. **An object has exactly one key.** `{"role": "admin", "authenticated": true}` is invalid. To combine conditions, wrap them in a group.
-2. **Comparisons take exactly two operands.** `{"eq": ["$a", "$b", "$c"]}` is invalid.
+1. **An object has exactly one key.** `{"role": "admin", "authenticated": true}` is invalid. To combine conditions, wrap them in a group. This rule exists because the parser needs to know which construct a condition represents. An object with two keys could be ambiguous — is it a comparison with two operands, or two separate conditions? By enforcing single-key objects, the grammar stays clean and the validation is straightforward.
+2. **Comparisons take exactly two operands.** `{"eq": ["$a", "$b", "$c"]}` is invalid. This ensures every comparison has a clear left and right side, which is essential for the pushdown mechanism to work correctly. The planner needs to know which side is the record path and which side is the known value, and that determination only works when there are exactly two operands.
 
-Both are checked when a policy is saved, so a malformed condition never reaches production.
+Both rules are checked when a policy is saved, so a malformed condition never reaches production. The `validate_condition` function in `pawabase_kit/policies/engine.py` enforces these rules recursively, walking the entire condition tree and raising `PolicyError` with a path like `condition.all[1].eq` so you can find the exact problem even in large conditions.
+
+The grammar summary at the bottom of this page captures all five forms and their shapes. Keep it handy as a reference while writing conditions.
 
 ## Booleans
 
@@ -35,13 +37,17 @@ Both are checked when a policy is saved, so a malformed condition never reaches 
 { "name": "anyone", "condition": true }
 ```
 
+The `public` built-in is literally the boolean `true`. Any operation guarded by `public` allows every caller, including anonymous users with a publishable key. This is useful for publicly readable resources like blog posts, product catalogs, or public documentation endpoints. The `deny` built-in is the boolean `false`, which refuses every caller except service credentials (which bypass policies entirely).
+
 <Warning>
-A policy that is literally `true` makes an operation public to anonymous callers with a publishable key. Prefer the built-in `public` so the intent is obvious when someone reads the resource.
+A policy that is literally `true` makes an operation public to anonymous callers with a publishable key. Prefer the built-in `public` so the intent is obvious when someone reads the resource definition. The two are functionally identical, but the built-in name communicates purpose.
 </Warning>
+
+Booleans are also the base case for the `partial` evaluation function used in list planning. When the planner evaluates a condition and encounters `true`, it immediately knows the result is unrestricted. When it encounters `false`, it knows the request should be refused. This short-circuiting is what makes the planner efficient: it can resolve entire branches of a condition without evaluating every leaf.
 
 ## Groups
 
-Groups combine conditions.
+Groups combine conditions. There are three combinators: `all`, `any`, and `not`.
 
 ### `all`: every condition must pass
 
@@ -53,6 +59,8 @@ Groups combine conditions.
 ] }
 ```
 
+`all` evaluates each child in order. If any child is `false`, the entire `all` is `false` and evaluation stops (short-circuits). If all children are `true`, the `all` is `true`. If all children are `true` except some that are undecided (they depend on the record), the `all` returns a residual condition containing only the undecided children.
+
 ### `any`: at least one condition must pass
 
 ```json
@@ -61,6 +69,8 @@ Groups combine conditions.
   { "owner": "author_id" }
 ] }
 ```
+
+`any` evaluates each child in order. If any child is `true`, the entire `any` is `true` and evaluation stops (short-circuits). If all children are `false`, the `any` is `false`. If some children are undecided, the `any` returns a residual containing only the undecided children.
 
 ### `not`: invert one condition
 
@@ -77,7 +87,7 @@ Groups combine conditions.
 ] } }
 ```
 
-Studio's rule builder calls this **None of**.
+Studio's rule builder calls this **None of**. The `not` combinator is essential for exclusion rules: "nobody may do this except..." and "don't allow this transition." It also enables the pattern of "allow unless a specific condition is true," which is more readable than listing all the allowed cases.
 
 ### Empty groups
 
@@ -86,7 +96,9 @@ Studio's rule builder calls this **None of**.
 | `{"all": []}` | `true` | Nothing failed |
 | `{"any": []}` | `false` | Nothing passed |
 
-This matters when you build conditions programmatically: an `any` you forgot to fill denies everyone, which is the safe failure.
+This matters when you build conditions programmatically: an `any` you forgot to fill denies everyone, which is the safe failure. An `all` you forgot to fill allows everyone, which is potentially dangerous. The asymmetry is deliberate: it's safer for an empty condition to be restrictive than permissive, because permissive conditions can leak data.
+
+If you're building conditions dynamically in code, always validate the final result. An empty `any` might be a bug, not a feature. The `validate_condition` function won't catch this because both shapes are valid JSON, but the semantic meaning is clear: an empty `any` is a denial of all access.
 
 ### Nesting and short-circuiting
 
@@ -99,11 +111,23 @@ Groups nest to any depth. Evaluation **short-circuits**: `all` stops at the firs
 ] }
 ```
 
-For an admin, the first branch decides everything and the record is never consulted. That also lets list requests skip filtering entirely. See [pushdown](/policies/pushdown).
+For an admin, the first branch decides everything and the record is never consulted. That also lets list requests skip filtering entirely — the `any` evaluates to `true` at plan time, so the query runs unrestricted. For a non-admin, the `role` branch is `false`, and the second branch is evaluated. If the second branch is also `false`, the entire condition is `false` and the request is refused with a `403` before any SQL runs.
+
+This short-circuit behavior is not just a performance optimization; it's a correctness feature. It means that policy evaluation is deterministic and predictable: the same condition and context always produce the same result, and the result is determined by the first decisive branch encountered in evaluation order.
+
+### The partial evaluation semantics
+
+When the planner evaluates a group during list planning, it applies these rules:
+
+- **`all`**: any child `false` → the whole `all` is `false`; `true` children disappear; undecided children are collected into the residual.
+- **`any`**: any child `true` → the whole `any` is `true`; `false` children disappear; undecided children are collected into the residual.
+- **`not`**: if the child is decided, invert it; if the child is undecided, wrap it in `not` and keep it in the residual.
+
+This means that a top-level `all` of which all children are decided is either `true` (unrestricted plan) or `false` (refused with `403`, no SQL). A top-level `any` with one `true` child is also unrestricted. Only when at least one child remains undecided does the planner fall through to the pushdown stage.
 
 ## Operands: paths and literals
 
-Operands are the values a comparison or check works on.
+Operands are the values a comparison or check works on. Every operand is either a **path** (a string starting with `$`) or a **literal** (anything else).
 
 ### Paths
 
@@ -127,6 +151,10 @@ Paths use dots. A numeric segment indexes a list: `$auth.roles.0` is the first r
 
 **Missing paths resolve to `null`.** `$record.nonexistent` doesn't raise; it's `null`, and comparisons treat it accordingly (see [operators](/policies/operators#null-handling)). Because `$auth.user_id` is `null` for anonymous callers, a comparison with it never accidentally matches a record whose `owner_id` is also missing, as long as you also require `authenticated` (which the `owner` shorthand does for you).
 
+The `lookup` function in the engine handles path resolution. It walks the path segment by segment through nested dictionaries, lists, and objects. If any segment doesn't exist (a key is missing in a dict, an index is out of bounds in a list, or an attribute doesn't exist on an object), the lookup returns `null` (actually the internal `_MISSING` sentinel, which becomes `None`). This means deeply nested paths like `$auth.claims.app.department_id` are safe even if the user has no `app_metadata` — the lookup returns `null` rather than raising a KeyError.
+
+**Important edge case with `$now`**: The path `$now` is handled specially by the lookup function. Instead of resolving against the context dictionary, it returns `datetime.now(UTC)`. This is a timezone-aware UTC datetime. However, records store datetimes as ISO strings, so comparing `$now` with a record field using `eq` or ordering operators usually doesn't work as expected — see the [operators page](/policies/operators#time) for the recommended patterns.
+
 ### Literals
 
 Anything that isn't a `$`-string is a literal:
@@ -135,11 +163,13 @@ Anything that isn't a `$`-string is a literal:
 { "eq": ["$record.status", "published"] }        // string
 { "gte": ["$record.score", 50] }                  // number
 { "eq": ["$record.flagged", false] }              // boolean
-{ "eq": ["$record.deleted_at", null] }            // null
+{ "eq": ["$record.deleted_at", null] }              // null
 { "in": ["$record.status", ["draft", "review"]] } // list
 ```
 
-To use a string that **begins with a dollar sign** as a literal, double the dollar: `"$$9.99"` is the literal `"$9.99"`.
+To use a string that **begins with a dollar sign** as a literal, double the dollar: `"$$9.99"` is the literal `"$9.99"`. This escaping mechanism is implemented in the `resolve` function: if an operand starts with `$$`, the function strips one dollar and returns the rest as a literal string.
+
+Lists are also literals. A comparison's right operand can be a list, which is essential for `in`, `not_in`, and `contains` operators. The `in` operator checks whether the left operand is an element of the right operand's list, using id normalisation for equality.
 
 ### Either side can be a path
 
@@ -150,19 +180,36 @@ Comparisons don't care which side is the path:
 { "eq": ["admin", "$auth.claims.app.level"] }        // literal vs path
 ```
 
-Both work the same way, including for [pushdown](/policies/pushdown).
+Both work the same way, including for [pushdown](/policies/pushdown). The pushdown mechanism works regardless of which side is the record path: it looks for an `eq` where one side is a single-level `$record.<column>` and the other is a known value (a literal or a resolved `$auth`/`$credential`/`$request` path).
+
+The pushdown code in the engine handles both directions symmetrically:
+
+```python
+if _mentions_record(left) and not _deferred(right) and left.count(".") == 1:
+    column = left.split(".", 1)[1]
+    value = resolve(right, {})
+if _mentions_record(right) and not _deferred(left) and right.count(".") == 1:
+    column = right.split(".", 1)[1]
+    value = resolve(left, {})
+```
+
+This symmetry means you can write `{"eq": ["$record.org_id", "$auth.org"]}` or `{"eq": ["$auth.org", "$record.org_id"]}` — either direction pushes down correctly.
 
 ### Id normalisation
 
 Ids arrive as integers from databases and as strings from tokens. Equality normalises integers to strings, so `42 == "42"` is **true** in `eq`, `ne`, `in` and `contains`. Ownership checks never fail just because of a type difference. Booleans and `null` are not normalised: `true != "true"`.
 
+The `_norm` function implements this: it converts integers to strings, leaves booleans and null as-is, and passes everything else through unchanged. This means `42` and `"42"` compare as equal in `eq` and `ne`, but `42` and `"42"` do not compare as equal in ordering operators (`gt`, `lt`, etc.) because those operators don't normalise — they just compare the raw values, and comparing a number with a string returns `false`.
+
+Floats are also not normalised: `1.5` and `"1.5"` are not equal. This is a deliberate choice because floating-point representations can be ambiguous, and normalising them could introduce subtle bugs.
+
 ## Comparisons
 
 ```json
-{ "<operator>": [left, right] }
+{"<operator>": [left, right]}
 ```
 
-The twelve operators are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `starts_with`, `ends_with` and `matches`. Their exact semantics, null handling and examples are in the [operators reference](/policies/operators). In summary:
+The twelve operators are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `starts_with`, `ends_with` and `matches`. Their exact semantics, null handling, type rules, and SQL behaviour are documented in detail on the [operators reference](/policies/operators). In summary:
 
 | You want | Use |
 | --- | --- |
@@ -172,6 +219,10 @@ The twelve operators are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `
 | A list containing a value, or a string containing a substring | `contains` |
 | Prefixes / suffixes | `starts_with`, `ends_with` |
 | A pattern | `matches` (regular expression) |
+
+Each comparison operator has well-defined null semantics. `gt`, `gte`, `lt`, and `lte` return `false` if either operand is null. `eq` returns `true` if both operands are null. `ne` returns `true` if exactly one operand is null. `in` with a null list returns `false`, while `not_in` with a null list returns `true`. `contains` returns `false` if the left operand is null, but for string containment, `null` on the left also returns `false`.
+
+The `_compare` function wraps every comparison in a try/except that catches `TypeError` and returns `false`. This means comparing incompatible types (a number with a string in `gt`, for example) is always `false`, never an error. A policy never crashes a request because a field had an unexpected type; it just doesn't match. This fail-safe behavior is critical for production systems where schema migrations or data inconsistencies could otherwise cause cascading policy failures.
 
 ## Checks
 
@@ -194,6 +245,10 @@ Checks test a single operand:
 
 "Anyone who passes the rest of the policy may update, but only admins may touch `salary`."
 
+The distinction between `exists` and `truthy` is subtle but important. `exists` asks "was a value given?" — `false` and `0` **exist** but aren't **truthy**. `truthy` asks "is this switched on?" — `false` and `0` are falsy. `empty` is the opposite of `truthy`: an empty list, empty string, or zero is "empty." Use `exists` to ask "was this field sent?", `truthy` to ask "is this on?", and `empty` to ask "is this empty or absent?"
+
+The `exists` check is also useful for protecting individual fields during updates. `{"not": {"exists": "$input.salary"}}` means "the salary field is not being changed," which is a precise way to say "anyone can update this record except they can't change the salary." Combined with other conditions in an `all`, this gives you fine-grained control over which fields may be modified by whom.
+
 ## Shorthands
 
 Shorthands are single-key conditions for the rules everyone writes:
@@ -210,6 +265,10 @@ Shorthands are single-key conditions for the rules everyone writes:
 ```
 
 Each expands to ordinary comparisons before evaluation, so they combine freely with everything else. [Shorthands reference →](/policies/shorthands)
+
+The expansion happens at evaluation time, not storage time. What's stored (and shown in Studio's JSON tab) is always the short form. When the engine encounters a shorthand during evaluation, it calls `_shorthand(op, arg, context)` to expand it into the full condition. For example, `{"role": ["admin", "principal"]}` expands to `{"any": [{"contains": ["$auth.roles", "admin"]}, {"contains": ["$auth.roles", "principal"]}]}`. The expansion is recursive — if the expanded condition contains other shorthands, those are expanded too.
+
+The `SHORTHANDS` set in the engine defines the eight shorthands: `authenticated`, `role`, `permission`, `owner`, `service`, `kind`, `scope`, and `aal`. Each has a corresponding entry in the `_shorthand` function that returns the condition it stands for. The `owner` shorthand is special because it always includes `{"authenticated": true}` in its expansion, ensuring that anonymous callers can't match an ownership check even when the record's owner field is `null`.
 
 ## Evaluation, step by step
 
@@ -230,9 +289,13 @@ Take this condition and a guardian reading a report card:
 | 1 | `role` expands to `any(contains($auth.roles, "admin"), …)` | the guardian has `["guardian"]` → **false** |
 | 2 | `any` continues to the next branch | |
 | 3 | `eq($record.published, true)` | the card is published → **true** |
-| 4 | `contains($record.guardian_user_ids, "8")` | `["8"]` contains `"8"` → **true** |
+| 4 | `contains($record.guardian_user_ids, "$auth.user_id")` | `["8"]` contains `"8"` → **true** |
 | 5 | `all` of steps 3 and 4 | **true** |
 | 6 | `any` of step 1 and step 5 | **true** → allowed |
+
+Evaluation is recursive and depth-first. The `evaluate` function dispatches on the top-level key of the condition object. For `all`, it calls `every` on the children. For `any`, it calls `some`. For `not`, it inverts the child's evaluation. For comparison operators, it resolves both operands and calls `_compare`. For shorthands, it expands and recurses. For checks, it resolves the operand and applies the check logic.
+
+The `evaluate` function is synchronous — it doesn't perform any I/O, doesn't call databases, and doesn't make network requests. This is by design: conditions must be evaluable without side effects. Python policies are the escape hatch for rules that need I/O, and they're evaluated separately with their own async execution path.
 
 ## Writing conditions people can read
 
@@ -252,6 +315,15 @@ Take this condition and a guardian reading a report card:
   <Accordion title="Describe every policy">
     The `description` shows in Studio and in pickers. Write it in the language of the business: *Staff always; the student and guardians once the report is published.*
   </Accordion>
+  <Accordion title="Use groups for readability, not just logic">
+    Even when a single `all` would suffice, breaking a condition into named groups makes it easier to review and maintain. A condition that reads like a sentence is a condition that won't be misunderstood six months from now.
+  </Accordion>
+  <Accordion title="Order conditions from cheapest to most expensive">
+    Within an `all`, the order matters for performance because evaluation short-circuits. Put role checks and authentication checks before record-dependent comparisons, because they're decided without consulting the database. Within an `any`, put the most likely-to-succeed branch first.
+  </Accordion>
+  <Accordion title="Use `not` for exclusions, not `all` with negated conditions">
+    `{"not": {"eq": ["$record.status", "archived"]}}` is more readable than `{"all": [{...}, {"not": {"eq": ["$record.status", "archived"]}}]}`. Reserve `all` for when you genuinely need multiple conditions to hold simultaneously.
+  </Accordion>
 </AccordionGroup>
 
 ## Validation errors you might see
@@ -266,7 +338,7 @@ Conditions are checked when a policy (or any definition carrying a condition) is
 | `condition.matches: invalid pattern: …` | A regular expression that doesn't compile | Fix the regex; escape backslashes in JSON |
 | `condition: unknown operator 'equals'` | A misspelled operator or shorthand | See [operators](/policies/operators) and [shorthands](/policies/shorthands) |
 
-Paths like `condition.all[1].eq` point at the second item of the top-level `all`, so you can find the problem even in large conditions.
+Paths like `condition.all[1].eq` point at the second item of the top-level `all`, so you can find the problem even in large conditions. The validation function walks the entire tree recursively, checking every node. For `matches` patterns, it calls `re.compile` to verify the pattern is a valid regular expression before saving. This catches invalid regexes at save time, not when a request triggers a policy evaluation that would raise an exception at runtime.
 
 ## From requirements to conditions
 
@@ -373,6 +445,18 @@ The hardest part of writing policies is translating a sentence from a product sp
   </Step>
 </Steps>
 
+For automated testing, the `evaluate` function is available as a pure function, which means you can test conditions without any server infrastructure:
+
+```python
+from pawabase_kit.policies import evaluate
+
+condition = {"any": [{"role": "admin"}, {"eq": ["$record.status", "published"]}]}
+context = {"auth": {"roles": ["admin"]}, "record": {"status": "draft"}}
+assert evaluate(condition, context) is True
+```
+
+This is the most direct way to test a condition: feed it a context and verify the result. You don't need the policy engine, the database, or the network. For integration testing, call the endpoint as different users and verify the HTTP status codes.
+
 ## Grammar summary
 
 ```text
@@ -380,11 +464,11 @@ condition   := true | false | group | comparison | check | shorthand
 group       := {"all": [condition*]} | {"any": [condition*]} | {"not": condition}
 comparison  := {op: [operand, operand]}
 op          := eq | ne | gt | gte | lt | lte | in | not_in | contains
-             | starts_with | ends_with | matches
+              | starts_with | ends_with | matches
 check       := {"exists" | "truthy" | "empty": operand}
 shorthand   := {"authenticated": bool} | {"role": str | [str]} | {"permission": str | [str]}
-             | {"owner": str | true} | {"service": bool} | {"kind": str}
-             | {"scope": str} | {"aal": str}
+              | {"owner": str | true} | {"service": bool} | {"kind": str}
+              | {"scope": str} | {"aal": str}
 operand     := "$path" | "$$literal" | string | number | boolean | null | [operand*]
 path        := segment ("." segment)*        e.g. $auth.roles.0, $record.address.city
 ```
@@ -397,3 +481,102 @@ path        := segment ("." segment)*        e.g. $auth.roles.0, $record.address
   <Card title="Shorthands" icon="zap" href="/policies/shorthands">What each shorthand expands to.</Card>
   <Card title="Recipes" icon="chef-hat" href="/policies/recipes">Conditions for real situations.</Card>
 </CardGroup>
+
+## Advanced condition patterns
+
+Beyond the basic forms and examples covered above, there are several patterns that experienced policy authors use to handle complex authorization scenarios. These patterns represent the frontier of what the condition language can express.
+
+### Multi-level nesting for complex hierarchies
+
+When your authorization model has multiple levels of hierarchy, the condition language supports arbitrarily deep nesting. Consider a university system where access depends on the caller's role, their department, the course, and the term:
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [
+    { "eq": ["$record.institution", "$auth.claims.app.institution_id"] },
+    { "any": [
+      { "all": [ { "eq": ["$record.course.department", "$auth.claims.app.department_id"] }, { "role": "instructor" } ] },
+      { "all": [ { "eq": ["$record.course.department", "$auth.claims.app.department_id"] }, { "role": "ta" }, { "eq": ["$record.term", "$auth.claims.app.current_term"] } ] }
+    ] }
+  ] }
+] }
+```
+
+This pattern uses `any` at the top level for role-based access, `all` for the institution check, and nested `any`/`all` for the department and term checks. The `partial` evaluation handles this correctly: the `admin` branch decides immediately, the institution check is decided at plan time (it compares `$record.institution` with `$auth.claims.app.institution_id`, which is known), and the inner branches are resolved for each caller. For staff in the right department and term, the inner conditions may also be decided at plan time. For everyone else, a residual remains.
+
+The key insight is that the deeper you nest, the more opportunities the planner has to short-circuit. Each `any` that resolves to `true` short-circuits its parent `all`. Each `all` that resolves to `false` short-circuits its parent `any`. The planner exploits this aggressively to minimize the residual condition.
+
+### Conditional logic with `not` and `any`
+
+Some authorization scenarios require "unless" logic that's difficult to express with `all` alone. The pattern `{"any": [{"role": "admin"}, {"all": [condition, {"not": {exception}}]}}` is the standard way to express "admins always, or everyone else if X but not Y":
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [
+    { "eq": ["$record.status", "draft"] },
+    { "not": { "eq": ["$input.status", "published"] } }
+  ] }
+] }
+```
+
+This is the pattern used in the blog example for `editable_post`. The `not` inverts the exception condition, and the `all` requires both the main condition and the negated exception.
+
+### Using `$input` for transition rules
+
+The `$input` variable is only present on `create` and `update` operations, and it represents the submitted body. On `create`, `$input` and `$record` contain the same data (after the owner field is set). On `update`, `$record` is the row before the change and `$input` is the partial patch.
+
+This distinction enables powerful transition rules:
+
+```json
+{ "all": [
+  { "owner": "author_id" },
+  { "eq": ["$record.status", "draft"] },
+  { "not": { "exists": "$input.status" } }
+] }
+```
+
+"Authors can edit their own drafts, but only if they're not trying to change the status." The `not { "exists": "$input.status" }` checks that the status field is not being modified in this update. If the client sends `{"status": "published"}`, `exists` returns `true`, `not` makes it `false`, and the entire `all` is `false`.
+
+You can combine multiple `$input` checks to protect multiple fields:
+
+```json
+{ "all": [
+  { "not": { "exists": "$input.amount" } },
+  { "not": { "exists": "$input.student_id" } },
+  { "not": { "exists": "$input.author_id" } }
+] }
+```
+
+"Nobody may change the amount, student, or author fields." Each `not { "exists": ... }` checks that a specific field is absent from the patch. If the client sends a patch that includes any of those fields, the condition fails.
+
+### Combining `in` with `$auth` paths for set membership
+
+When the set of allowed values is stored in the caller's token, `in` with `$auth` paths is a powerful pattern:
+
+```json
+{ "in": ["$auth.claims.app.department_id", "$record.allowed_departments"] }
+```
+
+This checks whether the caller's department ID is in the record's list of allowed departments. The right side is a path to a list on the record, and the left side is a path to the caller's department. This pattern pushes down into SQL if the record path is single-level and the auth path is known — but in this case, `$record.allowed_departments` is a list comparison, so it likely remains a residual.
+
+### Time-based conditions with maintained flags
+
+Because `$now` is a datetime object and record datetimes are ISO strings, direct time comparisons in policies are unreliable. The standard workaround is to maintain a boolean flag:
+
+```json
+{ "eq": ["$record.released", true] }
+```
+
+A scheduled flow updates `released` to `true` at the appropriate time. The policy checks the flag instead of the datetime. This pattern works because the flag is a simple boolean that the planner can evaluate at plan time, making it fully pushdown-compatible.
+
+For more complex time windows, the pattern extends: maintain multiple flags (`draft`, `published`, `archived`) and let the flow manage the state transitions. The policy then checks these flags rather than computing time arithmetic.
+
+### Error handling in conditions
+
+The condition language is designed to never raise errors. Every comparison that would be a type error returns `false` instead. Every missing path resolves to `null`. Every malformed condition is caught by validation before storage. This means that a policy can never crash a request due to a malformed condition or unexpected data types.
+
+However, there is one edge case where a condition might not behave as expected: when a field name is misspelled in the condition. `$record.ownr_id` instead of `$record.owner_id` resolves to `null`, and `eq(null, "$auth.user_id")` is `false`. This means the condition always fails, which could deny everyone. The validation step catches syntax errors but not semantic errors like misspelled field names. The only way to catch these is through testing — specifically, the role-by-role checks recommended in the testing section above.
+
+The `exists` check is the most reliable way to verify that a field exists in the context: `{"exists": "$record.ownr_id"}` returns `false` for a misspelled field, which could be used as a sanity check. In practice, however, the best defense is a comprehensive test suite that exercises every condition with realistic data.

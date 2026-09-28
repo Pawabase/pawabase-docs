@@ -6,6 +6,8 @@ icon: "list-tree"
 
 A policy is only as good as the facts it can see. This page documents the **evaluation context**: every path, its type, where the value comes from, and which entry points provide it.
 
+The context is the single most important concept to understand when writing policies. Every path in a condition resolves against the context, and the context varies depending on the entry point. A resource `get` has a `record`; a custom route doesn't. Storage has `$object`; subscriptions have `$event`. Understanding exactly what's available where is essential for writing correct conditions.
+
 ## The common context
 
 Every HTTP entry point builds this base context:
@@ -75,12 +77,20 @@ For an anonymous caller, `auth` is:
 Token values are a **snapshot**. If you change a user's roles, their existing access token keeps the old roles until it's refreshed (by default within 15 minutes). For immediate effect, revoke their sessions from **Users & auth**. See [tokens and sessions](/auth/tokens-and-sessions).
 </Note>
 
+The `auth` object is built by the `policy_auth` function in `pawabase_kit/principal.py`. When `ctx.user` is a `Principal` (a verified authenticated user), `policy_auth` calls `user.as_policy_context()`, which extracts all the relevant fields from the user's verified token claims. When there's no authenticated user, it returns the `ANONYMOUS_POLICY_CONTEXT` constant, which has all fields set to their anonymous defaults.
+
+The distinction between `claims.app` and `claims.meta` is critical for security. `app_metadata` is set only by administrators through Studio or the admin API, so it's a trusted source of authorization data. `user_metadata` can be changed by the user themselves through the `PATCH /auth/v1/user` endpoint, so it's not a reliable authorization source. A policy that reads `$auth.claims.meta.role` could be bypassed by a user changing their own metadata. Always use `claims.app` for authorization decisions.
+
+The `auth.org` and `auth.org_role` fields are populated when the token is issued for an organization. Organizations in Akountz are multi-tenant units: a user can be a member of multiple organizations, and each organization has its own roles (owner, admin, member, viewer). When a token is minted for a specific organization, `auth.org` is set to that organization's slug, and `auth.org_role` reflects the user's role within it. This enables the common pattern of `{"eq": ["$record.org_id", "$auth.org"]}` for tenant isolation.
+
 ### `credential`: the API key
 
 <ResponseField name="credential.role" type="string">`publishable` or `secret` (or the caller kind for internal calls).</ResponseField>
 <ResponseField name="credential.is_service" type="boolean">`true` for secret keys and operators. When true, policies are bypassed.</ResponseField>
 <ResponseField name="credential.scopes" type="string[]">The key's scopes; empty means unrestricted.</ResponseField>
 <ResponseField name="credential.key_id" type="string | null">The key's id, handy for per-integration rules.</ResponseField>
+
+The `credential` object is built by the `credential_context` function in `pawabase_kit/policies/gate.py`. It reads the platform context (set by the gateway's API key resolution) and the user object to construct the credential context. For service credentials, `is_service` is `true` regardless of the user object. This is the field the engine checks first in `PolicyEngine.check`: if `credential.is_service` is `true`, the policy is bypassed immediately.
 
 ### `request`: the HTTP request
 
@@ -90,9 +100,17 @@ Token values are a **snapshot**. If you change a user's roles, their existing ac
 <ResponseField name="request.params" type="object">Path parameters, e.g. `{"id": "44"}`. Values are strings.</ResponseField>
 <ResponseField name="request.query" type="object">Query-string parameters, e.g. `{"expand": "student"}`.</ResponseField>
 
+The `request` object is built by the `request_context` function in `pawabase_kit/policies/gate.py`. It reads from the Sillo request context (`ctx.scope`, `ctx.path_params`, `ctx.query_params`, `ctx.client.host`). Path parameters are always strings. Query parameters are also strings (or lists for repeated parameters).
+
+The `request.ip` field is the address the gateway saw after forwarding headers. It's not directly trusted — configure your proxy to set forwarding headers correctly, and treat IP-based rules as defence in depth, never as the only control.
+
 ### `project`, `env`, `now`
 
 `$project` and `$env` are the project reference and environment name. `$now` is the current time (timezone-aware UTC).
+
+`$project` and `$env` come from the `PlatformContext` resolved by the gateway from the API key. Every environment has a unique `project:env` combination, and tokens are signed with per-environment derived keys. This means a token minted for `acme/development` can't be used against `acme/production` — the `project` and `env` fields in the context will be different.
+
+`$now` is implemented as a special case in the `lookup` function: when the path is literally `"now"`, it returns `datetime.now(UTC)` rather than looking up the path in the context. This is the only context path that returns a different type at runtime.
 
 ## Resource operations
 
@@ -117,6 +135,10 @@ On create, `$record` and `$input` are the same data. The owner field has already
 
 "Teachers may create tests, assignments and classwork, but not exams."
 
+The owner field is set by the server before the policy runs. This means that on create, `$record.owner_id` (or whatever the `owner_field` is) is already populated with the caller's user ID. The policy sees the complete new row, including the server-assigned fields.
+
+On create, the `input` validation has already run, so the policy sees only validated data. Fields that failed validation are not present in `$input`. Unknown fields are rejected before the policy runs. This means a policy can safely assume that every field in `$input` passed validation.
+
 ### `update`: checking a transition
 
 `$record` is the row **before** the change and `$input` is the partial patch. That lets a policy reason about the transition:
@@ -135,11 +157,15 @@ On create, `$record` and `$input` are the same data. The owner field has already
 
 "Admins can change anything. Authors can edit their own drafts, can't reassign them, and can't publish them."
 
-<Tip>
-`$input` contains **only the fields being changed**. `{"exists": "$input.status"}` asks "is the status being changed?", which is a precise way to protect individual fields.
-</Tip>
+The `$input` object contains **only the fields being changed**. If a client sends a full object but only some fields have changed, the patch contains only those fields. This is because Pawabase's update mechanism merges the incoming data with the existing row, and `$input` reflects the delta. The `exists` check on `$input` fields is the precise way to detect whether a specific field is being changed: `{"exists": "$input.salary"}` is true only if the client sent a `salary` field in the patch.
 
-## Custom routes, functions and flow triggers
+On updates, the owner field is dropped from the patch automatically. Even if the client sends `owner_id` in the request body, it's removed before the policy sees the data. This prevents ownership transfer through the API. The policy can safely assume that `$input` doesn't contain the owner field on update operations.
+
+<Warning>
+On `create`, the owner field appears in both `$record` and `$input`. On `update`, it appears in `$record` but is removed from `$input`. This asymmetry is intentional and must be accounted for when writing conditions that reference the owner field in `$input`.
+</Warning>
+
+### Custom routes, functions and flow triggers
 
 | Entry point | `$record` | `$input` | Notes |
 | --- | --- | --- | --- |
@@ -153,6 +179,10 @@ Because routes have no record, a route policy decides *who may call*. Record-lev
 // route POST /report-cards/{id}/publish
 "policy": "report_publisher"
 ```
+
+For custom routes, the `$request.params` object contains all path parameters as strings. So `{"eq": ["$request.params.id", "42"]}` works (ids are normalised) but `{"gt": ["$request.params.id", "10"]}` does not (string comparison).
+
+For functions called via `/functions/v1/<name>`, the `input` is the request body validated against the function's `input_fields` schema. If the function has no `input_fields`, the entire body is passed as `input`.
 
 ## Storage
 
@@ -174,6 +204,8 @@ Bucket policies are evaluated for every object operation with a **different, sma
 
 There's no `request`, `record` or `input` for storage decisions. Bucket policies must be **JSON conditions** (named or inline); Python policies aren't accepted for buckets.
 
+The storage context is built by `PolicyStorage` in `pawabase_kit/policies/storage.py`. The `allows` method constructs the context with `auth`, `credential`, `project`, `env`, and `object`. The `object` section includes the full key, the segments (split on `/`), and the action being performed. The action value comes from the Sillo storage operation: `"read"`, `"list"`, `"stat"` for read policies; `"write"`, `"delete"` for write policies.
+
 Common layouts:
 
 ```json
@@ -182,11 +214,21 @@ Common layouts:
 { "all": [ { "role": "teacher" }, { "eq": ["$object.segments.0", "coursework"] } ] }
 ```
 
+The `segments` array is particularly useful because it allows path-based policies without regex. `$object.segments.0` is the first segment, `$object.segments[1]` is the second, and so on. For a key `"7/avatar.png"`, `segments` is `["7", "avatar.png"]`. This makes it easy to write policies like "users can only access their own folder": `{"eq": ["$object.segments.0", "$auth.user_id"]}`.
+
+Storage policies see the `credential.is_service` field. For service credentials, the `PolicyStorage.allows` method returns `true` immediately (the service bypass applies). This means that even though storage policies are JSON conditions, the service bypass still works — it's handled before the condition is evaluated.
+
 [Storage access →](/storage/access)
 
 ## Realtime channels
 
 Channel rules have `subscribe` and `publish` policies, evaluated when a client subscribes or publishes. They see `auth` and `credential`. Channel **patterns** can include templates such as `user:{{ auth.user_id }}`, which give every user a private channel without writing a condition at all. [Channel rules →](/realtime/channel-rules)
+
+The realtime context is simpler than the HTTP context because realtime connections are stateful and the channel pattern already determines much of the access. The `subscribe` policy checks whether the caller may subscribe to the channel. The `publish` policy checks whether the caller may publish to the channel. Both use the standard `auth` and `credential` fields.
+
+For templated channel patterns like `user:{{ auth.user_id }}`, the template is resolved at subscription time and the pattern matching itself acts as the policy — no explicit condition is needed. This is a convenient alternative to writing `{"eq": ["user:{{ auth.user_id }}", "$channel"]}` or similar.
+
+The `default_policy` for an environment applies to channels that don't have an explicit rule matching. By default, it's `authenticated`, meaning only signed-in users can subscribe to or publish to unmatched channels. This default is enforced by the Angula service.
 
 ## Event subscriptions
 
@@ -205,6 +247,10 @@ A subscription's optional `condition` filters **events**, not callers. Its conte
 ```
 
 "Only when an invoice becomes paid."
+
+Event subscription conditions are the only context that uses `$event` instead of the standard fields. The `event` object contains the event's metadata (id, name, project, env, source, actor, occurred_at, request_id) and the `payload`, which includes the resource name, the change type, and the full record. This means you can filter events based on the record's state, the event name, or any other metadata.
+
+Event conditions are evaluated when the event is published, before the subscription's target (flow, function, realtime channel, webhook) is invoked. A condition that returns `false` means the subscription is not triggered for this event. The condition is evaluated by the event processor, not by the policy engine, but it uses the same condition syntax and evaluation semantics.
 
 ## Inside flows: `policy.check`
 
@@ -230,6 +276,10 @@ It follows the `allowed` or `denied` handle. [Platform blocks →](/flows/platfo
 Flows triggered by events, schedules or inbound hooks don't have a signed-in user, so `auth` is anonymous or service-level there. `policy.check` is most useful in flows triggered by HTTP routes, where `auth` is the caller.
 </Warning>
 
+The `policy.check` block is the only way to do record-level access control inside a flow. A flow triggered by an HTTP route receives the caller's auth context. A flow triggered by an event receives the event's actor context (which may be anonymous if the event was emitted by a system process). A flow triggered by a schedule receives a service-level context. This means that a `policy.check` in a scheduled flow would evaluate the policy against a service credential, which bypasses policies — so the `policy.check` would always allow. To guard a scheduled flow's data access, use explicit checks inside the flow logic instead.
+
+The `record` config in `policy.check` is a template that's resolved from the flow's state. You can reference any previous block's output: `{{ steps.load_user.output }}`, `{{ vars.record }}`, etc. The `input` config works similarly. The resolved values are passed as the `record` and `input` fields of the evaluation context.
+
 ## Putting data where policies can see it
 
 Policies can't query the database. When a rule needs facts that aren't in the context, bring them in:
@@ -241,6 +291,16 @@ Policies can't query the database. When a rule needs facts that aren't in the co
 | "The user's department" | Set it in the user's `app_metadata` (admin-only), then read `$auth.claims.app.department_id` |
 | "The assessment's max score" | Check in a flow after loading the assessment |
 | Anything needing a lookup | A [Python policy](/policies/python-policies) |
+
+This is the most important design principle for policy systems: **policies read; flows maintain.** Policies can only read from the context, which is built from the token, the API key, the request, and the database row. They can't make API calls, run queries, or compute values. Any fact a policy needs must be present in the context at evaluation time.
+
+This means your data model needs to be designed with policies in mind. If a policy needs to check "is this user a member of the record's organization?", the organization slug must be on the record (`org_id`), and the token must carry the organization (`auth.org`). You can't compute this at policy evaluation time; you need to maintain it as part of your data model.
+
+The techniques for getting data into the context fall into three categories:
+
+1. **Denormalization**: Copy data from related records onto the record being protected. `guardian_user_ids` on a report card, `org_id` on a resource. This is the most common and most performant approach.
+2. **Token claims**: Put data in the user's `app_metadata` (set by administrators), which appears as `$auth.claims.app`. This is appropriate for user-level attributes like department, family ID, or tenant.
+3. **Python policies**: For facts that can't be pre-computed, use a Python policy that can make API calls. This is always a residual on lists, so use it sparingly.
 
 ## Full example contexts
 
@@ -322,6 +382,15 @@ Seeing complete contexts makes it much easier to write conditions against them. 
   <Accordion title="$auth.org is null (org-scoped tokens)">
     The token wasn't issued for an organization. See [organizations](/auth/organizations) for switching the active org.
   </Accordion>
+  <Accordion title="$object.segments is empty">
+    The object key has no `/` in it, so `segments` has one element (the full key). For a key like `"avatar.png"`, `segments` is `["avatar.png"]` and `$object.segments.0` is `"avatar.png"`, not a folder.
+  </Accordion>
+  <Accordion title="$now is a datetime object, not a string">
+    `$now` returns `datetime.now(UTC)`. Comparing it with a datetime field stored as an ISO string fails. Use a maintained boolean flag instead.
+  </Accordion>
+  <Accordion title="$credential.scopes is empty">
+    An empty scope list means the key is unrestricted. The `scope` shorthand returns `false` for unrestricted keys because it asks whether a specific scope was granted, not whether the key has any scopes.
+  </Accordion>
 </AccordionGroup>
 
 ## FAQ
@@ -335,6 +404,15 @@ Seeing complete contexts makes it much easier to write conditions against them. 
   </Accordion>
   <Accordion title="Why don't storage policies get $request?">
     Storage decisions are made per object key inside Sillo's storage layer, which gets the key, the action and the caller, not the HTTP request. Encode what you need into the key layout (`<user_id>/…`, `public/…`).
+  </Accordion>
+  <Accordion title="Can a policy access the request body on a list?">
+    No. On `list`, `$input` is always `null` because there's no request body. Filters are applied through the query string (`filter[...]`), which is in `$request.query`, not `$input`.
+  </Accordion>
+  <Accordion title="How does the context differ between a route and a resource operation?">
+    A route has `$request` and `$input` but no `$record`. A resource operation has `$record` (the loaded row) and `$input` (the submitted data). Both have `$auth`, `$credential`, `$request`, `$project`, `$env`, and `$now`.
+  </Accordion>
+  <Accordion title="What happens when a field in the record is a JSON column?">
+    JSON columns are stored as serialized JSON and deserialized into Python dicts when loaded. So `$record.metadata.key` works if `metadata` is a JSON column containing `{"key": "value"}`. However, such nested paths can't be pushed down into SQL.
   </Accordion>
 </AccordionGroup>
 
@@ -360,7 +438,16 @@ The context is fixed, but **what you put in tokens and records** is up to you. G
   </Step>
 </Steps>
 
-The general pattern: **policies read; flows maintain.** Put the facts policies need where policies can read them, and let event-driven flows keep them correct.
+The general pattern: **policies read; flows maintain.** Put the facts policies need where policies can read them, and let event-driven flows keep them correct. This principle applies to every design decision: if a policy needs to check a fact, that fact must be in the context. If it's not naturally available, denormalize it, put it in the token, or compute it in a flow.
+
+The most common denormalization patterns in production systems are:
+
+1. **Owner fields**: Set by the server on create, dropped from updates. Enables `owner` shorthand with pushdown.
+2. **Organization slugs**: Stored on every record, carried in the token. Enables tenant isolation with `eq` pushdown.
+3. **User ID lists**: Copied from relationships onto the parent record. Enables `contains` checks (but not pushdown on lists).
+4. **Role-based flags**: Maintained booleans derived from the caller's roles. Enables `eq` pushdown for complex role logic.
+
+Each denormalization trades write complexity for read simplicity. The write side (flows, triggers) maintains the data; the read side (policies) can evaluate it efficiently.
 
 ## Quick reference
 
@@ -373,3 +460,13 @@ $record.<field>  $input.<field>  $project  $env  $now
 $object.key  $object.segments.<n>  $object.action           (storage)
 $event.name  $event.payload.<…>  $event.actor              (subscriptions)
 ```
+
+## Context construction in the engine
+
+The `build_policy_context` function in `pawabase_kit/policies/gate.py` constructs the evaluation context for every policy check. It assembles the `auth`, `credential`, `request`, `project`, `env`, `record`, and `input` fields from the Sillo request context, the resolved platform context, and the loaded record. The `policy_auth` function from `pawabase_kit/principal.py` builds the `auth` object, and `credential_context` builds the `credential` object.
+
+The context is built fresh for every policy evaluation. This means it always reflects the current state of the request — the record is the latest version from the database, the request parameters are the current ones, and the auth claims are the current token. There's no caching of the context.
+
+For list requests, the context is built once for the plan phase (where `$record` is a placeholder), and then the residual check receives a context with `$record` set to the actual row. The `row_allowed` method in `PolicyEngine` handles this: it takes the plan and a context with `record` set, and evaluates the residual.
+
+The `extra` parameter in `build_policy_context` allows the caller to add additional fields to the context. This is used by `policy.check` blocks inside flows, where the block's `record` and `input` config values are passed as `record` and `input` in the context. It's also used internally for any context that needs to be augmented beyond the standard fields.

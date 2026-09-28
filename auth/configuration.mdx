@@ -28,10 +28,14 @@ Every field lives in an environment's `auth` object, alongside the project's own
 | `mfa_enabled` | boolean | `true` | Whether TOTP MFA is available and enforced when a user has enrolled a factor. |
 | `site_url` | string | `""` | The application's public URL, used to build redirect targets and magic-link/email-callback URLs. |
 | `redirect_urls` | list of strings | `[]` | Additional allowed origins for `redirect_to` on sign-in, sign-up and recovery requests. |
-| `providers` | object | `{}` | OAuth/OIDC provider configuration — see [Social login →](#social-login). |
+| `providers` | object | `{}` | OAuth/OIDC provider configuration — see [Social login →](/auth/social-login). |
 | `default_roles` | list of strings | `[]` | Roles assigned to every new account automatically, from the environment's RBAC. |
 | `emails` | object | `{}` | Per-message template overrides for verify, recovery, magic, invite and email_change — see below. |
 | `public_url` | string | `""` | The base URL Akountz uses for link pages and callbacks when `site_url` is not set. |
+| `config_ttl` | integer | `10` | How long (in seconds) Akountz caches the auth configuration before re-fetching from the API. |
+| `lockout_threshold` | integer | `10` | Failed sign-in attempts before an account is locked. |
+| `lockout_minutes` | integer | `15` | Duration (in minutes) an account stays locked after reaching the threshold. |
+| `state_secret` | string | — | Secret used to sign OAuth state parameters, derived per project/environment by `akountz.state_secret()`. |
 
 <Note>
 The `providers`, `default_roles` and `emails` fields have rich sub-structures that deserve their own sections. They are covered in [Social login →](/auth/social-login), [Organizations →](/auth/organizations) and [Email verification →](/auth/email-verification) respectively.
@@ -368,3 +372,162 @@ The `GET /auth/v1/settings` endpoint returns the effective configuration for the
 ```
 
 This endpoint is useful for frontends that need to know what sign-in methods are available before rendering a sign-in form — for example, hiding the magic-link button when `magic_link_enabled` is `false`, or showing the MFA enrollment prompt when the user has not yet enrolled a factor.
+
+## Rate limiting configuration
+
+Every authentication endpoint is wrapped with rate limiting configured through the `rate_limit_middleware` calls in `routes/auth.py` and `routes/security.py`:
+
+| Endpoint | Limit | Window | Middleware key |
+| --- | --- | --- | --- |
+| `POST /auth/v1/token` | 30 requests | 60 seconds | `"akz:auth"` |
+| `POST /auth/v1/verify/request`, `/recover`, `/magic-link` | 10 requests | 60 seconds | `"akz:links"` |
+| `POST /auth/v1/mfa/totp/verify`, `/mfa/disable`, `/mfa/recovery-codes` | 10 requests | 60 seconds | `"akz:mfa"` |
+
+These limits are enforced using Redis-backed sliding windows (the `redis_url` from `PlatformSettings`). If Redis is unavailable, the middleware falls back to in-process tracking — which is correct for single-process deployments but does not coordinate across multiple instances.
+
+The limits are hard-coded in the route registrations; there is no environment-level configuration field for them. If your deployment needs different rate limits, modify the `limits` variable in the route registration functions.
+
+## Token lifetimes in depth
+
+The `access_ttl` and `refresh_ttl` are not just passive configuration values — they actively shape the security posture and the client behavior patterns:
+
+### Access token lifetime trade-offs
+
+| TTL | Best for | Risk |
+| --- | --- | --- |
+| 300s (5 min) | Banking, healthcare, high-security | Frequent refresh; user-facing delays if refresh fails |
+| 900s (15 min) | Most web applications | Balanced; the default choice |
+| 3600s (1 hr) | Internal tools, low-risk apps | Larger exposure window if a token leaks |
+| 86400s (24 hr) | Very low-risk, convenience-focused | Token effectively acts like a long-lived session |
+
+The key insight is that the access token's lifetime is the **maximum window of exposure** if a token leaks. A shorter `access_ttl` doesn't prevent theft — it bounds the damage. Combined with refresh token rotation and theft detection, the effective exposure window is always much smaller than `access_ttl` alone suggests, because a legitimate client will have already refreshed before the token expires.
+
+### Refresh token lifetime trade-offs
+
+The refresh token's lifetime determines how long a stolen refresh token remains useful. Since refresh tokens are rotating (each use consumes the old one and issues a new one), a stolen refresh token gives the attacker at most one successful refresh — after that, theft detection kicks in and revokes the entire session family. The `refresh_ttl` therefore bounds the window in which that single successful refresh could occur.
+
+### The interplay between TTLs
+
+The access token lifetime determines how frequently the client must refresh. With a 15-minute access token and a 30-day refresh token, a typical client refreshes roughly 96 times per day per user. Each refresh rotates the refresh token. If a client is inactive for more than `refresh_ttl` seconds, its refresh token expires and the user must sign in again.
+
+## Configuration for multi-tenant environments
+
+When a project serves multiple tenants (organizations), the `auth` configuration applies uniformly across all organizations within the environment. There is no per-organization auth configuration — every organization's users share the same `password_policy`, `mfa_enabled`, `access_ttl`, and other settings.
+
+This means you cannot have one organization with MFA required and another without. If your product needs that distinction, you must implement it at the application layer (e.g., an organization-level setting in your own database, checked in your own middleware before forwarding to Akountz).
+
+## The complete AuthConfig dataclass
+
+For reference, here is the complete structure of the `AuthConfig` dataclass as it exists in `app/environment.py`:
+
+```python
+@dataclass
+class AuthConfig:
+    project: str
+    env: str
+    project_name: str = ""
+    signup_enabled: bool = True
+    require_email_verification: bool = False
+    password_policy: str = "basic"
+    password_min_length: int = 8
+    access_ttl: int = 900
+    refresh_ttl: int = 2592000
+    magic_link_enabled: bool = True
+    mfa_enabled: bool = True
+    site_url: str = ""
+    redirect_urls: list[str] = field(default_factory=list)
+    providers: dict[str, Any] = field(default_factory=dict)
+    default_roles: list[str] = field(default_factory=list)
+    emails: dict[str, Any] = field(default_factory=dict)
+    public_url: str = ""
+    config_ttl: int = 10
+    lockout_threshold: int = 10
+    lockout_minutes: int = 15
+    state_secret: str = ""
+
+    def enabled_providers(self) -> list[str]:
+        return [name for name, cfg in self.providers.items() if cfg.get("enabled", False)]
+
+    def redirect_allowed(self, url: str | None) -> bool: ...
+```
+
+The `from_api` classmethod constructs an `AuthConfig` from the API payload, applying defaults for any fields absent from the response. The `platform_config()` function bypasses the API entirely, constructing the `_platform` config directly.
+
+## Environment-specific considerations
+
+### Development environments
+
+In development, it is common to relax security settings to reduce friction for developers:
+
+- `signup_enabled: true` (default — already permissive)
+- `password_policy: "basic"` (minimum complexity)
+- `require_email_verification: false` (no email round-trip)
+- `magic_link_enabled: true` (convenient for quick testing)
+- `mfa_enabled: false` (don't require MFA during development)
+- `site_url: ""` (accept any redirect during local development)
+
+These are safe because the development environment has its own independent user pool and signing key — nothing done in development can affect production.
+
+### Staging environments
+
+Staging should mirror production as closely as possible, especially for auth-related testing:
+
+- Use the same `password_policy`, `mfa_enabled`, and `require_email_verification` as production.
+- Use test credentials and test email domains that don't send real emails (configure a local mail catcher or set `emails` templates to log instead of send).
+- The staging environment's user pool is completely separate from production, so test accounts in staging don't affect production data.
+
+### Production environments
+
+Production should be as restrictive as your product's risk profile allows:
+
+- Enable `require_email_verification` for any product handling real user data.
+- Use `"strict"` password policy with a minimum length of at least 12.
+- Keep `mfa_enabled: true` and encourage all users to enroll TOTP.
+- Set `site_url` to your production domain and `redirect_urls` to an explicit allow-list.
+- Configure `access_ttl` based on the sensitivity of your data — shorter is generally better.
+- Review `providers` and disable any OAuth providers that aren't in active use.
+
+## Troubleshooting configuration issues
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Changes to `signup_enabled` or `mfa_enabled` don't take effect | The `config_ttl` cache (default 10s) hasn't expired | Wait up to 10 seconds, or restart Akountz to clear the cache |
+| `GET /auth/v1/settings` shows different values than the Studio UI | The `_platform` vs project-level config confusion | Confirm you're using a project API key, not the platform key |
+| Password changes are rejected even though the password looks strong | `password_policy` is `"strict"` and `password_min_length` has been raised | Check `password_min_length` and the `problems` array in the `422` response |
+| `redirect_to` is rejected despite being on your domain | `site_url` is empty, and the redirect URL doesn't match `redirect_urls` | Either set `site_url` to your domain or add the redirect origin to `redirect_urls` |
+| Magic links work but password sign-up doesn't | `signup_enabled` was toggled off | Re-enable `signup_enabled` in the environment auth config |
+| MFA enroll returns `403 MFA is disabled for this project` | The environment's `mfa_enabled` is `false` | Set `mfa_enabled: true` in the environment auth config |
+
+<Note>
+All configuration is read from the environment's `auth` block in the project definition stored in the platform database. There is no `.env` file or configuration file that overrides these values at runtime — everything goes through the Platform API and the `AuthConfig` cache. The only exceptions are the `_platform` environment's hard-coded values and the `PlatformSettings` defaults (development secrets, URLs, etc.) which are set via `PAWABASE_*` environment variables.
+</Note>
+
+## Common mistakes
+
+<AccordionGroup>
+  <Accordion title="Assuming configuration changes are instant">
+    They aren't — Akountz caches the config for `config_ttl` seconds (default 10). Changes take effect within that window. If you need immediate propagation, restart Akountz to clear the cache.
+  </Accordion>
+  <Accordion title="Setting `site_url` to empty in production">
+    An empty `site_url` means every absolute URL is an allowed redirect. This is an open redirect vulnerability waiting to be exploited. Always set `site_url` to your production domain.
+  </Accordion>
+  <Accordion title="Using `basic` password policy in production">
+    `basic` only checks length. It provides no protection against weak passwords. Use `strict` in production with a minimum length of 12.
+  </Accordion>
+  <Accordion title="Not setting `require_email_verification` in production">
+    Without email verification, accounts cannot be recovered through email and the account pool includes unverified addresses that may be typos or disposable emails.
+  </Accordion>
+  <Accordion title="Using the same `redirect_urls` across all environments">
+    Development should have relaxed redirect URLs. Production should have an explicit allow-list. Never share `redirect_urls` between `development` and `production`.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Passwords" icon="lock" href="/auth/passwords">Sign-up, the password grant, policy enforcement, hashing, updating a profile.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">Claims, rotation, theft detection, revocation.</Card>
+  <Card title="Email verification" icon="mail-check" href="/auth/email-verification">The verify flow, templates, resending.</Card>
+  <Card title="Password recovery" icon="key" href="/auth/password-recovery">The reset flow, link TTLs, the keyless recovery page.</Card>
+  <Card title="Magic links" icon="wand-2" href="/auth/magic-links">Passwordless sign-in, account creation on first use.</Card>
+</CardGroup>
