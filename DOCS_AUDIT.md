@@ -1,7 +1,7 @@
 # Pawabase Documentation Audit
 
 Audit-only pass over all 146 pages (~38,500 lines) across 24 sections, cross-checked against
-actual source in `services/{akountz,angula,api,gateway,studio}` and `packages/kit`. No files were
+actual source in `{akountz,angula,api,gateway,studio}/` and `pawabase_kit`. No files were
 rewritten. This report is the input to a subsequent rewrite pass — see per-directory sections for
 file-by-file verdicts, and the cross-cutting patterns below for what to fix first.
 
