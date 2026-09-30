@@ -286,3 +286,227 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
 This pattern is how the [production checklist](/self-hosting/production-checklist) recommends layering production-specific configuration on top of the development default.
+
+## Resource limits per service
+
+The base `docker-compose.yml` does not set CPU or memory limits on any service — every container can use as much of the host's resources as the kernel allows. This is appropriate for a single-service-per-host default, but once several services share a host (which is the default single-host topology), an unbounded worker consuming a burst of CPU-heavy jobs can starve the gateway of CPU it needs to keep serving requests. Add limits via an override file once you have observed real resource usage with `docker stats`:
+
+```yaml
+# docker-compose.override.yml
+services:
+  api:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+  worker:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1g
+  gateway:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+```
+
+<Note>
+Under plain `docker compose up` (not `docker stack deploy`), the `deploy.resources` block is honored for CPU and memory limits as of Compose v2 — you do not need Swarm mode for this to take effect. Verify with `docker inspect <container> --format='{{.HostConfig.Memory}}'` after starting the stack; a nonzero value confirms the limit applied.
+</Note>
+
+Start without limits, observe steady-state and peak resource usage for a week under real traffic, then set limits with headroom above the observed peak — tight limits that trigger OOM kills under normal load are worse than no limits at all.
+
+## Environment variable precedence
+
+Compose resolves environment variables for a container from several layers, and the order matters when values conflict:
+
+1. Variables set directly in the `environment:` block of the service (including anything merged in via a YAML anchor like `<<: *env`) — highest precedence.
+2. Variables loaded from the file referenced by `env_file:` (`.env` in Pawabase's case) — lower precedence than `environment:`.
+3. Variables used only for **substitution** inside `docker-compose.yml` itself (the `${VAR}` syntax) are resolved from the shell environment or the `.env` file in the project directory, which Compose loads automatically for this purpose specifically — this is a separate mechanism from `env_file:` and happens before the compose file is even parsed into service definitions.
+
+This is why `POSTGRES_PASSWORD` behaves the way the Warning above describes: it is consumed at substitution time (layer 3) to build `PAWABASE_DATABASE_URL`, but it is never itself injected into a container's process environment via `environment:` or `env_file:` — nothing in `docker-compose.yml` lists `POSTGRES_PASSWORD` in an `environment:` block for the `api` or `akountz` services (only the `postgres` service receives it directly, to configure the database engine itself).
+
+## Single-server deployment (complete walkthrough)
+
+This is the default topology every other section on this page describes: one host runs every service via `docker compose up -d`. Here is the complete sequence from a bare Docker install to a running platform:
+
+```bash
+# 1. Verify Docker and Compose
+docker --version
+docker compose version
+
+# 2. Clone or copy the Pawabase project directory
+cd /opt/pawabase
+
+# 3. Create and populate .env
+cp .env.example .env
+openssl rand -hex 32   # run four times, once per secret, paste into .env
+nano .env
+
+# 4. Build the image
+docker compose build
+
+# 5. Start the stack
+docker compose up -d
+
+# 6. Watch startup order: postgres and redis become healthy first,
+#    then api, then akountz/angula, then gateway/studio
+docker compose logs -f
+
+# 7. Confirm everything is healthy
+docker compose ps
+```
+
+This is appropriate for development, staging, demos, and production deployments that fit comfortably within a single host's resources (see [Requirements](/self-hosting/requirements) for sizing guidance). Its main limitation is a single point of failure: if the host goes down, every Pawabase service goes down with it, including Postgres and Redis.
+
+## Single-server with an external managed Postgres
+
+A common middle ground before moving to a full multi-server topology: keep every application service on one host, but point at a managed Postgres instance instead of the bundled container. This removes Postgres's resource footprint and operational burden from the host while keeping everything else simple.
+
+```yaml
+# docker-compose.override.yml
+services:
+  postgres:
+    # Disable the bundled Postgres entirely by scaling it to zero replicas,
+    # or remove the service block altogether if you never need it locally.
+    deploy:
+      replicas: 0
+
+  api:
+    environment:
+      PAWABASE_DATABASE_URL: postgres://pawabase:${MANAGED_PG_PASSWORD}@managed-db.example.com:5432/pawabase?sslmode=require
+    depends_on: {}   # remove the postgres dependency since it no longer runs here
+
+  akountz:
+    environment:
+      PAWABASE_DATABASE_URL: postgres://pawabase:${MANAGED_PG_PASSWORD}@managed-db.example.com:5432/akountz?sslmode=require
+    depends_on:
+      redis: { condition: service_healthy }
+```
+
+<Warning>
+Overriding `environment:` on a service that uses a YAML anchor merge (`<<: *api-env` or `<<: *env`) in the base file does not merge at the key level in Compose's override semantics for the `environment` mapping form used here — Compose merges override `environment` entries on top of the base service's resolved environment map, so individual keys like `PAWABASE_DATABASE_URL` are replaced while the rest of the inherited environment (`PAWABASE_REDIS_URL`, `PAWABASE_API_URL`, and so on) is preserved. Verify the final resolved configuration with `docker compose config` before starting the stack, since silently losing an inherited variable is a common override mistake.
+</Warning>
+
+You still need to create the `akountz` database yourself on the managed instance (the `docker/postgres/init.sql` script only runs against the bundled container's first-boot initialization), and you need network connectivity from the host to the managed database (a VPC peering connection, a VPN, or an allow-listed IP with `sslmode=require`, never a database open to the public internet without TLS).
+
+## Multi-server deployment behind a load balancer
+
+For a topology where multiple hosts each run a full application tier behind a load balancer (see [Requirements](/self-hosting/requirements) and [Scaling](/self-hosting/scaling) for when this becomes necessary), the compose file itself does not change much — what changes is that the Docker Compose internal DNS names (`api`, `akountz`, `angula`, `gateway`, `studio`) only resolve *within a single Compose project's network on a single host*. Across hosts, you must replace these with real, reachable addresses.
+
+```yaml
+# docker-compose.override.yml on each application host
+services:
+  api:
+    environment:
+      PAWABASE_REDIS_URL: redis://redis.internal.example.com:6379/0
+      PAWABASE_DATABASE_URL: postgres://pawabase:${POSTGRES_PASSWORD}@postgres.internal.example.com:5432/pawabase
+  akountz:
+    environment:
+      PAWABASE_REDIS_URL: redis://redis.internal.example.com:6379/0
+      PAWABASE_DATABASE_URL: postgres://pawabase:${POSTGRES_PASSWORD}@postgres.internal.example.com:5432/akountz
+  gateway:
+    environment:
+      PAWABASE_API_URL: http://api.internal.example.com:8001
+      PAWABASE_AKOUNTZ_URL: http://akountz.internal.example.com:8002
+      PAWABASE_ANGULA_URL: http://angula.internal.example.com:8003
+```
+
+Each application host still runs its own local `postgres` service definition disabled (replicas: 0, as above) or removed, since the data tier now lives on dedicated hosts reachable over the internal network. The load balancer in front sits above all application hosts and only needs to reach each host's gateway port (`PAWABASE_GATEWAY_PORT`, default 8080) and, if Studio should be reachable through the same balancer, the Studio port (`PAWABASE_STUDIO_PORT`, default 8090).
+
+<Note>
+This pattern requires a private network that spans your hosts — a cloud VPC, a WireGuard mesh, or a data-center private network. Never expose `PAWABASE_REDIS_URL` or `PAWABASE_DATABASE_URL` targets over the public internet without a VPN or TLS, since Redis has no authentication configured by default in the bundled setup and Postgres's password alone is not a substitute for network isolation.
+</Note>
+
+## Command reference
+
+A working set of `docker compose` commands for day-to-day operation of the stack:
+
+```bash
+# Start everything in the background
+docker compose up -d
+
+# Start only specific services (and their dependencies)
+docker compose up -d gateway studio
+
+# Stop everything without removing containers
+docker compose stop
+
+# Stop and remove containers (keeps volumes)
+docker compose down
+
+# Stop and remove containers and volumes (destroys data — see Backups first)
+docker compose down -v
+
+# Tail logs for every service
+docker compose logs -f
+
+# Tail logs for one service
+docker compose logs -f worker
+
+# Show the last 100 lines without following
+docker compose logs --tail=100 api
+
+# Open a shell inside a running container
+docker compose exec api sh
+
+# Run a one-off command in a new container (does not affect the running one)
+docker compose run --rm api migrate
+
+# Live resource usage per container
+docker stats
+
+# Container status and health
+docker compose ps
+
+# Scale a stateless service to multiple replicas
+docker compose up -d --scale worker=3
+
+# Rebuild the image after a source change, then recreate affected containers
+docker compose build && docker compose up -d
+
+# Print the fully resolved configuration (all anchors, overrides, and
+# variable substitutions expanded) — invaluable for debugging override files
+docker compose config
+```
+
+## Troubleshooting the compose stack
+
+<AccordionGroup>
+  <Accordion title="A service is stuck in a restart loop">
+    Check its logs first: `docker compose logs <service>`. The most common causes are a missing or malformed environment variable (check `docker compose config` to see the fully resolved environment), a database connection failure (Postgres not yet healthy, or a typo in the connection string), or a migration failure on startup (`PAWABASE_MIGRATE=true` by default, and `entrypoint.sh` runs `python -m database.migrate` for `api` and `akountz` before serving — a failing migration prevents the service from ever reaching its health check).
+  </Accordion>
+  <Accordion title="A dependent service never starts because its dependency shows unhealthy">
+    `depends_on` with `condition: service_healthy` blocks startup until the health check passes. If `postgres` never reports healthy, check `docker compose logs postgres` for a crash-looping database (often caused by a permissions problem on the mounted volume, or a corrupted data directory from an interrupted previous run). If `api` never reports healthy, check whether it is still running its migration (large migrations can exceed the `start_period: 20s` grace window and cause early health check failures that Compose ignores until `start_period` elapses, but if the migration itself is genuinely stuck, the container will keep failing checks indefinitely).
+  </Accordion>
+  <Accordion title="Permission denied errors writing to /data or /code">
+    The image runs as a non-root user (`useradd --create-home --uid 10001 pawabase` in the Dockerfile, and the container drops to `USER pawabase` before running). If you bind-mount a host directory in place of a named volume (for `api-data`, for example) and that host directory is owned by `root` or another UID, the `pawabase` user (UID 10001) will not have write access. Fix ownership on the host: `sudo chown -R 10001:10001 /path/on/host`.
+  </Accordion>
+  <Accordion title="Changes to .env do not take effect">
+    `docker compose up -d` alone does not always recreate a container whose only change is an environment variable value it already had a value for — Compose detects configuration drift and recreates containers automatically in most cases, but if you suspect a stale value, force it: `docker compose up -d --force-recreate`. Also double check you edited `.env` in the same directory as `docker-compose.yml` — Compose only auto-loads the `.env` colocated with the compose file being run.
+  </Accordion>
+  <Accordion title="Port already in use">
+    If `PAWABASE_GATEWAY_PORT` (default 8080) or `PAWABASE_STUDIO_PORT` (default 8090) collides with another process on the host, either stop the conflicting process or change the port in `.env` before starting. `docker compose up -d` will fail with a clear "port is already allocated" error rather than silently picking another port.
+  </Accordion>
+  <Accordion title="docker compose config reports an unknown anchor or merge error">
+    This almost always means the Compose version is too old to understand the YAML anchor and merge-key syntax (`&pawabase`, `<<: *env`) used throughout `docker-compose.yml`. Upgrade to Compose v2 as described in [Requirements](/self-hosting/requirements).
+  </Accordion>
+</AccordionGroup>
+
+## Build process details
+
+The Dockerfile that `build: .` in `x-pawabase` refers to is a two-stage build:
+
+1. **`studio-assets` stage** (`node:22-slim`): installs the Studio frontend's npm dependencies with `npm ci`, then runs `npm run build`, producing a compiled Vite bundle.
+2. **`runtime` stage** (`python:3.11-slim`): installs `uv` as the Python package manager, copies each service's `pyproject.toml` first (so dependency layers cache independently of source changes), runs `uv sync --frozen --no-dev --all-packages`, then copies `packages/`, `services/`, and `examples/` source, copies `docker/entrypoint.sh` to `/usr/local/bin/pawabase`, creates the non-root `pawabase` user, and finally copies the compiled Studio frontend bundle from the first stage into `services/studio/frontend/dist`.
+
+Because dependency installation happens before source code is copied, changing application code and re-running `docker compose build` reuses the cached dependency-installation layers and only rebuilds from the `COPY packages packages` step onward — this makes iterative rebuilds meaningfully faster than a from-scratch build. A full `docker compose build --no-cache` (as recommended for the very first production build, and for upgrades in [Upgrades](/self-hosting/upgrades)) discards all layer caching and rebuilds everything, which is slower but eliminates any risk of a stale cached layer.
+
+The final image's `ENTRYPOINT` is `["pawabase"]` (the `entrypoint.sh` script), and its default `CMD` is `["help"]`, which prints the usage line if you run the image without a `command:` override — this is exactly what each service's `command: ["api"]`, `command: ["worker"]`, and so on supplies in `docker-compose.yml`.

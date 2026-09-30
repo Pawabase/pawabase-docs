@@ -1,81 +1,216 @@
 ---
 title: "Relations"
-description: "How resources connect."
+description: "How resources connect, and what ?expand= can and can't do."
 icon: "link"
 ---
-## Overview
 
-Relations define how resources connect to each other. They enable ?expand=&lt;relation&gt; on list and get operations, and they establish the foreign-key semantics between resources.
+## The mental model
 
-Every relation is declared in the resource definition's relations array with a name, a type (belongs_to or has_many), a target resource name, and a field name.
+A relation is a declared link from one resource to another, used exclusively to power `?expand=<relation>` on `list` and `get`. It is not a database-level foreign key constraint the platform enforces on write, and it is not a query-language feature that lets you filter one resource by another resource's fields. Expanding a relation is best understood as *the platform performing the related resource's own read for you, and attaching the result* — with that read fully subject to the related resource's own policy and transformer.
 
-## Relation types
+Each relation is declared in a resource's `relations` array:
 
-| Type | Meaning | Foreign key lives on | Expand direction |
-| --- | --- | --- | --- |
-| `belongs_to` | This record references one of another resource | On this resource's table | Returns the related record |
-| `has_many` | Another resource references this one | On the other resource's table | Returns a collection of related records |
+```json
+{"name": "student", "resource": "students", "field": "student_id", "type": "belongs_to"}
+```
 
-## belongs_to in detail
+| Key | Meaning |
+| --- | --- |
+| `name` | The key the expanded data appears under in the response, and the name used in `?expand=` |
+| `resource` | The related resource's name |
+| `field` | The foreign key column — on *this* resource for `belongs_to`, on the *related* resource for `has_many` |
+| `type` | `belongs_to` or `has_many` (defaults to `belongs_to` if omitted) |
 
-A belongs_to relation means this resource's table has a foreign key column pointing to another resource's primary key. For example, an invoices resource has a belongs_to relation to students because invoices have a student_id column that references students.
+Saving a resource with a relation validates only that `name`, `resource`, and `field` are present and that `type` is one of the two allowed values — it does **not** verify that `resource` names a resource that actually exists, or that `field` is a real column on either side. A relation pointing at a typo'd resource name or field name saves without error and only fails, loudly, the first time someone tries to `?expand=` it.
 
-When you expand a belongs_to relation on a list or get operation, the platform fetches the related record and embeds it in the response. The related record is returned as a complete resource object with all its declared fields.
+## belongs_to
 
-The foreign key column is automatically managed by the platform. When you create a record with a belongs_to field, the platform validates that the referenced record exists and that the caller has permission to access it.
+`belongs_to` means *this* resource's table holds the foreign key. An `invoices` resource with a `student_id` column pointing at `students.id` declares:
 
-## has_many in detail
+```json
+{"name": "student", "resource": "students", "field": "student_id", "type": "belongs_to"}
+```
 
-A has_many relation means another resource's table has a foreign key column pointing to this resource's primary key. For example, a students resource has a has_many relation to invoices because invoices have a student_id column that references students.
+```bash
+curl "$GW/rest/v1/invoices/44?expand=student" \
+  -H "apikey: $PK" -H "Authorization: Bearer $TOKEN"
+```
 
-When you expand a has_many relation on a list or get operation, the platform fetches all related records and embeds them as a collection. The platform handles pagination of the related collection automatically.
+```json
+{
+  "id": 44,
+  "student_id": 12,
+  "amount": 210000,
+  "status": "overdue",
+  "student": {"id": 12, "first_name": "Ada", "last_name": "Okafor", "class_id": 3}
+}
+```
 
-Has_many relations are read-only through the expand parameter. To create or modify related records, you need to use the related resource's own operations.
+For a `list` with `expand=student`, the platform collects every distinct `student_id` value across the current page, fetches all of them in a single `get_many` query against `students`, and attaches the matching one to each row — this is one extra query for the whole page, not one per row (no N+1). If a row's `student_id` is `null`, or points at a student the fetch didn't return (deleted, or refused by policy — see below), the `student` key on that row is `null`.
 
-## Expand depth and limits
+## has_many
 
-The expand parameter supports one level of depth. You cannot expand a relation of a relation — for example, expanding invoices->student->invoices is not supported.
+`has_many` means the *related* resource's table holds the foreign key pointing back here. A `students` resource with a matching relation to `invoices`:
 
-This limit prevents deep nesting that could lead to performance issues and excessively large responses. If you need to fetch deeply related data, use a custom route backed by a flow.
+```json
+{"name": "invoices", "resource": "invoices", "field": "student_id", "type": "has_many"}
+```
 
-Unknown relation names in the expand parameter return 400 Bad Request with a message identifying the unknown relation name.
+```bash
+curl "$GW/rest/v1/students/12?expand=invoices" \
+  -H "apikey: $PK" -H "Authorization: Bearer $TOKEN"
+```
 
-## Relations and filtering
+```json
+{
+  "id": 12,
+  "first_name": "Ada",
+  "last_name": "Okafor",
+  "invoices": [
+    {"id": 44, "student_id": 12, "amount": 210000, "status": "overdue"},
+    {"id": 51, "student_id": 12, "amount": 210000, "status": "paid"}
+  ]
+}
+```
 
-Relations interact with filtering in powerful ways. You can filter a resource's list by fields on related resources using dot notation in filter parameters.
+The expanded array is **not paginated, filtered, or sorted independently** — it is every related row the fetch and the related resource's own read policy allow, for that parent. For a parent with a very large number of children, expanding a `has_many` relation can produce a very large response; there is no `expand_limit` or similar control. If you need a bounded, paginated view of just the children, query the child resource directly with its own `filter[<foreign_key>]=eq.<parent_id>` instead of expanding.
 
-For example, filter[student.class_name]=Math filters invoices to only those belonging to students in the Math class.
+`has_many` is read-only through `?expand=` — there is no way to create or modify a child record by nesting it in the parent's request body. Create or update child records through their own resource's `create`/`update` operations.
 
-The platform translates these filter parameters into SQL JOINs, allowing efficient filtering across resource boundaries.
+## The expand/read-policy boundary
+
+Expanding a relation is a read of the related resource, and it answers to that resource's own read policy — specifically its `get` policy if enabled, falling back to its `list` policy if `get` isn't enabled, evaluated per related row. This exists so a relation can never be a side door around access control: `invoices?expand=payments` cannot hand a caller the full `payments` ledger just because they're allowed to read `invoices`, if the `payments` resource's own policy would refuse them that row directly.
+
+The practical effect: a related row your policy would refuse to hand you directly through its own resource simply doesn't appear in the `expand`ed result — the field is `null` (for `belongs_to`) or the row is silently missing from the array (for `has_many`). There is no error raised for a hidden related row.
+
+If the related resource has *neither* `get` nor `list` enabled at all, expansion falls back to service-credential-only: an ordinary API-key or user caller gets nothing back for that relation (empty array or `null`), while a request made with service credentials sees the related data. This matters if you build a relation to a resource that's intentionally internal-only (no public operations) — expanding it from client traffic will always come back empty, which is correct, not a bug.
+
+If the related resource has its own `transformer` configured, the expanded rows are shaped by that transformer too — an expanded `student` is camelCased the same way a direct `GET /rest/v1/students/12` would be, if that's how the `students` resource is configured.
+
+## Expand depth: exactly one level
+
+`?expand=` only resolves relations declared directly on the resource you're querying. You cannot expand a relation of an expanded relation — `invoices?expand=student.invoices` (or any dotted/nested expand syntax) is not supported; there is no multi-hop expand. If you need `student` and, nested inside it, that student's *other* invoices, issue a second request against `/rest/v1/students/{id}?expand=invoices`, or build a custom route that assembles exactly the shape you need.
+
+An unknown relation name in `?expand=` — one not declared in the resource's `relations` array — returns `400 Bad Request`:
+
+```json
+{"error": "bad_request", "message": "invoices has no relation 'nonexistent'"}
+```
+
+## The expand/filter boundary: what filtering by a relation cannot do
+
+Filters resolve exclusively against the resource's **own** field map — the same fields you can list, sort by, or select. There is no cross-resource JOIN performed by `filter[...]`, and no dot-notation syntax like `filter[student.class_name]=Math` that reaches into a related resource's columns. If you try it, the dotted name (`student.class_name`) is not a field on `invoices`, so it fails the same way any other unknown-field filter does — `400 Bad Request` — because the parser checks the raw key against the resource's own field map before it ever gets to interpreting operators.
+
+This is a real boundary, not a missing feature you're expected to work around with a special syntax — the platform genuinely does not resolve filters through relations. Two supported ways to get the outcome you actually want:
+
+**1. Filter client-side after expanding, for small result sets.** Fetch a page with `?expand=student`, then filter the returned array in your own code for `student.class_name === 'Math'`. This only works when the page is small enough that discarding some of it client-side is acceptable — it does not reduce database load or shrink the page you paid for, and pagination still reflects the *unfiltered* parent count.
+
+**2. Build a custom route.** A [custom route](/data/custom-routes) backed by a flow or function has full control over the query it runs and can join `invoices` to `students` however you need, applying `class_name = 'Math'` at the database level and returning exactly the shape and pagination you want. This is the correct answer for anything beyond a small, one-off client-side filter.
+
+There is no third option — no relation-aware filter syntax is planned to appear inside the standard `filter[...]` query parameters; if you need it routinely, model it as a custom route once and reuse it, rather than working around it per request.
 
 ## Relations and pagination
 
-When you expand a has_many relation on a paginated list, the pagination applies to the parent resource's records. Each parent record includes its related records as a nested collection.
+Pagination (`page`/`per_page`) always applies to the resource you're directly listing — the *parent* records — never to an expanded `has_many` collection. `total` in a `list` response with `expand=invoices` on `students` is the count of matching `students`, not the sum of every expanded invoice across every student on the page.
 
-The total count reflects the number of parent records matching the filters, not the total number of related records across all parents.
+## Relations and select
 
-## Circular relations
+`select` only projects columns on the resource you're querying directly; it has no effect on the shape of an expanded relation's rows — an expanded relation always returns every field the related resource's read model exposes (minus anything `write_only` there), regardless of what you passed to `select` on the outer request.
 
-Circular relations between resources are supported but should be used with caution. A circular relation creates a dependency loop that can cause issues with compilation and response size.
+## Bidirectional and self-referential relations
 
-If two resources have mutual belongs_to relations, the platform can handle them, but expanding both directions in a single request will produce large responses.
+Two resources can each declare a relation pointing at the other (`orders` has a `belongs_to` on `customer`, `customers` has a `has_many` on `orders`) — this is the normal, supported shape for a one-to-many relationship and is exactly how the worked examples on this page are set up. A resource can also declare a relation to *itself* (for example, a `comments` resource with a `belongs_to parent_comment` pointing at its own `parent_comment_id`), which works the same way as any other `belongs_to` — one level of expand, no recursion into further replies.
+
+Because expand only ever goes one level deep in either direction, there is no risk of an unbounded response from a bidirectional pair — expanding `orders?expand=customer` cannot also pull in that customer's other orders, since that would require a second hop the platform doesn't perform.
 
 ## Performance considerations
 
-Relations require additional database queries. The platform optimizes this by fetching related records in a single query per relation, avoiding the N+1 problem.
+Every expanded relation costs exactly one additional query for the whole page (via `get_many`), not one per row — this holds for both `belongs_to` and `has_many`. Expanding several relations on the same request means several such queries, still each a single round trip for the batch, not the page size. The related-resource read policy is then evaluated per fetched row in-process, which is inexpensive for typical policies but is real per-row work — a `list` of 200 rows with `expand=<relation>` evaluates the related policy up to 200 times.
 
-For list operations with many parent records and large related collections, consider using select to limit the fields returned, or use a custom route for more complex queries.
+For a `has_many` relation where a handful of parents could plausibly have thousands of children each, expanding is the wrong tool — page the children resource directly with its own filter on the foreign key instead, as described above.
+
+## Realistic business scenario: an order with its line items and its customer
+
+```json
+{
+  "name": "orders",
+  "fields": [
+    {"name": "customer_id", "type": "integer", "required": true},
+    {"name": "status", "type": "string", "enum": ["pending", "paid", "shipped"], "default": "pending"},
+    {"name": "total_cents", "type": "integer", "required": true}
+  ],
+  "operations": {
+    "list": {"enabled": true, "policy": "own_orders"},
+    "get": {"enabled": true, "policy": "own_orders"}
+  },
+  "relations": [
+    {"name": "customer", "type": "belongs_to", "resource": "customers", "field": "customer_id"},
+    {"name": "line_items", "type": "has_many", "resource": "order_line_items", "field": "order_id"}
+  ]
+}
+```
+
+```bash
+curl "$GW/rest/v1/orders/901?expand=customer,line_items" \
+  -H "apikey: $PK" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "id": 901,
+  "customer_id": 44,
+  "status": "paid",
+  "total_cents": 15800,
+  "customer": {"id": 44, "name": "Grace Hopper", "email": "grace@example.com"},
+  "line_items": [
+    {"id": 1, "order_id": 901, "sku": "MUG-01", "qty": 2, "price_cents": 4900},
+    {"id": 2, "order_id": 901, "sku": "TSHIRT-M", "qty": 1, "price_cents": 5900}
+  ]
+}
+```
+
+If the caller's `own_orders` policy on `customers` (the `customer` relation's target) would refuse them Grace's record directly — for instance, a `customers` policy scoped to staff only — `customer` in this response comes back `null` even though `line_items` (whose target resource's policy the caller does pass) is fully populated. Each expanded relation is evaluated against its own target's policy independently.
 
 ## Troubleshooting
 
-- Relation not working: verify that the field name matches the actual foreign key column name.
+<AccordionGroup>
+<Accordion title="expand returns 400 with 'has no relation'">
+The name in ?expand= doesn't match any name declared in the resource's relations array. Check spelling and that the relation was actually saved.
+</Accordion>
+<Accordion title="An expanded belongs_to relation is always null, even though the foreign key column has a value">
+Either the related record doesn't exist (a dangling foreign key), or the related resource's get/list policy refuses this caller for that row — both produce the same null, by design.
+</Accordion>
+<Accordion title="An expanded has_many relation returns an empty array for every parent">
+The related resource likely has neither get nor list enabled for ordinary callers, so only service credentials can see expanded rows for it. Enable at least one read operation with an appropriate policy if client callers should see it.
+</Accordion>
+<Accordion title="I tried filter[relation.field]=value and got a 400 for an unknown field">
+Filtering through a relation isn't supported — the dotted name is checked as a literal field name on the resource you're filtering, and it doesn't exist there. See The expand/filter boundary above for the two real alternatives.
+</Accordion>
+<Accordion title="Expanding two relations at once is slow">
+Each relation adds one batched query, which is normally fast. If a has_many relation is fetching a very large number of children per parent, switch to filtering the child resource directly with pagination instead of expanding.
+</Accordion>
+</AccordionGroup>
 
-- Expand returns 400: the relation name does not match any declared relation on the resource.
+## FAQ
 
-- Related records not showing: check that the foreign key values match existing records in the related resource.
+<AccordionGroup>
+<Accordion title="Can I expand more than one relation at once?">
+Yes — expand is comma-separated: ?expand=student,payments.
+</Accordion>
+<Accordion title="Can I go two levels deep, like expand=student.class?">
+No. Expand resolves exactly the relations declared on the resource you're querying, one level. Issue a second request against the related resource for a second hop.
+</Accordion>
+<Accordion title="Does declaring a relation create a database foreign key constraint?">
+No. A relation is purely a read-time convenience for ?expand=; it has no effect on migrate and enforces nothing at the database level. Referential integrity, if you want it enforced at the database, has to come from the database schema itself.
+</Accordion>
+<Accordion title="Can I filter or sort the expanded has_many array?">
+No — it returns every related row the target resource's policy allows for that parent, in whatever order the target resource's default ordering produces. Query the child resource directly if you need control over that.
+</Accordion>
+</AccordionGroup>
 
 <CardGroup cols={2}>
   <Card title="Resources" icon="database" href="/data/resources" />
   <Card title="Filtering" icon="filter" href="/data/filtering" />
   <Card title="Sorting and pagination" icon="sort" href="/data/sorting-pagination" />
+  <Card title="Custom routes" icon="route" href="/data/custom-routes" />
 </CardGroup>

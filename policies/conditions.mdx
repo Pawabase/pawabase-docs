@@ -473,6 +473,138 @@ operand     := "$path" | "$$literal" | string | number | boolean | null | [opera
 path        := segment ("." segment)*        e.g. $auth.roles.0, $record.address.city
 ```
 
+## The same condition, four entry points
+
+Because one engine evaluates one language everywhere, a single named policy can guard a resource operation, a Flow block, and a realtime channel rule without being rewritten — but what the condition is *checked against*, and what happens when it refuses, differs by entry point. Seeing the same `family_access` condition attached in all three places makes the differences concrete.
+
+```json
+// family_access
+{ "any": [
+  { "role": ["admin", "teacher"] },
+  { "owner": "student_user_id" },
+  { "contains": ["$record.guardian_user_ids", "$auth.user_id"] }
+] }
+```
+
+<Tabs>
+  <Tab title="Resource operation">
+    ```json
+    "operations": {
+      "get": { "enabled": true, "policy": "family_access" },
+      "list": { "enabled": true, "policy": "family_access" }
+    }
+    ```
+    Here `$record` is the row being read — supplied automatically by the resource layer, one row at a time for `get`, planned and then iterated for `list`. A refusal on `get` is `404`; on `list`, the condition is [planned](/policies/pushdown) before any query runs, and rows are still filtered even where the plan leaves a residual. Nothing about the condition changes between `get` and `list` — only how the engine drives it changes.
+  </Tab>
+  <Tab title="A Flow block">
+    ```json
+    { "block": "policy.check", "config": {
+      "policy": "family_access",
+      "record": "{{ steps.load_report_card.output }}"
+    } }
+    ```
+    Here `$record` is whatever the flow explicitly hands the block — typically the output of an earlier block that loaded a row by id. There is no automatic planning: a flow's `policy.check` always evaluates the **full** condition against **one** concrete record, the way `get` does, never the way `list` does. If a flow needs to check a policy against many candidate records, it must loop and call `policy.check` per record, or load the records through a resource `list` endpoint (which does the planning) rather than through raw data access. `policy.check` exposes `allowed`/`denied` handles rather than an HTTP status code — the flow decides what response to send.
+  </Tab>
+  <Tab title="Realtime channel rule">
+    Channel rules don't naturally have a `$record` at all — a subscription is to a channel, not to a specific row. If a channel's messages correspond to a specific record (a chat channel per ticket, say), the common pattern is to encode the identifying information into the **channel name** and check it directly rather than reaching for `$record`:
+    ```json
+    // ticket channel: support:{{ ticket_id }}
+    { "any": [
+      { "role": "support" },
+      { "eq": ["$request.params.ticket_id", "$auth.claims.app.assigned_ticket_id"] }
+    ] }
+    ```
+    `family_access` as written above, with its `$record.guardian_user_ids`, cannot be attached directly to a channel rule — there's no record in the realtime context. Reusing a resource-shaped policy for realtime access is a common mistake; see the [context reference](/policies/context#realtime-channels) for what realtime rules actually see, and reach for channel-name templating (`user:{{ auth.user_id }}`) before writing a custom condition.
+  </Tab>
+</Tabs>
+
+The lesson: **the condition language is universal, but the shape of a specific condition is not automatically portable between entry points that supply different contexts.** A condition written for resource operations, with `$record` at its center, is the right shape for a `policy.check` block that's handed an equivalent record. It is the wrong shape, unmodified, for storage buckets (`$object` instead of `$record`), event subscriptions (`$event` instead of `$record`), or realtime channels (neither). Before reusing a policy across entry points, check what context it will actually receive — the [context reference](/policies/context) has the exact fields for each.
+
+## Deeply nested conditions: a worked design
+
+Real authorization requirements often nest three or four levels deep. Rather than write the final condition directly, it helps to build it the way you'd reason about the requirement in English, one clause at a time. Take this requirement from a multi-school platform:
+
+> Platform admins see everything. Within a school, the principal and school admins see everything in their school. Teachers see their own classes' students. Guardians see their own children, but only once the school has activated the current term.
+
+<Steps>
+  <Step title="Start with the broadest exemption">
+    ```json
+    { "any": [
+      { "role": "platform_admin" },
+      "…everyone else…"
+    ] }
+    ```
+  </Step>
+  <Step title="Add the school-scoped staff exemption">
+    School staff need both the role and the school match — an `all`, nested inside the outer `any`:
+    ```json
+    { "any": [
+      { "role": "platform_admin" },
+      { "all": [
+        { "role": ["principal", "school_admin"] },
+        { "eq": ["$record.school_id", "$auth.claims.app.school_id"] }
+      ] },
+      "…everyone else…"
+    ] }
+    ```
+  </Step>
+  <Step title="Add the teacher's narrower scope">
+    Teachers need the school match *and* a class match — another `all`, itself containing an `any` for however classes are represented (a single `class_id` or a list of taught classes):
+    ```json
+    { "all": [
+      { "role": "teacher" },
+      { "eq": ["$record.school_id", "$auth.claims.app.school_id"] },
+      { "in": ["$record.class_id", "$auth.claims.app.taught_class_ids"] }
+    ] }
+    ```
+  </Step>
+  <Step title="Add the guardian's state-dependent scope">
+    Guardians need ownership-shaped membership *and* a state check on the term:
+    ```json
+    { "all": [
+      { "contains": ["$record.guardian_user_ids", "$auth.user_id"] },
+      { "eq": ["$record.school_id", "$auth.claims.app.school_id"] },
+      { "eq": ["$record.term_active", true] }
+    ] }
+    ```
+  </Step>
+  <Step title="Assemble">
+    ```json
+    { "any": [
+      { "role": "platform_admin" },
+      { "all": [
+        { "role": ["principal", "school_admin"] },
+        { "eq": ["$record.school_id", "$auth.claims.app.school_id"] }
+      ] },
+      { "all": [
+        { "role": "teacher" },
+        { "eq": ["$record.school_id", "$auth.claims.app.school_id"] },
+        { "in": ["$record.class_id", "$auth.claims.app.taught_class_ids"] }
+      ] },
+      { "all": [
+        { "contains": ["$record.guardian_user_ids", "$auth.user_id"] },
+        { "eq": ["$record.school_id", "$auth.claims.app.school_id"] },
+        { "eq": ["$record.term_active", true] }
+      ] }
+    ] }
+    ```
+  </Step>
+  <Step title="Check what plans and what doesn't">
+    For `platform_admin`, the plan is unrestricted — no query filter at all. For staff and teachers, every branch is an `all` of AND-ed equalities against known values (`$auth.claims.app.school_id`, `$auth.claims.app.taught_class_ids`), so **each branch pushes down individually**, but the *top-level* combinator joining the branches is `any`, which [cannot be pushed down](/policies/pushdown#stage-3-pushdown) as a whole. The practical effect: for a caller who is *only* a teacher (not also staff or a guardian), `partial()` evaluates the `platform_admin` and staff branches to `false` and drops them, evaluates the `in(class_id, taught_class_ids)` branch fully at plan time only if `taught_class_ids` is known (it is — it's a token claim), and is left with a single surviving branch, which pushes down cleanly as `school_id = ? AND class_id IN (?, ?, …)`. A caller who is simultaneously a teacher *and* a guardian, though, leaves two surviving branches under `any`, and pushdown gives up on the combination, falling back to a residual. This is worth testing explicitly if dual-role callers exist in your system.
+  </Step>
+</Steps>
+
+This progressive construction — one actor group per step, assembled at the end — is the practical antidote to the "wall of nested JSON" problem. It also maps directly onto how you should *read* an existing deeply nested condition you didn't write: identify each top-level branch of the outermost `any` as "the case for one kind of actor," and read each branch's `all` as that actor's full list of requirements.
+
+## Combining conditions across policies you don't control
+
+When a policy set grows across a team, you'll often need to compose a condition with one that a colleague owns, without editing their policy. Two supported mechanisms exist for this, and it's worth being precise about which one you need:
+
+- **A list of references** (`["colleague_policy", "my_addition"]`) ANDs two independently-maintained policies without touching either one's stored condition. This is the right tool when the requirement is "everything my colleague's policy already requires, plus one more thing." It does not work for OR-composition — there is no equivalent "any of these named policies" shorthand at the reference level, because `any` only combines *conditions*, and a name is a reference, not a condition, until it's resolved.
+- **An inline `any` naming nothing** duplicates logic instead of composing it: if you need "my colleague's rule, OR my own separate rule," you must either ask them to expose their condition as something you can inline (copy the JSON, which then drifts if they change it), or restructure so both cases are expressed as one shared, actor-group-based policy that a third name composes cleanly with `any`. This is a real limitation of the reference system, not an oversight — the fix is almost always "define a broader shared policy," not "find a cleverer reference."
+
+In practice, teams solve the OR-composition gap by agreeting on **layered actor-group policies** (see [designing a policy set](/policies/overview#designing-a-policy-set)) up front, so that the pieces people need to OR together already exist as names, and composition only ever needs `all`-shaped lists.
+
 ## Next
 
 <CardGroup cols={2}>

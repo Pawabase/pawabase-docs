@@ -1,379 +1,295 @@
 ---
 title: "Roles and permissions"
-description: "Role-based access control — the `Role` and `RoleAssignment` models, `assign_role`/`revoke_role`, how roles appear in access tokens, `has_permission`, and permission checking performance."
+description: "Sillo's real RBAC primitives — Permission, Group, UserGroup — scoped per environment, the functions in app/rbac.py, and how roles surface as claims for policy conditions."
 icon: "shield"
 ---
 
-Roles and permissions form the access control layer of Pawabase's authentication system. Roles group permissions together, and permissions define what actions a user can perform. Pawabase provides a flexible role-based access control (RBAC) system with global and organization-scoped roles.
-
-The RBAC system is built on three models: `Role`, `RoleAssignment`, and the `Permissions` array. Roles are assigned to users through `RoleAssignment` records, and the resulting permissions are included in the user's access token claims. The `has_permission` function in the policy engine resolves permissions from roles in real-time.
+Pawabase's role-based access control is not a bespoke Akountz feature — it's Sillo's own generic permission system (`Permission`, `Group`, `UserGroup`), which Akountz scopes so that many project environments can share one database without their roles colliding. There is no `Role` or `RoleAssignment` model, and no separate policy-expression syntax for permissions: a "role" in this documentation is simply a named `Group` of `Permission`s.
 
 <CardGroup cols={3}>
-  <Card title="Flat role model" icon="layer">Roles are flat — no inheritance. Each role is independent with its own permissions.</Card>
-  <Card title="Global and org-scoped" icon="globe">Roles can be global (applied everywhere) or org-scoped (applied within one organization).</Card>
-  <Card title="Permission caching" icon="speed">`has_permission` performs database lookups. Cache results for high-traffic endpoints.</Card>
+  <Card title="Three real models" icon="database">`Permission`, `Group`, `UserGroup` — all Sillo's, all reused as-is. Akountz adds no new tables for RBAC.</Card>
+  <Card title="Names are strings, scoped by prefix" icon="tag">A role or permission named `editor` for `acme/production` is stored as `acme/production/editor` and unprefixed on the way out.</Card>
+  <Card title="Flat, not hierarchical" icon="git-branch">There is no built-in role inheritance. A role is exactly the set of permissions you put in it.</Card>
 </CardGroup>
 
-## The `Role` model
+## The real models
 
-The `Role` model defines a set of permissions that can be assigned to users:
+Sillo's permission system lives outside Akountz entirely (`sillo.permissions`); Akountz's own contribution is `app/rbac.py`, a thin scoping layer over three of Sillo's models:
 
-```python
-class Role(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    name: str = Field(unique=True)  # e.g., "admin", "editor", "member"
-    permissions: list[str] = Field(default_factory=list)  # e.g., ["user:read", "user:write"]
-    scope: str = "global"  # "global" or "org"
-    description: str | None = None
-    created_at: datetime = Field(default_factory=datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=datetime.now(UTC))
-```
-
-The `Role` model stores:
-
-- **`name`**: The unique name of the role (e.g., `"admin"`, `"editor"`, `"member"`). Role names are unique across the environment.
-- **`permissions`**: An array of permission strings. Each permission string follows the format `resource:action` (e.g., `"user:read"`, `"user:write"`, `"org:delete"`).
-- **`scope`**: The scope of the role — `"global"` or `"org"`. Global roles apply to all organizations. Organization-scoped roles apply only within a specific organization.
-- **`description`**: Optional description of the role's purpose.
-
-### Permission format
-
-Permissions follow a consistent `resource:action` format:
-
-| Permission | Description |
+| Model | What it is |
 | --- | --- |
-| `user:read` | Read user information. |
-| `user:write` | Modify user information. |
-| `user:delete` | Delete a user account. |
-| `org:read` | Read organization information. |
-| `org:write` | Modify organization information. |
-| `org:delete` | Delete an organization. |
-| `session:revoke` | Revoke user sessions. |
-| `mfa:reset` | Reset MFA for a user. |
-| `role:assign` | Assign roles to users. |
-| `role:revoke` | Revoke roles from users. |
+| `Permission` | A named permission string, e.g. `reports.publish`. Globally unique across the whole Sillo database. |
+| `Group` | A named collection of permissions — what this documentation calls a **role**. Also globally unique by name. |
+| `UserGroup` | The join row: one user belongs to one group. |
 
-The permission strings are defined by the application developer. Pawabase does not impose a fixed set of permissions — the `permissions` array is arbitrary and defined by the application.
-
-### Role scope: `global` vs `org`
-
-Roles have two scopes:
-
-1. **`global`**: Global roles apply to the user across all organizations and the personal context. A user with a global `"admin"` role is an admin everywhere.
-2. **`org`**: Organization-scoped roles apply only within a specific organization. A user with an org-scoped `"admin"` role is only an admin in that organization.
+Because `Permission` and `Group` names are unique across the *entire* database — and Akountz serves every project's every environment out of one database — a role literally named `editor` cannot exist twice. Akountz solves this by storing every name with its environment baked in as a prefix:
 
 ```python
-# Global role — applies everywhere
-Role(name="admin", permissions=["user:read", "user:write"], scope="global")
-
-# Org-scoped role — applies only within the organization
-Role(name="org_admin", permissions=["org:read", "org:write"], scope="org")
+def scoped(project: str, env: str, name: str) -> str:
+    return f"{project}/{env}/{name}"
 ```
 
-### Default roles
-
-The `default_roles` configuration defines which roles are automatically assigned to new users:
-
-```toml
-[auth]
-default_roles = ["member"]
-```
-
-When a new user signs up, they are automatically assigned all roles listed in `default_roles`. This is configured at the environment level.
-
-## The `RoleAssignment` model
-
-Role assignments link users to roles:
+So the role you create as `editor` in Studio for `acme/production` is stored as `Group(name="acme/production/editor")`, and the permission `reports.publish` becomes `Permission(name="acme/production/reports.publish")`. Every function in `app/rbac.py` strips the prefix back off before returning anything to a caller:
 
 ```python
-class RoleAssignment(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="auth_user.id")
-    role_id: UUID = Field(foreign_key="role.id")
-    scope: str = "global"  # "global" or "org"
-    org_id: UUID | None = None  # Only set when scope is "org"
-    assigned_by: UUID | None = None  # The user who assigned the role
-    assigned_at: datetime = Field(default_factory=datetime.now(UTC))
-    revoked_at: datetime | None = None
+def _strip(project: str, env: str, names: list[str]) -> list[str]:
+    prefix = f"{project}/{env}/"
+    return sorted({name[len(prefix):] for name in names if name.startswith(prefix)})
 ```
-
-The `RoleAssignment` model tracks:
-
-- **`user_id`**: The user who has been assigned the role.
-- **`role_id`**: The role that was assigned.
-- **`scope`**: The scope of the assignment (`"global"` or `"org"`).
-- **`org_id`**: The organization ID if the assignment is org-scoped. `null` for global assignments.
-- **`assigned_by`**: The user ID of the administrator who assigned the role. `null` for system-assigned roles (like `default_roles`).
-- **`assigned_at`**: When the role was assigned.
-- **`revoked_at`**: When the role was revoked. If `null`, the role is still active.
-
-### Multiple assignments per user
-
-A user can have multiple `RoleAssignment` records — one for each role assigned to them. This allows a user to have multiple roles simultaneously. For example, a user could be both an `"admin"` (global) and an `"org_admin"` (org-scoped for `acme-hq`).
-
-The `has_permission` function aggregates permissions from all active role assignments:
-
-```python
-async def has_permission(principal: Principal, permission: str) -> bool:
-    # Check all active role assignments
-    for assignment in await RoleAssignment.filter(
-        user_id=principal.user_id,
-        revoked_at=None
-    ):
-        role = await Role.get(id=assignment.role_id)
-        if permission in role.permissions:
-            return True
-    return False
-```
-
-## `assign_role` and `revoke_role`
-
-Roles are assigned and revoked through the `assign_role` and `revoke_role` functions:
-
-### `assign_role`
-
-```python
-async def assign_role(
-    config: AuthConfig,
-    *,
-    user_id: UUID,
-    role_name: str,
-    scope: str = "global",
-    org_id: UUID | None = None,
-    assigned_by: UUID | None = None,
-) -> RoleAssignment:
-    role = await Role.get(name=role_name)
-    assignment = RoleAssignment.create(
-        user_id=user_id,
-        role_id=role.id,
-        scope=scope,
-        org_id=org_id,
-        assigned_by=assigned_by,
-    )
-    # Emit role.assigned event
-    await log_event(...)
-    return assignment
-```
-
-The `assign_role` function:
-
-1. Looks up the `Role` by name.
-2. Creates a new `RoleAssignment` record.
-3. Sets `assigned_by` if provided.
-4. Emits a `role.assigned` event.
-5. Returns the `RoleAssignment` record.
-
-### `revoke_role`
-
-```python
-async def revoke_role(
-    config: AuthConfig,
-    *,
-    user_id: UUID,
-    role_name: str,
-    scope: str = "global",
-    org_id: UUID | None = None,
-) -> None:
-    assignment = await RoleAssignment.filter(
-        user_id=user_id,
-        role_name=role_name,
-        scope=scope,
-        org_id=org_id,
-        revoked_at=None
-    ).first()
-    if assignment:
-        assignment.revoked_at = datetime.now(UTC)
-        await assignment.save()
-        # Emit role.revoked event
-        await log_event(...)
-```
-
-The `revoke_role` function:
-
-1. Looks up the active `RoleAssignment` for the user, role, scope, and org.
-2. Sets `revoked_at = now()` to mark the assignment as revoked.
-3. Emits a `role.revoked` event.
-
-### Admin API for role management
-
-Administrators can assign and revoke roles through the admin API:
-
-```bash
-# Assign a role
-curl -X POST "$GW/projects/my-project/envs/prod/users/{user_id}/roles" \
-  -H "apikey: $PAWABASE_SECRET_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "role": "admin",
-    "scope": "global"
-  }'
-
-# Revoke a role
-curl -X DELETE "$GW/projects/my-project/envs/prod/users/{user_id}/roles" \
-  -H "apikey: $PAWABASE_SECRET_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "role": "admin",
-    "scope": "global"
-  }'
-```
-
-The admin API delegates to `assign_role` and `revoke_role` internally. The service key must have the `role_manage` permission.
-
-## How roles appear in access tokens
-
-The `roles` claim in the access token is constructed from the user's active role assignments:
-
-```python
-def build_role_names(config: AuthConfig, user_id: UUID) -> list[str]:
-    roles = []
-    assignments = await RoleAssignment.filter(
-        user_id=user_id,
-        revoked_at=None
-    )
-    for assignment in assignments:
-        role = await Role.get(id=assignment.role_id)
-        roles.append(role.name)
-    return roles
-```
-
-The `build_role_names` function queries all active `RoleAssignment` records for the user, looks up each `Role`, and collects the role names. These names are stored in the `roles` claim of the access token.
-
-### Role names in the `Principal`
-
-The `Principal` constructor sets `self.roles` and adds it to `self.claims`:
-
-```python
-self.roles = token.get("roles", [])
-self.claims["roles"] = self.roles
-```
-
-So `Principal.roles` and `$auth.claims.roles` are the same array of role names. The `roles` claim is what `$auth.claims.roles` resolves to in policies.
-
-### Role names on refresh
-
-When a token is refreshed, the `roles` claim is re-read from the database. This means:
-
-1. If a role is revoked, it will no longer appear in the `roles` claim on the next refresh.
-2. If a new role is assigned, it will appear in the `roles` claim on the next refresh.
-3. The current access token continues to carry the old `roles` claim until it expires and is refreshed.
-
-<Note>
-Role changes are reflected on the next refresh — not immediately. The current access token continues to carry the old roles until it expires. This is by design — refreshing the token database on every request would be prohibitively expensive.
-</Note>
-
-## The `has_permission` function
-
-The `has_permission` function checks whether a user has a specific permission:
-
-```python
-async def has_permission(principal: Principal, permission: str) -> bool:
-    # Check all active role assignments
-    assignments = await RoleAssignment.filter(
-        user_id=principal.user_id,
-        revoked_at=None
-    )
-    for assignment in assignments:
-        role = await Role.get(id=assignment.role_id)
-        if permission in role.permissions:
-            return True
-    return False
-```
-
-The function iterates through all active `RoleAssignment` records for the user, looks up each `Role`, and checks whether the requested permission is in the `Role.permissions` array.
-
-### Using `has_permission` in policies
-
-In policy expressions, `has_permission` is called like this:
-
-```toml
-expression = "has_permission($auth, 'user:delete')"
-```
-
-The `has_permission` function receives the `Principal` object and the permission string. It returns `true` if the user has the permission, `false` otherwise.
-
-### How `has_permission` is evaluated
-
-The policy engine evaluates `has_permission` at request time:
-
-1. The policy expression references `has_permission($auth, 'permission')`.
-2. The policy engine extracts the `Principal` from the request's access token.
-3. The `has_permission` function queries the database for the user's active role assignments.
-4. For each assignment, the `Role` is looked up and the permissions are checked.
-5. If any matching permission is found, `true` is returned. Otherwise, `false`.
 
 <Warning>
-`has_permission` performs a database query on every call. For high-traffic endpoints, this can create a performance bottleneck. Consider caching permission results or using role-based checks (`$auth.claims.roles contains ...`) instead.
+There is no `Role` model and no `RoleAssignment` model anywhere in this codebase. "Role" is purely a documentation term for a `Group` — Sillo's own generic grouping primitive, which Akountz happens to use for authorization roles but which carries no role-specific fields of its own beyond `name`, `description`, and its members.
 </Warning>
 
-### Performance optimization
+## Defining a role
 
-For performance-critical endpoints, consider these optimization strategies:
+```python
+async def define_role(
+    project: str, env: str, name: str, *,
+    description: str = "",
+    permissions: list[str] | None = None,
+) -> Group:
+```
 
-1. **Cache role assignments**: Cache the result of `has_permission` for a short duration (e.g., 60 seconds).
-2. **Use role checks instead**: `$auth.claims.roles contains 'admin'` is faster than `has_permission($auth, 'user:delete')` because it doesn't require a database query.
-3. **Pre-compute permissions**: At sign-in time, pre-compute the user's permissions and store them in the token claims (in `app_metadata`). This avoids database lookups on every request.
-4. **Batch permission checks**: If multiple permissions need to be checked, batch them into a single query instead of multiple `has_permission` calls.
+`define_role` is idempotent — calling it again with a different `permissions` list *reconciles* the group's permissions to match exactly what you passed, adding what's missing and removing what's no longer listed:
 
-## Permission checking performance
+```python
+group = await Group.get_or_create(scoped(project, env, name), description)
+if permissions is not None:
+    current = set(await group.get_permissions())
+    wanted = {scoped(project, env, p) for p in permissions}
+    for perm in wanted - current:
+        await Permission.define(perm)
+    if wanted - current:
+        await group.add_permissions(*(wanted - current))
+    if current - wanted:
+        await group.remove_permissions(*(current - wanted))
+```
 
-Permission checking performance is a critical consideration for production applications:
+Any permission named in `permissions` that doesn't exist yet is defined automatically (`Permission.define(perm)`) — you don't need a separate "create this permission" step before referencing it in a role. Passing `permissions=None` (the default when calling `define_role` without that argument) leaves the group's existing permissions untouched; passing `permissions=[]` explicitly clears them all.
 
-### Database query cost
+Through the admin API, this is exposed as an idempotent `PUT`:
 
-Each call to `has_permission` performs at least one database query to fetch the user's role assignments and another query to fetch each role. For a user with many roles, this can result in multiple queries per request.
+```bash
+curl -X PUT "$STUDIO/internal/v1/projects/acme/envs/production/roles" \
+  -H "Authorization: Bearer $SERVICE_TOKEN" -H "content-type: application/json" \
+  -d '{
+    "name": "editor",
+    "description": "Can create and publish content",
+    "permissions": ["posts.create", "posts.edit", "posts.publish"]
+  }'
+```
 
-| Number of roles | Queries per `has_permission` call |
-| --- | --- |
-| 1 | 2 (assignment + role) |
-| 5 | 6 (1 + 5) |
-| 10 | 11 (1 + 10) |
+```json
+{
+  "name": "editor",
+  "description": "Can create and publish content",
+  "permissions": ["posts.create", "posts.edit", "posts.publish"],
+  "members": 0
+}
+```
 
-### Caching strategies
+Role names are validated against `^[a-z][a-z0-9_:-]{0,62}$` at the admin API layer — lowercase, starting with a letter, up to 63 characters, allowing digits, underscores, colons, and hyphens. Permission strings themselves have no format constraint in Akountz beyond being non-empty; the convention used throughout this documentation and the built-in `admin` role is dotted-path style (`reports.publish`, `users.disable`), but nothing enforces that shape.
 
-1. **In-memory cache**: Cache the result of `has_permission` for the duration of the request. All calls within the same request can share the cached result.
-2. **Redis cache**: Use Redis to cache permission results across requests. Cache TTL of 60-120 seconds.
-3. **Token claims cache**: Store pre-computed permissions in the `app_metadata` claim of the access token. The token is refreshed periodically (every 15 minutes), so permissions are up-to-date within that window.
+## Listing, assigning, and revoking
 
-### When to use `has_permission` vs role checks
+```python
+async def list_roles(project: str, env: str) -> list[dict]:
+    ...  # [{"name": ..., "description": ..., "permissions": [...], "members": int}, ...]
 
-| Method | Speed | Use Case |
-| --- | --- | --- |
-| `$auth.claims.roles contains 'admin'` | Fast (no DB query) | Simple role-based checks. Best for high-traffic endpoints. |
-| `has_permission($auth, 'user:delete')` | Slow (DB query) | Granular permission checks. Best for low-traffic or admin endpoints. |
+async def assign_role(user: AuthUser, name: str) -> None:
+    """Creates the role (with no permissions) if it doesn't exist yet, then adds the user."""
 
-<Note>
-For most applications, role-based checks are sufficient and more performant. Use `has_permission` only when you need granular permission checks that can't be expressed as role names.
-</Note>
+async def revoke_role(user: AuthUser, name: str) -> None:
+    """A no-op if the user isn't in the role, or the role doesn't exist."""
+
+async def roles_of(user: AuthUser) -> list[str]:
+    """The names of every group this user belongs to, unprefixed."""
+
+async def delete_role(project: str, env: str, name: str) -> bool:
+    """Deletes the group and every UserGroup membership row for it. Returns False if it didn't exist."""
+```
+
+Notice that `assign_role` silently creates the role if it doesn't already exist, with no permissions attached — a convenient default for `default_roles` in the auth configuration (see [below](#default-roles-on-sign-up)), but worth knowing so a typo in a role name doesn't raise an error; it just quietly creates an empty role.
+
+```bash
+# Admin API
+curl -X PATCH "$STUDIO/internal/v1/projects/acme/envs/production/users/482" \
+  -H "Authorization: Bearer $SERVICE_TOKEN" -H "content-type: application/json" \
+  -d '{"roles": ["editor", "billing_viewer"]}'
+```
+
+The admin user-update endpoint reconciles a user's full role set the same way `define_role` reconciles a group's permissions — it diffs the requested `roles` list against `rbac.roles_of(user)` and assigns/revokes the difference, rather than requiring one call per role.
+
+## Direct permission grants
+
+Separately from roles, a user can hold permissions directly, bypassing any group:
+
+```python
+async def grant(user: AuthUser, *permissions: str) -> None:
+    for perm in permissions:
+        await Permission.define(scoped(user.project, user.env, perm))
+    await Permission.assign(user, *(scoped(user.project, user.env, p) for p in permissions))
+
+async def revoke(user: AuthUser, *permissions: str) -> None:
+    await Permission.revoke(user, *(scoped(user.project, user.env, p) for p in permissions))
+```
+
+```bash
+curl -X POST "$STUDIO/internal/v1/projects/acme/envs/production/users/482/permissions" \
+  -H "Authorization: Bearer $SERVICE_TOKEN" -H "content-type: application/json" \
+  -d '{"permissions": ["reports.export"]}'
+```
+
+A user's *effective* permissions are the union of their direct grants and every permission held by every group they belong to:
+
+```python
+async def permissions_of(user: AuthUser) -> list[str]:
+    direct = await Permission.of(user)
+    via_groups: list[str] = []
+    for group in await Group.of_user(user):
+        via_groups.extend(await group.get_permissions())
+    return _strip(user.project, user.env, [*direct, *via_groups])
+```
+
+This is the exact list that ends up as the `perms` claim on an access token (see [Tokens and sessions](/auth/tokens-and-sessions#claims-on-the-access-token)) — resolved fresh at every sign-in and every refresh, never cached on the user row.
+
+## No built-in hierarchy, and what `"*"` means
+
+Roles are flat: there is no concept of one role inheriting another's permissions. If your product needs "admin implies editor implies viewer," you either list every underlying permission explicitly in the `admin` role, or check multiple roles in a policy condition (`{"role": ["admin", "editor"]}` matches either).
+
+The one built-in exception is a **wildcard permission**, `"*"`, checked explicitly wherever `Permission.assign`/`Permission.of` results are consulted — for example, the platform's bootstrap-created `admin` role (see [Overview → bootstrapping the first operator](/auth/overview#bootstrapping-the-first-operator)) is defined with `permissions=["*"]`, and `Principal.has_permission` treats it as matching any permission string:
+
+```python
+def has_permission(self, permission: str) -> bool:
+    if self.kind in ("service", "operator") and "admin" in self.roles:
+        return True
+    perms = self.permissions
+    return permission in perms or "*" in perms
+```
+
+Use `"*"` sparingly — it's meant for a small number of fully trusted operator/admin roles, not as a general-purpose "give this role everything" shortcut for project-level roles.
+
+## How roles and permissions reach a policy
+
+Neither `roles_of` nor `permissions_of` is called from inside a policy condition directly — they're resolved once, at token-issuance time, and baked onto the access token as `roles` and `perms` claims (see [`issue_user_token`](/auth/tokens-and-sessions#issue_user_token)). `Principal.as_policy_context()` then exposes them under `$auth`:
+
+```python
+def as_policy_context(self) -> dict[str, Any]:
+    return {
+        "authenticated": True,
+        "kind": self.kind,
+        "roles": self.roles,
+        "permissions": self.permissions,
+        ...
+    }
+```
+
+From there, the real [condition language](/policies/conditions) — plain JSON, no expression syntax, no `has_permission()` function call — has two purpose-built shorthands:
+
+```json
+{ "role": "admin" }
+{ "role": ["admin", "editor"] }        // any of these
+{ "permission": "reports.publish" }
+{ "permission": ["reports.publish", "reports.export"] }   // all of these
+```
+
+`role` expands to an `any` of `contains($auth.roles, "<name>")` checks; `permission` expands to an `all` of `contains($auth.permissions, "<name>")` checks (a single-element list behaves the same as a bare string). Both are synchronous, in-memory checks against the token's own claims — there is no database round trip and no async `has_permission()` call happening at policy-evaluation time, because the roles and permissions were already resolved once, when the token was minted.
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [ { "role": "editor" }, { "owner": "author_id" } ] }
+] }
+```
+
+"Admins may do this to anything; editors only to content they own." See [the condition language](/policies/conditions#shorthands) and [shorthands reference](/policies/shorthands) for the complete shorthand catalog, and [recipes](/policies/recipes) for more role-and-ownership patterns.
+
+<Warning>
+There is no `has_permission()` function inside a policy condition, and conditions are never written in TOML — the entire condition language is plain JSON with the five forms (boolean, group, comparison, check, shorthand) documented on [the condition language](/policies/conditions) page. Anything describing a `has_permission(...)` call or a `[policy] expression = "..."` TOML block does not match how Pawabase policies actually work.
+</Warning>
+
+## Default roles on sign-up
+
+The environment's `default_roles` configuration field (see [Configuration → `default_roles`](/auth/configuration#default_roles)) is a list of role names every newly created account is automatically assigned to, via exactly `rbac.assign_role`:
+
+```python
+for role in config.default_roles:
+    await rbac.assign_role(user, role)
+```
+
+Because `assign_role` creates the role if it's missing (with no permissions), a typo in `default_roles` doesn't raise a sign-up error — it silently creates an empty, useless role and assigns everyone to it. Verify `default_roles` entries against `GET /projects/{project}/envs/{env}/roles` after changing them.
+
+## Real scenarios
+
+### Feature gating by role
+
+A SaaS with `free`, `pro`, and `enterprise` tiers modeled as roles, each carrying the permissions for the features that tier unlocks:
+
+```bash
+curl -X PUT ".../roles" -d '{"name": "pro", "permissions": ["exports.csv", "exports.pdf", "api.access"]}'
+curl -X PUT ".../roles" -d '{"name": "enterprise", "permissions": ["exports.csv", "exports.pdf", "api.access", "sso.configure", "audit.export"]}'
+```
+
+Because there's no inheritance, `enterprise` has to restate every permission `pro` has plus its own — there's no shorthand for "everything `pro` has, plus." Keeping the permission lists for related tiers generated from one place in your own provisioning script (rather than hand-maintained in two separate `PUT` bodies) avoids drift between them.
+
+### Combining role and ownership checks
+
+"Editors may edit anything; authors may only edit their own drafts":
+
+```json
+{ "any": [
+  { "role": "editor" },
+  { "all": [
+    { "role": "author" },
+    { "owner": "author_id" },
+    { "eq": ["$record.status", "draft"] }
+  ] }
+] }
+```
+
+### Scoped service access
+
+A background service that only needs read access to reports, using a permission rather than a role, combined with the `service` shorthand so an ordinary staff member with the same permission string doesn't unintentionally satisfy a rule meant for machine callers:
+
+```json
+{ "all": [ { "service": true }, { "permission": "reports.read" } ] }
+```
 
 ## Common mistakes
 
 <AccordionGroup>
-  <Accordion title="Assuming role hierarchy exists">
-    Pawabase roles are flat — there is no inheritance between roles. If you need an admin role to inherit editor permissions, you must explicitly assign the same permissions to the admin role or implement it in the policy expression.
+  <Accordion title="Looking for a Role or RoleAssignment model">
+    They don't exist. RBAC is `Permission`/`Group`/`UserGroup` — Sillo's generic primitives — with every name prefixed by `project/env/` so one database can serve every environment without collisions.
   </Accordion>
-  <Accordion title="Putting too many permissions in a single role">
-    Over-granular roles lead to role explosion (too many roles). Keep roles focused — a role should represent a job function, not a single permission.
+  <Accordion title="Passing an unprefixed name straight to Sillo's Group/Permission APIs">
+    Always go through `app/rbac.py`'s functions (`define_role`, `assign_role`, `grant`, …), which apply and strip the `project/env/` prefix consistently. Calling Sillo's `Group`/`Permission` models directly bypasses environment scoping and risks colliding with another project's role of the same name.
   </Accordion>
-  <Accordion title="Not revoking roles properly">
-    Use `revoke_role` (which sets `revoked_at`) instead of deleting `RoleAssignment` records. Deleting records breaks the audit trail. Always use `revoke_role`.
+  <Accordion title="Expecting role inheritance">
+    There is none. `enterprise` does not automatically include everything `pro` has — list every permission explicitly, or check multiple roles with `{"role": ["pro", "enterprise"]}` in policies that should apply to both tiers.
   </Accordion>
-  <Accordion title="Using `has_permission` on every request">
-    `has_permission` performs database queries. Using it on every request for high-traffic endpoints will create a performance bottleneck. Cache results or use role-based checks instead.
+  <Accordion title="Expecting a role assignment to update an already-issued token">
+    Roles and permissions are baked onto the access token at issuance and only re-read on the next refresh (see [Tokens and sessions → what changes at refresh, not immediately](/auth/tokens-and-sessions#what-changes-at-refresh-not-immediately)). Revoking a role doesn't invalidate tokens already handed out; it changes what the *next* refresh or sign-in produces.
   </Accordion>
-  <Accordion title="Not checking `revoked_at`">
-    When checking permissions, always filter by `revoked_at == None`. If you don't, revoked roles will still grant permissions.
-  </Accordion>
-  <Accordion title="Confusing `scope` in role assignments">
-    A global role assignment has `org_id = null`. An org-scoped role assignment has `org_id` set. Mixing these up leads to incorrect permission checks. Always check the scope when assigning or revoking roles.
+  <Accordion title="Writing a permission check as a TOML expression or calling has_permission(...)">
+    Neither exists in this system. Every condition, including role and permission checks, is JSON using the shorthands `{"role": ...}` and `{"permission": ...}` — see [the condition language](/policies/conditions).
   </Accordion>
 </AccordionGroup>
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| A role assigned through the admin API doesn't show up on the user's next request | The user's current access token was issued before the assignment. | Have the client refresh; roles are re-resolved on every refresh, not mid-token. |
+| `default_roles` created a role with no permissions | A typo in the role name in the environment's auth config. | Check `GET .../roles` for an unexpectedly empty role and fix the spelling. |
+| A permission check always fails even though the role clearly has it | The permission or role name wasn't scoped consistently (mixed casing, extra whitespace, wrong environment). | Compare the exact string in `GET .../roles` against what the policy condition or `grant()` call uses. |
+| Deleting a role doesn't revoke access immediately | Same as above — claims already on an issued token stay valid until it expires or is refreshed. | Revoke sessions explicitly (`POST .../users/{id}/sessions/revoke`) if immediate effect is required. |
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Organizations" icon="building" href="/auth/organizations">Multi-tenant organization management.</Card>
-  <Card title="Managing users" icon="users" href="/auth/managing-users">Admin API for user management.</Card>
-  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth` in policy expressions.</Card>
-  <Card title="Security model" icon="shield-check" href="/auth/security-model">Threat model and security best practices.</Card>
+  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth.roles` and `$auth.permissions` inside real conditions.</Card>
+  <Card title="The condition language" icon="brackets" href="/policies/conditions">The full JSON grammar, including the `role` and `permission` shorthands.</Card>
+  <Card title="Organizations" icon="building" href="/auth/organizations">A second, separate axis of access control — membership role within one organization.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">How `roles`/`perms` claims are minted onto the access token.</Card>
 </CardGroup>

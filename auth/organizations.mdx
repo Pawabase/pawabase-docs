@@ -1,397 +1,326 @@
 ---
 title: "Organizations"
-description: "Multi-tenant organization management — the `Org` and `OrgMember` models, organization-scoped authentication, membership management, switching, clearing, and the commerce blueprint."
+description: "The real multi-tenancy model — Organization, Membership, Team, TeamMember, Invitation — role strings validated against ORG_ROLES, token-based invitations, and how a session gets scoped to an org."
 icon: "building"
 ---
 
-Organizations provide multi-tenant architecture for Pawabase applications. An organization is a logical grouping of users that share roles, permissions, and configuration. Organizations allow you to build applications that serve multiple tenants — each tenant has its own set of users, roles, and data isolation.
-
-Organizations are deeply integrated into Pawabase's authentication system. The `$auth.org` object is available in policy expressions, allowing you to write organization-scoped access control. Users can belong to multiple organizations and switch between them seamlessly.
+Organizations are Akountz's multi-tenancy primitive: a way to group users *within one environment* into separate tenants, each with its own membership, its own teams, and its own invitation flow — all backed by plain integer-keyed tables, not UUIDs, and with no per-organization auth configuration.
 
 <CardGroup cols={3}>
-  <Card title="Org-scoped auth" icon="shield">`$auth.org` and `$auth.org_role` are available in policies for org-level access control.</Card>
-  <Card title="Flexible membership" icon="users">Users can belong to multiple organizations and switch between them on refresh.</Card>
-  <Card title="Commerce blueprint" icon="cart">The commerce blueprint extends organizations with product catalogs, orders, and payment processing.</Card>
+  <Card title="Five real tables" icon="database">`Organization`, `Membership`, `Team`, `TeamMember`, `Invitation` — integer primary keys throughout, all scoped to one `(project, env)`.</Card>
+  <Card title="Four roles, enforced" icon="users">`owner`, `admin`, `member`, `viewer` — validated against a real `ORG_ROLES` tuple, not a free-form string.</Card>
+  <Card title="Invitations are tokens" icon="mail">An invitation is a one-time token plus a database row for listing and revocation — not a bare database flag.</Card>
 </CardGroup>
 
-## The `Org` model
+## The five models
 
-The `Org` model represents an organization:
+All defined in `database/models/orgs.py`:
 
 ```python
-class Org(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    name: str
-    slug: str = Field(unique=True)
-    logo_url: str | None = None
-    invite_only: bool = False
-    created_at: datetime = Field(default_factory=datetime.now(UTC))
-    updated_at: datetime = Field(default_factory=datetime.now(UTC))
-    deleted_at: datetime | None = None
+ORG_ROLES = ("owner", "admin", "member", "viewer")
+
+class Organization(Model):
+    id = fields.IntField(primary_key=True)
+    project = fields.CharField(max_length=63, db_index=True)
+    env = fields.CharField(max_length=63)
+    slug = fields.CharField(max_length=63)
+    name = fields.CharField(max_length=200)
+    metadata = AnyJSONField(default=dict)
+    created_by = fields.IntField(null=True)
+    # unique_together: (project, env, slug)
+
+class Membership(Model):
+    id = fields.IntField(primary_key=True)
+    organization = fields.ForeignKeyField("models.Organization", related_name="memberships")
+    user = fields.ForeignKeyField("models.AuthUser", related_name="memberships")
+    role = fields.CharField(max_length=32, default="member")
+    # unique_together: (organization, user)
+
+class Team(Model):
+    id = fields.IntField(primary_key=True)
+    organization = fields.ForeignKeyField("models.Organization", related_name="teams")
+    slug = fields.CharField(max_length=63)
+    name = fields.CharField(max_length=200)
+    # unique_together: (organization, slug)
+
+class TeamMember(Model):
+    id = fields.IntField(primary_key=True)
+    team = fields.ForeignKeyField("models.Team", related_name="members")
+    user = fields.ForeignKeyField("models.AuthUser", related_name="team_memberships")
+    # unique_together: (team, user)
+
+class Invitation(Model):
+    id = fields.IntField(primary_key=True)
+    organization = fields.ForeignKeyField("models.Organization", related_name="invitations")
+    email = fields.CharField(max_length=255)
+    role = fields.CharField(max_length=32, default="member")
+    token_id = fields.CharField(max_length=32)
+    invited_by = fields.IntField(null=True)
+    accepted_at = fields.DatetimeField(null=True)
+    revoked_at = fields.DatetimeField(null=True)
+    expires_at = fields.DatetimeField()
 ```
-
-The `Org` model stores the organization's identity and configuration:
-
-- **`name`**: The display name of the organization (e.g., "Acme Corporation").
-- **`slug`**: A URL-friendly identifier for the organization (e.g., "acme-corp"). Slugs are unique and used in URLs and references.
-- **`logo_url`**: Optional URL to the organization's logo.
-- **`invite_only`**: If `True`, new members can only join through an invitation. If `False`, anyone with a valid invite link can join.
-- **`deleted_at`**: If set, the organization is soft-deleted. Organization-scoped sessions become invalid when the organization is deleted.
-
-### Organization creation
-
-Organizations are created through the admin API or by the first user (who becomes the organization owner). When an organization is created:
-
-1. A new `Org` record is inserted.
-2. The creator is added as the first member via `OrgMember`.
-3. The creator is assigned the `owner` role (or a configurable default role).
-4. An organization-scoped authentication context is created.
-
-<Note>
-The `invite_only` flag controls whether new members can join without an explicit invitation. When `invite_only` is `True`, the organization requires an invitation link or admin approval for new members. When `False`, any user can join using a join link.
-</Note>
-
-### Soft delete
-
-Organizations support soft delete through the `deleted_at` field:
-
-1. When an organization is deleted, `deleted_at` is set to the current timestamp.
-2. All organization-scoped sessions are invalidated.
-3. All `OrgMember` records for the organization remain in the database (for audit purposes).
-4. The organization name and slug are preserved.
-5. Users who were members of the deleted organization are no longer associated with it — `$auth.org` is `null` for those users.
 
 <Warning>
-When an organization is deleted, all sessions for users scoped to that organization become invalid. Users attempting to refresh their tokens with that organization will receive `401 session revoked`. The organization must be restored from the soft delete or the user must create a new session.
+There is no `Org` model, no `OrgMember` model, no `CommerceOrg` "commerce blueprint," no `invite_only` flag, and no `left_at` timestamp anywhere in this schema. The real models are `Organization` and `Membership` — an organization has exactly one membership row per user, deleted outright (not soft-deleted with a `left_at`) when someone leaves or is removed.
 </Warning>
 
-## The `OrgMember` model
+An organization is scoped to a `(project, env)` pair like everything else in Akountz, and its `slug` is unique only within that pair — `acme-hq` can exist as a slug in both `acme/development` and `acme/production` independently, because they're `unique_together` on `(project, env, slug)`, not on `slug` alone.
 
-The `OrgMember` model represents a user's membership in an organization:
+## Roles within an organization
 
-```python
-class OrgMember(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    org_id: UUID = Field(foreign_key="org.id")
-    user_id: UUID = Field(foreign_key="auth_user.id")
-    role: str  # The user's role within the organization
-    joined_at: datetime = Field(default_factory=datetime.now(UTC))
-    left_at: datetime | None = None
-```
-
-The `OrgMember` model tracks:
-
-- **`org_id`**: The organization the user belongs to.
-- **`user_id`**: The user who is a member.
-- **`role`**: The user's role within this specific organization. This is different from global roles — a user can have the role `"admin"` in one organization and `"member"` in another.
-- **`joined_at`**: When the user joined the organization.
-- **`left_at`**: When the user left the organization (if applicable). If `null`, the user is still a member.
-
-### Membership states
-
-A user can have the following membership states:
-
-1. **Active**: `left_at` is `null`. The user is a current member.
-2. **Left**: `left_at` is set to a timestamp. The user was once a member but has left.
-3. **Pending**: The user has been invited but has not yet accepted the invitation.
-
-### Multiple memberships
-
-A user can be a member of multiple organizations. Each membership is a separate `OrgMember` record with its own `org_id`, `role`, and `joined_at`. This allows a user to have different roles in different organizations.
-
-## Organization-scoped authentication
-
-When a user signs in with an organization parameter, their session becomes organization-scoped:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "password",
-    "email": "user@example.com",
-    "password": "password123",
-    "org": "acme-hq"
-  }'
-```
-
-### The `org` parameter on sign-in
-
-The `org` parameter is accepted on all sign-in endpoints (`password`, `refresh_token`, `magic_link`, social login). It specifies the organization for the session:
-
-1. The server validates that the user is a member of the specified organization.
-2. If the user is not a member, the sign-in fails with `403 you are not a member of that organization`.
-3. If the user is a member, the `SessionInfo` row is created with `org` set to the organization ID and `org_role` set to the user's role in that organization.
-4. The access token includes the `org` claim and the `roles` claim includes the organization role.
-
-### `$auth.org` in policies
-
-The `$auth.org` object is available in policy expressions:
-
-```toml
-# Policy example: only allow members of the "acme-hq" organization
-[policy]
-expression = "$auth.org.slug == 'acme-hq'"
-```
-
-The `$auth.org` object contains:
-
-- **`id`**: The organization UUID.
-- **`slug`**: The organization slug.
-- **`name`**: The organization name.
-
-### `org_role` claim
-
-The `org_role` is the user's role within the organization. It is stored in the `SessionInfo.org_role` field and included in the access token claims. The `org_role` is different from global roles — it is specific to the organization.
+`Membership.role` is a plain string, but every endpoint that accepts one validates it against the real, closed set:
 
 ```python
-# The org_role is included in the token payload:
-"org_role": "admin"  # The user's role within the organization
+ORG_ROLES = ("owner", "admin", "member", "viewer")
+
+def _check_role(role: str) -> None:
+    if role not in ORG_ROLES:
+        raise HTTPException(status_code=422, detail=f"role is one of {', '.join(ORG_ROLES)}")
 ```
 
-The `org_role` is used in policy expressions like `$auth.org_role` to determine what actions the user can perform within the organization.
+| Role | Can manage members/invitations/teams? | Can delete the organization? |
+| --- | --- | --- |
+| `owner` | Yes | Yes (and grant/revoke ownership) |
+| `admin` | Yes | No |
+| `member` | No | No |
+| `viewer` | No | No |
 
-## Membership management
-
-Administrators can manage organization memberships through the admin API:
-
-### Adding a member
-
-```bash
-curl -X POST "$GW/projects/my-project/envs/prod/orgs/{org_id}/members" \
-  -H "apikey: $PAWABASE_SECRET_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "user_id": "user-uuid",
-    "role": "member"
-  }'
-```
-
-Adding a member creates a new `OrgMember` record and emits a `org.member_added` event. If the organization has `invite_only = True`, the member must accept an invitation before the membership is active.
-
-### Removing a member
-
-```bash
-curl -X DELETE "$GW/projects/my-project/envs/prod/orgs/{org_id}/members/{user_id}" \
-  -H "apikey: $PAWABASE_SECRET_KEY"
-```
-
-Removing a member sets `left_at = now()` on the `OrgMember` record. The user's `org` and `org_role` in their active sessions are cleared. The user can still sign in without an organization.
-
-### Updating a member's role
-
-```bash
-curl -X PATCH "$GW/projects/my-project/envs/prod/orgs/{org_id}/members/{user_id}" \
-  -H "apikey: $PAWABASE_SECRET_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "role": "admin"
-  }'
-```
-
-Updating a member's role changes the `role` field on the `OrgMember` record. The new role takes effect on the next refresh — the current access token continues to carry the old role until it expires.
-
-## Switching organizations
-
-Users can switch between organizations they belong to through the refresh flow:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c...",
-    "org": "acme-hq"
-  }'
-```
-
-The switch process:
-
-1. The server validates that the user is a member of the target organization.
-2. The `SessionInfo` row is updated with the new `org` and `org_role`.
-3. New tokens are issued with the updated `org` and `org_role` claims.
-4. The `last_active_at` is updated.
-5. A `session.org_switched` event is emitted.
-
-### The `KEEP` sentinel
-
-The `KEEP` sentinel is used to preserve the current organization during a refresh:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c...",
-    "org": "KEEP"
-  }'
-```
-
-When `org: "KEEP"` is sent, the server preserves the current organization from the existing session. This is useful when the client doesn't know which organization the user is currently scoped to. The `KEEP` sentinel ensures the user doesn't accidentally switch organizations during a refresh.
-
-<Note>
-If the `org` parameter is omitted from a refresh request, the current organization is preserved (the default behavior). The `KEEP` sentinel is an explicit way to say "keep the current organization" and is useful when the client is explicitly setting the `org` parameter.
-</Note>
-
-## Clearing the organization
-
-To return to a non-organization-scoped session:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c...",
-    "org": null
-  }'
-```
-
-Clearing the organization:
-
-1. The `SessionInfo` row's `org` and `org_role` are set to `null`.
-2. New tokens are issued with `org: null` and `org_role: null`.
-3. The user is now in a "personal" context where `$auth.org` is `null`.
-
-### What clearing affects
-
-1. **`$auth.org`** becomes `null` in policies.
-2. **`$auth.org_role`** becomes `null`.
-3. **Organization-scoped policies** no longer apply to the user.
-4. **Organization resources** (if any) are no longer accessible.
-5. **The user can still sign in** — they just don't have an organization context.
-
-## Session management for organizations
-
-Each session has an `org` and `org_role` stored in the `SessionInfo` row. This means:
-
-1. **Multiple sessions per user**: A user can have sessions scoped to different organizations simultaneously.
-2. **Session isolation**: Tokens for one organization cannot be used to access resources scoped to a different organization.
-3. **Organization switching**: Switching organizations through refresh creates new tokens while preserving the session row.
-4. **Organization deletion**: When an organization is deleted, all sessions scoped to that organization are invalidated.
-
-### Listing organization sessions
-
-The admin API can list sessions for a specific organization:
-
-```bash
-curl -X GET "$GW/projects/my-project/envs/prod/orgs/{org_id}/sessions" \
-  -H "apikey: $PAWABASE_SECRET_KEY"
-```
-
-This returns all active sessions for members of the specified organization. Each session includes the member's `user_id`, `org_role`, `method`, `aal`, `ip_address`, and `user_agent`.
-
-## The `min_aal` per organization
-
-Organizations can set their own `min_aal` requirement:
-
-```toml
-[org.acme-hq.auth]
-min_aal = "aal2"
-```
-
-When `min_aal` is set for an organization:
-
-1. Members of the organization must have at least `aal2` to access protected resources within that organization.
-2. Refresh requests from sessions with AAL below `min_aal` are denied for that organization.
-3. The organization-level `min_aal` overrides the environment-level setting for members of that organization.
-
-### How `min_aal` is enforced per organization
-
-The `min_aal` check happens during the refresh flow:
+"Managers" — the set allowed to invite, change roles, create teams, and remove other members — are `owner` and `admin`:
 
 ```python
-async def refresh(config, session, refresh_token):
-    # ... validate refresh token ...
-    # Check min_aal for the session's organization
-    if session.org:
-        org_min_aal = await get_org_min_aal(session.org)
-        if org_min_aal and session.aal < org_min_aal:
-            raise PrincipalException("aal2 authentication required")
+MANAGERS = ("owner", "admin")
 ```
 
-If the session's organization has `min_aal = "aal2"` and the session's AAL is `"aal1"`, the refresh is denied. The user must complete MFA to elevate their AAL before they can refresh.
+Beyond that four-value distinction, `member` and `viewer` carry no different behavior inside Akountz itself — Akountz enforces only the manager/non-manager split at the organization-management endpoints. If your application needs `member` and `viewer` to behave differently against *your own* data (say, viewers can read but not create records), that distinction belongs in your [policy conditions](/policies/conditions), read off `$auth.org_role`, not inside Akountz.
 
-## Organization metadata
+### An organization always keeps at least one owner
 
-The `Org` model has a `metadata` field for storing arbitrary organization-specific data:
+Two separate checks enforce this invariant:
 
 ```python
-class Org(BaseModel):
-    ...
-    metadata: dict = Field(default_factory=dict)
+if (body.role == "owner" or target.role == "owner") and me.role != "owner":
+    raise HTTPException(status_code=403, detail="only owners can grant or remove ownership")
+if (target.role == "owner" and body.role != "owner"
+        and await Membership.filter(organization=org, role="owner").count() <= 1):
+    raise HTTPException(status_code=409, detail="an organization keeps at least one owner")
 ```
 
-The `metadata` field is a JSON object that can store any organization-specific configuration:
+The same "last owner" guard applies to removing a member outright, not just demoting one — you cannot remove the sole remaining owner, and you cannot demote them, without first promoting someone else to `owner`.
+
+## Creating an organization
+
+```bash
+curl -X POST "$GW/orgs" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"slug": "acme-hq", "name": "Acme Corp", "metadata": {"plan": "growth"}}'
+```
 
 ```json
 {
-    "billing_plan": "enterprise",
-    "feature_flags": {
-        "beta_features": true,
-        "custom_domains": false
-    },
-    "settings": {
-        "default_role": "member",
-        "max_members": 100
-    }
+  "id": 7,
+  "slug": "acme-hq",
+  "name": "Acme Corp",
+  "metadata": { "plan": "growth" },
+  "role": "owner",
+  "created_at": "2026-09-30T10:00:00Z"
 }
 ```
 
-The `metadata` field is not accessible through `$auth.org` in policies. It is stored in the database and accessed through the admin API.
+`slug` must match `^[a-z0-9][a-z0-9-]{1,62}$` (lowercase, starts with an alphanumeric, 2–63 characters, hyphens allowed thereafter) and must be unique within the environment — `409 that slug is taken` otherwise. The caller is automatically added as `Membership(role="owner")` — there's no separate step to become a member of an organization you just created. `metadata` is an open JSON object with no schema; use it for whatever organization-level settings your application needs (a plan tier, a billing customer id, feature flags), keeping in mind it's readable and writable by any `owner`/`admin` through `PATCH /orgs/{slug}`.
 
-## Commerce blueprint
+## Membership and team management
 
-The commerce blueprint extends organizations with e-commerce capabilities:
-
-```python
-class CommerceOrg(Org):
-    store_name: str
-    currency: str = "USD"
-    default_tax_rate: float = 0.0
-    payment_settings: dict = Field(default_factory=dict)
-    product_catalog: list = Field(default_factory=list)
-```
-
-The commerce blueprint adds:
-
-- **Store identity**: `store_name`, `currency`, `default_tax_rate`.
-- **Payment configuration**: `payment_settings` for processing payments.
-- **Product catalog**: `product_catalog` for managing products.
-- **Order management**: Orders are scoped to the organization.
+<Tabs>
+  <Tab title="Members">
+    | Endpoint | Who | Effect |
+    | --- | --- | --- |
+    | `GET /orgs/{slug}/members` | any member | List every member with role. |
+    | `PUT /orgs/{slug}/members/{user_id}` | manager | Change a member's role (subject to the owner-count and ownership-transfer rules above). |
+    | `DELETE /orgs/{slug}/members/{user_id}` | manager, or the member themself (leaving) | Remove a member. Also deletes their `TeamMember` rows across every team in the org. |
+  </Tab>
+  <Tab title="Teams">
+    | Endpoint | Who | Effect |
+    | --- | --- | --- |
+    | `GET /orgs/{slug}/teams` | any member | List teams with member counts. |
+    | `POST /orgs/{slug}/teams` | manager | Create a team (`slug` + `name`, same slug pattern as organizations). |
+    | `PUT /orgs/{slug}/teams/{team}/members/{user_id}` | manager | Add an existing org member to a team. `404` if the team doesn't exist or the target isn't already an org member. |
+    | `DELETE /orgs/{slug}/teams/{team}/members/{user_id}` | manager | Remove someone from a team (they remain an org member). |
+  </Tab>
+</Tabs>
 
 <Note>
-The commerce blueprint is an optional extension for organizations that need e-commerce capabilities. It is not part of the core Pawabase authentication system — it extends the `Org` model with commerce-specific fields. See the commerce documentation for more details.
+Teams are a flat grouping within an organization — there is no team-level role, no nested teams, and no team-scoped permission set. `TeamMember` is just a join row between `Team` and `AuthUser`. If your application needs team-level authorization, model it in your own data and reference `$auth.org` plus a team lookup in your policies, or keep team membership entirely inside your own schema rather than Akountz's.
 </Note>
+
+A user leaving voluntarily and a manager removing them go through the exact same `DELETE /orgs/{slug}/members/{user_id}` endpoint — the only difference is who's allowed to call it for which target (`user_id != caller.id` requires the caller to be a manager; leaving yourself never does). There is no `left_at` timestamp recording *when* someone left; the `Membership` row is deleted outright, so "when did they leave" is only ever recoverable from `LoginEvent`/platform event history (the `organization.deleted`, `invitation.accepted` style events emitted alongside these operations), not from the membership table itself.
+
+## Invitations
+
+Inviting someone by email is a two-part mechanism: a signed, single-use [one-time token](/auth/tokens-and-sessions#one-time-tokens) (purpose `"invite"`, 7-day lifetime) plus an `Invitation` row that lets the organization list, and revoke, pending invitations — the token alone can't do either of those, which is why both exist together.
+
+```bash
+curl -X POST "$GW/orgs/acme-hq/invitations" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"email": "new.hire@example.com", "role": "member", "redirect_to": "https://app.example.com/invite"}'
+```
+
+```json
+{
+  "id": 3,
+  "email": "new.hire@example.com",
+  "role": "member",
+  "expires_at": "2026-10-07T10:00:00Z"
+}
+```
+
+Requires manager privileges, rejects an invite to someone who's already a member (`409 already a member`), and sends an email using the `invite` message template (see [Configuration → `emails`](/auth/configuration#emails-customizing-message-templates), which has placeholders `{organization}`, `{project}`, `{role}`, `{link}`).
+
+### Accepting an invitation
+
+```bash
+curl -X POST "$GW/invitations/accept" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" -d '{"token": "eyJ..."}'
+```
+
+The signed-in user must already have (or create) an account with **exactly the email the invitation was sent to** — `403 this invitation was sent to another address` otherwise. This means a common real flow is: the invited person clicks the emailed link, which is not yet signed in; your client should route them through sign-up/sign-in with that same address first, and only then submit the accept call with a valid access token.
+
+Acceptance is an *upsert*, not a plain insert — if the invited email already somehow holds a stale, pre-existing membership row (e.g. they were removed and re-invited), accepting replaces its role rather than conflicting:
+
+```python
+await upsert(Membership, organization=invitation.organization, user=user, defaults={"role": invitation.role})
+```
+
+### Listing and revoking pending invitations
+
+```bash
+curl "$GW/orgs/acme-hq/invitations" -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $KEY"
+curl -X DELETE "$GW/orgs/acme-hq/invitations/3" -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $KEY"
+```
+
+The list only ever shows invitations that are still pending: not accepted, not revoked, and not past `expires_at`. Revoking sets `revoked_at`; the underlying one-time token becomes unusable the moment `accept` is attempted against a row that's no longer `accepted_at=None, revoked_at=None`, even though the signed token itself would otherwise still verify until its 7-day expiry.
+
+## Organizations and sessions
+
+An organization is not just a grouping of users — it can be woven into the *session* itself, so that an access token carries which organization the caller is currently acting within.
+
+### Signing in scoped to an organization
+
+Adding `"org": "acme-hq"` to a `POST /auth/v1/token` request (password, magic-link, or MFA-completion grant) scopes the resulting session:
+
+```json
+{ "grant_type": "password", "email": "...", "password": "...", "org": "acme-hq" }
+```
+
+If the user is a member, the response carries `org` and `org_role`; if not, the request fails outright with `403 you are not a member of that organization` — Akountz never silently drops an organization the caller explicitly asked for and issues an unscoped token instead.
+
+```python
+async def require_membership(config: AuthConfig, user: AuthUser, slug: str | None) -> str | None:
+    if not slug:
+        return None
+    if await membership_role(config, user, slug) is None:
+        raise HTTPException(status_code=403, detail="you are not a member of that organization")
+    return slug
+```
+
+### Switching or clearing the organization on refresh
+
+A refresh (`grant_type: "refresh_token"`) can carry `org` to switch which organization the *new* access token is scoped to, or omit it entirely to keep the session's current organization unchanged:
+
+```python
+KEEP: Any = object()
+
+async def refresh_session(..., org: Any = KEEP) -> dict[str, Any]:
+    ...
+    active = info.org if info else None
+    if org is not KEEP:
+        active = await require_membership(config, user, org or None)
+```
+
+| Request body | Effect |
+| --- | --- |
+| `org` field omitted entirely | The session's current organization is kept unchanged. |
+| `"org": "another-org"` | Switches to that organization (must be a member; `403` otherwise). |
+| `"org": null` or `"org": ""` | Clears the organization — the next access token has `org: null`, `org_role: null`. |
+
+The route layer distinguishes "omitted" from "explicitly null" using Pydantic's `model_fields_set`, which is why omitting the field and sending `null` behave differently — this is a real, load-bearing distinction, not an accident:
+
+```python
+org=body.org if "org" in body.model_fields_set else KEEP,
+```
+
+### The membership role is re-read at issue time
+
+```python
+org_role = await membership_role(config, user, org)
+if org_role is None:
+    org = None
+```
+
+Every time an access token is minted — sign-in or refresh — the caller's role in the requested organization is looked up fresh from the `Membership` table. If the role was just changed by an admin, or the membership was just removed, **the currently-live access token still carries the old `org_role` until the session refreshes**; only the *next* refresh picks up the change. This mirrors the same "claims are fixed at mint time" behavior [roles have](/auth/roles-and-permissions#common-mistakes) and [tokens have generally](/auth/tokens-and-sessions#what-changes-at-refresh-not-immediately).
+
+## One auth configuration per environment
+
+There is exactly one `AuthConfig` per `(project, env)` — password policy, `mfa_enabled`, token lifetimes, everything in [Configuration](/auth/configuration) applies uniformly to every organization inside that environment. There is no per-organization override of any of those settings, and no `min_aal` (or any other) field scoped to an individual organization.
+
+<Warning>
+If your product needs "organization Acme requires MFA but organization Globex doesn't," that distinction does not exist inside Akountz's configuration model. You would need to enforce it yourself — for example, a policy condition that checks both `$auth.org` and `$auth.claims.aal` together, or an application-level gate that reads a flag from your own database before allowing certain operations for a specific organization's members.
+</Warning>
+
+## Real scenarios
+
+### Multi-tenant SaaS with team invitations
+
+A typical B2B SaaS onboarding: a founder signs up, creates an organization (becoming its `owner` automatically), invites teammates by email at `member` or `admin`, and each invitee accepts once they've created or signed into their own account with the matching email. Session tokens are issued with `org` set once a user picks (or is defaulted into) a workspace in your client, and `$auth.org`/`$auth.org_role` drive every organization-scoped policy from there.
+
+### Downgrading a departing admin
+
+An `admin` who's leaving the company should be demoted or removed. If they happen to be the organization's only `owner`, the API refuses both the demotion and the removal until someone else is promoted to `owner` first — this is enforced server-side, not something your client needs to check beforehand, though surfacing a clear error ("promote another owner first") in your UI avoids a confusing raw `409`.
+
+### Re-inviting after a revoked invitation
+
+If an invitation is revoked before being accepted, sending a *new* invitation to the same email is a completely independent `POST /orgs/{slug}/invitations` call — it creates a new token and a new `Invitation` row; the revoked one has no bearing on whether a new one can be issued (the only duplicate check is against *current membership*, not against past invitation history).
 
 ## Common mistakes
 
 <AccordionGroup>
-  <Accordion title="Not handling organization deletion">
-    When an organization is deleted, all sessions scoped to it are invalidated. If you're not handling this case, users may suddenly find themselves unable to refresh their tokens. Always check if the organization still exists on refresh.
+  <Accordion title="Looking for an Org or OrgMember model">
+    They're `Organization` and `Membership`. Both use plain auto-incrementing integer primary keys, not UUIDs.
   </Accordion>
-  <Accordion title="Confusing global roles with `org_role`">
-    Global roles are stored in the `Role` table and applied to all organizations. `org_role` is specific to a single organization. A user can have the global role `"admin"` but the `org_role` `"member"` in a specific organization.
+  <Accordion title="Expecting an invite_only flag">
+    There isn't one. Whether an organization accepts self-service joins or only invited members is an application-level decision — Akountz gives you organization creation, membership, and invitations as primitives; it doesn't have an "open vs. closed" organization setting.
   </Accordion>
-  <Accordion title="Not setting `invite_only` correctly">
-    If `invite_only` is `False` and you're using organization invitations, anyone with the invite link can join. If `invite_only` is `True`, new members must have an explicit invitation. Choose the right setting for your use case.
+  <Accordion title="Expecting a left_at timestamp on Membership">
+    There isn't one — leaving or being removed deletes the `Membership` row outright. If you need an audit trail of departures, consume the platform event stream (`invitation.accepted`, `organization.created`, `organization.deleted`, and friends emitted via `akountz.emit`) rather than looking for a soft-delete column.
   </Accordion>
-  <Accordion title="Not using `KEEP` when switching organizations">
-    Omitting `org` from a refresh preserves the current organization. But if the client explicitly sets `org`, it switches. Use `KEEP` to preserve the current organization when you're not sure which one the user is currently scoped to.
+  <Accordion title="Assuming a CommerceOrg or any organization 'blueprint' exists">
+    It doesn't. There is exactly one organization shape — `Organization` plus `Membership`/`Team`/`Invitation` — with no specialized subtype for commerce or any other vertical.
   </Accordion>
-  <Accordion title="Storing sensitive data in `Org.metadata`">
-    The `metadata` field is a JSON object stored in the database. It's not accessible through `$auth.org` in policies. Don't store data you need to gate access on in `metadata` — use roles and `org_role` instead.
+  <Accordion title="Expecting per-organization auth settings like a min_aal">
+    Auth configuration (`password_policy`, `mfa_enabled`, token lifetimes, everything in Configuration) is environment-wide. There is no organization-scoped override for any of it.
+  </Accordion>
+  <Accordion title="Forgetting that org_role only updates on refresh">
+    A role change made through `PUT /orgs/{slug}/members/{user_id}` doesn't retroactively change an already-issued access token's `org_role` claim — only the next sign-in or refresh reflects it.
   </Accordion>
 </AccordionGroup>
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `403 you are not a member of that organization` at sign-in | The `org` slug in the request doesn't have a `Membership` row for this user. | Confirm membership with `GET /orgs`, or have them accept a pending invitation first. |
+| `409 an organization keeps at least one owner` | Trying to demote or remove the sole `owner`. | Promote another member to `owner` first. |
+| `403 only owners can grant or remove ownership` | An `admin` (not `owner`) tried to change someone to/from `owner`. | Only an `owner` can touch the `owner` role. |
+| `403 this invitation was sent to another address` | The signed-in account's email doesn't match the invited email exactly. | Sign in with the exact address the invitation was sent to. |
+| An accepted role change to `org_role` isn't visible on the client | The client is using a stale access token. | Refresh the session; `org_role` is re-read at issue time on every refresh. |
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth` in policy expressions.</Card>
-  <Card title="Roles and permissions" icon="shield" href="/auth/roles-and-permissions">Role-based access control.</Card>
-  <Card title="Managing users" icon="users" href="/auth/managing-users">Admin API for user management.</Card>
-  <Card title="Security model" icon="shield-check" href="/auth/security-model">Threat model and security best practices.</Card>
+  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth.org` and `$auth.org_role` in real conditions.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">How `org`/`org_role` are minted onto the token and threaded through refresh.</Card>
+  <Card title="Roles and permissions" icon="shield" href="/auth/roles-and-permissions">The separate, environment-wide RBAC system — distinct from an organization's own role field.</Card>
 </CardGroup>

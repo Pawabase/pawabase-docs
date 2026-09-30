@@ -1,201 +1,317 @@
 ---
 title: "Local development"
-description: "Run Pawabase locally without Docker for development, testing, and debugging."
+description: "Run the whole Pawabase stack on your machine with one script, no Docker, no Postgres, no Redis — scripts/dev.sh, the uv workspace, SQLite by default, and the day-to-day development loop."
 icon: "laptop-code"
 ---
 
-If you prefer to run Pawabase directly on your machine (without Docker), this guide walks through the prerequisites, setup, and development workflow. This is useful when you need to debug issues, add custom Python functions, or contribute to the platform.
+Pawabase is a `uv` workspace of five Python services (`api`, `akountz`, `angula`, `gateway`, `studio`) plus one shared package (`packages/kit`). There is no `pawabase` CLI and no installable `pawabase` PyPI package — each service is an ordinary ASGI app you run with `uvicorn`, and the repository ships a single script, `scripts/dev.sh`, that starts all five for you against SQLite with no external database or cache.
 
-The Docker installation is still the recommended approach for most users — see [Docker installation](/installation/docker) if you just want to run Pawabase locally and start building.
+This page describes the real local development workflow as it exists in the repository: what `scripts/dev.sh` does, line by line, how to run a single service on its own when you're working on just one of them, and the everyday loop of editing, restarting, and inspecting logs.
 
-## When to use this approach
+<Info>
+If you only want to run Pawabase and build on top of it — not modify the platform's own source — [Docker](/installation/docker) is simpler: one command, one set of containers, Postgres and Redis included. Reach for this page when you're working on Pawabase itself, debugging a service in an editor, or you'd rather not run Docker at all.
+</Info>
 
-Use the standalone development setup when you need:
-- Debugging with `pdb` or an IDE debugger
-- Hot-reloading of custom Python functions
-- Direct access to the Python package for development
-- Running tests against your local setup
-
-<Warning>
-This setup is for **development only**. Do not use it in production. The Docker Compose installation includes proper health checks, restart policies, and isolation that are required for production use.
-</Warning>
+<CardGroup cols={3}>
+  <Card title="No CLI, no install step" icon="terminal">Each service is `uv run uvicorn app.main:app` run from inside its own `services/<name>/` directory.</Card>
+  <Card title="SQLite by default" icon="database">The whole stack runs on SQLite files under `.dev/`. No Postgres, no Redis, nothing to install beyond Python and `uv`.</Card>
+  <Card title="One script starts everything" icon="play">`scripts/dev.sh` sets sane defaults, builds Studio's frontend once, and launches all five services with `trap` cleanup on Ctrl-C.</Card>
+</CardGroup>
 
 ## Prerequisites
 
-| Tool | Version | How to check |
+| Tool | Version | Why |
 | --- | --- | --- |
-| Python | 3.12+ | `python --version` |
-| PostgreSQL | 16+ | `pg_config --version` or `psql --version` |
-| Redis | 7+ | `redis-cli --version` |
-| pip | latest | `pip --version` |
+| Python | `>=3.11` | The root `pyproject.toml` sets `requires-python = ">=3.11"`. There's no upper bound and no requirement to use 3.12 specifically. |
+| [uv](https://docs.astral.sh/uv/) | recent | Manages the workspace and its virtual environment. `uv run` resolves and runs against the workspace lockfile without a separate `pip install` step. |
+| Node.js + npm | any current LTS | Only needed to build Studio's frontend once (`services/studio/frontend`), unless you run it in Vite dev mode instead (see below). |
+| bash | — | `scripts/dev.sh` is a bash script (`#!/usr/bin/env bash`, `set -euo pipefail`). macOS and Linux both ship a compatible shell; on Windows use WSL2. |
 
-### macOS
+You do **not** need Postgres, Redis, or Docker for local development. Every service falls back to SQLite for its database and to an in-process rate limiter and cache when no Redis URL is configured — which is the default (`redis_url: str = ""` in `pawabase_kit.settings.PlatformSettings`).
 
-```bash
-# Using Homebrew
-brew install python@3.12 postgresql@16 redis
-brew services start postgresql@16
-brew services start redis
-```
+<Warning>
+Earlier drafts of this page described a `pawabase` CLI (`pawabase migrate`, `pawabase gateway`, `pawabase akountz`, …), a required PostgreSQL 16 install, and a required Redis 7 install. None of that exists in this codebase. There is no CLI binary anywhere in the workspace, and `scripts/dev.sh` runs every service on SQLite with Redis left unconfigured. If you've seen those instructions elsewhere, they don't apply to this version of Pawabase.
+</Warning>
 
-### Ubuntu
-
-```bash
-# Python, Postgres, Redis
-sudo apt install python3.12 python3-pip postgresql-16 redis-server
-sudo systemctl start postgresql redis
-```
-
-### Windows
-
-Use **WSL2** with Ubuntu. The standalone setup is not supported on native Windows.
-
-## Installation steps
-
-### 1. Get Pawabase source
+## Getting the source and `uv`
 
 ```bash
 git clone https://github.com/silloHQ/pawabase.git
 cd pawabase
 ```
 
-### 2. Create a virtual environment
+Install `uv` if you don't already have it:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # macOS/Linux
-# or: .venv\Scripts\activate  # Windows WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS/Linux
+# or: pipx install uv / brew install uv
 ```
 
-### 3. Install the package
+You don't create a virtualenv by hand and you don't run `pip install -e .`. The root `pyproject.toml` declares the project as a `uv` **workspace**, not a single installable package:
+
+```toml
+[project]
+name = "pawabase"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "packages/kit",
+    "services/api",
+    "services/akountz",
+    "services/angula",
+    "services/gateway",
+    "services/studio",
+]
+```
+
+`package = false` means the root project itself has no code to install — it exists only to define the workspace and its shared dev dependencies (`pytest`, `pytest-asyncio`, `ruff`, `fakeredis[lua]`). Each member under `services/` and `packages/kit` is its own installable package with its own `pyproject.toml` and its own dependencies. `uv run <command>` from anywhere in the workspace resolves the lockfile and runs `<command>` inside the right environment automatically — there's no manual `source .venv/bin/activate` step, though `uv` does create a shared `.venv/` at the workspace root the first time you run something.
+
+The first `uv run` (whether you invoke it yourself or `scripts/dev.sh` does) will resolve and install every workspace member's dependencies. This takes longer the first time; subsequent runs are fast.
+
+## Starting everything: `scripts/dev.sh`
+
+The whole stack starts with one command from the repository root:
 
 ```bash
-pip install -e ".[dev]"
+scripts/dev.sh
 ```
 
-This installs Pawabase and its development dependencies (pytest, debuggers, etc.).
-
-### 4. Configure environment variables
+This is the real script, unabridged:
 
 ```bash
-cp .env.example .env
+#!/usr/bin/env bash
+# Run every Pawabase service locally on SQLite, no Docker needed.
+#
+#   scripts/dev.sh            # start everything; Ctrl-C stops it
+#   STUDIO_VITE=1 scripts/dev.sh   # Studio loads the front end from `npm run dev`
+#
+# State lives in ./.dev (delete it to start over). Studio is on :8090, the
+# gateway on :8080. Sign in as admin@pawabase.local / Pawabase!admin1.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STATE="${PAWABASE_DEV_DIR:-$ROOT/.dev}"
+mkdir -p "$STATE/logs"
+
+export SILLO_ENV_FILE=""
+export PAWABASE_APP_ENV="${PAWABASE_APP_ENV:-local}"
+export PAWABASE_INTERNAL_SECRET="${PAWABASE_INTERNAL_SECRET:-dev-internal-secret-change-me-please}"
+export PAWABASE_JWT_MASTER_SECRET="${PAWABASE_JWT_MASTER_SECRET:-dev-jwt-master-secret-change-me-please}"
+export PAWABASE_MASTER_KEY="${PAWABASE_MASTER_KEY:-dev-master-key-change-me-please-0000}"
+export PAWABASE_DB_GENERATE_SCHEMAS=true
+export PAWABASE_PUBLIC_URL="http://127.0.0.1:8080"
+export PAWABASE_PUBLIC_GATEWAY_URL="http://127.0.0.1:8080"
+export PAWABASE_ADMIN_EMAIL="${PAWABASE_ADMIN_EMAIL:-admin@pawabase.local}"
+export PAWABASE_ADMIN_PASSWORD="${PAWABASE_ADMIN_PASSWORD:-Pawabase!admin1}"
+export PAWABASE_INLINE_SCHEDULER=true
+[ -n "${STUDIO_VITE:-}" ] && export PAWABASE_VITE_DEV=true
+
+if [ -z "${STUDIO_VITE:-}" ] && [ ! -f "$ROOT/services/studio/frontend/dist/.vite/manifest.json" ]; then
+  echo "Building Studio's front end…"
+  (cd "$ROOT/services/studio/frontend" && npm install --no-audit --no-fund && npm run build)
+fi
+
+pids=()
+start() {
+  local name=$1 port=$2
+  shift 2
+  (cd "$ROOT/services/$name" && env "$@" uv run uvicorn app.main:app --host 127.0.0.1 --port "$port" --log-level warning) \
+    >"$STATE/logs/$name.log" 2>&1 &
+  pids+=($!)
+  echo "  $name → http://127.0.0.1:$port   (log: .dev/logs/$name.log)"
+}
+trap 'kill "${pids[@]}" 2>/dev/null; wait' EXIT INT TERM
+
+echo "Starting Pawabase:"
+start api 8001 PAWABASE_DATABASE_URL="sqlite://$STATE/api.db" PAWABASE_DEFAULT_DATA_URL="sqlite://$STATE/data/{project}__{env}.db" PAWABASE_STORAGE_ROOT="$STATE/objects" PAWABASE_CODE_PATH="$ROOT/examples/code"
+start akountz 8002 PAWABASE_DATABASE_URL="sqlite://$STATE/akountz.db"
+start angula 8003
+start gateway 8080
+start studio 8090
+echo "Studio: http://127.0.0.1:8090  ($PAWABASE_ADMIN_EMAIL / $PAWABASE_ADMIN_PASSWORD)"
+wait
 ```
 
-Edit `.env` and set the required values. For local development, you can use simple values:
+Walking through what actually happens:
 
-```env
-# Generate with: openssl rand -hex 32
-PAWABASE_INTERNAL_SECRET=dev-internal-secret-00000000000000000000000000000000
-PAWABASE_JWT_MASTER_SECRET=dev-jwt-secret-000000000000000000000000000000
-PAWABASE_MASTER_KEY=dev-master-key-00000000000000000000000000000000
+<Steps>
+  <Step title="A state directory is created">
+    `$STATE` defaults to `.dev` at the repository root (override it with `PAWABASE_DEV_DIR` if you want the databases and logs somewhere else, or want to run two stacks side by side). `.dev/logs/` is created up front; every service's stdout and stderr goes to `.dev/logs/<service>.log`.
+  </Step>
+  <Step title="Environment defaults are exported">
+    `SILLO_ENV_FILE=""` disables Sillo's automatic `.env` file loading for the child processes, so the script's own exported variables are what each service sees — a stray `.env` in your working directory won't silently override the dev secrets. The three secrets (`PAWABASE_INTERNAL_SECRET`, `PAWABASE_JWT_MASTER_SECRET`, `PAWABASE_MASTER_KEY`) get fixed development placeholders unless you've already exported your own before running the script — `${VAR:-default}` only applies the default when `VAR` is unset. `PAWABASE_DB_GENERATE_SCHEMAS=true` tells each service to create its own tables directly from its Tortoise ORM models on startup, which is how a fresh SQLite file gets its schema without a separate migration step in development.
+  </Step>
+  <Step title="Studio's frontend is built once, unless you ask for Vite">
+    If `STUDIO_VITE` is unset and `services/studio/frontend/dist/.vite/manifest.json` doesn't already exist, the script runs `npm install` and `npm run build` inside `services/studio/frontend` before starting anything. This is a one-time cost — once the `dist/` build exists, subsequent runs of `scripts/dev.sh` skip straight to starting services. Delete `services/studio/frontend/dist` (or run `STUDIO_VITE=1`, see below) to force a rebuild.
+  </Step>
+  <Step title="Five services start as background processes">
+    The `start` function `cd`s into `services/<name>`, sets any service-specific environment variables inline, and runs `uv run uvicorn app.main:app --host 127.0.0.1 --port <port> --log-level warning` in the background, redirecting output to that service's log file. `pids+=($!)` records each background process's PID.
+  </Step>
+  <Step title="Ctrl-C stops everything cleanly">
+    `trap 'kill "${pids[@]}" 2>/dev/null; wait' EXIT INT TERM` means that whether the script exits normally, is interrupted (Ctrl-C), or is killed, every child process it started gets a `kill` signal and the script waits for them to exit before returning your shell. You never end up with orphaned `uvicorn` processes holding the ports open.
+  </Step>
+  <Step title="The script blocks on `wait`">
+    The final `wait` blocks the script (and your terminal) until every backgrounded service exits — normally that means it just sits there running the stack until you press Ctrl-C.
+  </Step>
+</Steps>
 
-POSTGRES_PASSWORD=pawabase
+### What's listening where
 
-# First admin user
-PAWABASE_ADMIN_EMAIL=admin@example.com
-PAWABASE_ADMIN_PASSWORD=DevPass123!
+| Service | Port | Database | Notes |
+| --- | --- | --- | --- |
+| `api` | 8001 | `.dev/api.db` (SQLite) | `PAWABASE_DEFAULT_DATA_URL` points project/environment data at `.dev/data/{project}__{env}.db`; `PAWABASE_CODE_PATH` points at `examples/code` for custom Python functions. `PAWABASE_STORAGE_ROOT` is `.dev/objects`. |
+| `akountz` | 8002 | `.dev/akountz.db` (SQLite) | Identity service — users, sessions, MFA, organizations. See the [auth section](/auth/overview) for what it does. |
+| `angula` | 8003 | — | Realtime service (WebSocket channels, presence). No dedicated database in dev. |
+| `gateway` | 8080 | — | The one address a client talks to. Routes to `api`, `akountz` and `angula` based on the request path. |
+| `studio` | 8090 | — | The web UI, served from the built frontend (or Vite in dev mode). Signs in as the admin operator created on first boot. |
 
-# Local URLs
-PAWABASE_PUBLIC_URL=http://localhost:8080
-PAWABASE_PUBLIC_GATEWAY_URL=http://localhost:8080
-PAWABASE_COOKIE_SECURE=false
-```
+Once `scripts/dev.sh` prints `Studio: http://127.0.0.1:8090`, open that URL and sign in with `PAWABASE_ADMIN_EMAIL` / `PAWABASE_ADMIN_PASSWORD` — by default `admin@pawabase.local` / `Pawabase!admin1`. That operator account is created automatically on first boot because `PAWABASE_ADMIN_EMAIL` and `PAWABASE_ADMIN_PASSWORD` are set; see [Docker → configure secrets](/installation/docker#3-configure-secrets) for the same mechanism running against Postgres.
 
-### 5. Set up the database
+<Warning>
+The default admin password (`Pawabase!admin1`) and the placeholder secrets are for local development only. Never reuse them, and never point `scripts/dev.sh` at a shared or production database — it's designed to run entirely against disposable local SQLite files.
+</Warning>
+
+## Starting the stack with your own values
+
+Every default in the script can be overridden by exporting the variable before running it:
 
 ```bash
-# Create the database user and database
-psql -U postgres -c "CREATE USER pawabase WITH PASSWORD 'pawabase';"
-psql -U postgres -c "CREATE DATABASE pawabase OWNER pawabase;"
-
-# Run migrations
-pawabase migrate
+export PAWABASE_ADMIN_EMAIL=me@example.com
+export PAWABASE_ADMIN_PASSWORD='MyDevPassword1!'
+export PAWABASE_DEV_DIR="$HOME/.pawabase-dev"   # keep state outside the repo
+scripts/dev.sh
 ```
 
-### 6. Start the platform
+Because of `${VAR:-default}`, any variable you've already exported is left alone — the script only fills in what's missing. This is also how you'd point one of the dev services at a *non-default* database without touching the script: export `PAWABASE_DATABASE_URL` yourself before running `scripts/dev.sh`, and the `akountz`/`api` `start` calls in the script would still win for those two services specifically, since they set that variable explicitly inline. If you need to override a value the script sets inline (like `akountz`'s database URL), run that one service by hand instead — see below.
 
-Open **five** terminal windows:
+### Studio in Vite dev mode
 
 ```bash
-# Terminal 1: Gateway (port 8080)
-pawabase gateway
-
-# Terminal 2: API (port 8001)
-pawabase api
-
-# Terminal 3: Akountz - identity service (port 8002)
-pawabase akountz
-
-# Terminal 4: Angula - realtime service (port 8003)
-pawabase angula
-
-# Terminal 5: Worker and scheduler
-pawabase worker &
-pawabase scheduler
+STUDIO_VITE=1 scripts/dev.sh
 ```
 
-<Info>
-Each process reads its role from the `PAWABASE_ENTRYPOINT` environment variable. The `pawabase` CLI command sets this automatically based on the subcommand (`gateway`, `api`, `akountz`, `angula`, `worker`, `scheduler`).
-</Info>
+With `STUDIO_VITE` set, the script skips the `npm run build` step entirely and exports `PAWABASE_VITE_DEV=true`, which tells the Studio service to serve the frontend from a running Vite dev server instead of a static build. This gets you hot module reloading while editing Studio's frontend. You still need to have run `npm install` in `services/studio/frontend` at least once, and you'll typically run `npm run dev` there yourself in a separate terminal alongside `scripts/dev.sh` — the script doesn't start the Vite dev server for you, it only flips the flag that tells the Studio backend to expect one.
 
-Once all services are running, you can access:
-- **Studio** at `http://localhost:8090`
-- **API gateway** at `http://localhost:8080`
+### Resetting to a clean slate
 
-## Development workflow
-
-### Hot-reloading
-
-The API process watches for changes to:
-- Python source files in the code directory (`PAWABASE_CODE_PATH`, default `./code`)
-- Resource definitions in Studio (picked up on the next request)
-- Flow definitions (picked up on the next execution)
-
-No restart is needed — changes take effect automatically.
-
-### Adding custom functions
-
-1. Create a Python file in the `code/` directory:
-   ```python
-   # code/my_functions.py
-   from pawabase_kit import function
-
-   @function("send_notification")
-   def send_notification(ctx, user_id, message):
-       ctx.logger.info(f"Sending to {user_id}: {message}")
-       return {"status": "sent"}
-   ```
-
-2. The function is automatically discovered and available in Studio's flow editor under **Blocks → Functions**.
-
-### Debugging with a debugger
-
-Attach your IDE debugger to the API or worker process:
+Every piece of local state — every SQLite database, every uploaded object, every log — lives under `.dev/` (or wherever `PAWABASE_DEV_DIR` points). To start completely fresh:
 
 ```bash
-# With breakpoints in your code
-python -m pdb -m pawabase.api
-# or use debugpy for VS Code
-DEBUGPY=1 pawabase api
+rm -rf .dev
+scripts/dev.sh
 ```
 
-### Testing
+`PAWABASE_DB_GENERATE_SCHEMAS=true` means each service recreates its tables from its models the next time it boots against an empty database file, so there's no separate "run migrations" step to remember in development.
+
+## Running a single service by hand
+
+You don't need the whole stack running to work on one service. Since each service is just an ASGI app, you can start it exactly the way `scripts/dev.sh` does, from inside its own directory:
 
 ```bash
-pytest tests/
+cd services/akountz
+PAWABASE_INTERNAL_SECRET=dev-internal-secret-change-me-please \
+PAWABASE_JWT_MASTER_SECRET=dev-jwt-master-secret-change-me-please \
+PAWABASE_MASTER_KEY=dev-master-key-change-me-please-0000 \
+PAWABASE_DATABASE_URL=sqlite://./akountz-dev.db \
+PAWABASE_DB_GENERATE_SCHEMAS=true \
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8002 --reload
 ```
 
-Tests cover the API, worker, scheduler, and platform components. See the [test fixtures documentation](/concepts/testing-fixtures) for writing your own tests.
+Every service's entry point is the same one-liner, `app/main.py`:
+
+```python
+from app.bootstrap import create_app
+
+app = create_app()
+```
+
+so `app.main:app` is what you point `uvicorn` at for every service, always. A few things worth knowing when you run one service on its own rather than through the script:
+
+- **The three secrets must match across services** if you're running more than one at once by hand (say, `akountz` plus `api`). They derive signing keys from each other — `akountz` derives its per-environment user-token secret from `PAWABASE_JWT_MASTER_SECRET`, and internal service-to-service calls are signed with `PAWABASE_INTERNAL_SECRET`. If you start `akountz` with one internal secret and `gateway` with another, requests between them will fail to authenticate.
+- **`--reload`** (uvicorn's autoreload flag) is genuinely useful when iterating on one service, since `scripts/dev.sh` doesn't pass it — the script's own `start` function is written for "run everything and leave it running," not tight edit-reload loops on a single service. Add `--reload` yourself when you're actively editing that service's code; each import of your changed module happens on the next request without a manual restart.
+- **Downstream services still need to be reachable.** `akountz` alone works fine for exercising its own endpoints directly (`curl localhost:8002/auth/v1/settings` with the right headers), but a browser or client normally talks to the `gateway`, which needs `akountz`, `api` and `angula` all running to route to. For most day-to-day work, running the whole stack via `scripts/dev.sh` and only *restarting* the one service you're changing (kill its process from `.dev/logs`, or just re-run `scripts/dev.sh`) is simpler than juggling several manual `uvicorn` invocations with matching secrets.
+- **`PAWABASE_DB_GENERATE_SCHEMAS=true`** is what lets a bare SQLite path spin up with the right tables. Without it, a service expects its schema to already exist (the production path uses versioned migrations instead — see `services/akountz/database/migrate.py` and the sibling `migrations/` packages for the real migration mechanism used outside local development).
+
+## Editing and seeing changes take effect
+
+Pawabase's own services are ordinary Python/ASGI processes with no hot-reload built into `scripts/dev.sh`. If you edit a service's Python source while it's running under the script, you need to restart that process to see the change — there's no watcher wired in by default. Two practical approaches:
+
+1. **Restart the whole stack.** `Ctrl-C` the running `scripts/dev.sh`, then run it again. Because your SQLite databases already exist under `.dev/`, this is fast — no rebuild of Studio's frontend (the `dist/.vite/manifest.json` check short-circuits it) and no re-resolution of dependencies beyond what changed.
+2. **Run just the service you're editing by hand, with `--reload`.** Kill that one service (see below), then start it manually as shown in the previous section with `--reload` added, keeping the rest of the stack running from `scripts/dev.sh`.
+
+Project-level code (custom Python functions the `api` service loads from `PAWABASE_CODE_PATH`, which `scripts/dev.sh` points at `examples/code`) is read per-request by the compiled app, not imported once at process boot the same way — check `services/api/app/compiler` if you're working on that layer specifically, since its reload behavior is separate from the platform services' own code.
+
+### Finding and killing one service
+
+`scripts/dev.sh` doesn't print each service's PID after the initial listing, but you can find it by port:
+
+```bash
+lsof -nP -iTCP:8002 -sTCP:LISTEN   # macOS/Linux: find what's on akountz's port
+kill <pid>
+```
+
+Killing one service this way leaves the others (and the `wait` in `scripts/dev.sh`) running; the script's `trap` only fires when the script itself receives a signal or exits, not when an individual child dies unexpectedly. If a service you killed manually needs to come back, the simplest route is to stop the whole script (Ctrl-C) and start it again — SQLite state persists, so nothing is lost.
+
+## Logs
+
+Every service's combined stdout/stderr goes to `.dev/logs/<service>.log`:
+
+```bash
+tail -f .dev/logs/akountz.log
+tail -f .dev/logs/gateway.log
+```
+
+`--log-level warning` is passed to every `uvicorn` invocation in the script, so routine request logging is quiet by default — you'll see warnings, errors and tracebacks, not a line per request. If you want per-request access logs while debugging, run that one service by hand (see above) without `--log-level warning`, or with `--log-level info`.
 
 ## Common issues
 
-**"Connection refused" on port 5432** — Postgres isn't running. Start it with `brew services start postgresql@16` (macOS) or `sudo systemctl start postgresql` (Linux).
+<AccordionGroup>
+  <Accordion title="`ModuleNotFoundError` or an import error when a service starts">
+    Almost always means `uv` hasn't resolved that workspace member yet, or you're running a bare `python`/`uvicorn` instead of `uv run uvicorn`. Always invoke services through `uv run` (as `scripts/dev.sh` does) so the right workspace environment is used. Running `uv sync` from the repository root resolves every workspace member up front if you want to pre-warm the environment before the first `scripts/dev.sh` run.
+  </Accordion>
+  <Accordion title="Studio shows a blank page or 404s on its assets">
+    The frontend build is missing or stale. Either delete `services/studio/frontend/dist` and re-run `scripts/dev.sh` (it will rebuild automatically), or run `STUDIO_VITE=1 scripts/dev.sh` alongside `npm run dev` in `services/studio/frontend` for a dev-mode frontend that doesn't need a build step at all.
+  </Accordion>
+  <Accordion title="Two services disagree about tokens, or an internal call returns 401">
+    The three secrets (`PAWABASE_INTERNAL_SECRET`, `PAWABASE_JWT_MASTER_SECRET`, `PAWABASE_MASTER_KEY`) must be identical across every service in the same stack, because they're used to derive per-environment signing keys and verify service-to-service calls. This almost always happens when a service was started by hand with different (or no) exported secrets while the rest of the stack came from `scripts/dev.sh`. Stop the manually-started service and restart it with the same three values the script uses (or just let the script start it).
+  </Accordion>
+  <Accordion title="Port already in use">
+    Something is already listening on 8080, 8090, 8001, 8002 or 8003 — often a previous `scripts/dev.sh` run that wasn't stopped cleanly, or Docker Compose running the same ports (see [Docker](/installation/docker), which uses the identical port numbers). Find and stop the conflicting process (`lsof -nP -iTCP:8080 -sTCP:LISTEN`), or don't run the Docker stack and `scripts/dev.sh` at the same time.
+  </Accordion>
+  <Accordion title="Changes to a `.env` file in the repository root aren't taking effect">
+    `scripts/dev.sh` explicitly sets `SILLO_ENV_FILE=""` for every service it starts, which disables Sillo's automatic `.env` loading. This is deliberate, so the script's own exported defaults are authoritative and a leftover `.env` file (perhaps left over from a Docker setup, or copied from `.env.example`) doesn't silently change local development behavior. If you want a service to read a `.env` file when you're running it by hand (outside the script), set `SILLO_ENV_FILE` to that file's path yourself, or export the variables directly as shown in [running a single service by hand](#running-a-single-service-by-hand).
+  </Accordion>
+  <Accordion title="Wiping local state doesn't seem to help">
+    Make sure you're deleting the right directory. `PAWABASE_DEV_DIR` overrides where state lives; if you've exported it in your shell profile and forgotten about it, `rm -rf .dev` in the repository root won't touch the actual state directory. Run `echo "${PAWABASE_DEV_DIR:-$(pwd)/.dev}"` to see where the script is actually looking.
+  </Accordion>
+</AccordionGroup>
 
-**"Connection refused" on port 6379** — Redis isn't running. Start it with `brew services start redis` or `sudo systemctl start redis`.
+## Running the test suite
 
-**Health check failing** — Make sure all five processes are running. The API health check is at `http://localhost:8001/health`.
+The workspace's dev dependency group (`pytest`, `pytest-asyncio`, `ruff`, `fakeredis[lua]`) is declared once at the root and shared by every member:
 
-**Database migration errors** — Drop and recreate the database, then re-run migrations:
 ```bash
-pawabase migrate
+uv run pytest services/akountz/tests
+uv run pytest services/api/tests
+uv run pytest                          # everything discoverable from the repo root
 ```
+
+`fakeredis[lua]` in the dev dependencies means tests that exercise Redis-backed code paths (like rate limiting) can do so without a real Redis server, which is consistent with the rest of local development requiring no external services. Lint the workspace with:
+
+```bash
+uv run ruff check .
+```
+
+`pyproject.toml`'s `[tool.ruff]` section sets `line-length = 100`, targets `py311`, and excludes migration files and `node_modules` from linting.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Docker" icon="docker" href="/installation/docker">The one-command path with Postgres and Redis included — recommended if you're building on Pawabase rather than modifying it.</Card>
+  <Card title="Auth overview" icon="fingerprint" href="/auth/overview">What Akountz does once it's running.</Card>
+</CardGroup>

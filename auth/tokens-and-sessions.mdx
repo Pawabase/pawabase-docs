@@ -1,589 +1,312 @@
 ---
 title: "Tokens and sessions"
-description: "Access and refresh token claims, rotation, theft detection, revocation, operator versus user sessions, and switching or clearing the organization on refresh."
+description: "issue_user_token's real claim shape, Sillo's token-family rotation and theft detection, SessionInfo, one-time tokens, and every revocation path — from pawabase_kit/tokens.py and app/sessions.py."
 icon: "key-round"
 ---
 
-After a successful sign-in (password, magic link, social login, or MFA recovery), Pawabase issues an `access_token` and a `refresh_token`. The access token is a short-lived JWT used for every authenticated request. The refresh token is a long-lived opaque string used only to obtain a new access token. Together they form a session that persists across the access token's short lifetime. This page covers every aspect of the token and session system: what claims the access token carries, how the refresh flow works, how sessions are stored and managed, how theft detection works, how revocation works, and the details of operator versus user sessions and organization switching on refresh.
+A Pawabase session is the pairing of two things: Sillo's own generic token-family mechanism (rotation, reuse detection, revocation — the same primitive every Pawabase service's users ride on) and `SessionInfo`, a small Akountz table that remembers what Sillo's tokens don't: which device, which sign-in method, and what assurance level. This page documents both halves, plus the exact shape of the claims a client actually receives.
 
 <CardGroup cols={3}>
-  <Card title="Access tokens are JWTs" icon="jwt">900-second lifetime by default, containing identity, roles, and organization claims.</Card>
-  <Card title="Refresh tokens are opaque" icon="refresh-circle">Long-lived, stored in the database, rotated on every use (unless `refresh_token_rotation` is `false`).</Card>
-  <Card title="Sessions are the ground truth" icon="database">Every token pair is backed by a `SessionInfo` row that tracks method, AAL, organization, and device.</Card>
+  <Card title="Three kinds of token, one signing scheme" icon="layers">Service tokens, context tokens, and user tokens — all JWTs, only user tokens ever reach a client.</Card>
+  <Card title="Per-environment signing keys" icon="key">A user token's signing key is derived from `(project, env)`, so a token from `acme/development` can never verify against `acme/production`.</Card>
+  <Card title="Rotation with theft detection" icon="shield-alert">Every refresh consumes the old refresh token and issues a new one. Reusing a consumed one revokes the whole session family.</Card>
 </CardGroup>
 
-## Access token claims
+## The three kinds of token
 
-The access token is a JWT signed with the environment's secret key. Every claim is set in `build_token_payload` in `routes/auth.py`:
+`pawabase_kit.tokens` defines three token shapes, all JWTs, but only one of them — the user access token — is ever handed to a client application:
+
+| Kind | Issued by / for | Signing key | Typical lifetime |
+| --- | --- | --- | --- |
+| **Service token** | One Pawabase service calling another. | The installation's internal secret, per `(issuer, audience)`. | Short (default 60s) — re-minted per call. |
+| **Context token** | The gateway telling a service which project/environment/credential a request carries. | The internal secret. | 60s. |
+| **User token** | Akountz, for a project's end users. | Derived per `(project, env)` from the platform's JWT master secret. | `access_ttl` (default 900s) for access; `refresh_ttl` (default 2,592,000s / 30 days) for refresh. |
+
+This page is about the third kind. The first two are internal plumbing — worth knowing exist (so a `typ` claim of `"service"` or `"context"` on a token you happen to inspect doesn't surprise you), but never something a client integration issues or verifies directly.
+
+### Per-environment signing keys
 
 ```python
-def build_token_payload(
-    config: AuthConfig,
-    *,
-    sub: str,
-    org: str | None,
-    session_id: str,
+def derive_env_secret(master: str, project: str, env: str) -> str:
+    message = f"pawabase:user-token:{project}:{env}".encode()
+    return hmac.new(master.encode(), message, hashlib.sha256).hexdigest()
+```
+
+Every environment's user-token signing key is deterministically derived from one platform-wide master secret plus the `(project, env)` pair. Nobody needs to generate or store a separate key per environment, and — critically — a token successfully verified against `acme/development`'s derived key cannot be re-verified against `acme/production`'s, because they're different derived secrets. `verify_user_token` additionally checks the `prj`/`env` claims inside the token match the environment being verified against, as a second, redundant guard against a token being replayed at the wrong environment.
+
+## `issue_user_token`: the real claim shape
+
+Access tokens are minted by `issue_user_token` in `pawabase_kit/tokens.py` — not by a hand-rolled `build_token_payload()` or any function inside Akountz itself. Akountz calls it once per session start and once per refresh, from `app/sessions.py`'s `_access_token`:
+
+```python
+def issue_user_token(
+    master: str, *,
+    project: str, env: str, user_id: str, jti: str, session_id: str,
+    ttl: int = 900,
+    email: str | None = None,
+    roles: list[str] | None = None,
+    permissions: list[str] | None = None,
+    org: str | None = None,
+    org_role: str | None = None,
     aal: str = "aal1",
-    role_names: list[str],
-    user_metadata: dict | None,
-    app_metadata: dict | None,
-) -> dict:
-    now = int(time.time())
-    return {
-        "iss": config.issuer,
-        "sub": sub,
-        "aud": config.audience,
-        "iat": now,
-        "exp": now + config.access_token_ttl,
-        "jti": str(uuid4()),
-        "org": org,
-        "session_id": session_id,
-        "aal": aal,
-        "roles": role_names,
-        "user": user_metadata or {},
-        "app": app_metadata or {},
-    }
+    extra: dict[str, Any] | None = None,
+    app: dict[str, Any] | None = None,
+) -> str:
 ```
 
-The payload is serialized to JSON, base64url-encoded, and signed. The claims map directly to the `Principal` object constructed in the `Principal` constructor:
-
-```python
-class Principal:
-    def __init__(self, token: dict, secret: str):
-        self.claims = token
-        self.org = token.get("org")
-        self.user_id = token.get("sub")
-        self.session_id = token.get("session_id")
-        self.roles = token.get("roles", [])
-        self.claims["roles"] = self.roles
-        self.claims["org"] = self.org
-        self.claims["aal"] = token.get("aal", "aal1")
-        self._secret = secret
-        self._token = token
-```
-
-Every claim in the token is accessible through `Principal.claims`, including `roles`, `org`, `aal`, `user` (the `user_metadata`), and `app` (the `app_metadata`).
-
-### Claim-by-claim reference
-
-| Claim | Type | Description |
-| --- | --- | --- |
-| `iss` | string | The token issuer URL, set to `config.issuer`. This is the environment's token issuer identifier. |
-| `sub` | string | The user's unique ID (the `AuthUser.id`). This is the primary key for the user row in the database. |
-| `aud` | string | The token audience, set to `config.audience`. Used to validate the token is intended for this service. |
-| `iat` | integer | Unix timestamp of when the token was issued. |
-| `exp` | integer | Unix timestamp of when the token expires. `iat + access_token_ttl`. |
-| `jti` | string | A unique UUID for each token. Used for revocation tracking and audit logging. |
-| `org` | string or null | The organization ID if the session is scoped to an organization, otherwise `null`. |
-| `session_id` | string | The session UUID. Links the token to a `SessionInfo` row in the database. |
-| `aal` | string | The Authenticator Assurance Level (`"aal1"`, `"aal2"`, or `"aal3"`). Set by sign-in method. |
-| `roles` | array of strings | The role names assigned to the user at sign-in time. |
-| `user` | object | The `user_metadata` object. **Not safe for policies** — it can be modified by the user themselves. |
-| `app` | object | The `app_metadata` object. **Safe for policies** — only modifiable by administrators or service keys. |
-
-### The `sub` claim
-
-The `sub` claim is the user's unique identifier. It is set from the `AuthUser.id` field and is the primary key in the `auth_user` database table. The `sub` value is stable across sign-in methods — a user who signed up with a password and later linked a Google account still has the same `sub`. The `sub` is the most reliable way to identify a user across sessions and organizations.
-
-### The `aud` claim
-
-The `aud` claim is set to `config.audience`. It is validated on every request to ensure the token is intended for this service. If a token is presented with an incorrect `aud`, the `Principal` constructor raises `PrincipalException("invalid_token")`. This prevents tokens issued for one environment from being used against another.
-
-### The `org` claim
-
-The `org` claim is `null` by default (when the user signs in without specifying an organization). It is set to the organization ID when the user specifies an `org` parameter during sign-in or when the user switches organizations through the refresh flow. The `org` claim determines what `org` is visible in `$auth.org` within policies. See [auth in policies →](/auth/auth-in-policies#the-org-claim).
-
-### The `aal` claim
-
-The Authenticator Assurance Level indicates the strength of authentication used to obtain the token:
-
-| AAL | Meaning | Set by |
-| --- | --- | --- |
-| `"aal1"` | Single-factor authentication (password, magic link, social login without MFA). | Sign-in endpoints when MFA is not enabled or not required. |
-| `"aal2"` | Multi-factor authentication (password + TOTP, magic link + TOTP, social login + TOTP). | Sign-in endpoints when MFA is enabled and the user completes the TOTP challenge. |
-| `"aal3"` | Phishing-resistant authentication (future: hardware security keys). | Reserved for future use. |
-
-The AAL is checked in the token refresh flow to enforce minimum AAL requirements for sensitive operations. See [Minimum AAL on refresh →](/auth/tokens-and-sessions#minimum-aal-on-refresh).
-
-### The `roles` claim
-
-The `roles` claim is an array of role name strings (`list[str]`). These are the names of the roles assigned to the user at sign-in time, read from the database. If no roles are assigned, the array is empty (`[]`). The `roles` claim is what `$auth.claims.roles` resolves to in policies. The role names correspond to entries in the `Role` table. See [Roles and permissions →](/auth/roles-and-permissions).
-
-### The `user` and `app` claims
-
-The `user` claim contains the `user_metadata` object — data the user themselves can modify (through `PATCH /auth/v1/user` with a `data` field). This is user-editable and must never be trusted for access decisions.
-
-The `app` claim contains the `app_metadata` object — data that only administrators or service keys can modify. This is safe to gate access on because users cannot change it themselves.
-
-The `Principal` constructor merges both into `self.claims`:
-
-```python
-self.claims["roles"] = self.roles
-self.claims["org"] = self.org
-self.claims["aal"] = token.get("aal", "aal1")
-```
-
-So `self.claims` is the complete token payload with `roles`, `org`, and `aal` added at the top level (in addition to being nested under their own keys).
-
-### The `jti` claim and revocation
-
-Every access token has a unique `jti` (JWT ID) generated with `str(uuid4())`. This UUID is stored in the `SessionInfo` row and is used for audit logging and revocation tracking. When a session is revoked, the `jti` is recorded in the `RevokedToken` table so that even if the token is presented, it can be identified as revoked. See [Revocation →](/auth/tokens-and-sessions#revocation).
-
-## The refresh token
-
-The refresh token is the long-lived counterpart to the access token. While the access token expires in 900 seconds (15 minutes by default), the refresh token can last for days, weeks, or indefinitely depending on the `refresh_token_ttl` configuration.
-
-<Note>
-Refresh tokens are not JWTs — they are opaque strings (`rft_...` prefix) stored in the database. This means they can be individually revoked without needing a special revocation mechanism. Every refresh token is tied to a specific `SessionInfo` row.
-</Note>
-
-### How the refresh flow works
-
-When a client needs a new access token, it sends the refresh token to `POST /auth/v1/token`:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c..."
-  }'
-```
-
-The server validates the refresh token, checks the session, and issues a new access token (and optionally a new refresh token). The refresh flow goes through these steps:
-
-<Steps>
-  <Step title="Extract and parse the refresh token">
-    The `refresh_token` field is parsed using `parse_refresh_token`. This function extracts the `session_id` and `jti` from the token string. The token format includes the session UUID and a cryptographic signature that binds the token to the specific session. If the token format is invalid, returns `401 invalid refresh token`.
-  </Step>
-  <Step title="Look up the session">
-    The `session_id` is used to fetch the `SessionInfo` row. If the session does not exist, returns `401 invalid refresh token`. If the session exists but is marked as `revoked`, returns `401 session revoked`.
-  </Step>
-  <Step title="Check session status">
-    If `revoked` is `True`, returns `401 session revoked`. If `revoked_at` is set, the session is permanently revoked and a new session cannot be started.
-  </Step>
-  <Step title="Verify the token signature">
-    The refresh token's signature is verified against the session's stored `refresh_jti`. If the signature does not match, the token is invalid.
-  </Step>
-  <Step title="Check `refresh_token_rotation`">
-    If `refresh_token_rotation` is `true` (the default), a **new** refresh token is issued alongside the new access token. The old refresh token is invalidated. If `refresh_token_rotation` is `false`, the same refresh token can be reused indefinitely.
-  </Step>
-  <Step title="Check minimum AAL">
-    If the session's AAL is below `min_aal`, the refresh is denied with `403 aal2 authentication required`. This prevents low-assurance sessions from being refreshed into high-assurance contexts. See [Minimum AAL on refresh →](/auth/tokens-and-sessions#minimum-aal-on-refresh).
-  </Step>
-  <Step title="Check organization validity">
-    If the session has an `org` and that organization has been deleted, the refresh is denied. The organization must still exist for the session to be valid.
-  </Step>
-  <Step title="Issue new tokens">
-    A new access token is issued with the same `sub`, `org`, `session_id`, `aal`, `roles`, and metadata as the original. A new refresh token may be issued (if rotation is enabled). The session's `last_active_at` is updated. A `token.refreshed` event is emitted.
-  </Step>
-</Steps>
-
-### Refresh token format
-
-A refresh token looks like `rft_8f2c...`. The exact format includes:
-
-1. A prefix (`rft_`) identifying it as a refresh token.
-2. A session UUID.
-3. A cryptographic signature binding the token to the specific session.
-
-The signature is verified using the session's stored data. If any part of the session data has changed (e.g., the organization was deleted), the signature verification fails and the token is rejected.
-
-### `refresh_token_rotation`
-
-When `refresh_token_rotation` is enabled (the default), every refresh request issues a new refresh token and invalidates the old one. This provides two security benefits:
-
-1. **Theft detection**: If an attacker steals a refresh token and uses it, the legitimate user's refresh token is already invalidated (because it was rotated on the previous use). When the legitimate user tries to refresh, they get a new token and the attacker's token is now invalid. Both the legitimate user and the attacker have valid tokens — but the legitimate user can detect the theft because their own token was unexpectedly rotated.
-2. **Limited exposure window**: A stolen refresh token can only be used once before it's invalidated. Even if the attacker immediately uses it, the rotation happens and the token is consumed.
-
-When `refresh_token_rotation` is disabled, the same refresh token can be reused indefinitely. This is simpler but less secure — a stolen refresh token gives the attacker indefinite access until the token TTL expires or the session is manually revoked.
-
-<Warning>
-Even with rotation enabled, if an attacker steals a refresh token and uses it before the legitimate user, both the attacker and the legitimate user end up with valid tokens. The legitimate user's token is rotated, but the attacker's token (used just before the rotation) is still valid. Theft detection relies on the legitimate user noticing that their token was unexpectedly rotated — which is why monitoring for unexpected token rotation events is recommended in production.
-</Warning>
-
-## Session storage and structure
-
-Every sign-in creates a `SessionInfo` row in the `auth_session` database table. This row is the ground truth for every token pair:
-
-```python
-class SessionInfo(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="auth_user.id")
-    project_id: UUID
-    env_id: UUID
-    method: str  # "password", "magic_link", "social", "refresh", "recovery"
-    aal: str = "aal1"
-    org: str | None = None
-    org_role: str | None = None
-    ip_address: str | None = None
-    user_agent: str | None = None
-    device_info: str | None = None
-    refresh_jti: str | None = None
-    revoked: bool = False
-    revoked_at: datetime | None = None
-    created_at: datetime = Field(default_factory=datetime.now(UTC))
-    last_active_at: datetime = Field(default_factory=datetime.now(UTC))
-    expires_at: datetime | None = None
-```
-
-The `SessionInfo` row tracks the method (how the user signed in), the AAL, the organization (if any), the IP address and user agent of the device, and the `refresh_jti` used for refresh token validation. The `revoked` flag marks whether the session has been explicitly revoked. The `revoked_at` timestamp records when the revocation happened.
-
-### `start_session`
-
-The `start_session` function creates the `SessionInfo` row and mints the token pair:
-
-```python
-async def start_session(
-    config: AuthConfig,
-    session: SessionInfo,
-) -> dict:
-    # Mint access token
-    access_token = create_access_token(config, payload)
-    # Mint refresh token
-    refresh_token = create_refresh_token(config, session)
-    # Save session with refresh_jti
-    session.refresh_jti = extract_jti(refresh_token)
-    await session.save()
-    # Emit token.issued event
-    await log_event(...)
-    return {"access_token": access_token, "refresh_token": refresh_token, ...}
-```
-
-The `start_session` function is called from every sign-in endpoint — password, magic link, social login, and recovery. Each endpoint constructs a `SessionInfo` with the appropriate `method`, `aal`, `org`, and `org_role` before calling `start_session`.
-
-### Session fields in detail
-
-- **`method`**: How the user signed in. `"password"`, `"magic_link"`, `"social"`, `"refresh"`, or `"recovery"`. The method is recorded for audit purposes and affects the AAL (e.g., `"password"` without MFA gives `"aal1"`, while `"password"` with MFA gives `"aal2"`).
-- **`aal`**: The Authenticator Assurance Level. Set based on the sign-in method and whether MFA was completed. See [AAL levels above](#the-aal-claim).
-- **`org` and `org_role`**: If the user signed in with an `org` parameter, these fields are set. The `org` is the organization ID and `org_role` is the user's role within that organization. On refresh, these are preserved unless the organization is switched or cleared.
-- **`ip_address` and `user_agent`**: Captured from the request headers (`X-Forwarded-For` or `Remote-Addr`, and `User-Agent`). Used for device tracking and theft detection.
-- **`refresh_jti`**: The JTI of the refresh token, stored in the session so it can be verified on refresh. If the `refresh_jti` doesn't match the refresh token presented, the token is invalid.
-- **`revoked` and `revoked_at`**: `revoked` is `True` if the session has been explicitly revoked. `revoked_at` records when. A session with `revoked == True` cannot be refreshed.
-- **`expires_at`**: Optional expiration timestamp. If set, the session expires at this time regardless of the token TTL. If `null`, the session is valid until explicitly revoked.
-
-### Session enumeration
-
-Sessions are accessible through the admin API (`GET .../sessions`). Each session shows the method, AAL, organization, IP address, user agent, device info, creation time, last activity time, and revocation status. This allows administrators to see all active sessions for a user and revoke any of them.
-
-## Token rotation in detail
-
-Token rotation is the process of issuing a new access token (and optionally a new refresh token) when the current access token expires. There are two contexts in which rotation happens:
-
-### Automatic rotation via the refresh endpoint
-
-When a client sends a refresh token to `POST /auth/v1/token` with `grant_type: "refresh_token"`, the server issues a new access token. If `refresh_token_rotation` is enabled, it also issues a new refresh token and invalidates the old one. The new tokens are tied to the same `SessionInfo` row — the session itself is not replaced, only the tokens are refreshed.
-
-### Manual rotation by the server
-
-The server can also rotate tokens internally without a client-initiated refresh. This happens when:
-
-1. **The access token expires**: The client sends the refresh token, and the server issues new tokens.
-2. **The user switches organizations**: The refresh token is exchanged with a new `org` parameter, and new tokens are issued with the updated `org` claim.
-3. **The user clears the organization**: The refresh token is exchanged with `org: null`, and new tokens are issued with `org: null`.
-
-In all cases, the `SessionInfo` row is updated with the new `org` and `org_role` values, and the `last_active_at` is updated.
-
-### The `jti` and token identity
-
-Every access token has a unique `jti`. When a token is refreshed, a new `jti` is generated. The old `jti` remains associated with the `SessionInfo` row (it's stored in the session's `refresh_jti` field or in the `RevokedToken` table if the old token was revoked). This means:
-
-- An access token's `jti` is unique and never reused.
-- A refresh token's `jti` is stored in the session and used for validation.
-- When a session is revoked, the `jti` is recorded in `RevokedToken` so any later presentation of the token can be identified.
-
-## Theft detection
-
-When `refresh_token_rotation` is enabled and an attacker steals a refresh token, the following detection mechanism activates:
-
-<CardGroup cols={2}>
-  <Card title="The attacker uses the stolen token" icon="alert-triangle">The attacker presents the stolen refresh token to `/auth/v1/token`.</Card>
-  <Card title="The token is consumed" icon="circle-xmark">The server issues new tokens and invalidates the old refresh token (rotation).</Card>
-  <Card title="The legitimate user tries to refresh" icon="user-shield">The legitimate user's old refresh token is now invalid. The server detects this and flags the session as compromised.</Card>
-  <Card title="Both have valid tokens" icon="key">Both the attacker and the legitimate user have valid tokens. The legitimate user can detect the theft by noticing the unexpected rotation.</Card>
-</CardGroup>
-
-The theft detection flow:
-
-1. The legitimate user has refresh token `rft_A` associated with session `S1`.
-2. An attacker steals `rft_A`.
-3. The attacker sends `rft_A` to `/auth/v1/token`. The server validates it, issues new tokens, and rotates — `rft_A` is now invalid, replaced by `rft_B`.
-4. The legitimate user later sends `rft_A` to `/auth/v1/token`. The server rejects it because `rft_A` is now invalid (it was rotated in step 3).
-5. The legitimate user receives a `401` response indicating the refresh token is invalid. This is the theft signal.
-
-The legitimate user should then sign out all sessions (using the admin API or a "sign out everywhere" feature) and re-authenticate on their own device.
-
-<Warning>
-Theft detection does **not** automatically revoke the attacker's session. Both sessions remain valid until the legitimate user takes action (signs out all sessions). The detection mechanism only signals that something is wrong — it does not stop the attacker.
-</Warning>
-
-### Detecting theft programmatically
-
-A client can detect theft by monitoring for unexpected refresh token rotation:
-
-```typescript
-const oldRefreshToken = getStoredRefreshToken();
-const response = await fetch('/auth/v1/token', {
-  method: 'POST',
-  body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oldRefreshToken }),
-});
-const data = await response.json();
-if (data.refresh_token !== oldRefreshToken) {
-  // The refresh token was rotated — someone else may have used it
-  // Alert the user and offer to sign out all sessions
-  showTheftWarning();
+The resulting JWT payload:
+
+```json
+{
+  "sub": "482",
+  "aud": "authenticated",
+  "iss": "pawabase:akountz:acme",
+  "prj": "acme",
+  "env": "production",
+  "sid": "f3f0c2f8a91b4d5e",
+  "jti": "8a2e1c...",
+  "iat": 1735660800,
+  "exp": 1735661700,
+  "typ": "access",
+  "aal": "aal1",
+  "email": "chioma@example.com",
+  "roles": ["editor"],
+  "perms": ["reports.publish"],
+  "org": "acme-hq",
+  "org_role": "admin",
+  "meta": { "tier": "starter" },
+  "app": { "customer_id": "cus_9f21" }
 }
 ```
 
-If the returned `refresh_token` is different from the one you stored, the token was rotated by someone else's use. This is a strong signal of compromise.
-
-### Rate limiting as theft detection
-
-The per-IP rate limiting on `/auth/v1/token` (30 requests per 60 seconds) also serves as a theft detection signal. If a refresh token is being used from an unusual IP address at an unusual rate, the rate limiter may trigger `429` responses, alerting both the server and the client that something unusual is happening.
-
-## Revocation
-
-Session revocation is the process of invalidating a session so that its tokens can no longer be used. Revocation is handled at multiple levels:
-
-### Manual revocation by administrators
-
-Administrators can revoke individual sessions or all sessions for a user through the admin API:
-
-```bash
-# Revoke a specific session
-POST /projects/{project}/envs/{env}/users/{user_id}/sessions/{session_id}/revoke
-
-# Revoke all sessions for a user
-POST /projects/{project}/envs/{env}/users/{user_id}/sessions/revoke
-```
-
-Both endpoints set `revoked = True` and `revoked_at = now()` on the `SessionInfo` row. Any subsequent refresh attempt with that session's refresh token returns `401 session revoked`.
-
-### Automatic revocation on password change
-
-Password changes do **not** automatically revoke sessions (by design). However, administrators can revoke all sessions for a user if they suspect compromise. The admin API `POST .../sessions/revoke` is the tool for this.
-
-### Automatic revocation on account disablement
-
-When an account is disabled (by an administrator setting `disabled_at`), all sessions are immediately revoked via `revoke_all`. This is handled in the `disable_account` function, which iterates through all active sessions and sets `revoked = True` for each one.
-
-### The `revoke_all` function
-
-The `revoke_all` function is the core revocation mechanism:
-
-```python
-async def revoke_all(config: AuthConfig, user_id: UUID, env_id: UUID) -> None:
-    sessions = await SessionInfo.filter(user_id=user_id, env_id=env_id, revoked=False)
-    for session in sessions:
-        session.revoked = True
-        session.revoked_at = datetime.now(UTC)
-        await session.save()
-        # Record in RevokedToken table for audit
-        await RevokedToken.create(session_id=session.id, jti=session.refresh_jti)
-```
-
-The `RevokedToken` table records each revoked token's `session_id` and `jti`. This table is checked on every refresh attempt — if the refresh token's `jti` appears in `RevokedToken`, the token is rejected even if the session hasn't been explicitly marked as revoked.
-
-### Revocation on the refresh endpoint
-
-When a refresh token is presented, the server checks:
-
-1. Is the `SessionInfo` row found? If not, `401 invalid refresh token`.
-2. Is `revoked == True`? If so, `401 session revoked`.
-3. Is the `refresh_jti` in the `RevokedToken` table? If so, `401 session revoked`.
-4. Is the session's organization still valid (not deleted)? If not, `401 session revoked`.
-
-Any of these checks failing results in `401` with the appropriate detail. The client should treat any `401` on refresh as a sign that the session is no longer valid and redirect the user to re-authenticate.
-
-### The `RevokedToken` table
-
-The `RevokedToken` table provides an additional revocation mechanism independent of the `SessionInfo` row. Even if a session row is somehow restored (which shouldn't happen in normal operation), the `RevokedToken` record ensures the token is still rejected. This is a safety net — the primary revocation mechanism is the `revoked` flag on `SessionInfo`.
-
-```sql
-CREATE TABLE auth_revoked_token (
-    id UUID PRIMARY KEY,
-    session_id UUID NOT NULL REFERENCES auth_session(id),
-    jti VARCHAR(255) NOT NULL,
-    revoked_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-```
-
-The `RevokedToken` table is append-only — rows are never deleted. This provides a complete audit trail of all revoked tokens. In production, the table may be periodically pruned of entries older than the maximum refresh token TTL, but the audit trail should be preserved.
-
-## Operator versus user sessions
-
-Pawabase distinguishes between two types of sessions based on how they are created and who controls them:
-
-### User sessions
-
-User sessions are created when a user signs in through the self-service endpoints (`/auth/v1/token` with `grant_type: "password"`, `"refresh_token"`, `"magic_link"`, or social login). The user controls these sessions — they can sign out, view all their sessions, and revoke individual sessions through the self-service API.
-
-User sessions have the following properties:
-
-- Created through the self-service token endpoint.
-- The user can revoke their own sessions through `DELETE /auth/v1/sessions/{session_id}`.
-- The user can view all their sessions through `GET /auth/v1/sessions`.
-- Sessions are stored in `SessionInfo` with `method` set to the sign-in method.
-- The user's `Principal` is constructed from the access token claims.
-
-### Operator (service key) sessions
-
-Operator sessions are created when a service key (publishable key or secret key) is used to authenticate on behalf of a user. These are used by backend services, cron jobs, and server-to-server communication.
-
-Operator sessions have different properties:
-
-- Created through the service key authentication path (not the self-service token endpoint).
-- The service key determines the operator's permissions, not the user's roles.
-- Operator sessions are not visible to the user through the self-service session enumeration API.
-- The `Principal` for an operator session carries the service key's claims, including the `operator` flag and the service key's associated metadata.
-
-```python
-# Service key authentication creates an operator Principal:
-principal = Principal(token, secret)
-# The token contains the service key's claims, not the user's
-```
-
-The distinction matters for policy design. In [auth in policies →](/auth/auth-in-policies), `$auth.operator` indicates whether the request came from a service key. User sessions have `operator == false`, while operator sessions have `operator == true`.
-
-### Why the distinction matters
-
-The user/operator distinction is critical for security:
-
-1. **User sessions** are bound to a specific user identity and are subject to user-level policies (role checks, MFA requirements, AAL checks).
-2. **Operator sessions** are bound to a service key identity and are subject to service-key-level policies. They bypass user-level checks (like MFA) because the service key itself is the authentication mechanism.
-3. **Audit logging** distinguishes between the two — user actions and operator actions are logged separately, allowing administrators to see who (or what) performed each action.
-
-## Switching or clearing the organization on refresh
-
-When a user has an organization-scoped session and wants to switch or clear the organization, they can do so through the refresh flow:
-
-### Switching organizations
-
-To switch to a different organization, the client sends a refresh request with the new `org` parameter:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c...",
-    "org": "acme-hq"
-  }'
-```
-
-The server validates that the user is a member of the requested organization, then issues new tokens with the updated `org` and `org_role` claims. The `SessionInfo` row is updated with the new `org` and `org_role`.
-
-If the user is not a member of the requested organization, the server returns `403 you are not a member of that organization`. The current session and tokens remain unchanged — the refresh simply fails without modifying the session.
-
-### Clearing the organization
-
-To return to a non-organization-scoped session (where `$auth.org` is `null`), the client sends a refresh request with `org: null`:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "rft_8f2c...",
-    "org": null
-  }'
-```
-
-The server validates the request and issues new tokens with `org: null` and `org_role: null`. The `SessionInfo` row is updated accordingly. The user is now in a "personal" context where `$auth.org` is `null` and `$auth.org_role` is `null`.
-
-### The `org` parameter is optional
-
-If the `org` parameter is omitted from the refresh request, the current organization is preserved. This means:
-
-- A session scoped to `org: "acme-hq"` will refresh with `org: "acme-hq"` by default.
-- A session with `org: null` will refresh with `org: null` by default.
-- Only explicitly passing a different `org` (or `null` to clear it) changes the organization.
-
-### How the organization is persisted across refreshes
-
-The organization is persisted in the `SessionInfo` row (`org` and `org_role` fields). On each refresh, the server reads these fields and includes them in the new token payload. This means:
-
-1. The organization is stored in the database, not just in the token.
-2. If the organization is deleted, the session becomes invalid (the refresh check verifies the organization still exists).
-3. If the user's role in the organization changes (e.g., through an admin update), the new role is reflected on the **next** refresh — the current access token continues to carry the old role until it expires and is refreshed.
-
-<Note>
-The organization is not stored in the access token itself as a mutable field — it's stored in the `SessionInfo` row and read on each refresh. This means changes to the organization membership are reflected on the next refresh, but the current access token continues to carry the old `org` claim until it expires.
-</Note>
-
-## Minimum AAL on refresh
-
-If the environment has `min_aal` configured (e.g., `"aal2"`), refresh requests from sessions with an AAL below the minimum are denied:
-
-```
-403 aal2 authentication required
-```
-
-This prevents a session obtained through password-only sign-in (`aal1`) from being refreshed into a context that requires MFA (`aal2`). The `min_aal` check is performed on the session's stored AAL — not on the access token's `aal` claim — because the session's AAL is the authoritative record.
-
-The `min_aal` configuration is set at the environment level. If `min_aal` is `"aal1"` (the default), all sessions can refresh regardless of their AAL. If `min_aal` is `"aal2"`, only sessions with AAL `"aal2"` or higher can refresh.
-
-### When `min_aal` matters
-
-The `min_aal` check is most relevant in the following scenarios:
-
-1. **Sensitive operations**: If your application requires MFA for sensitive operations, setting `min_aal: "aal2"` ensures that sessions obtained without MFA cannot be refreshed indefinitely. The user would need to re-authenticate with MFA to get a new session.
-2. **Compliance**: Some compliance frameworks require that sessions accessing certain resources maintain a minimum AAL. Setting `min_aal` enforces this at the token level.
-3. **Organization policies**: An organization can set `min_aal` to require MFA for all organization members. This applies to all sessions associated with that organization.
+| Claim | Meaning |
+| --- | --- |
+| `sub` | The user's id, as a string. |
+| `aud` | Always `"authenticated"` for a user token. |
+| `iss` | `pawabase:akountz:<project>`. |
+| `prj`, `env` | The environment this token is valid for — re-checked on every verification, on top of the signing key already being environment-specific. |
+| `sid` | The **session id** — Sillo's token family id. Every access token minted from the same session shares this value across every refresh. |
+| `jti` | This specific token's id. Reused from Sillo's own tracked token-family JTI, so revocation and rotation stay aligned with Sillo's `JWTToken` rows. |
+| `typ` | `"access"` — `verify_user_token` rejects anything else. |
+| `aal` | `"aal1"` or `"aal2"` — see [MFA → assurance levels](/auth/mfa#assurance-levels-aal1-and-aal2). |
+| `roles`, `perms` | Resolved fresh at mint time from [`rbac.roles_of`/`rbac.permissions_of`](/auth/roles-and-permissions#listing-assigning-and-revoking). |
+| `org`, `org_role` | The active organization (if any) and the caller's role in it — see [Organizations → organizations and sessions](/auth/organizations#organizations-and-sessions). |
+| `meta` | `user_metadata` — present only if non-empty. **User-editable; never trust it in a policy.** |
+| `app` | `app_metadata` — present only if non-empty. Only an administrator or a service key can set it; safe to gate access on. |
 
 <Warning>
-If a session's AAL is below `min_aal`, the refresh is denied. The client should redirect the user to re-authenticate with MFA (or another AAL-raising method) to obtain a new session. The old session remains valid until it expires — only the refresh is blocked.
+There is no `build_token_payload()` function anywhere in this codebase, and there is no `Principal.__init__(self, token, secret)` signature that parses claims out of a raw JWT at construction time. The real `Principal` (`pawabase_kit.principal.Principal`) takes already-verified `(kind, claims)` and does no decoding itself — token verification happens once, earlier in the request pipeline, via `verify_user_token`. See [Overview → the `Principal`](/auth/overview#the-principal-what-a-request-actually-carries).
 </Warning>
 
-## Token expiration and renewal
+## Starting a session
 
-### Access token lifetime
+`start_session` is the single function behind every "sign the user in" path — password, magic link, email verification, social login, and MFA completion all call it with a different `method` string:
 
-The default access token lifetime is 900 seconds (15 minutes), configured through `access_token_ttl` in the environment settings. The `exp` claim is set to `iat + access_token_ttl`. Once the access token expires, the client must use the refresh token to obtain a new one.
+```python
+async def start_session(
+    akountz: Akountz, config: AuthConfig, user: AuthUser, *,
+    method: str, ctx: Any = None, aal: str = "aal1", org: str | None = None,
+) -> dict[str, Any]:
+```
 
-### Refresh token lifetime
+It does five things, in order: validates `org` membership (if one was requested), asks Sillo's `JWTUserMixin.issue_token_pair` for a fresh access/refresh pair, records a `SessionInfo` row for the family, resets the account's failure/lockout counters via `record_success`, and logs a `sign_in` event plus a `user.signed_in` platform event.
 
-The refresh token lifetime is configured through `refresh_token_ttl`. If `refresh_token_ttl` is `null` (the default), the refresh token does not expire based on time — it only expires when the session is revoked, the user changes their password (in some configurations), or the organization is deleted. If `refresh_token_ttl` is set to a duration, the refresh token expires after that duration regardless of session activity.
+```json
+{
+  "access_token": "eyJhbGciOi...",
+  "refresh_token": "rft_8f2c...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1735661700,
+  "session_id": "f3f0c2f8a91b4d5e",
+  "org": null,
+  "org_role": null,
+  "user": { "id": "482", "email": "...", "..." : "..." }
+}
+```
 
-### The `expires_at` field on `SessionInfo`
+`expires_in` is `config.access_ttl` (seconds remaining); `expires_at` is a Unix timestamp computed at response time — both describe the **access** token only. The refresh token's own, much longer, lifetime (`config.refresh_ttl`) is never surfaced as a field in this response; a client tracks refresh-token validity implicitly by whether the next refresh call succeeds.
 
-The `SessionInfo` row has an optional `expires_at` field. If set, the session expires at this time regardless of the refresh token TTL. This provides an additional expiration mechanism — even if the refresh token is still valid, the session row's `expires_at` can prevent renewal.
+## Refreshing: rotation and theft detection
 
-### What happens when tokens expire
+Every refresh call **consumes** the refresh token it's given and issues a brand-new one — this is Sillo's rotating-refresh-token model, and Akountz adds nothing to the mechanism itself beyond re-minting the richer access token claims on top of it:
 
-When an access token expires, the client should send the refresh token to `/auth/v1/token`. If the refresh token is still valid (the session exists, is not revoked, and the signature is valid), new tokens are issued. If the refresh token is also expired or invalid, the client must redirect the user to re-authenticate.
+```python
+pair = await user.refresh_token_pair(refresh_token, akountz.refresh_secret(config.project, config.env))
+```
+
+A successful refresh always returns a **new** `refresh_token` in the response — clients must persist it and discard the one they sent, exactly the same as the initial sign-in response. Presenting the same refresh token twice is precisely what theft detection watches for:
+
+```python
+except ValueError as exc:
+    if "theft" in str(exc):
+        row = await JWTToken.filter(token_jti=claims.get("jti") or "").first()
+        if row is not None:
+            await SessionInfo.filter(family=row.token_family).update(revoked_at=datetime.now(UTC))
+        await akountz.emit(config.project, config.env, "session.reuse_detected", {"user_id": str(user.id)}, actor=str(user.id))
+    raise HTTPException(status_code=401, detail="invalid refresh token") from exc
+```
+
+If a refresh token that's already been consumed is presented again — the signature of either a stolen token being used after the legitimate client already refreshed, or a client bug that retried a request with a stale token — Sillo raises a "theft" error, and Akountz responds by revoking the **entire session family**, not just the one token, and emitting `session.reuse_detected`. Every access token from that session stops being useful the moment it naturally expires (revocation doesn't retroactively invalidate an unexpired access token — see [immediate revocation](#what-revocation-does-and-doesnt-do-immediately) below), and the refresh chain is dead; the user must sign in again.
+
+<Warning>
+Refresh-token rotation means a client must never keep using an old refresh token "just in case." If two requests race and both try to refresh with the same token, one wins and the other is treated as reuse — revoking the session for both. A correct client refreshes proactively, serially, and always overwrites its stored refresh token with the one from the latest successful response before making another request that needs it.
+</Warning>
+
+### What changes at refresh, not immediately
+
+Several things about a session are deliberately **not** re-evaluated until the next refresh, because the access token is a self-contained, signed artifact valid for its whole `access_ttl` window regardless of what changes server-side in the meantime:
+
+- Role and permission changes ([Roles and permissions](/auth/roles-and-permissions#how-roles-and-permissions-reach-a-policy)).
+- Organization membership-role changes ([Organizations](/auth/organizations#the-membership-role-is-re-read-at-issue-time)).
+- `app_metadata` changes made by an administrator.
+- The assurance level, *unless* `elevate()` is called explicitly on the live session (see [MFA → assurance levels](/auth/mfa#assurance-levels-aal1-and-aal2)).
+
+If your application needs a change to take effect immediately rather than on next refresh, the only mechanism is revoking the affected session(s) so the client is forced to re-authenticate.
+
+## Switching organization context mid-session
+
+A refresh can name `org` to move the session to a different organization (or clear it), independent of anything else about the refresh. See [Organizations → switching or clearing the organization on refresh](/auth/organizations#switching-or-clearing-the-organization-on-refresh) for the full three-way distinction between omitting the field, naming a new organization, and explicitly clearing it with `null`/`""`.
+
+## The `SessionInfo` model
+
+Sillo's own `JWTToken` rows track the rotation/revocation state of a token family; `SessionInfo` is what Akountz adds on top, one row per family:
+
+```python
+class SessionInfo(Model):
+    family = fields.CharField(max_length=64, primary_key=True)
+    user = fields.ForeignKeyField("models.AuthUser", related_name="sessions")
+    project = fields.CharField(max_length=63, db_index=True)
+    env = fields.CharField(max_length=63)
+    method = fields.CharField(max_length=32)
+    aal = fields.CharField(max_length=8, default="aal1")
+    org = fields.CharField(max_length=63, null=True)
+    ip = fields.CharField(max_length=64, null=True)
+    user_agent = fields.CharField(max_length=512, null=True)
+    last_refreshed_at = fields.DatetimeField(null=True)
+    revoked_at = fields.DatetimeField(null=True)
+```
+
+`family` **is** the session id (`sid` claim) — the primary key of this table is literally the string that shows up on every access token minted from it. `method` records how the session began (`"password"`, `"magic_link"`, `"oauth:google"`, `"recovery"`, `"email_verification"`, …) and never changes after creation, even across refreshes.
+
+### Listing sessions
+
+```bash
+curl "$GW/auth/v1/sessions" -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $KEY"
+```
+
+```json
+{ "data": [
+  { "id": "f3f0c2f8...", "method": "password", "aal": "aal1", "ip": "203.0.113.4",
+    "user_agent": "Mozilla/5.0 ...", "created_at": "2026-09-28T09:00:00Z",
+    "last_refreshed_at": "2026-09-30T08:12:00Z", "current": true },
+  { "id": "9b1e4a02...", "method": "oauth:google", "aal": "aal1", "ip": "198.51.100.9",
+    "user_agent": "...", "created_at": "2026-09-15T14:22:00Z",
+    "last_refreshed_at": null, "current": false }
+] }
+```
+
+The list only includes families that are **both** un-revoked in `SessionInfo` **and** currently have an active, non-consumed, non-expired refresh token in Sillo's own `JWTToken` table — a `SessionInfo` row whose refresh token has simply expired from age (never revoked, just aged out past `refresh_ttl`) is filtered out rather than shown as a stale, misleadingly "active" entry.
+
+## Revocation: every path
+
+| Action | Effect | Who can trigger it |
+| --- | --- | --- |
+| `POST /auth/v1/logout` with `{"scope": "local"}` (default) | Revokes only the current session. | The user. |
+| `POST /auth/v1/logout` with `{"scope": "others"}` | Revokes every session except the current one. | The user. |
+| `POST /auth/v1/logout` with `{"scope": "global"}` | Revokes every session, including the current one. | The user. |
+| `DELETE /auth/v1/sessions/{session_id}` | Revokes one specific session by id. | The user, for their own sessions. |
+| `POST /projects/.../users/{user_id}/sessions/revoke` | Revokes every session for that user. | An administrator / service key. |
+| `DELETE /projects/.../users/{user_id}/sessions/{session_id}` | Revokes one specific session. | An administrator / service key. |
+| A refresh-token reuse ("theft") is detected | Revokes the entire family automatically. | The system, never a person. |
+| An administrator disables the account | Calls `revoke_all` as part of disabling. | An administrator. |
+
+`revoke_session` and `revoke_all` both do two things together — revoke the underlying Sillo `JWTToken` family **and** stamp `SessionInfo.revoked_at` — so the two records of "is this session alive" never drift out of sync:
+
+```python
+async def revoke_session(user: AuthUser, family: str) -> bool:
+    revoked = await JWTToken.revoke_family(family)
+    updated = await SessionInfo.filter(user=user, family=family, revoked_at=None).update(revoked_at=datetime.now(UTC))
+    return bool(revoked or updated)
+```
+
+### What revocation does and doesn't do, immediately
+
+Revoking a session invalidates its **refresh token** immediately — the next refresh attempt with it fails with `401 invalid refresh token`. It does **not** retroactively invalidate an access token that's already been issued and hasn't expired yet; that token remains verifiable (its signature and claims are still valid) until its own `exp` passes, which is at most `access_ttl` seconds away — 15 minutes by default. This is the same trade-off documented for [password changes](/auth/passwords#password-change-security-model): a short `access_ttl` is what bounds the actual window of exposure after a revocation, not the revocation call itself.
+
+<Warning>
+If you need truly immediate termination of access (not just "can't refresh anymore"), the only real lever is `access_ttl` — a shorter access-token lifetime means a shorter worst-case window between "we revoked this" and "the token stopped working." There is no separate access-token blocklist check on every request.
+</Warning>
+
+## One-time tokens
+
+Every single-use link or code flow in Akountz — email verification, password recovery, magic links, invitations, and MFA challenges — is backed by one shared mechanism: a `OneTimeToken` row plus a signed, time-limited wrapper around its id.
+
+```python
+LIFETIMES = {
+    "verify": 24 * 3600,      # 24 hours
+    "recovery": 3600,          # 1 hour
+    "magic": 900,              # 15 minutes
+    "invite": 7 * 24 * 3600,  # 7 days
+    "mfa": 300,                # 5 minutes
+    "email_change": 24 * 3600,
+    "link": 600,               # identity-linking tickets, 10 minutes
+}
+```
+
+The token string itself is Sillo's `URLSafeTimedSerializer` signature over `{"id": row.id}`, keyed per `(project, env, purpose)` — not a JWT, and unrelated to the access/refresh token signing scheme above. `consume()` checks the signature and its embedded age (`max_age=LIFETIMES[purpose]`), then separately checks the database row hasn't already been used or expired, and marks it used with a conditional update (`WHERE used_at IS NULL`) so two concurrent redemptions of the same link can't both succeed. Every failure mode — bad signature, expired signature, missing row, already-used row, database-level expiry — collapses to the identical `400 the link is invalid or has expired`, deliberately, so a client (or an attacker probing links) can't distinguish "this link is old" from "this link was already used" from "this link was forged."
+
+`peek=True` verifies and looks up the row **without** consuming it — used by the recovery flow's "is this link still valid" check before showing a password form, and by the invitation-accept flow's initial lookup before the final consuming call.
+
+## Real scenarios
+
+### Session refresh in a mobile app
+
+A mobile client typically stores the refresh token in secure device storage and refreshes proactively — a few minutes before the access token's `expires_at` — rather than waiting for a `401` from an API call. Because refresh rotates the token every time, the client's storage write (new refresh token in, old one discarded) must complete before the token is used again; a client that refreshes from two code paths concurrently (a background sync and a foreground request both waking up at once) risks one of them presenting an already-consumed token and triggering theft detection, which revokes the whole session. Serializing refresh calls behind a single in-flight request (a mutex or a shared promise/future around the refresh call) avoids this entirely.
+
+### Detecting a compromised session after a password reset
+
+Resetting a password (via the recovery flow) calls `revoke_all` automatically — every session dies, everywhere, the moment a new password is set. A plain in-account password *change* (via `PATCH /auth/v1/user`) does **not** do this by design (see [Passwords → password change security model](/auth/passwords#password-change-security-model)); if a user suspects compromise and changes their password proactively rather than through the forgot-password flow, your client should also offer an explicit "sign out everywhere" action, which maps to `POST /auth/v1/logout` with `{"scope": "global"}`.
+
+### Building a "you're signed in on 3 devices" settings page
+
+`GET /auth/v1/sessions` gives you everything needed: `method` for an icon/label ("Signed in with Google" vs. "Password"), `ip`/`user_agent` for a human-readable device description, `created_at`/`last_refreshed_at` for recency, and `current: true` to visually distinguish the session making the request itself (usually rendered without a "sign out" button, or with a different one that also ends the local app session).
 
 ## Common mistakes
 
 <AccordionGroup>
-  <Accordion title="Assuming refresh tokens are JWTs">
-    They are not. Refresh tokens are opaque strings stored in the database. They cannot be decoded or inspected without the server. The only way to validate a refresh token is to look up the associated `SessionInfo` row and verify the signature.
+  <Accordion title="Looking for build_token_payload() or a Principal(token, secret) constructor">
+    Neither exists. Token minting is `issue_user_token` in `pawabase_kit/tokens.py`; `Principal` takes already-verified `(kind, claims)` and does no verification itself.
   </Accordion>
-  <Accordion title="Thinking that password changes revoke sessions">
-    They don't. A password change updates the hash but does not invalidate existing access tokens. If you need immediate revocation, use the admin `POST .../sessions/revoke` endpoint.
+  <Accordion title="Reusing a refresh token after a successful refresh">
+    The refresh token you sent is consumed the instant the refresh succeeds. Always store and use the **new** `refresh_token` from the response; presenting the old one again triggers theft detection and kills the whole session.
   </Accordion>
-  <Accordion title="Not handling `401 session revoked` properly">
-    When a refresh returns `401 session revoked`, the client should clear all stored tokens and redirect the user to sign in again. Ignoring this response leads to infinite refresh loops where the client keeps sending a revoked token.
+  <Accordion title="Expecting a role or org_role change to appear on the current access token">
+    It won't, until the next refresh or sign-in. See [what changes at refresh, not immediately](#what-changes-at-refresh-not-immediately).
   </Accordion>
-  <Accordion title="Storing refresh tokens in localStorage">
-    Storing refresh tokens in localStorage makes them vulnerable to XSS attacks. Use httpOnly cookies or a secure token store. The refresh token should never be exposed to JavaScript running in the browser.
+  <Accordion title="Expecting revocation to instantly invalidate an unexpired access token">
+    It doesn't — only the refresh token is immediately dead. The access token remains valid until its own `exp`. Shorten `access_ttl` if your threat model needs a tighter worst-case window.
   </Accordion>
-  <Accordion title="Ignoring theft detection signals">
-    If your refresh token is unexpectedly rotated (the returned `refresh_token` differs from the one you sent), someone else may have used it. The client should alert the user and offer to sign out all sessions. Ignoring this signal leaves the attacker's session active.
-  </Accordion>
-  <Accordion title="Confusing `org` preservation with `org` switching">
-    Omitting `org` from a refresh request preserves the current organization. It does NOT clear it. To clear the organization, explicitly pass `org: null`.
+  <Accordion title="Treating a magic-link, invite, or recovery token as a JWT">
+    They're all `URLSafeTimedSerializer` signatures over a database row id, a completely different mechanism from the JWT access/refresh pair, with their own per-purpose lifetimes.
   </Accordion>
 </AccordionGroup>
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| `401 invalid refresh token` right after a refresh that appeared to succeed | Two concurrent refresh calls raced; the second presented an already-consumed token. | Serialize refresh calls behind one in-flight request. |
+| `session.reuse_detected` events appearing in production | Either a genuine stolen refresh token, or a client bug retrying with a stale token. | Audit client refresh logic for concurrency bugs before assuming compromise. |
+| A user's new role doesn't show up in `$auth.roles` right away | The client is using an access token minted before the change. | Wait for the next refresh, or revoke the session to force re-authentication. |
+| `GET /auth/v1/sessions` is missing a session the user swears is active | Its refresh token aged out past `refresh_ttl` without ever being revoked. | Expected — an aged-out, non-revoked session is filtered from the active list. |
+| Access token still "works" for a few minutes after the user signed out on another device | Expected — revocation kills the refresh token immediately, not the still-valid access token. | Lower `access_ttl` if this window is unacceptable for your threat model. |
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Email verification" icon="mail-check" href="/auth/email-verification">How to verify an email address after sign-up.</Card>
-  <Card title="Password recovery" icon="key" href="/auth/password-recovery">What to do when a password is forgotten.</Card>
-  <Card title="Magic links" icon="link" href="/auth/magic-links">Passwordless sign-in through email links.</Card>
-  <Card title="MFA" icon="shield-check" href="/auth/mfa">Adding a second factor for additional security.</Card>
+  <Card title="MFA" icon="shield-check" href="/auth/mfa">How `aal` gets onto a session and its token.</Card>
+  <Card title="Organizations" icon="building" href="/auth/organizations">How `org`/`org_role` are threaded through sign-in and refresh.</Card>
+  <Card title="Roles and permissions" icon="shield" href="/auth/roles-and-permissions">How `roles`/`perms` are resolved onto the token.</Card>
+  <Card title="Passwords" icon="lock" href="/auth/passwords">The reference sign-in flow that calls `start_session`.</Card>
 </CardGroup>

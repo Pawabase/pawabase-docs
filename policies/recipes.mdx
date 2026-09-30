@@ -245,6 +245,203 @@ Inbound hooks aren't governed by caller policies; they're verified by signature.
 
 [Channel rules →](/realtime/channel-rules)
 
+## Complete recipe: multi-tenant SaaS project management tool
+
+A fuller build-out than the "org-scoped data" recipe above, covering the pieces that only show up once an app has several related resources: seats, invitations, per-plan limits, and an audit trail.
+
+**Requirements:**
+
+- Each organization ("workspace") has members with roles `owner`, `admin`, `member`, `viewer`.
+- Projects and tasks belong to a workspace; only members of the active workspace see them.
+- Only `owner`/`admin` can invite members or change roles; `owner` alone can delete the workspace.
+- The number of members is capped by the workspace's plan.
+- Every write to a project is recorded in an append-only audit log nobody can edit through the API.
+
+<Steps>
+  <Step title="Workspace membership carries the tenant and the org role">
+    Members sign in with an org-scoped token via [organizations](/auth/organizations): `$auth.org` is the active workspace id, and `$auth.org_role` is their role **within that workspace** — distinct from environment roles like `admin`, which would apply platform-wide. Two named policies build on this:
+    ```json
+    // workspace_member: any signed-in member of the active workspace
+    { "all": [ { "authenticated": true }, { "exists": "$auth.org" } ] }
+    ```
+    ```json
+    // workspace_admin: owner or admin of the active workspace
+    { "all": [ { "authenticated": true }, { "in": ["$auth.org_role", ["owner", "admin"]] } ] }
+    ```
+  </Step>
+  <Step title="Projects and tasks scope to the workspace">
+    Both resources carry `workspace_id`. Reads and most writes use an AND-ed equality against `$auth.org`, which pushes down fully:
+    ```json
+    // in_workspace
+    { "all": [ { "authenticated": true }, { "eq": ["$record.workspace_id", "$auth.org"] } ] }
+    ```
+    | Resource | list/get | create | update | delete |
+    | --- | --- | --- | --- | --- |
+    | `projects` | `in_workspace` | `["in_workspace", "workspace_admin"]`-equivalent: `{"all": [{"eq": ["$input.workspace_id", "$auth.org"]}, {"in": ["$auth.org_role", ["owner", "admin"]]}]}` | `in_workspace` | `workspace_admin` (still scoped) |
+    | `tasks` | `in_workspace` | `in_workspace` (any member creates tasks) | `in_workspace` | `in_workspace` |
+    Creating a project is restricted to admins/owners; creating a task is open to any member, matching how most project-management tools work.
+  </Step>
+  <Step title="Membership changes are gated separately from workspace data">
+    `memberships` (workspace_id, user_id, role) is its own resource:
+    ```json
+    // memberships.update: change a role, admins/owners only, and never your own role
+    { "all": [
+      { "eq": ["$record.workspace_id", "$auth.org"] },
+      { "in": ["$auth.org_role", ["owner", "admin"]] },
+      { "not": { "eq": ["$record.user_id", "$auth.user_id"] } }
+    ] }
+    ```
+    The last clause stops an admin from promoting or demoting *themselves*, which is the kind of privilege-escalation edge case that's easy to miss when a rule only says "admins can change roles." Deleting the last `owner` of a workspace should also be blocked, but "is this the last owner" needs a count, which a JSON condition can't do — that check belongs in a flow behind a dedicated `DELETE /memberships/{id}` route, not the raw resource operation.
+  </Step>
+  <Step title="Seat limits are enforced by a flow, not a policy">
+    "May this workspace invite one more member" depends on counting existing members and comparing to a plan limit — arithmetic a condition can't express. Route invites through `POST /workspaces/invite` (policy `workspace_admin`) whose flow does `resource.list` memberships with a count, `control.if` against the plan's seat limit (looked up from the workspace record or an Akountz organization attribute), and `error.raise` with a `409` if the workspace is full before creating the invitation.
+  </Step>
+  <Step title="The audit log is append-only by construction, not by policy">
+    An `audit_entries` resource has `create` enabled (written by a flow triggered on every project/task write, via [event subscriptions](/events/overview)) and `update`/`delete` **disabled entirely**. A disabled operation doesn't exist as an endpoint at all — there's no policy that could accidentally make it writable later, short of re-enabling it deliberately. Reads use `workspace_admin`, so members can't see other members' individual actions unless they're staff of that workspace.
+  </Step>
+</Steps>
+
+**Traps specific to this shape:** confusing `$auth.roles` (environment roles) with `$auth.org_role` (organization role) is the most common bug in multi-tenant apps — a policy that checks `{"role": "admin"}` when it means "admin of this workspace" will instead check "admin of the whole environment," admitting nobody in a normal SaaS setup where environment roles are reserved for your own staff. Keep the two vocabularies visually distinct in policy names (`workspace_admin` vs. `platform_admin`) so it's never ambiguous which one a policy checks.
+
+## Complete recipe: marketplace with buyers, sellers and admins
+
+A second full pass at a marketplace, this time centered on the state machine an order goes through and who may move it between states — the part [references](/policies/references#walkthrough-references-for-a-marketplace) touches on but doesn't develop.
+
+**Requirements:**
+
+- Buyers place orders against listings; sellers fulfil orders for their own shop; admins and support can intervene anywhere.
+- An order moves `pending → paid → shipped → delivered`, or `pending → cancelled`.
+- Only the buyer can cancel, and only while `pending`. Only the seller can mark `shipped`. Only a webhook (payment provider) marks `paid`. Only the buyer confirms `delivered`, or it auto-confirms after 14 days via a schedule flow.
+- Refunds always go through support, never directly by buyer or seller.
+
+<Steps>
+  <Step title="Model the transition, not just the row">
+    Every `orders.update` policy needs both `$record.status` (where it is now) and `$input.status` (where the request wants it to go). This is the pattern from the blog's publishing workflow, generalized to more states:
+    ```json
+    // order_party
+    { "any": [ { "owner": "buyer_id" }, { "eq": ["$record.shop_id", "$auth.org"] }, { "role": ["support", "admin"] } ] }
+    ```
+  </Step>
+  <Step title="Write one branch per legal transition">
+    ```json
+    // orders.update
+    { "any": [
+      { "role": ["support", "admin"] },
+      { "all": [
+        { "owner": "buyer_id" },
+        { "eq": ["$record.status", "pending"] },
+        { "eq": ["$input.status", "cancelled"] }
+      ] },
+      { "all": [
+        { "owner": "buyer_id" },
+        { "eq": ["$record.status", "shipped"] },
+        { "eq": ["$input.status", "delivered"] }
+      ] },
+      { "all": [
+        { "eq": ["$record.shop_id", "$auth.org"] },
+        { "eq": ["$record.status", "paid"] },
+        { "eq": ["$input.status", "shipped"] }
+      ] }
+    ] }
+    ```
+    Each branch names exactly one allowed move: buyer cancels a pending order, buyer confirms delivery of a shipped order, seller ships a paid order. A request that doesn't match any branch — a buyer trying to mark their own order `shipped`, say — falls through every branch and is refused. This is more verbose than a single "buyer or seller can update" rule, but it's the only way to encode "who may do *this specific transition*" rather than "who may touch this resource at all."
+  </Step>
+  <Step title="`paid` comes only from a trusted path">
+    No branch above admits a transition into `paid` from a buyer or seller — intentionally. The payment provider's webhook (verified by signature, not by caller policy, per [enforcement points](/policies/enforcement-points#what-is-not-governed-by-caller-policies)) triggers a flow that calls `resource.update` on the order with service rights, which bypasses the resource's own update policy entirely. This is the one transition that must never depend on what a client claims about payment success.
+  </Step>
+  <Step title="Auto-confirmation after 14 days">
+    A schedule flow runs daily, queries orders `WHERE status = 'shipped' AND shipped_at <= now() - interval '14 days'`, and updates each to `delivered` — again with service rights, bypassing the caller-facing update policy, because there's no caller here at all.
+  </Step>
+  <Step title="Refunds are a separate route, not a status transition">
+    `POST /orders/{id}/refund`, policy `["mfa", "role:support"]`. The flow behind it loads the order, checks it's in a refundable state with `control.if`, calls the payment provider, and updates the order's status to `refunded` with service rights. Keeping refund **out of** the general `orders.update` policy means the state-machine policy above never has to reason about refunds at all — a route with its own permission and its own flow is easier to audit than one more branch buried in an `any`.
+  </Step>
+</Steps>
+
+**Trap:** an `any` with this many branches is easy to get wrong by omission — a legal transition nobody wrote a branch for silently becomes impossible rather than throwing an error, which can look like a bug report ("sellers can't cancel a paid order for the buyer") that's actually a missing policy branch. Keep a table of every legal transition next to the policy in your documentation, and check off each one against a branch.
+
+## Complete recipe: healthcare-style need-to-know access
+
+Healthcare (and similarly regulated domains — legal, HR) impose a stricter model than typical role-based access: staff should see only what they specifically need for their current task, not everything their role would technically permit. This recipe builds a **need-to-know** layer on top of ordinary role checks.
+
+**Requirements:**
+
+- Clinicians see full records only for patients **assigned to their care team**; other clinicians see a minimal summary, not full history.
+- Billing staff see billing-relevant fields only, never clinical notes.
+- Every read of a full record is logged with who, when, and why (a required "reason for access" on break-glass reads).
+- A patient's own guardian sees only that patient's data, per the [families](#families-and-dependants) pattern, further limited to non-sensitive fields.
+
+<Steps>
+  <Step title="Split the resource by need, not by role">
+    Rather than one `patient_records` resource with a role check, expose **two resources over the same underlying table**: `patient_summary` (name, care team, allergies, active medications — low sensitivity) and `patient_chart` (full clinical notes, history, diagnoses — high sensitivity). This mirrors the pattern in [field-level protection](#field-level-protection) taken further: when the split between "some may read this, others may not" runs through *most* of a resource's fields rather than a few, two resources with two policies are clearer than one resource with a transformer trying to hide half its own fields.
+    ```json
+    // patient_summary.get/list — any care-team clinician or admin
+    { "any": [
+      { "role": "admin" },
+      { "contains": ["$record.care_team_user_ids", "$auth.user_id"] }
+    ] }
+    ```
+    ```json
+    // patient_chart.get — only assigned clinicians, with a permission gate too
+    { "all": [
+      { "permission": "records.read" },
+      { "contains": ["$record.care_team_user_ids", "$auth.user_id"] }
+    ] }
+    ```
+  </Step>
+  <Step title="Billing sees a third, non-overlapping shape">
+    `patient_billing` exposes insurance and invoice fields, policy `{"permission": "billing.manage"}`, with **no** `care_team_user_ids` check at all — billing staff work across the whole patient population by design, but the resource itself contains nothing clinical, so there's nothing to leak even if billing's policy is broader than a clinician's.
+  </Step>
+  <Step title="Break-glass access needs a reason, logged before the read succeeds">
+    Emergency access — a clinician not on the care team who needs the chart in an urgent situation — is common enough in healthcare systems to design for explicitly rather than treat as a policy violation. Route it through `POST /patient-chart/{id}/break-glass` (policy: `permission:records.read`, no care-team check) whose flow requires an `{{ input.reason }}` field (validated non-empty by the route's schema), writes an audit entry **before** returning the chart, and emits an event that notifies a compliance reviewer. The chart itself is still returned by the same `resource.get` block the flow uses, with service rights — the policy enforcement here is about the *audit trail being mandatory*, not about narrowing who can technically reach the data once the reason is given.
+  </Step>
+  <Step title="Every full-chart read is logged, not just break-glass ones">
+    Ordinary care-team reads of `patient_chart` also need an audit trail for compliance, but ordinary reads go through the resource `get` operation directly, not a route — so there's no flow in the loop to write a log entry. Subscribe to the platform's `resource.read` event (if enabled for this resource; check [events](/events/overview) for availability) or, more reliably, front `patient_chart.get` with a thin custom route that does the `resource.get` and the audit write together, keeping the *policy* the same (`patient_chart`'s own) but ensuring every access — not just break-glass — leaves a trace.
+  </Step>
+  <Step title="Guardians get the family pattern, further narrowed">
+    A guardian's access to `patient_summary` reuses [family_access](#families-and-dependants) restricted to summary-level fields only — guardians never get `patient_chart` access at all, even though `family_access` as defined earlier would technically admit them; the split-resource approach means the chart's policy simply doesn't include a guardian branch, rather than relying on a transformer to hide fields from a policy that's too broad.
+  </Step>
+</Steps>
+
+**Trap:** need-to-know models tend to accumulate resources (`patient_summary`, `patient_chart`, `patient_billing`, and eventually more) faster than role-based models do. This is the cost of precision — resist the urge to consolidate them back into one resource with a complicated policy once there are five or six of these, because that reintroduces exactly the "policy tries to do too much" problem this pattern solves. If the number of split resources becomes unwieldy, the fix is better naming and documentation, not fewer resources.
+
+## Complete recipe: time-limited contractor access
+
+A common request that has no single built-in shorthand: a contractor or temporary staff member should have access that **automatically expires** on a known date, without anyone remembering to revoke it manually.
+
+**Requirements:**
+
+- A contractor account has full `editor` role access to specific projects, but only until a contract end date.
+- Access should stop working the moment the date passes, without a manual step, and without waiting for their token to expire on its own schedule.
+- Extending a contract should be a single edit, not a re-invitation.
+
+<Steps>
+  <Step title="Store the expiry on the user, not just in a calendar">
+    Add `contract_ends_at` (a datetime) to the user's `app_metadata` in Akountz (set by an admin, never by the user themselves — see the [distinction between `app` and `meta` claims](/policies/overview#what-a-policy-can-see)), so it arrives in every token as `$auth.claims.app.contract_ends_at`.
+  </Step>
+  <Step title="Don't compare the claim to `$now` directly">
+    The [time windows](#time-windows) recipe above already flags that policies can't reliably compare stored datetimes with `$now` — the same caution applies here, and for the same reason: the condition language does a plain comparison with no type coercion, and a datetime-shaped token claim (typically a string, since JWT claims are JSON) compared against the engine's actual `datetime` value for `$now` risks a type mismatch that `_compare` catches and quietly turns into `false`, not the `true`/`false` you'd get from a genuine date comparison. Don't gate access on `{"lt": ["$now", "$auth.claims.app.contract_ends_at"]}` and assume it degrades safely — verify the exact comparison behaves as expected for your claim's stored format before relying on it, and prefer the boolean-flag approach below unless you've confirmed it.
+  </Step>
+  <Step title="Maintain a boolean instead, the same way the homework recipe does">
+    Keep the actual end date on the user for reference, but drive the policy from a role rather than a date comparison: grant the `contractor` role (or a `contract_active` permission) when the contract starts, and revoke it — not the account, not the assignment — the moment it should end.
+    ```json
+    // contractor_editor
+    { "all": [
+      { "role": ["editor", "contractor"] },
+      { "eq": ["$record.project_id", "$auth.claims.app.assigned_project_id"] }
+    ] }
+    ```
+    A daily schedule flow queries Akountz for users whose `contract_ends_at` claim is today or earlier and removes the `contractor` role from each (`auth.user.update_roles` or the equivalent platform block); the policy itself never touches a date at all, so there's no comparison to get wrong. This is the same shape as the homework recipe's `released` boolean, applied to a role instead of a resource column.
+  </Step>
+  <Step title="Force the change to take effect immediately, not on next token refresh">
+    Removing a role changes what a **new** token contains, but a contractor's existing token keeps its old `roles` claim until it's refreshed or expires. If access must stop the moment the contract ends rather than up to a token-lifetime later, the schedule flow should also revoke the contractor's active sessions (Akountz's session-revocation call) at the same time it removes the role, forcing their next request to re-authenticate and pick up the updated roles.
+  </Step>
+  <Step title="Extending is one edit, in Akountz, not a policy change">
+    Because the expiry check lives in role assignment rather than in the policy's condition, extending a contract is "push `contract_ends_at` out and leave the `contractor` role in place" (or simply re-grant it before the next scheduled run) — a routine admin action that never touches `contractor_editor` itself.
+  </Step>
+</Steps>
+
+**Trap:** the instinct to reach for a direct `$now` comparison against a token claim is understandable — it looks like it should "just work" without a background flow — but the condition language's lack of type coercion makes it risky for anything date-shaped. When in doubt, drive policies from booleans, roles, and permissions that a flow maintains, and reserve `$now` comparisons for values you've confirmed compare correctly in your setup.
+
 ## Checklist before shipping a policy set
 
 <Check>Every enabled operation has an explicit policy; no accidental `null`s.</Check>

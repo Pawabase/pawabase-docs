@@ -1,356 +1,399 @@
 ---
 title: "Custom blocks"
-description: "Extend the flow engine with your own blocks — the Block API, the Registry, entry points, and how to write a block from scratch."
+description: "Adding your own block to the flow engine — a Python package registered through an entry point. This requires deploying code alongside Pawabase; it isn't something Studio's UI alone can do."
 icon: "puzzle-piece"
 ---
 
-The platform ships with a rich set of built-in blocks, but any developer on a team can write their own. A custom block is a Python class that implements the `Block` protocol — a `run(config, run)` method that returns a `BlockResult`. Once registered in the `Registry`, it becomes available in every flow's JSON definition just like the built-ins.
+<Note>
+This page is for a team that also deploys Python code alongside their Pawabase environment — the same audience as [Functions](/code/overview). Writing a custom block means writing and installing a real Python package into the process that runs your flows. There is no Studio-only, no-code path to adding a new block; if your team doesn't deploy Python, the built-in blocks documented on [Resource blocks](/flows/resource-blocks) and [Platform blocks](/flows/platform-blocks), together with [Functions](/code/overview) for anything those can't express, are what you have to work with.
+</Note>
 
-## The Block protocol
+## When you'd reach for a custom block instead of a Function
 
-Every block implements these two methods:
+Pawabase already gives a flow two ways to run arbitrary Python: [`function.call`](/flows/platform-blocks#function-call) invokes a stored [Function](/code/overview) inline, and `queue.function` runs one as a background job. Either is usually the right answer when a flow needs "logic that's easier to write as Python than to assemble from blocks."
+
+A custom block is a different kind of extension: it's for logic you want to **look like a built-in block** — with its own node in Studio's palette, its own config form, its own named output handles — rather than a `function.call` node with an opaque `function` string pointing at code elsewhere. Reach for a custom block when:
+
+- The same operation will be dropped into many different flows, and you want flow authors in Studio to configure it with a form (a dropdown, a required field, a documented output) instead of remembering a function name and its expected input shape.
+- The operation needs more than one outgoing handle — a `missing` branch, an `error` branch — the same way `resource.get` does, which a plain function call can't express since a function only ever returns one value.
+- You're distributing a reusable integration (a payment provider, a specific external API) as an installable package that other Pawabase environments can add to their block catalogue, the way the framework's own docstring shows a `pawabase_stripe` package doing.
+
+If none of that applies — you just need one flow to run some Python once — a Function is simpler and doesn't require touching the block registry at all.
+
+## The real interface: `run` and `describe`, nothing else
+
+A block is a Python class with two methods. From `pawabase_kit.flows.registry`:
 
 ```python
 class Block:
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        """Execute the block. Return a BlockResult."""
+    """Base class for blocks.
+
+    Class attributes describe the block to Studio; ``run`` does the work.
+    ``config`` arrives with templates already rendered, unless the block sets
+    ``raw_config`` and renders what it needs itself (conditions and loops do).
+    """
+
+    key: ClassVar[str] = ""
+    title: ClassVar[str] = ""
+    category: ClassVar[str] = "general"
+    description: ClassVar[str] = ""
+    config: ClassVar[list[dict[str, Any]]] = []
+    handles: ClassVar[list[str]] = ["next"]
+    raw_config: ClassVar[bool] = False
+    trigger: ClassVar[bool] = False
+
+    async def run(self, config: dict[str, Any], run: FlowRun) -> BlockResult:
         raise NotImplementedError
 
-    def validate(self, config: Mapping[str, Any]) -> list[str]:
-        """Return a list of problem strings. Empty means valid."""
-        return []
+    @classmethod
+    def describe(cls) -> dict[str, Any]:
+        ...
 ```
 
-| Attribute / Method | Description |
+There is no `validate(config)` method on this interface — a block does not get a separate save-time validation hook. Whatever checking a block's config needs happens either through the `config` schema itself (required fields, types — the same declarative schema every built-in block uses, in `pawabase_kit.schemas` format) or inside `run()` itself, by raising.
+
+| Attribute | Meaning |
 | --- | --- |
-| `key` | The block's identifier string (e.g., `"my_custom_block"`) |
-| `trigger` | `True` if this block can serve as a flow entry point |
-| `handles` | The output handles the block declares (`["next"]`, `["next", "error", "missing"]`, or `["*"]`) |
-| `raw_config` | `True` if the block needs the unrendered config (control blocks need this for conditions) |
-| `run(config, run)` | Execute the block, return `BlockResult` |
-| `validate(config)` | Validate the config before saving |
+| `key` | The block's identifier, e.g. `"stripe.create_charge"` — what a flow's `data.block` references |
+| `title` | The label Studio's palette shows |
+| `category` | Which group the palette files it under |
+| `description` | Shown under the title in Studio; falls back to the class's docstring first line if left blank |
+| `config` | A list of field specs (name, type, required, default, description, and an optional `widget` hint) — this is what Studio renders as the node's config form |
+| `handles` | The output handles this block can produce, in display order — `["next"]` for a plain block, `["next", "missing"]` for one that can fail to find something, `["*"]` for a block (like a control block) that can follow any handle |
+| `raw_config` | `True` if the block wants its config **unrendered** — untouched `{{ }}` sequences — so it can template or evaluate the config itself. Only set this if you're writing something like a condition or a loop; almost every block leaves it `False` |
+| `trigger` | `True` if this block can be a flow's entry point |
 
-## BlockResult
+`describe()` is what turns those class attributes into the catalogue entry Studio actually consumes:
 
-Every `run()` returns a `BlockResult`:
+```python
+@classmethod
+def describe(cls) -> dict[str, Any]:
+    return {
+        "key": cls.key,
+        "title": cls.title or cls.key,
+        "category": cls.category,
+        "description": cls.description or (cls.__doc__ or "").strip().split("\n")[0],
+        "config": cls.config,
+        "handles": cls.handles,
+        "trigger": cls.trigger,
+    }
+```
+
+You never call `describe()` yourself — the registry calls it on every registered block to build the catalogue Studio's palette reads.
+
+## `BlockResult` — what `run()` returns
+
+```python
+@dataclass(slots=True)
+class BlockResult:
+    output: Any = None
+    handle: str = "next"
+    stop: bool = False
+```
+
+- `output` is stored as `steps.<node id>.output` for later blocks and templates to read.
+- `handle` decides which outgoing edge the walk follows next — it must be one of the block's declared `handles` (or `"error"`, which every block gets implicitly for its error branch).
+- `stop: True` ends the run immediately after this block, the way `response.return` does.
+
+If `run()` returns a bare value instead of a `BlockResult`, the flow engine wraps it as `BlockResult(output=<that value>)` — a convenience for the common case of a single-output, single-handle block.
+
+## Registering blocks: `BlockRegistry`
+
+The registry is a small dataclass, not a global you `register()` against from anywhere:
 
 ```python
 @dataclass
-class BlockResult:
-    output: Any = None      # The result — available as {{ steps.<node>.output }}
-    handle: str = "next"    # Which edge to follow ("next", "error", "missing", etc.)
-    stop: bool = False      # If True, the walk stops immediately
+class BlockRegistry:
+    blocks: dict[str, type[Block]] = field(default_factory=dict)
+
+    def add(self, block: type[Block]) -> type[Block]:
+        if not block.key:
+            raise ValueError(f"{block.__name__} has no key")
+        self.blocks[block.key] = block
+        return block
+
+    def get(self, key: str) -> type[Block]: ...
+    def catalogue(self) -> list[dict[str, Any]]: ...
+    def __contains__(self, key: object) -> bool: ...
+```
+
+The method is `.add()`, not `.register()` — and there is no module-level `registry` object you import and mutate. Instead, the process builds **one** registry at startup (`default_registry()`), fills it with the built-in blocks, then asks every installed package that declares a `pawabase.blocks` entry point to add its own blocks to it.
+
+## The real extension mechanism: Python package entry points
+
+This is the part that actually differs from a plugin hook or a bootstrap config file. Blocks are discovered through `importlib.metadata.entry_points`, in the `pawabase.blocks` group — the same mechanism Python packages use to advertise pytest plugins or CLI subcommands to other tools:
+
+```python
+ENTRY_POINT_GROUP = "pawabase.blocks"
+
+def default_registry() -> BlockRegistry:
+    global _default
+    if _default is None:
+        registry = BlockRegistry()
+        from .blocks import register as register_builtins
+        register_builtins(registry)
+        for entry in entry_points(group=ENTRY_POINT_GROUP):
+            if entry.value.startswith("pawabase_kit.flows.blocks"):
+                continue
+            try:
+                entry.load()(registry)
+            except Exception:
+                logger.exception("could not load blocks from %s", entry.value)
+        _default = registry
+    return _default
+```
+
+A block author publishes an ordinary installable Python package. Its `pyproject.toml` declares one entry point pointing at a function that takes the registry and adds blocks to it:
+
+```toml
+# pyproject.toml of an extension package
+[project]
+name = "pawabase-stripe"
+version = "0.1.0"
+dependencies = ["pawabase-kit"]
+
+[project.entry-points."pawabase.blocks"]
+stripe = "pawabase_stripe.blocks:register"
 ```
 
 ```python
-# A block that always follows "next" and returns a value
-return BlockResult(output={"status": "ok"}, handle="next")
+# pawabase_stripe/blocks.py
+from pawabase_kit.flows.registry import Block, BlockResult
+from typing import Any
 
-# A block that stops the walk (like response.return)
-return BlockResult(output={"status": 200}, handle="next", stop=True)
+class CreateCharge(Block):
+    key = "stripe.create_charge"
+    title = "Create charge"
+    category = "integrations"
+    description = "Creates a Stripe charge for the given amount and customer."
+    handles = ["next", "failed"]
+    config = [
+        {"name": "amount_minor", "type": "integer", "required": True},
+        {"name": "currency", "type": "string", "required": True, "default": "usd"},
+        {"name": "customer_id", "type": "string", "required": True},
+    ]
 
-# A block that signals an error (like error.raise)
-return BlockResult(output=None, handle="error")
-```
-
-## Minimal custom block example
-
-Here's a complete custom block that computes a greeting and returns it:
-
-```python
-from pawabase_kit.flows.blocks import Block, BlockResult
-from typing import Any, Mapping
-
-class Greet(Block):
-    key = "my.greet"
-    handles = ["next"]
-    trigger = False
-    raw_config = False
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        name = config.get("name", "world")
-        rendered_name = run.render(name) if isinstance(name, str) and "{{" in name else name
-        return BlockResult(output=f"Hello, {rendered_name}!")
-
-    def validate(self, config: Mapping[str, Any]) -> list[str]:
-        problems = []
-        if "name" not in config:
-            problems.append("name is required")
-        return problems
-```
-
-Register it:
-
-```python
-from pawabase_kit.flows.registry import Registry
-
-registry = Registry()
-registry.register(Greet)
-```
-
-The block is now available in any flow's JSON definition:
-
-```json
-{ "id": "greet", "data": { "block": "my.greet", "config": { "name": "{{ input.event.payload.name }}" } } }
-```
-
-## The `run` method in detail
-
-The `run` method receives two arguments:
-
-1. **`config`** — the node's `data.config` dictionary, with all templates already rendered into their final values (unless the block opts into `raw_config`). You can call `config.get("field")` to access any config key.
-2. **`run`** — the `FlowRun` instance, which gives you access to:
-   - `run.state` — the full run state dictionary
-   - `run.render(value)` — render templates in a value against the current state
-   - `run.targets(node_id, handle)` — resolve edges from a node
-   - `run.run_branch(node_id, handle, extra)` — walk a sub-graph
-   - `run.entry_node()` — the trigger node id
-   - `run.current_node` — the node currently being executed
-
-```python
-async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-    # Read a config value
-    resource_name = config["resource"]
-    record_id = config["id"]
-
-    # Read from state directly
-    store = run.state["auth"]["org"]
-
-    # Render a template expression
-    rendered = run.render(config["query"])
-
-    # Call another block's method through the runtime
-    result = await run.resource_list(resource_name, filters={"store_id": store})
-
-    return BlockResult(output=result)
-```
-
-## The `validate` method
-
-`validate` is called before the flow is saved. It returns a list of problem strings — empty when the config is valid. This catches errors at save time rather than at runtime.
-
-```python
-def validate(self, config: Mapping[str, Any]) -> list[str]:
-    problems = []
-    if "api_key" not in config:
-        problems.append("api_key is required")
-    if config.get("timeout") and not isinstance(config["timeout"], int):
-        problems.append("timeout must be an integer")
-    return problems
-```
-
-## Registry — registering blocks
-
-The `Registry` is the central catalog of all blocks. It maps block keys to block classes and provides lookup by key:
-
-```python
-class Registry:
-    def __init__(self):
-        self._blocks: dict[str, type] = {}
-
-    def register(self, block_class: type) -> None:
-        """Register a block class by its `key` attribute."""
-        self._blocks[block_class.key] = block_class
-
-    def get(self, key: str) -> type | None:
-        """Return the block class for a key, or None."""
-        return self._blocks.get(key)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._blocks
-```
-
-The platform initializes the registry with all built-in blocks at startup. To add custom blocks, call `registry.register(MyBlock)` after the registry is created — either in a plugin, an import hook, or at the environment's bootstrap configuration.
-
-<Tip>
-Custom blocks are **per-environment**. Register a block in one environment and it's only available in that environment's flows. This lets you experiment with custom blocks without affecting production.
-</Tip>
-
-## Writing a block that handles errors
-
-Some blocks need to signal failure so the flow can take an `error` edge:
-
-```python
-class Fail(Block):
-    key = "my.fail"
-    handles = ["next", "error"]
-    trigger = False
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        should_fail = config.get("should_fail", False)
-        if should_fail:
-            return BlockResult(output=None, handle="error")
-        return BlockResult(output={"ok": True})
-```
-
-Inside the error branch, blocks can read `{{ error.message }}`, `{{ error.type }}`, and `{{ error.node }}`.
-
-## Writing a block that stops the walk
-
-`response.return` stops the walk because it sets `stop=True` on its `BlockResult`. Any block can do this:
-
-```python
-class Return(Block):
-    key = "my.return"
-    handles = ["next"]
-    trigger = True
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        body = config.get("body")
-        return BlockResult(output=body, handle="next", stop=True)
-```
-
-When `stop=True`, the engine halts immediately — even if there are more reachable nodes. This is how `response.return` and `control.stop` work.
-
-## Writing a block with custom handles
-
-Most blocks declare `["next"]`. Some declare multiple handles:
-
-```python
-class ResourceGet(Block):
-    key = "my.resource.get"
-    handles = ["next", "missing"]  # "next" on success, "missing" if not found
-```
-
-Inside the flow definition, edges specify which handle they follow:
-
-```json
-{ "id": "load", "data": { "block": "my.resource.get", "config": { "id": "{{ input.params.id }}" } } },
-{ "id": "not_found", "data": { "block": "error.raise", "config": { "status": 404 } } }
-```
-
-```json
-{ "edges": [
-  { "source": "load", "target": "not_found", "sourceHandle": "missing" },
-  { "source": "load", "target": "process" }
-]}
-```
-
-A block with `handles = ["*"]` declares that it accepts any handle — used by control blocks that can follow any edge.
-
-## Writing a trigger block
-
-A trigger block is a block with `trigger = True`. It must have `handles = ["next"]` (only one outgoing edge — the flow walks from there):
-
-```python
-class MyTrigger(Block):
-    key = "my.trigger"
-    handles = ["next"]
-    trigger = True
-    raw_config = True  # conditions need the unrendered config
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        # Trigger blocks don't return a value to steps — they start the walk
-        return BlockResult(output=None, handle="next")
-```
-
-A flow must have at least one trigger block. If a flow's nodes contain no block with `trigger = True`, validation fails with `"a flow needs a trigger block"`.
-
-## The `raw_config` flag
-
-Control blocks (`control.if`, `control.switch`, `control.foreach`) set `raw_config = True` because their condition objects contain template-like expressions that need to be evaluated as conditions, not rendered as strings. When `raw_config` is `True`, the engine passes the raw config dictionary to `block.run()` without rendering templates inside it.
-
-```python
-class ControlIf(Block):
-    key = "control.if"
-    handles = ["*"]
-    trigger = False
-    raw_config = True
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        condition = config["condition"]  # raw condition object, not rendered
-        # evaluate the condition against run.state
-        result = run.eval_condition(condition)
-        return BlockResult(output=result, handle="true" if result else "false")
-```
-
-## Writing a block that reads resources
-
-The simplest way to interact with resources from a custom block is through the `FlowRun`'s runtime methods:
-
-```python
-class MyResourceGet(Block):
-    key = "my.resource.get"
-    handles = ["next", "missing"]
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        resource = config["resource"]
-        record_id = config["id"]
+    async def run(self, config: dict[str, Any], run) -> BlockResult:
         try:
-            result = await run.resource_get(resource, record_id)
-            return BlockResult(output=result, handle="next")
-        except NotFoundError:
-            return BlockResult(output=None, handle="missing")
+            secret = await run.runtime.secret("STRIPE_SECRET_KEY")
+            result = await run.runtime.http_request(
+                method="POST",
+                url="https://api.stripe.com/v1/charges",
+                headers={"Authorization": f"Bearer {secret}"},
+                body={
+                    "amount": config["amount_minor"],
+                    "currency": config["currency"],
+                    "customer": config["customer_id"],
+                },
+            )
+        except Exception as exc:
+            return BlockResult(output={"error": str(exc)}, handle="failed")
+        if result["status"] >= 400:
+            return BlockResult(output=result["body"], handle="failed")
+        return BlockResult(output=result["body"], handle="next")
+
+
+def register(registry):
+    registry.add(CreateCharge)
 ```
 
-For writes, use `run.resource_create`, `run.resource_update`, and `run.resource_delete`. For queries, use `run.db_query`. For events, use `run.event_emit`. The runtime exposes every platform block's operation as an async method on `FlowRun`.
-
-## Complete example: custom block package
-
-A typical custom block lives in a Python module, is registered at startup, and is used in flow definitions:
-
-```python
-# myapp/flows/blocks.py
-from pawabase_kit.flows.blocks import Block, BlockResult
-from typing import Any, Mapping
-
-class Greet(Block):
-    key = "my.greet"
-    handles = ["next"]
-
-    async def run(self, config: Mapping[str, Any], run: FlowRun) -> BlockResult:
-        name = config.get("name", "world")
-        return BlockResult(output=f"Hello, {name}!")
-
-    def validate(self, config: Mapping[str, Any]) -> list[str]:
-        return [] if "name" in config else ["name is required"]
-```
-
-```python
-# myapp/bootstrap.py
-from pawabase_kit.flows.registry import registry
-from myapp.flows.blocks import Greet
-
-registry.register(Greet)
-```
+Once `pawabase-stripe` is installed into the same Python environment the Pawabase process runs in (`pip install pawabase-stripe`, or as a dependency of your project's own deployment), the next time that process starts, `default_registry()` discovers the `pawabase.blocks` entry point, calls `register(registry)`, and `stripe.create_charge` becomes a real block — usable in any flow's JSON exactly like a built-in one:
 
 ```json
 {
-  "name": "greet_flow",
-  "definition": {
-    "nodes": [
-      { "id": "start", "data": { "block": "trigger.manual", "config": {} } },
-      { "id": "greet", "data": { "block": "my.greet", "config": { "name": "{{ input.name }}" } } }
-    ],
-    "edges": [
-      { "source": "start", "target": "greet" }
-    ]
+  "id": "charge",
+  "data": {
+    "block": "stripe.create_charge",
+    "config": {
+      "amount_minor": "{{ steps.order.output.total_minor }}",
+      "currency": "{{ steps.order.output.currency }}",
+      "customer_id": "{{ steps.order.output.customer.stripe_id }}"
+    }
   }
 }
 ```
 
-## Debugging custom blocks
+There is no separate step to tell Studio about the new block. `BlockRegistry.catalogue()` — the same method the API's block-catalogue endpoint calls to build Studio's palette — returns `describe()` for every block currently in the registry, sorted by category and key, and Studio's flow editor renders that catalogue directly with no hardcoded block list of its own. A block that's in the registry appears in Studio's palette; a block that isn't, doesn't. Restarting the process after installing the package is what makes the difference, since `default_registry()` only reads entry points once, the first time it's called.
+
+<Warning>
+A package that fails to load — an import error inside `register()`, an exception while building block classes — is logged and skipped (`logger.exception("could not load blocks from %s", entry.value)`), not raised. The rest of the registry still loads normally. If a custom block silently doesn't appear in Studio, check the process's own startup logs for that message before assuming the entry point itself is misconfigured.
+</Warning>
+
+## Inside `run()`: the `FlowRun` object
+
+`run()` receives the block's own config (already rendered into final values, unless the block set `raw_config = True`) and the `FlowRun` executing it. `FlowRun`'s real, confirmed surface is:
+
+| Member | What it does |
+| --- | --- |
+| `run.state` | The full run state dict — `input`, `auth`, `project`, `env`, `vars`, `steps`, `run` |
+| `run.render(value, extra=None)` | Renders `{{ }}` templates in `value` against the run's state (used by a `raw_config` block that needs to template part of its own config) |
+| `run.runtime` | The `Runtime` implementation for this process — **this** is where platform capabilities live |
+| `run.current_node` | The node id currently executing |
+| `run.targets(node_id, handle)` | The node ids reached from `node_id` through a given handle |
+| `run.run_branch(node_id, handle, extra=None)` | Runs everything reachable through a handle (how a loop body executes) |
+| `run.entry_node()` | The id of the node the run started from |
+| `run.result()` | The run's overall value so far |
+| `run.trace()` | The steps executed so far, as dictionaries |
+
+<Warning>
+Capability methods — reading or writing a resource, querying the database, sending mail, calling `http.request`, reading a secret, checking a policy, and so on — are **not** methods on `run` directly. They live on `run.runtime`: `run.runtime.resource_get(...)`, `run.runtime.http_request(...)`, `run.runtime.secret(...)`, `run.runtime.check_policy(...)`. This is the exact pattern every built-in platform block already uses (see [Platform blocks → "Everything a runtime provides, at a glance"](/flows/platform-blocks#everything-a-runtime-provides-at-a-glance) for the full table of `Runtime` methods and which built-in block calls each one). A custom block calling `run.resource_get(...)` directly — without `.runtime` — will fail; that method doesn't exist on `FlowRun`.
+</Warning>
+
+```python
+async def run(self, config, run) -> BlockResult:
+    org = run.state["auth"]["org"]
+    try:
+        record = await run.runtime.resource_get("orders", config["order_id"])
+    except NotFoundError:
+        return BlockResult(output=None, handle="missing")
+    if record["store_id"] != org:
+        return BlockResult(output=None, handle="missing")
+    return BlockResult(output=record, handle="next")
+```
+
+A runtime that doesn't implement some capability (a fake runtime used in tests, say) doesn't raise `AttributeError` — `BaseRuntime.__getattr__` hands back an async function that raises `NotAvailable` for anything unimplemented, so a custom block calling an unsupported runtime method fails the same predictable way a missing config field would.
+
+## Error handling
+
+A block has two distinct ways to signal failure, and they mean different things to the flow:
+
+**Raise, when the failure should behave like any other block failure** — following the node's `error` edge if it has one, or failing the whole run with a `FlowError`-shaped error otherwise:
+
+```python
+async def run(self, config, run) -> BlockResult:
+    if not config.get("api_key"):
+        raise ValueError("api_key is required")
+    ...
+```
+
+**Return a `BlockResult` with a `failed`/`missing`-style handle, when failure is a normal, expected outcome the flow should be able to branch on explicitly** — the same way `resource.get` branches to `missing` instead of raising:
+
+```python
+async def run(self, config, run) -> BlockResult:
+    result = await run.runtime.http_request(method="GET", url=config["url"])
+    if result["status"] >= 400:
+        return BlockResult(output=result["body"], handle="failed")
+    return BlockResult(output=result["body"], handle="next")
+```
+
+Use the second style whenever "this didn't work" is a legitimate branch a flow author would want to route around — a lookup that might not find anything, an external call that might come back non-2xx — and only let an exception propagate for genuinely exceptional conditions (bad config, a bug) that every flow using the block should treat as a hard failure by default.
+
+## Blocks that need their own templating: `raw_config`
+
+Setting `raw_config = True` is for the narrow case of a block whose config contains something that isn't meant to be rendered as an ordinary `{{ }}` template before `run()` sees it — the built-in `control.if` and `control.while` are the reference examples, since their `condition` field is a small expression tree read with `$`-prefixed paths (see [Templates](/flows/templates)), not a template string. A `raw_config` block receives its config completely unrendered and is responsible for calling `run.render(...)` itself on whichever parts of the config actually are ordinary templates, or for evaluating a condition tree directly against `run.state`.
+
+Most custom blocks should leave `raw_config` at its default of `False` and let the flow engine render `{{ }}` templates in their config automatically, the way the Stripe example above does — only reach for `raw_config` if you're building something structurally like a control block.
+
+## The complete worked example, end to end
+
+A minimal package adding one block — `text.slugify`, turning a string into a URL-safe slug, something no built-in filter or block currently does:
+
+```
+pawabase-text-blocks/
+├── pyproject.toml
+└── pawabase_text_blocks/
+    ├── __init__.py
+    └── blocks.py
+```
+
+```toml
+# pyproject.toml
+[project]
+name = "pawabase-text-blocks"
+version = "0.1.0"
+dependencies = ["pawabase-kit"]
+
+[project.entry-points."pawabase.blocks"]
+text = "pawabase_text_blocks.blocks:register"
+```
+
+```python
+# pawabase_text_blocks/blocks.py
+import re
+from typing import Any
+
+from pawabase_kit.flows.registry import Block, BlockResult
+
+
+class Slugify(Block):
+    """Turns a string into a lowercase, hyphen-separated slug."""
+
+    key = "text.slugify"
+    title = "Slugify"
+    category = "data"
+    handles = ["next"]
+    config = [
+        {"name": "value", "type": "string", "required": True},
+        {"name": "max_length", "type": "integer", "required": False, "default": 80},
+    ]
+
+    async def run(self, config: dict[str, Any], run) -> BlockResult:
+        value = config.get("value") or ""
+        if not isinstance(value, str):
+            raise ValueError("text.slugify requires a string value")
+        slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        max_length = config.get("max_length") or 80
+        return BlockResult(output=slug[:max_length])
+
+
+def register(registry):
+    registry.add(Slugify)
+```
+
+Installed alongside the Pawabase environment (`pip install ./pawabase-text-blocks`, or as a pinned dependency of whatever deploys the API process), `text.slugify` appears in Studio's palette under the "data" category the next time the process starts, and can be dropped into any flow:
+
+```json
+{
+  "id": "slug",
+  "data": {
+    "block": "text.slugify",
+    "config": { "value": "{{ input.body.title }}", "max_length": 60 }
+  }
+}
+```
+
+## Common mistakes
 
 <AccordionGroup>
-  <Accordion title="Block not found in the registry">
-    Check that `registry.register(MyBlock)` ran before the flow saved. Custom blocks are registered per-environment — verify the registration runs in the correct environment's bootstrap.
+  <Accordion title="Calling run.resource_get(...) or run.http_request(...) directly">
+    Capability methods live on `run.runtime`, not `run` itself — `run.runtime.resource_get(...)`, `run.runtime.http_request(...)`. `FlowRun` only exposes `state`, `render`, `runtime`, `current_node`, `targets`, `run_branch`, `entry_node`, `result`, and `trace`.
   </Accordion>
-  <Accordion title="validate returns errors but the flow still runs">
-    Validation errors prevent saving, not running. If you're running a flow programmatically without going through the validate path, errors in `validate` won't catch anything. Add runtime checks in `run` instead.
+  <Accordion title="Adding a validate(config) method and expecting it to run">
+    There is no save-time validation hook on `Block`. Studio's own config form enforces `required`/`type` from the block's `config` schema at the field level; anything beyond that has to be checked inside `run()` itself, by raising.
   </Accordion>
-  <Accordion title="BlockResult.handle doesn't match any edge">
-    The walk will raise — an edge pointing at a missing handle fails validation. Ensure every declared handle has a corresponding edge in the flow definition.
+  <Accordion title="Expecting registry.register(MyBlock) to work">
+    The method is `.add()`. There's also no importable module-level `registry` object to mutate directly — blocks reach the process registry through the `pawabase.blocks` entry point, which is handed the live `BlockRegistry` instance as an argument when it's loaded.
   </Accordion>
-  <Accordion title="run.render raises unexpectedly">
-    `run.render` renders templates against the current state. If a template references `{{ steps.<id>.output }}` for a node that hasn't run yet, it resolves as `undefined`. Use `run.eval_condition` for condition objects that need more control.
+  <Accordion title="Forgetting to restart the process after installing a new block package">
+    `default_registry()` reads entry points once, the first time it's called in that process's lifetime, and caches the result. Installing a package that adds an entry point has no effect until the process restarts.
+  </Accordion>
+  <Accordion title="Assuming Studio needs its own configuration to show a new block">
+    It doesn't — the palette is populated entirely from the live registry's `catalogue()`, fetched over the API's block-catalogue endpoint. A block that registers successfully appears automatically; there's no separate Studio-side allowlist or config file naming it.
+  </Accordion>
+</AccordionGroup>
+
+## FAQ
+
+<AccordionGroup>
+  <Accordion title="Can a Studio-only user, with no ability to deploy Python, add a custom block?">
+    No. Registration happens through a Python package's entry points, discovered when the process that runs flows starts up. There is no in-Studio authoring path for a new block — a no-code user is limited to composing the built-in blocks and calling existing Functions.
+  </Accordion>
+  <Accordion title="Is a custom block scoped to one project, or available everywhere the package is installed?">
+    Availability follows the Python environment, not a project or an environment setting inside Pawabase. If the package is installed into the process serving a given deployment, every project and environment that process runs flows for can use the block.
+  </Accordion>
+  <Accordion title="Can a custom block declare more than two handles, like a switch?">
+    Yes — `handles` is just a list of strings; declare as many as the block needs (`["approved", "rejected", "pending"]`, say) and return whichever one applies from `run()`. Use `["*"]` only if the block, like a control block, can legitimately follow any edge and shouldn't be validated against a fixed handle list.
+  </Accordion>
+  <Accordion title="What happens if two installed packages register a block with the same key?">
+    Whichever one is loaded second overwrites the first in the registry's `blocks` dict — `BlockRegistry.add()` doesn't check for a collision. Namespace custom block keys (`yourcompany.something`, the way the built-in Stripe example above uses `stripe.*`) to avoid an accidental collision with another package or a future built-in block.
   </Accordion>
 </AccordionGroup>
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Flows overview" icon="waypoints" href="/flows/overview">How flows fit in the platform.</Card>
-  <Card title="Blocks reference" icon="shapes" href="/flows/block-reference">Every built-in block and its config.</Card>
-  <Card title="Control flow" icon="git-branch" href="/flows/control-flow">How if/switch/foreach/set shape the walk.</Card>
-  <Card title="State" icon="layers-stacked" href="/flows/state">What the run state contains.</Card>
+  <Card title="Templates" icon="code" href="/flows/templates">The {{ }} and $path syntaxes a custom block's config and conditions use.</Card>
+  <Card title="Platform blocks" icon="plug" href="/flows/platform-blocks">The full Runtime method table — every capability run.runtime exposes.</Card>
+  <Card title="Functions" icon="code" href="/code/overview">Writing Python that runs inline in a flow without becoming a block of its own.</Card>
+  <Card title="Control flow" icon="git-branch" href="/flows/control-flow">Real raw_config blocks (control.if, control.while) as a reference for writing one yourself.</Card>
 </CardGroup>

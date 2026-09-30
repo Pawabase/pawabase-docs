@@ -1,52 +1,104 @@
 ---
 title: "Migrations"
-description: "How schema changes work."
+description: "What running a migration actually does: immediate, forward-only DDL, with no preview and no rollback."
 icon: "arrow-right"
 ---
+
 ## Overview
 
-Migrations manage database schema changes when resource definitions change. The platform handles most schema changes automatically, but some require manual intervention.
+Saving a Resource definition in Studio never touches your database. It validates the definition and stores it. The database only changes when you explicitly run a **migration** for that Resource — a `POST .../resources/{name}/migrate` request (Studio's "Migrate" action does exactly this). Understanding that split — define now, migrate when you choose — is the single most important thing on this page, because it's also what lets you edit a Resource's definition freely without any risk to a live table until you decide to apply it.
 
-## Automatic migrations
+<Warning>
+Read this whole page before running your first migration against a production database. Pawabase migrations execute real DDL — `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX` — **immediately**, against the live connection, the moment you call the endpoint. There is no preview step, no dry run, no queued "pending migration" you approve later, and no automatic rollback if you decide afterward that you didn't want it.
+</Warning>
 
-When you add fields to a resource definition, the platform automatically generates migration suggestions. Running the migration adds new columns to the database table.
+## What migrate actually does
 
-The platform creates the appropriate column type based on the field type: VARCHAR for strings, INTEGER/BIGINT for integers, DECIMAL for numbers, BOOLEAN for booleans, DATE/TIMESTAMP for dates and datetimes.
+`store.migrate()` is a short, fully deterministic procedure:
 
-The platform also creates indexes on frequently queried fields to ensure good performance.
+1. **List the tables that exist** in the environment's database.
+2. **If the Resource's table doesn't exist yet**, generate and run a single `CREATE TABLE` statement, built from the Resource's `primary_key`, `id_type`, `fields`, and `timestamps` setting, in the current database's dialect (SQLite, PostgreSQL, or MySQL — see [Your database](/data/your-database)). If the Resource has an `owner_field` that isn't itself declared as a field, a column for it is added right after.
+3. **If the table already exists**, list its actual columns and compare them against every field the Resource defines (including the primary key, the timestamp columns if `timestamps: true`, and `owner_field`). For every field with no matching column, run an `ALTER TABLE ... ADD COLUMN` statement.
+4. **For every field marked `indexed` or `unique`**, run a `CREATE INDEX` (or `CREATE UNIQUE INDEX`) statement — whether the table was just created or already existed. If `owner_field` is set, an index is always created for it as well.
+5. Return the exact list of SQL statements that were executed.
 
-## Manual migrations
+Every one of these statements runs against your live connection as soon as you call migrate — there is nothing to review or confirm beforehand. The response includes the executed statements so you have a record of exactly what ran, but that record arrives *after* the fact, not before it.
 
-Some changes require manual migration: changing id_type, changing primary_key, changing table, or modifying column types that require data transformation.
+```json
+POST /projects/acme/envs/production/resources/orders/migrate
 
-For these changes, the platform provides guidance on the required manual steps. You should follow the guidance carefully to avoid data loss.
+{
+  "resource": "orders",
+  "table": "orders",
+  "statements": [
+    "ALTER TABLE \"orders\" ADD COLUMN \"gift_note\" TEXT"
+  ]
+}
+```
 
-## Migration safety
+An earlier version of this page described migrations as producing "suggestions" reviewed before running. That is not how Pawabase works: there is exactly one migrate endpoint, and calling it runs the DDL. If you want a review step of your own, the only reliable one is: run the migration against a non-production environment (or a copy of the production database) first, read the returned `statements`, and only then run it against production.
 
-Migrations are safe and reversible. They add columns, modify constraints, and create indexes without dropping existing data.
+## What migrate never does
 
-The platform validates that migrations are safe before executing them. If a migration would cause data loss, the platform warns you and refuses to execute it.
+By design, migrate is **additive only**. It never:
 
-## Skipping migrations
+- Drops a column, even if the field was removed from the Resource's definition.
+- Changes a column's type, even if the field's `type` changed.
+- Adds or removes a `NOT NULL` constraint, even if `required` changed.
+- Drops a table, even if the Resource itself was deleted.
+- Converts an `integer` primary key to `uuid` or vice versa.
+- Renames a column or table, even if `name`/`table` changed.
 
-When exposing an existing table, you can skip the migrate step if the schema is managed elsewhere. Columns not declared in the resource definition remain invisible to API clients.
+Every one of those is a genuinely destructive or data-transforming operation — the kind of change that can lose data or fail outright depending on what's already in the table — and Pawabase deliberately leaves it to a human with the database in front of them (through the [Database console](/data/database-console) or a direct connection), rather than inferring intent from a definition diff. If you change a field's `type` in Studio and re-migrate, nothing happens to the existing column at all; the definition and the actual column type simply disagree from that point on until you resolve it yourself.
 
-## Migration and promotion
+## Migrations are forward-only
 
-When you promote a resource definition between environments, the platform copies the definition and any pending migrations to the target environment.
+There is no down-migration, no rollback command, and no stored history of previous schema states anywhere in Pawabase. `migrate()` looks at the database's *current* structure and the Resource's *current* definition, computes the difference, and applies it — it has no memory of what the schema looked like five migrations ago, and nothing to replay backward even if it wanted to.
 
-Run migrations on the target environment after promotion to ensure the database schema matches the new definition.
+Practically, this means:
+
+- **Adding a column is safe to run and safe to leave.** If you add a field, migrate, and later decide you don't want it, the field simply stops being enabled at the API level when you remove it from the definition — the column stays in the table, untouched, which is itself the safety net (see "What migrate never does" above).
+- **There is no "undo" for a `CREATE TABLE` or `ADD COLUMN` beyond doing it yourself in SQL.** If you need a column gone, that's a `DROP COLUMN` you run deliberately through the console or a direct connection — Pawabase will not do it for you, and won't offer to.
+- **Because there's no rollback, the safe order of operations is: test the migration somewhere it doesn't matter, then run it somewhere it does.** Development and staging environments exist for exactly this — each has its own independent database (see [Your database](/data/your-database)), so you can run and inspect a migration's effect there before touching production.
+
+<Warning>
+Because migrations are forward-only and irreversible, the discipline that keeps them safe is entirely procedural: know what statements are about to run before you run them, run them somewhere lower-stakes first when the change is unfamiliar, and treat "adding a required field with no default to a table that already has rows" as the situation to think hardest about (see below) — not because Pawabase will stop you, but because nothing will.
+</Warning>
+
+## The one case worth extra care: adding a required field
+
+`required` is enforced only on **create** requests — it is never retroactively enforced against rows already in the table, and it's never turned into a database-level `NOT NULL` constraint by migrate. If you add `{"name": "priority", "type": "string", "required": true}` to a Resource with existing rows and migrate, the new column is added as a plain nullable column with existing rows getting `NULL` in it; only *new* creates from that point on are required to supply it. This is exactly the safety valve that makes additive-only migration workable — a `required` field on paper never breaks existing data — but it does mean `required` alone does not guarantee every row in the table has a value. If your application logic assumes every row has `priority` set, you'll need to backfill existing rows yourself (through the console, a flow, or a script hitting `PATCH`) rather than relying on the migration to have done it.
+
+## Indexes and uniqueness
+
+Setting `indexed: true` on a field creates an ordinary index on the next migrate. Setting `unique: true` creates a **unique index**, not a column-level `UNIQUE` constraint — this distinction matters in one specific case: a field added via `ALTER TABLE ADD COLUMN` never carries a column-level `UNIQUE` constraint from Pawabase (the generated `ADD COLUMN` statement explicitly strips it), so uniqueness on a field added after the table already existed is enforced purely through the accompanying unique index, created in the same migration run. Either way — column-level or index-level — duplicate values are rejected by the database from the moment the migration runs; rows inserted *before* that point are not checked retroactively, so if duplicates already exist in the table, creating the unique index will fail until you resolve them.
+
+## Skipping migration for an existing table
+
+If you're exposing a table that already exists and is managed elsewhere (a legacy table, one owned by another system), you can define the Resource and simply never call migrate for it — Pawabase reads and writes through the columns the Resource declares and doesn't require having created the table itself. Columns that exist in the table but aren't declared in the Resource's `fields` are invisible to the API; they're never returned, never filterable, and never writable through `/rest/v1`.
+
+## Migrations and promotion
+
+Promoting a Resource definition from one environment to another (`POST .../promote`) copies the *definition* — it does not run a migration on the target environment, and it does not carry over any record of what DDL has or hasn't been applied there. After promoting, run the migration against the target environment yourself, the same way you did on the source; the target's table is brought to the new shape at that point, independently, against its own database.
+
+## A realistic sequence: adding a field to a resource already in production
+
+1. In Studio, add the field to the Resource's definition in your `development` environment and save. Nothing in any database has changed yet.
+2. Migrate `development`. Confirm the returned `statements` are what you expect, and that the application behaves correctly against the updated table.
+3. Promote the definition to `staging` (or your next environment). Migrate `staging`. Verify there.
+4. Promote to `production`. Migrate `production` during a moment you're prepared to watch it — the statements that ran in staging are a strong signal of what will run here, but they're not a guarantee if production's table has drifted from staging's (manual changes, a skipped earlier migration, and so on).
+5. If the field needs values on existing rows and you can't rely on a `default`, backfill afterward through the API, a flow, or the [Database console](/data/database-console) — not through migrate, which never touches existing row data.
 
 ## Troubleshooting
 
-- Migration fails: check that the database connection is valid and the migration script is correct.
-
-- Column already exists: the field was already added to the database. The migration may be a no-op.
-
-- Data migration needed: changing a field type may require transforming existing data. Use a custom route or the database console for data migration.
+- **Migrate returns an empty `statements` list.** Nothing was missing — the table and every declared column already exist. This is a safe no-op, not an error.
+- **`SqlError` on migrate.** The Resource's definition has an invalid identifier (a bad table or column name) or a field spec the SQL layer can't turn into a column definition. Fix the definition and retry; nothing partial is left behind if this happens before any statement runs, but if it happens partway through a multi-statement migration, whichever statements already executed have already taken effect (there is no transaction wrapping the whole migration).
+- **A column you expected to be added doesn't show up.** Check that you actually called migrate after saving — saving alone never touches the database — and that the column doesn't already exist under a name the definition also matches (e.g. mismatched `table` pointing somewhere else than you think; see [Your database](/data/your-database) for how the connection and table are resolved).
+- **You need to change a column's type or drop one.** Not something migrate does. Use the [Database console](/data/database-console) or a direct connection, understanding that both bypass everything the Resource layer would otherwise check.
 
 <CardGroup cols={2}>
-  <Card title="Resources" icon="database" href="/data/resources" />
   <Card title="Defining resources" icon="table-properties" href="/data/defining-resources" />
-  <Card title="Your database" icon="database" href="/data/your-database" />
+  <Card title="Your database" icon="hard-drive" href="/data/your-database" />
+  <Card title="Database console" icon="terminal" href="/data/database-console" />
+  <Card title="Field types" icon="type" href="/data/field-types" />
 </CardGroup>

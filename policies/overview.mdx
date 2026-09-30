@@ -491,6 +491,149 @@ For teams that need both coverage and database-level protection, the practical a
   </Accordion>
 </AccordionGroup>
 
+## A scenario library
+
+The requirements above cover one blog. Real projects mix several distinct authorization *shapes* across dozens of resources. Here are the five shapes that come up in almost every backend, written out completely: the requirement, the policy, how it's attached, and what to test. Treat these as templates to adapt rather than rules to copy verbatim — the column names and role names are yours to change, but the *shape* of the condition rarely needs to.
+
+### Shape 1: multi-tenant data isolation
+
+**Requirement:** every row belongs to exactly one organization; a caller may only ever see rows belonging to the organization their token was issued for; platform staff (not tenant admins) can see across all organizations for support purposes.
+
+```json
+// tenant_isolated
+{ "any": [
+  { "role": "platform_support" },
+  { "eq": ["$record.org_id", "$auth.org"] }
+] }
+```
+
+Attach it to every operation on every tenant-scoped resource: `list`, `get`, `update`, `delete`. For `create`, pair it with a rule that also fixes the `org_id` being written, so a caller can't create a row in someone else's tenant:
+
+```json
+// tenant_isolated_create
+{ "all": [
+  { "authenticated": true },
+  { "eq": ["$input.org_id", "$auth.org"] }
+] }
+```
+
+<Warning>
+`org_id` is not an owner field the platform sets for you — it's an ordinary column. If you let clients send it on create without this check, a caller could write a row into a different tenant's data simply by sending a different `org_id` in the body. The `create` variant above closes exactly that gap.
+</Warning>
+
+This is the single highest-value shape to get right early: `{"eq": ["$record.org_id", "$auth.org"]}` is a single-level equality against a value known at plan time, so it plans to an indexed `WHERE org_id = '…'` for every non-support caller, and to an unrestricted query for support staff. See [pushdown](/policies/pushdown#example-families-at-scale) for the equivalent trace with a different column name.
+
+**Test:** a user in org A cannot see, update, or delete a row created in org B, even by guessing its id (`get` returns `404`, not `403`, per the [decision table](#from-decision-to-http-response)). A `platform_support` user can see rows in both orgs. A user in org A creating a row cannot set `org_id` to org B's slug.
+
+### Shape 2: role-gated admin actions
+
+**Requirement:** a specific, usually destructive or irreversible action — refunding a payment, deleting a user, force-publishing content, rotating a key — should be callable only by a named administrative role, regardless of ownership.
+
+```json
+// finance_admin_only
+{ "role": ["finance_admin", "superadmin"] }
+```
+
+This is deliberately the simplest shape in the library: no record check at all, just a role gate. Attach it to the **custom route or flow trigger** that performs the action, not to a resource CRUD operation — admin actions are almost always modeled as routes (`POST /payments/{id}/refund`) rather than a generic `update`, precisely so the gate can be a clean role check instead of being tangled with the ordinary update policy for the resource.
+
+```json
+"policy": "finance_admin_only"
+```
+
+<Tip>
+When an admin action should also require recent 2FA — refunds and account deletions usually should — compose it as a list rather than writing the AAL check into the role policy itself: `"policy": ["mfa", "finance_admin_only"]`. This keeps `finance_admin_only` reusable for actions that don't need step-up authentication, and keeps the 2FA requirement visible at the point where it's actually needed. See [Shape 5](#shape-5-time-boxed-access-via-aal) for the caveat on what `aal` actually guarantees.
+</Tip>
+
+**Test:** a `finance_admin` can call the route; a `finance_staff` (a lesser, read-mostly role) gets `403`; the resource's *owner*, if the action happens to touch a record they own, still gets `403` — ownership must never substitute for the role check in this shape. This last case is the one people most often get wrong by copy-pasting an `owner`-shaped policy onto an admin route out of habit.
+
+### Shape 3: owner-only record access
+
+**Requirement:** a caller may read and modify only the records they themselves created; nobody else, including other ordinary users, may see them; administrators are a separate concern (compose with Shape 2 if admins also need access).
+
+```json
+// own_records
+{ "owner": "user_id" }
+```
+
+Set `user_id` (or whatever you name it) as the resource's **owner field**. This does two things automatically and is why the shorthand is preferred over hand-writing the equality: the server sets `user_id` to the caller's id on `create`, so a client can never forge ownership of a new row, and the server drops `user_id` from the patch on `update`, so a caller can never reassign an existing row to someone else. The `owner` shorthand's expansion — `{"all": [{"authenticated": true}, {"eq": ["$record.user_id", "$auth.user_id"]}]}` — also means an anonymous caller can never match, even against a row whose owner field is somehow `null`.
+
+For `delete`, teams often want a slightly narrower rule than "any owner, any time" — for example, allowing deletion only within a grace period:
+
+```json
+// own_records_deletable
+{ "all": [
+  { "owner": "user_id" },
+  { "eq": ["$record.status", "draft"] }
+] }
+```
+
+"You may delete your own records, but only while they're still drafts."
+
+**Test:** the creator can `get`, `update`, and (while draft) `delete` their own record. A second user, signed in, gets `404` on `get` (existence is hidden) and `404` on `update`/`delete` attempts against someone else's id — wait, actually re-check: per the [decision table](#from-decision-to-http-response), a signed-in caller's refused `update`/`delete` is `403`, not `404`, because they already know the row exists if they have its id; only `get` and `list` hide existence with `404`. Write both assertions into the regression suite so the distinction stays intentional.
+
+### Shape 4: org-membership-based visibility
+
+**Requirement:** distinct from tenant isolation (Shape 1), this is the shape where visibility depends on membership in a *specific* sub-group within an organization — a team, a class, a department — rather than the organization as a whole. Multiple such groups can exist per organization, and a caller can belong to several.
+
+The key design decision is where membership lives. If it's cheap and rarely changes, denormalise a membership list directly onto the record:
+
+```json
+// team_visible
+{ "contains": ["$record.member_user_ids", "$auth.user_id"] }
+```
+
+This never pushes down into SQL (see [pushdown: designing for pushdown](/policies/pushdown#designing-for-pushdown)) because the list lives on the record and is unknown at plan time — fine for small teams and moderate table sizes, expensive at large scale. When membership is large or the resource itself is high-volume, invert the relationship instead: carry the caller's group id in their token (`app_metadata.department_id`, set by an admin) and compare it against a plain column on the record:
+
+```json
+// department_visible
+{ "eq": ["$record.department_id", "$auth.claims.app.department_id"] }
+```
+
+This is a clean single-level equality, so it plans to an indexed `WHERE department_id = '…'` — the same performance profile as tenant isolation, just scoped one level deeper. Combine either shape with a staff bypass the same way as the other shapes:
+
+```json
+{ "any": [
+  { "role": ["admin", "hr"] },
+  { "eq": ["$record.department_id", "$auth.claims.app.department_id"] }
+] }
+```
+
+**Test:** a member of department A sees department A's records and not department B's; a member of two departments (if your model allows multiple) sees the union, which requires the `contains`-on-token-side variant (`{"in": ["$record.department_id", "$auth.claims.app.department_ids"]}`) rather than a single equality; `hr` sees everything regardless of department. Because the token-based variant is a snapshot, also test that a department transfer doesn't take effect until the affected user's token refreshes — this is expected behavior, not a bug, but it surprises people the first time they hit it during testing.
+
+### Shape 5: time-boxed access via AAL
+
+**Requirement:** a sensitive action requires the caller to have completed a second authentication factor, and — this is the part that's easy to get wrong — recently, not merely at some point in the token's lifetime.
+
+The straightforward half of this is the `aal` shorthand:
+
+```json
+{ "aal": "aal2" }
+```
+
+This checks that the token was minted after a second factor was verified. It does **not** check *when*. `$auth.aal` is a snapshot fact about the token, and a long-lived token that was minted right after 2FA remains `aal2` for its entire lifetime — there is no `$auth.aal_issued_at` in the context, and no way for a JSON condition alone to express "aal2, and within the last 10 minutes."
+
+For actions where "recently" genuinely matters (a funds transfer, a destructive delete, changing a recovery email), two real options exist:
+
+1. **Shorten the token lifetime for the sensitive flow specifically.** Route the step-up challenge through a flow that mints a short-lived, purpose-scoped token (or session) solely for the sensitive action, so `aal2` and "recent" become the same fact by construction.
+2. **Record a verification timestamp and check it in a Python policy.** Have the step-up challenge write a timestamp into `app_metadata` (`aal2_verified_at`), then write a [Python policy](/policies/python-policies) that reads `context["auth"]["claims"]["app"]["aal2_verified_at"]` and compares it against `datetime.now(UTC)` — something the JSON condition language cannot do, since it has no arithmetic and `$now` doesn't compare against ISO strings reliably (see [operators: time](/policies/operators#time)).
+
+```python code/finance/policies.py
+from datetime import UTC, datetime, timedelta
+from pawabase_kit.policies import policy
+
+@policy("recent_step_up", description="2FA completed within the last 10 minutes")
+async def recent_step_up(context):
+    app = (context["auth"].get("claims") or {}).get("app") or {}
+    verified_at = app.get("aal2_verified_at")
+    if not verified_at:
+        return False
+    return datetime.now(UTC) - datetime.fromisoformat(verified_at) < timedelta(minutes=10)
+```
+
+Compose it with the role and record checks as usual: `"policy": ["recent_step_up", "finance_admin_only"]` — remembering that a list of references cannot mix Python policies with other references in the same merge; if `recent_step_up` is a Python policy, reference it alongside `finance_admin_only` at the entry point as a list only if the engine's list-merge restriction allows it for your version, or otherwise combine them inside the Python handler itself by calling the role check there too.
+
+**Test:** a bursar who completed 2FA one minute ago can call the route; the same bursar retrying 15 minutes later, same token, gets refused; a bursar who has never completed 2FA (no `aal2_verified_at` claim at all) is refused, not treated as "verified an unknown amount of time ago." See [debugging: time-boxed access via AAL never actually turning on](/policies/debugging#debugging-worked-scenarios-end-to-end) for the diagnostic walkthrough when this shape is implemented with the plain `aal` shorthand instead and the "recently" requirement is silently missing.
+
 ## Next
 
 <CardGroup cols={2}>

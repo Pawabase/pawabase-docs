@@ -6,6 +6,10 @@ icon: "boxes"
 
 Pawabase presents one application-facing backend even though several platform capabilities work together behind it. Your application does not need to know which internal process handles a request. It connects to the environment gateway, and Pawabase routes the request to the configured data, auth, storage, realtime, or automation capability.
 
+<Callout>
+This page describes the shape you need to design correctly — where a request enters, which boundaries it crosses, and what runs synchronously versus asynchronously. It intentionally does not describe Pawabase's internal implementation. You will never need to name an internal process or internal data format to build or operate a Pawabase backend.
+</Callout>
+
 ## The product-level architecture
 
 ```text
@@ -28,27 +32,37 @@ Web, mobile, or server application
 
 The gateway gives your application one stable origin. The environment then applies authentication, validation, policies, and configuration before the request reaches your data or workflow.
 
+## Why one gateway, one origin
+
+Every public request — sign-in, a resource operation, a file upload, a realtime connection, a custom route — arrives at the same origin and the same path prefixes for a given environment, regardless of which capability actually serves it. This matters for three reasons that show up directly in how you build:
+
+1. **Your client configuration stays simple.** One base URL and one API key per environment is everything a client needs; it never has to know that auth and data are conceptually different capabilities.
+2. **The environment boundary is enforced in one place.** Because every request passes through the same entry point, the check "does this key belong to this environment, and is it still valid" happens consistently for every capability, not once per capability with room for one of them to be configured differently.
+3. **You can add capabilities without changing integration code.** A client written against the resource and auth APIs today keeps working unmodified when you turn on realtime or storage later — it is additional paths behind the same gateway, not a new service to point at.
+
 ## The main boundaries
 
 ### Application boundary
 
 Your application owns the user experience and client-side state. It should use a publishable key, user sessions, and the public application interfaces documented under [Clients](/clients/overview).
 
-Never place a secret key, operator credential, or deployment secret in browser code or a mobile bundle.
+Never place a secret key, operator credential, or deployment secret in browser code or a mobile bundle. Treat every value that reaches the client as something a technically capable end user can read, because they can — browser developer tools and a decompiled mobile bundle both expose embedded strings trivially.
 
 ### Environment boundary
 
 Each project environment has its own data, users, keys, secrets, integrations, and runtime configuration. Development traffic cannot safely be assumed to behave like production traffic because the environments are isolated by design.
 
+The environment boundary is resolved from the request itself — the API key you send identifies which environment you're talking to — which is exactly why a development key silently pointed at what you assumed was a staging deployment is such a common source of confusion (see [Credentials](/concepts/credentials) and [Projects and environments](/concepts/projects-and-environments)).
+
 ### Data boundary
 
 Resources expose validated operations over application data. Policies protect those operations. Storage buckets protect files. Realtime channel rules protect live delivery.
 
-These surfaces can share the same authentication context, but each surface still needs an explicit access decision.
+These surfaces can share the same authentication context — the same signed-in user's roles and identity are visible to a resource policy, a bucket policy, and a channel rule — but each surface still needs an explicit access decision. A resource being protected does not automatically protect a bucket that stores files related to it; configure both.
 
 ### Automation boundary
 
-Flows, events, queues, schedules, and webhooks handle work that should not be embedded in every client request. They make long-running or retryable behavior visible in Studio.
+Flows, events, queues, schedules, and webhooks handle work that should not be embedded in every client request. They make long-running or retryable behavior visible in Studio, with their own execution history independent of the request (if any) that started them.
 
 ## Synchronous and asynchronous work
 
@@ -66,6 +80,16 @@ Save → emit event → queue flow → call provider → retry or record failure
 
 This separation protects response times and gives operators a place to inspect failures. It also means a successful write does not automatically mean every downstream consumer succeeded.
 
+### Deciding which category a piece of work falls into
+
+Ask: "if this step fails or is slow, should the customer's request fail too?" If yes — validating a required field, checking a policy, saving the record itself — it belongs in the synchronous path. If no — sending a confirmation email, notifying a warehouse, recalculating a dashboard metric, charging a card on a retry schedule — it belongs after the response, driven by an event, a queued job, or a schedule.
+
+A frequent design mistake is putting a slow, unreliable, or non-essential step in the synchronous path because it's easiest to write it inline first. The size of the mistake scales with how unreliable the external dependency is: a fast internal computation costs little in the request path, but a call to a third-party payment or shipping API — which can be slow, rate-limited, or briefly down — genuinely should not decide whether a database write appears to succeed.
+
+### What "the response already went out" means for correctness
+
+Because asynchronous work happens after the response, your application cannot assume that everything implied by a successful `201 Created` has already happened. A newly created order might return successfully to the client before the fulfillment flow has run, before the confirmation email has sent, and before a realtime update has reached other connected clients. Design your client accordingly: show the state you actually know (the order was created) rather than a state you're only hoping happened (the warehouse has been notified), and use realtime, polling, or a subsequent fetch to reflect the async work's eventual outcome.
+
 ## Data and external systems
 
 Pawabase can connect your application data to external services through HTTP steps, functions, inbound hooks, and outbound webhooks. Treat those services as unreliable dependencies:
@@ -78,9 +102,13 @@ Pawabase can connect your application data to external services through HTTP ste
 
 For webhook delivery, see [Outbound webhooks](/webhooks/outbound) and [Webhook signatures](/webhooks/signatures).
 
+### Why "treat them as unreliable" is not just caution
+
+External systems fail in ways that are easy to underestimate when you're building against a well-behaved sandbox: a payment provider's webhook arrives twice for the same event; a shipping API returns a 200 with an error message in the body instead of a proper error status; a partner's endpoint is unreachable for eleven minutes during their own deploy. None of these are edge cases in the statistical sense — over the lifetime of a product handling meaningful volume, all of them will happen. Building the retry, idempotency, and status-tracking behavior in from the start, even for the first integration, is materially cheaper than retrofitting it after an incident has already caused a double charge or a lost order.
+
 ## Self-hosted deployments
 
-When you self-host Pawabase, you operate the deployment infrastructure: the gateway, Studio, database connection, object storage, mail provider, cache, and workers. The customer-facing product model remains the same.
+When you self-host Pawabase, you operate the deployment infrastructure: the gateway, Studio, database connection, object storage, mail provider, cache, and workers. The customer-facing product model remains the same — the architecture you design against as a customer of Pawabase does not change based on who operates the deployment infrastructure underneath it.
 
 Before production, configure TLS, backups, secret handling, worker capacity, and monitoring. Start with [Self-hosting requirements](/self-hosting/requirements) and the [production checklist](/self-hosting/production-checklist).
 
@@ -103,3 +131,36 @@ External system or realtime client
 ```
 
 For every arrow, decide what data is passed, who may cross the boundary, what failure looks like, and where the outcome is observed. That is the architecture you need to document and operate; the internal service topology is an implementation detail.
+
+## Worked example: designing a returns feature
+
+To make the diagram concrete, walk through designing a returns feature for an e-commerce backend using exactly this method.
+
+**User action.** A customer wants to return a delivered item from their order.
+
+**Public route or resource operation.** You add a `return_requests` resource (order id, item, reason, status) rather than trying to overload the `orders` resource's fields, because a return has its own lifecycle independent of the order.
+
+**Authentication + policy.** The create operation requires an authenticated session; its policy checks that the caller owns the referenced order (`owner` shorthand against the order's customer, resolved via a relation, or checked explicitly in a flow if the resource policy language can't express the join directly — in which case a custom route backed by a flow with a `policy.check` step is the right escalation).
+
+**Database change.** The `return_requests` record is created with `status: "pending_review"`.
+
+**Event / flow / job.** A resource-change trigger on `return_requests` creation starts a flow: notify the fulfillment team (realtime or a queued notification), and if the item is eligible for auto-approval (a low-value item, or an established loyalty tier), auto-approve and queue a refund job; otherwise leave it for manual review in Studio's data view.
+
+**External system or realtime client.** An approved return triggers an outbound webhook to the warehouse for a return shipping label, and a refund flow calls the payment provider. Both are asynchronous, both have visible execution history, and neither blocks the customer's original "request a return" action from completing quickly.
+
+At every arrow, you can name the data (what fields), the permission (who), the failure mode (what if the payment provider is down), and the observation point (Studio's flow run history and job queue). That is a complete architectural design for the feature, and none of it required knowing anything about how Pawabase itself is implemented.
+
+## Common architectural mistakes
+
+- **Putting authorization logic in the client.** A mobile app that simply hides a "delete" button for non-owners provides no actual protection — the operation's policy is the only real boundary; the client hiding the button is a UX nicety at best.
+- **Treating the publishable key as a secret.** Because the key is visible to anyone using your application, security has to come entirely from policies, not from hoping the key stays hidden.
+- **Doing everything synchronously "to keep it simple."** This works until the first slow or flaky external dependency is added, at which point every customer request starts timing out because of a warehouse API's outage.
+- **Assuming a successful response means every downstream action completed.** See [What "the response already went out" means for correctness](#what-the-response-already-went-out-means-for-correctness) above.
+- **Skipping environment isolation "for now."** Testing directly against production because setting up staging felt like overhead is the single most common cause of accidental data loss or an accidental customer-facing email blast in Pawabase's design experience.
+
+## Related pages
+
+- [The mental model](/concepts/mental-model) for how to think about the capabilities themselves, independent of request flow.
+- [The request lifecycle](/concepts/request-lifecycle) for a detailed, boundary-by-boundary trace of one request.
+- [Credentials](/concepts/credentials) for exactly which credential belongs at which boundary.
+- [Projects and environments](/concepts/projects-and-environments) for how the environment boundary is created and promoted between.

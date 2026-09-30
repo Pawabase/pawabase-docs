@@ -557,6 +557,58 @@ On list requests, all non-`eq` operators contribute to the per-row residual chec
   </Accordion>
 </AccordionGroup>
 
+## Operators in the five business scenarios
+
+Each of the recurring authorization shapes leans on a small, predictable set of operators. Seeing them side by side clarifies which operator is the right default for which kind of fact.
+
+<AccordionGroup>
+  <Accordion title="Multi-tenant isolation → eq">
+    `{"eq": ["$record.org_id", "$auth.org"]}` is the entire mechanism. It's the only operator in the twelve that becomes a SQL filter, which is exactly why tenant isolation should be modeled as a single equality against a token-carried slug rather than, say, `in` against a list of allowed org ids — even if a caller could theoretically belong to several orgs, resolve *which one* at token-issue time (the active org) rather than pushing multi-org membership into the condition itself. See [organizations](/auth/organizations) for how the active org is chosen.
+  </Accordion>
+  <Accordion title="Role-gated admin actions → contains (via the role shorthand)">
+    `{"role": "finance_admin"}` expands to `{"contains": ["$auth.roles", "finance_admin"]}`. There's rarely a reason to write the `contains` form directly for roles — the shorthand is clearer and identical in cost — but recognizing the expansion matters when you're debugging with `evaluate()` directly, since the trace you'll see mentions `contains`, not `role`.
+  </Accordion>
+  <Accordion title="Owner-only access → eq, guarded by authenticated">
+    The `owner` shorthand is `eq` plus an explicit `authenticated` guard. If you ever write the equality by hand instead of using the shorthand — for instance, comparing two different id-shaped fields that aren't a literal owner relationship, like `{"eq": ["$record.assigned_to", "$auth.user_id"]}` — remember to add `{"authenticated": true}` yourself. Nothing does it for you outside the shorthand.
+  </Accordion>
+  <Accordion title="Org-membership visibility → eq or contains, depending on cardinality">
+    Single membership (a user belongs to exactly one department at a time) is `eq` against a token claim, and pushes down. Multiple simultaneous memberships push you to `contains` or `in` against a list, which does not push down and becomes a residual — a direct example of the "OR can't be pushed down" caution in [pushdown](/policies/pushdown#rewriting-common-slow-policies) applying just as much to "is a member of any of these groups" as it does to a literal `any` of conditions.
+  </Accordion>
+  <Accordion title="Time-boxed AAL access → eq on aal, never ordering on time">
+    `{"aal": "aal2"}` is an `eq` shorthand under the hood (`{"eq": ["$auth.aal", "aal2"]}`), which is why it plans cleanly. The temptation to also bound *how recently* using `gte`/`lte` against `$now` runs straight into the [time](#time) section below: there's no reliable ordering comparison available for it inside the condition language, which is exactly why that scenario needs a Python policy or a shortened token lifetime instead.
+  </Accordion>
+</AccordionGroup>
+
+## Operator combinations that look equivalent but aren't
+
+A handful of pairs of expressions produce the same result in most everyday cases, which is precisely what makes their edge-case divergence dangerous — the difference only shows up on data you didn't think to test.
+
+<AccordionGroup>
+  <Accordion title="{eq: [$record.status, null]} vs {not: {exists: $record.status}}">
+    These agree whenever `status` is either present-and-non-null or genuinely absent. They diverge if the column exists but a *different* field resolution quirk is in play — for instance if `status` is present but is the literal string `"null"` (a common data-entry mistake from a CSV import): `eq(..., null)` is `false` (a string is never equal to the JSON `null`), while `exists` is `true` (a string is not `None`), so `{"not": {"exists": ...}}` is also `false`. They happen to agree here, but for a field that's an **empty string** `""`: `eq(..., null)` is `false`, `exists` is `true` (empty string is not `None`), `not(exists)` is `false` — still agreeing. Where they genuinely diverge is a field whose value is the boolean `false` or the number `0`: `eq(false, null)` is `false`, and `exists(false)` is `true` (per the [truth table](#checks)), so both forms agree there too. In practice `eq(x, null)` and `not(exists(x))` are equivalent for every value the condition language can produce from `lookup()`, because a missing path and a `None` value are the same `_MISSING`-collapsed result — but prefer `{"not": {"exists": ...}}` anyway, because it reads as intent ("is this absent?") rather than as a coincidental equality.
+  </Accordion>
+  <Accordion title="{in: [$auth.user_id, $record.editor_ids]} vs {contains: [$record.editor_ids, $auth.user_id]}">
+    Functionally identical for a well-formed list column, and the [operators reference](#choosing-between-similar-operators) already covers the readability trade-off. The divergence appears when `editor_ids` is stored as a **string** rather than an `array`-typed field: `contains` on a non-list left operand silently switches to substring matching (`"7"` is a substring of `"71"`, a false positive), while `in` requires its **right** operand to genuinely be iterable — a plain string is iterable character-by-character in Python, so `in("7", "71")` would actually check whether the single character `"7"` normalises to match one of `"7"` or `"1"` after `_norm` is applied to each character, which is almost certainly not what you meant and will behave unpredictably rather than cleanly failing. Neither form protects you from a wrongly-typed column; declaring the field as `array` is the only real fix.
+  </Accordion>
+  <Accordion title="{ne: [$record.owner_id, $auth.user_id]} vs {not: {eq: [$record.owner_id, $auth.user_id]}}">
+    These are true logical negations of each other for every input, including nulls — `ne(null, null)` is `false` (matching `not(eq(null, null) == true)`), and `ne(null, "x")` is `true` (matching `not(eq(null, "x") == false)`). There is no divergence here; this pair is listed specifically because people sometimes *assume* a divergence exists (reasoning "ne must have different null handling from not-eq") and it doesn't. Prefer `ne` for a plain negated equality — it's one condition object instead of two nested ones.
+  </Accordion>
+</AccordionGroup>
+
+## Reading an operator's cost into policy design
+
+Beyond the pushdown/residual distinction already covered, it's worth internalizing roughly how "far" each operator is from becoming free at scale, so a policy review can spot expensive choices before they ship:
+
+```text
+free at any scale        eq / ne on a single-level $record field, AND-ed at the top level
+cheap per row             starts_with / ends_with, gt / gte / lt / lte, small contains / in
+moderate per row          contains / in against a $record-side list of nontrivial length
+avoid on large tables      matches (regex) as part of a per-row residual
+never pushed, ever         any Python policy, any nested-path comparison, any top-level any/not
+```
+
+This isn't a hard rule to enforce in Studio — nothing stops you from writing a `matches` inside a list policy's residual — but it's the mental model that should guide a second look whenever a list endpoint feels slower than the table size would suggest. Pair it with the `total: null` signal from [pushdown](/policies/pushdown#residuals-what-they-mean-for-you): if you see it on a resource you expected to plan cleanly, this ladder tells you which operator in the condition is the likely culprit.
+
 ## Next
 
 <CardGroup cols={2}>

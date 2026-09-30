@@ -1,56 +1,135 @@
 ---
 title: "Schemas"
-description: "How models are generated."
+description: "How Pawabase compiles field definitions into models, how reusable Schemas work, and the read_only/write_only asymmetry."
 icon: "code-2"
 ---
+
 ## Overview
 
-Pawabase automatically generates three Pydantic models for each resource: the create model, the update model, and the read model. These models are compiled from the resource's field definitions at request time.
+Two related but distinct things share the word "schema" in Pawabase, and it's worth separating them before going further:
 
-The models determine what the API accepts in request bodies and what it returns in responses. They are the bridge between the resource definition and the runtime behavior.
+1. **A reusable Schema** is a named, saved field list — a Studio entity, created under an environment's **Schemas** section, that you can point `ref`-type fields at from any Resource or from another Schema. This is Pawabase's mechanism for sharing one shape (an address, a line item, a money amount) across several places instead of repeating the field list.
+2. **A compiled model** is the Pydantic model Pawabase generates, on the fly, from a field list — a Resource's own `fields`, a reusable Schema's `fields`, or a custom route's `input_fields`. Every field list, wherever it comes from, goes through the same compiler.
 
-## Create model
+This page is about the compiler and about reusable Schemas: what models get generated, how `ref` fields resolve, and the one asymmetry (`read_only` vs `write_only`) that's easy to get backwards.
 
-The create model is used for POST /rest/v1/&lt;name&gt; requests. It requires all fields marked required: true in the resource definition. Fields with default values are treated as having the default if omitted.
+## What gets compiled, and when
 
-The create model rejects unknown fields (extra="forbid") and validates all constraints including patterns, enums, ranges, and array element types.
+For every Resource, Pawabase compiles up to three models from its `fields`, one per mode:
 
-write_only fields are accepted in the create model but are never returned in the response. This allows sensitive data like internal costs or passwords to be submitted without being exposed.
+- **create** — the request model for `POST /rest/v1/<name>`.
+- **update** — the request model for `PATCH /rest/v1/<name>/{id}`.
+- **read** — the response model for `GET` requests and for what `create`/`update` return.
 
-## Update model
+There's a fourth mode, **any**, used when validating a field list generically — for example, a reusable Schema is compiled in `any` mode when the platform needs to check that it compiles at all, without picking a create/update/read perspective.
 
-The update model is used for PATCH /rest/v1/&lt;name&gt;/{id} requests. Unlike the create model, every field is optional in the update model because a PATCH request by definition only contains the fields being changed.
+Compilation happens when the environment's compiled application is (re)built — after you save a definition and the version counter bumps, the next request rebuilds it — not on every request. The compiled models are what Sillo uses as `request_model`/`response_model` on the generated routes, so the same models drive request validation, response shaping, and the OpenAPI document all at once: there's no separate "docs" schema that could drift from what's actually enforced.
 
-The update model also rejects unknown fields and validates all constraints for the fields that are present.
+## The four modes, precisely
 
-## Read model
+| Mode | Used for | `required` enforced? | Extra/unknown fields | Fields made optional |
+| --- | --- | --- | --- | --- |
+| `create` | `POST` request body | Yes (unless `default` is set) | Rejected (422) | No — required fields stay required |
+| `update` | `PATCH` request body | No — every field becomes optional | Rejected (422) | Yes, all fields |
+| `read` | Response body | N/A (not a request) | N/A | Yes, all fields (nullable) |
+| `any` | Generic validation (e.g. compiling a Schema to check it's well-formed) | No | Rejected (422) | Yes, all fields |
 
-The read model determines the shape of responses for GET /rest/v1/&lt;name&gt; and GET /rest/v1/&lt;name&gt;/{id}. write_only fields are excluded from the read model entirely.
+In every mode, a field with `enum` set is compiled as a fixed `Literal` of those values regardless of its declared `type`, and every model rejects unknown properties — none of the four modes silently ignores a field the client sent that isn't in the definition.
 
-The read model includes all non-write_only fields from the resource definition, plus any computed or transformed fields added by the transformer.
+## The `read_only` / `write_only` asymmetry
 
-## Model compilation
+These two properties look like mirror images and are easy to swap by mistake. They are not symmetric in *which* models they affect:
 
-Models are compiled at request time and cached per environment version. When you save a resource definition, the platform bumps the version counter and the next request triggers recompilation.
+- **`read_only` fields are skipped in `create` and `update` mode** — they don't exist in the compiled request model at all. A client cannot set a `read_only` field no matter what it sends; if it tries, the extra-field rejection in `create`/`update` mode rejects the request outright (since `read_only` fields are absent from those models, sending one counts as an unknown field). `read_only` fields **are** included in `read` mode, so they show up in responses normally.
+- **`write_only` fields are skipped in `read` mode only** — they're present and settable in both `create` and `update`, but never appear in a response.
 
-The compilation process generates Pydantic models from the field definitions. Unknown fields are rejected. Required fields are enforced. Constraints are validated.
+So the two properties are gated by different, non-overlapping mode checks:
 
-## Inspecting models
+```
+mode in ("create", "update") and read_only  → field is dropped from the model
+mode == "read" and write_only               → field is dropped from the model
+```
 
-You can inspect the compiled models using the API reference tab in Studio. The compiled OpenAPI document shows the exact request and response schemas for every endpoint.
+A field can't usefully be both — marking a field `read_only` and `write_only` together drops it from every mode (it would never be settable and never be visible), which is almost certainly not what you want; Pawabase doesn't reject this combination, but it has no useful effect.
 
-The platform API also exposes the compiled schemas programmatically. You can retrieve the create, update, and read models for any resource using the platform API.
+Use `read_only` for anything the server computes or owns — a timestamp, a status the platform manages, the primary key (which Pawabase marks `read_only` for you automatically; you never declare it yourself). Use `write_only` for anything the client legitimately sends but that shouldn't be echoed back — a one-time activation code, an internal cost figure a customer-facing response shouldn't include.
 
-## Custom model behavior
+```json
+{"name": "id", "type": "integer", "read_only": true}
+```
 
-The transformer function can modify the read model's output. This allows you to add computed fields, format dates, or hide implementation details without changing the resource definition.
+```json
+{"name": "internal_cost_cents", "type": "integer", "write_only": true}
+```
 
-## Validation model errors
+With the second field, a `POST` can include `internal_cost_cents` and it will be stored, but no `GET` response — not `list`, not `get`, not the body returned from the `create` call itself — will ever contain it.
 
-When a request body does not match the model, the platform returns 422 Unprocessable Entity with a detailed error object. The error object identifies each field that failed validation and the reason for the failure.
+## Reusable Schemas
+
+A Schema is a named field list saved independently of any one Resource, under **Schemas** in Studio for a given environment. It exists for two purposes:
+
+1. **Shared shapes across Resources**, via `ref`-type fields (see [Field types](/data/field-types)):
+
+```json
+// Schema "address"
+{"name": "address", "fields": [
+  {"name": "line1", "type": "string", "required": true},
+  {"name": "city", "type": "string", "required": true},
+  {"name": "postal_code", "type": "string"}
+]}
+```
+
+```json
+// Resource "orders" field
+{"name": "billing_address", "type": "ref", "schema": "address"}
+```
+
+```json
+// Resource "customers" field
+{"name": "shipping_address", "type": "ref", "schema": "address"}
+```
+
+Both `orders.billing_address` and `customers.shipping_address` validate against the same `address` shape, defined once. Edit the `address` Schema and both Resources pick up the change the next time the environment recompiles.
+
+2. **Custom route input/response shapes.** A custom route (defined outside Resources, under Routes) can name `input_schema`/`response_schema` pointing at a saved Schema instead of, or alongside, its own inline `input_fields`. If a route names a schema that doesn't exist in the environment, saving the route is rejected outright — this is checked against the same registry `ref` fields resolve against.
+
+### How the registry is built
+
+When an environment's compiled state is (re)built, every Schema in that environment is compiled once, together, into a *registry*: a `{name: compiled_model}` map. Schemas are compiled in dependency order as much as possible, and a Schema that references another (via a `ref` field) resolves against that same registry — so Schemas can reference each other, not just be referenced by Resources.
+
+**A broken Schema doesn't take the whole environment down.** If one Schema fails to compile — an unknown `ref` target, an invalid `pattern`, a duplicate field name — it's left out of the registry and reported as a problem rather than raising immediately. Everything else that doesn't depend on it keeps working. A Resource field that `ref`s the broken Schema will itself fail to compile and that Resource is skipped and reported the same way, but unrelated Resources and Schemas are unaffected. These problems surface in Studio and in the environment's compiled-state diagnostics, so a mistake in one Schema is visible and scoped, not a full outage.
+
+### `ref` resolution failure
+
+If a field's `schema` names something not present in the registry — a typo, or a Schema deleted after something started `ref`-ing it — that field fails to compile with an error naming the missing Schema, and (per the paragraph above) that failure is scoped to whatever was trying to use it.
+
+## Nesting: `object` vs `ref`
+
+Both let a field hold a structured sub-shape; the difference is reuse and origin:
+
+- **`object`** fields carry their `fields` list inline, right there in the Resource or Schema definition. It's private to that one field — nothing else can reference it. Good for a shape that's genuinely local to one field.
+- **`ref`** fields point at a Schema that exists independently and can be `ref`-ed from multiple places. Good for a shape you expect to reuse, or one large/important enough to want a single source of truth for.
+
+Both compile identically underneath — `object` compiles its inline `fields` into an anonymous nested model on the spot; `ref` compiles (or reuses an already-compiled) named model from the registry. Nesting composes freely across both: an `object` field can contain a `ref` field, a Schema can have a field that is itself an `array` of `ref`, and so on, to whatever depth the data actually needs.
+
+```json
+{
+  "name": "line_items",
+  "type": "array",
+  "items": {"type": "ref", "schema": "order_line_item"}
+}
+```
+
+## Inspecting compiled schemas
+
+The generated OpenAPI document — visible at `/docs` for the compiled environment, and readable in full through the platform API — is the authoritative view of exactly what every compiled model accepts and returns, per operation, including every constraint from every field. Because Sillo generates the document directly from the same models it validates against, there is no separate "documentation schema" that can drift from enforcement: what you read in the docs is what's checked on the wire.
+
+## Validation errors
+
+A request body that fails against a compiled model returns `422 Unprocessable Entity` with a structured error body identifying each offending field, its location, and the reason (Pydantic's own validation error detail, reshaped into the response). A `ref` to a Schema that failed to compile, or a Resource that references a broken Schema, surfaces as a compiled-state problem rather than a per-request validation error — those are two different failure points: one is "the shape of *this request* is wrong," the other is "the environment's *definitions* don't compile."
 
 <CardGroup cols={2}>
-  <Card title="Resources" icon="database" href="/data/resources" />
+  <Card title="Field types" icon="type" href="/data/field-types" />
   <Card title="Defining resources" icon="table-properties" href="/data/defining-resources" />
-  <Card title="Validation" icon="badge-check" href="/data/validation" />
+  <Card title="Migrations" icon="arrow-right" href="/data/migrations" />
 </CardGroup>

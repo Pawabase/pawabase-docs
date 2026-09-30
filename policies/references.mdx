@@ -316,6 +316,86 @@ Eight names and a handful of inline conditions describe the whole marketplace's 
   </Accordion>
 </AccordionGroup>
 
+## Named-policy reuse across resources, routes and flows, in depth
+
+The value of a named policy is that the same name resolves identically everywhere it's referenced — a resource operation, a custom route's `policy` field, a bucket's `read_policy`, a channel rule's `subscribe`, and a flow's `policy.check` block all call the same `PolicyEngine.resolve_ref` with the same string, against whatever context that entry point builds. This section works through what that sharing actually looks like end to end, and the two situations where it's easy to get wrong: a name meant for one shape of entry point used at another, and a rename that misses a reference.
+
+### The same policy, five different contexts
+
+Take `family_access` from the school system, defined once:
+
+```json
+{
+  "name": "family_access",
+  "condition": { "any": [
+    { "role": ["admin", "principal", "teacher", "bursar", "librarian"] },
+    { "owner": "user_id" },
+    { "contains": ["$record.guardian_user_ids", "$auth.user_id"] }
+  ] }
+}
+```
+
+Referencing `"family_access"` from five places evaluates the *same condition object* each time, but against five different contexts, because each entry point builds `$record` (and everything else) differently:
+
+| Entry point | Reference | `$record` at evaluation time |
+| --- | --- | --- |
+| `students.get` | `"policy": "family_access"` | the student row being fetched |
+| `students.list` | `"policy": "family_access"` | each row, during planning/residual (see [pushdown](/policies/pushdown)) |
+| `POST /students/{id}/transcript` (custom route) | `"policy": "family_access"` | `null` — routes have no `$record` at all |
+| `policy.check` inside a flow | `{"block": "policy.check", "config": {"policy": "family_access", "record": "{{ steps.load_student.output }}"}}` | whatever record the flow explicitly passed in |
+| bucket `student-photos` read | *(not used here — see below)* | — |
+
+The route row above is the one worth pausing on: `family_access` references `$record.guardian_user_ids` and the `owner` shorthand's `$record.<column>`, but a **custom route has no record in its context at all** (per [enforcement points](/policies/enforcement-points#custom-routes)). Evaluated there, every `$record.*` path resolves to `null` via `lookup()`'s default-on-missing behavior, `contains(null, ...)` and the `owner` shorthand's `eq(null, $auth.user_id)` both evaluate to `false` (assuming the caller isn't literally `null`), and the whole condition degrades to just its first branch: staff roles. That's not a validation error — the reference resolves fine, the condition is well-formed — it's a **silent semantic mismatch**: a policy written with a record-shaped resource in mind, reused on a route, quietly stops admitting guardians and students, without any error telling you so.
+
+This is the practical reason [names should describe *who's admitted*, not *where they're used*](#name-for-whos-admitted-not-where-its-used) — but it cuts both ways: a policy name that reads like it should work anywhere (`family_access`) can still be **record-shaped** in its condition even though nothing about the name says so. Before reusing a named policy at a new kind of entry point, check whether its condition mentions `$record` at all; if it does, confirm the new entry point actually populates one, or the reuse will silently narrow (or, in an `any` starting with a broad branch, sometimes silently widen) what the policy admits there.
+
+### Reuse that works cleanly: role- and permission-only names
+
+Policies built entirely from `role`, `permission`, `authenticated`, `service`, `kind`, `scope`, `aal` — the shorthands whose column notes "decided without the record" in [shorthands](/policies/shorthands#at-a-glance) — never touch `$record` or `$input`, so they resolve identically at *every* entry point, records or none: a resource operation, a route, a function, a flow's `trigger.http`, a bucket, a channel rule, and a `policy.check` block all get the same answer for the same caller. This is why the "actor group" layer in a [layered policy library](#build-in-layers) is the safest, most freely reusable tier: `staff`, `finance_staff`, `library_staff` work anywhere without the record-shape caveat above.
+
+### What "ambiguous" means for a name, precisely
+
+There is exactly one place a name is genuinely ambiguous rather than merely reused for the wrong shape of entry point: when a **stored policy** and a **parameterised built-in** would both match the same string. `resolve_ref` checks stored/Python/built-in names first (`if ref in self.policies`), and only falls through to parsing `kind:argument` syntax if the string isn't already a registered name:
+
+```python
+if isinstance(ref, str):
+    if ref in self.policies:
+        return self.policies[ref]
+    kind, _, argument = ref.partition(":")
+    if argument and kind in ("role", "permission", "owner", "scope", "kind"):
+        return Policy(ref, {kind: argument})
+```
+
+In practice this particular collision can't happen for a *stored* policy: names are validated against `^[a-z][a-z0-9_-]{0,62}$`, which has no colon in it, so Studio and the Platform API both refuse to save a policy named `"role:librarian"` before the ambiguity could ever arise. The check in `resolve_ref` (registry lookup before colon-parsing) is really there for the **Python policy** registry, which enforces no such naming pattern — nothing stops `@policy("role:librarian")` in project code. If a Python policy is ever registered under a string that happens to look like `kind:argument`, every reference to that string resolves to the Python function, never to the shorthand, with no error and no warning at save time. The fix is the same preventive one either way: keep Python policy names out of `kind:argument` shape, and prefer the project-prefixed convention from [naming and isolation](/policies/python-policies#naming-and-isolation) (`school.office_network`), which can't collide with parameterised syntax at all since it contains a `.` before any `:` would appear.
+
+A second, milder ambiguity: a **stored policy with the same name as a built-in** (`"authenticated"`, `"owner"`, `"mfa"`, etc.) overrides the built-in for that environment, as noted [above](#the-built-ins), because `PolicyEngine.__init__` merges dictionaries as `{**BUILTIN_POLICIES, **(python or {}), **(policies or {})}` — stored policies are merged in last, so they win. This isn't a resolution-order accident so much as a deliberate escape hatch (redefining what `authenticated` means for one environment), but it means every place in your documentation, your team's mental model, and even this documentation site that says "`authenticated` means `{"authenticated": true}`" is describing the **built-in**, not necessarily what `"authenticated"` resolves to in a specific environment that has overridden it. If you ever do this, say so loudly in the policy's own `description`, because every other engineer on the project will otherwise assume the built-in's well-known behavior.
+
+### Resolution order, restated precisely
+
+Putting the exact order in one place, since it determines every case above:
+
+1. Is the reference a `Policy` object already? (Only reachable programmatically, not from JSON.) Return it as-is.
+2. Is the reference `None`? Return the environment's `authenticated` policy — the built-in, or an override if one exists (see above).
+3. Is the reference a `bool` or a `Mapping` (an inline condition)? Validate it and wrap it in an anonymous `Policy` named `"inline"`.
+4. Is the reference a `list`? Resolve every item recursively (following this same order for each), refuse if any resolved item has a Python handler, otherwise merge all their conditions into one `{"all": [...]}` named by joining their names with `+`.
+5. Is the reference a `str`? Check the **merged name registry** first — built-ins, then Python policies, then stored policies, with each later group able to override an earlier one by name. If found, return it.
+6. Still a `str` and not found? Split on the first `:`. If the prefix is one of `role`, `permission`, `owner`, `scope`, `kind` and there's a non-empty argument, build a parameterised inline policy.
+7. Nothing matched: raise `PolicyError("unknown policy ...")`.
+
+Steps 5 and 6 are where the "stored beats Python beats built-in, and names beat parameterised syntax" rule actually lives in code — everything in the earlier [names](#1-names) and [parameterised built-ins](#2-parameterised-built-ins) sections is this same logic, described for someone who isn't reading Python.
+
+## Flows: `policy.check` as a fourth reuse pattern
+
+The four forms of reference (name, parameterised, inline, list) all pass through `resolve_ref` identically whether they're attached to a resource, a route, or used inside a flow's `policy.check` block — the block just calls `engine.check(config["policy"], context)` with a context the flow assembles itself from `record` and `input` fields you configure on the block. This has one consequence worth calling out for named-policy reuse specifically: because the flow author chooses exactly what becomes `$record` and `$input` for that one check, a record-shaped policy like `family_access` can be reused **correctly** inside a flow even though it can't be reused correctly on a bare custom route — the flow explicitly supplies a record, where the route simply has none:
+
+```text
+http (policy: authenticated) → resource.get student → policy.check family_access (record = {{ steps.load_student.output }})
+  → allowed: continue
+  → denied: error.raise 404
+```
+
+This is the general escape valve for "I want to reuse a record-shaped named policy somewhere that doesn't naturally have a record": put a `resource.get` (or any block that loads the relevant object) before the `policy.check`, and pass its output in as `record`. It's exactly what the [enforcement points](/policies/enforcement-points#inside-flows) page's example does, and it's the reason `policy.check` exists as a separate block rather than routes simply gaining a `record` parameter of their own — the record has to come from *somewhere*, and a flow is where "load a record, then check a policy against it" is expressed as an explicit, visible step rather than an implicit one.
+
 ## Next
 
 <CardGroup cols={2}>

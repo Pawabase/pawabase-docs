@@ -264,7 +264,7 @@ Where a policy **reference** is expected (resource operations, routes, buckets, 
 
 Only one argument fits in the string form. For role lists use the object form: `{"role": ["admin", "principal"]}`.
 
-The parameterised string form is resolved by `PolicyEngine.resolve_ref`. The method splits the string on the first colon, checks if the prefix is a known shorthand kind, and creates an inline policy from the shorthand name and argument. This resolution happens at request time, and the resulting `Policy` object is cached by the engine.
+The parameterised string form is resolved by `PolicyEngine.resolve_ref`. The method splits the string on the first colon, checks if the prefix is a known shorthand kind, and creates an inline policy from the shorthand name and argument. This resolution happens **fresh on every request**: `resolve_ref` re-parses the string and builds a new `Policy` object each time it's called, and there is no caching layer in the engine at any level. The cost of this is negligible — string splitting and a dict construction — and the benefit is that a stored policy can be edited or a Python policy reloaded without anything needing to be invalidated.
 
 ## Choosing the right shorthand
 
@@ -441,12 +441,205 @@ To see how shorthands carry real requirements, here's the access model of a smal
   </Accordion>
 </AccordionGroup>
 
-## Next
+## Deep dives: each shorthand in a realistic system
 
-<CardGroup cols={2}>
-  <Card title="Context reference" icon="list-tree" href="/policies/context">Every path, per entry point.</Card>
-  <Card title="Roles and permissions" icon="users" href="/auth/roles-and-permissions">Defining the roles these shorthands check.</Card>
-</CardGroup>
+The scenarios above show shorthands one at a time. Real projects lean on all eight together, and the interesting decisions are usually at the edges: what happens when a role is renamed, what a scope-only integration can and can't do, what an `aal2` requirement means for a support workflow. This section works through each shorthand once more, this time all the way to the edge cases.
+
+### `authenticated`, in depth
+
+`authenticated` looks like the simplest shorthand, but it's worth being precise about what it does and doesn't cover, because it's the shorthand every other private-data rule builds on.
+
+**Scenario: a newsletter sign-up form that should disappear once you've subscribed.**
+
+A marketing site has a resource `subscribers` with an owner field `user_id`, and a route `POST /newsletter/subscribe`. The product requirement is: signed-out visitors see the sign-up form; signed-in subscribers see "you're on the list" instead. The route itself doesn't need a policy change for this — that's a frontend concern, decided by whether the client has a token — but the **API** still needs to refuse a duplicate subscribe:
+
+```json
+// subscribers.create
+{ "all": [
+  { "authenticated": true },
+  { "not": { "exists": "$record.id" } }
+] }
+```
+
+That second clause doesn't make sense as written (a new record never has an id yet), which is exactly the kind of mistake `authenticated` alone won't catch — the real duplicate check belongs in a **unique index** on `user_id`, with the policy simply being `authenticated`. The lesson: `authenticated` answers "is anyone signed in", never "has this specific thing already happened." Reach for a database constraint or a flow's `control.if` for the latter.
+
+**Scenario: hiding a route from signed-in users entirely.**
+
+A "claim your account" route should only work for a token that doesn't exist yet, because a signed-in user has nothing to claim:
+
+```json
+{ "method": "POST", "path": "/accounts/claim", "policy": { "authenticated": false }, "…": "…" }
+```
+
+A signed-in caller hitting this route gets a `403` from the policy, before the handler ever runs a lookup on the claim code. Without this guard, a signed-in user could accidentally (or maliciously) claim an account that isn't theirs while still authenticated as themselves, and the handler would need to defend against that itself. Putting the check in the policy means it can never be forgotten when the route is edited later.
+
+**Edge case: what `authenticated` does *not* protect you from.**
+
+`{"authenticated": true}` says nothing about *which* user, only that there is one. A resource with `list` → `authenticated` and no further condition returns **every row in the table** to every signed-in user — it is not a private-data policy by itself. This is the single most common mistake teams make when they're moving fast: they set `authenticated` intending "logged-in users see their own stuff" and get "logged-in users see everyone's stuff." If the resource is meant to be private, `authenticated` is a floor, not the whole rule — it belongs inside an `all` with an ownership or tenancy comparison, or you reach for the `owner` shorthand directly.
+
+### `role`, in depth
+
+**Scenario: renaming a role without breaking policies.**
+
+A project ships with a role called `staff`, referenced from a dozen policies as `{"role": "staff"}`. Eighteen months later, the team splits `staff` into `teaching_staff` and `support_staff` because the two groups need different access. Renaming or splitting a role in Akountz does **not** automatically update policy conditions — `role` checks a literal string against `auth.roles`, and the policy JSON still says `"staff"`. After the split, every policy still checking `{"role": "staff"}` refuses everyone, because nobody carries that role anymore.
+
+The safe sequence:
+
+<Steps>
+  <Step title="Add the new roles alongside the old one">
+    Create `teaching_staff` and `support_staff` in Akountz, and grant them to the right users, **without removing** `staff` yet.
+  </Step>
+  <Step title="Widen the policies first">
+    Change `{"role": "staff"}` to `{"role": ["staff", "teaching_staff", "support_staff"]}` everywhere it's used. Anyone with any of the three roles now passes.
+  </Step>
+  <Step title="Remove the old role from users">
+    Once every user has one of the two new roles, remove `staff` from their role assignments.
+  </Step>
+  <Step title="Narrow the policies">
+    Change the widened `role` lists to just the two new roles, or split the policy into `teaching_staff`-only and `support_staff`-only variants where access actually differs.
+  </Step>
+</Steps>
+
+Skipping the widen step (going straight from `"staff"` to `["teaching_staff", "support_staff"]` in one deploy, before users are reassigned) locks everyone out between the policy change and the role reassignment.
+
+**Scenario: a role that exists in the token but shouldn't grant access here.**
+
+A school project has a `parent_portal_beta` role used only to gate a frontend feature flag — it's not meant to be a policy input at all. Nothing stops someone from referencing `{"role": "parent_portal_beta"}` in a policy by mistake, and it would work exactly like any other role check. The distinction between "roles that are UI feature flags" and "roles that are access-control facts" is not enforced by the platform; it's a convention your team has to keep. A `description` on every policy, and a naming convention (`*_beta`, `*_flag` for UI-only roles) makes the difference visible in Studio's pickers.
+
+### `permission`, in depth
+
+**Scenario: two permissions that sound related but aren't.**
+
+A finance module defines `invoices.read` and `invoices.export`. A support engineer is granted `invoices.read` so they can help customers with billing questions, but not `invoices.export`, because exports include bank details in bulk. A policy written as:
+
+```json
+{ "permission": "invoices.read" }
+```
+
+correctly admits the support engineer to `GET /invoices` and `GET /invoices/{id}`, but a **separate** route `POST /invoices/export` must check `{"permission": "invoices.export"}` — not `invoices.read` — or the separation is meaningless. This sounds obvious in the abstract, but the common bug is copy-pasting the read policy onto the export route and changing only the resource name, forgetting that export is a materially different capability.
+
+**Scenario: an "any of several permissions" requirement.**
+
+A dashboard route should be visible to anyone with at least one reporting permission, not all of them:
+
+```json
+{ "any": [
+  { "permission": "reports.finance" },
+  { "permission": "reports.attendance" },
+  { "permission": "reports.enrollment" }
+] }
+```
+
+This is **not** the same as `{"permission": ["reports.finance", "reports.attendance", "reports.enrollment"]}`, which requires all three. Get this backwards and either everyone with just one reporting permission is locked out (if you meant `any` but wrote the list form), or everyone with just one reporting permission gets the dashboard anyway when you meant to require all three for a "senior report viewer" tier (if you meant the list form but wrote `any`). Read the requirement in plain English before choosing the shape: "any of" is `any` of single-permission conditions; "all of" is the list form (or an explicit `all`, which is equivalent but more verbose).
+
+**Scenario: the wildcard trap surfacing in an audit.**
+
+A compliance review asks "who can export finance records?" The obvious query is "which roles have `finance.export`?" — but if any role has been granted the literal permission `*` (as `admin` typically is), that role's holders can also export, and they won't show up in a search for `finance.export` specifically. When auditing permission-based policies, always check for `*` holders separately: `{"any": [{"permission": "finance.export"}, {"permission": "*"}]}` is the actual admitted set, not just `{"permission": "finance.export"}`.
+
+### `owner`, in depth
+
+**Scenario: an owner field that used to be nullable.**
+
+A `documents` resource originally allowed anonymous uploads (a public drop-box feature), so `owner_id` is nullable and old rows have `owner_id = null`. After the feature is retired and every new document requires sign-in, someone adds `"policy": "owner"` to `get` and `update`. The old anonymous rows, with `owner_id = null`, become **permanently inaccessible** through the API: no signed-in user's `$auth.user_id` will ever equal `null` (the `authenticated` half of `owner`'s expansion also rules out anonymous callers seeing them). This is usually the *correct* outcome from a security standpoint — nobody should "own" an anonymous upload — but it surprises teams who expected old data to still be reachable. If those documents need to stay reachable, backfill `owner_id` to a service account or an admin's id before switching the policy over, or add an explicit branch: `{"any": [{"owner": "owner_id"}, {"all": [{"not": {"exists": "$record.owner_id"}}, {"role": "admin"}]}]}`.
+
+**Scenario: two owner-like fields on the same resource.**
+
+A `swap_requests` resource in a scheduling app has both `requested_by` and `requested_with` — either party should be able to view and cancel the request, but neither should be able to unilaterally approve it:
+
+```json
+// view_or_cancel
+{ "any": [ { "owner": "requested_by" }, { "owner": "requested_with" } ] }
+```
+
+```json
+// approve: only the *other* party may approve
+{ "all": [
+  { "authenticated": true },
+  { "eq": ["$record.requested_with", "$auth.user_id"] },
+  { "not": { "eq": ["$record.requested_by", "$auth.user_id"] } }
+] }
+```
+
+The `approve` policy can't be written as a single `owner` shorthand because "the other party, not this one" isn't an ownership check — it's a relationship check that happens to look similar. This is a good signal for when to stop reaching for `owner` and write the comparison directly.
+
+### `service`, in depth
+
+**Scenario: a route deliberately restricted to your own backend, called from a flow.**
+
+An internal route `POST /internal/recompute-balances` should only ever be triggered by a nightly schedule flow, never by a client, even an admin client. Marking its policy `"service"` makes that explicit:
+
+```json
+{ "method": "POST", "path": "/internal/recompute-balances", "policy": "service", "…": "…" }
+```
+
+Since service credentials bypass the policy engine before any condition runs, this is functionally identical to leaving the route's policy `null`... except `null` on a **custom route** defaults to `authenticated`, not to service-only (see the [enforcement-points defaults table](/policies/enforcement-points#defaults-at-a-glance)). Writing `"service"` explicitly is the only way to get "service credentials only" on a route — you cannot get that behavior by omission the way you can on a resource operation. This is one of the few places where `service` is not redundant but load-bearing.
+
+**Scenario: telling apart a user-triggered flow run from an operator's manual re-run.**
+
+A refund-processing flow can be triggered two ways: a route that customers hit (`policy: "authenticated"`), and a "re-run failed refund" button in Studio that an operator clicks directly on a failed flow run. Inside the flow, a `policy.check` on `{"service": true}` distinguishes the two, because Studio's manual re-run passes an operator credential while the route passes the customer's token:
+
+```text
+policy.check {"service": true}
+  allowed (operator re-run): control.if skip_duplicate_notification = true
+  denied (customer-triggered): continue normally, send the customer a status email
+```
+
+This is the scenario the `service` shorthand exists for: everywhere else, the bypass makes the check moot, but inside a flow's own `policy.check`, the flow's caller context is exactly what's being examined, and the bypass rule doesn't apply to that block.
+
+### `kind`, in depth
+
+**Scenario: preparing for a credential type that doesn't exist yet.**
+
+A platform roadmap includes a future "service account" login flow — a non-human identity that signs in with a long-lived token but should be treated differently from both regular users and secret-key servers for a specific reporting route. Writing the route's policy today as `{"kind": "user"}` rather than `{"authenticated": true}` means that when service accounts ship and get their own `auth.kind` value (say, `service_account`), this route continues to admit only humans without any change — a plain `authenticated` check would have started admitting service accounts too, since they'd carry valid tokens.
+
+**Scenario: distinguishing anonymous from unauthenticated.**
+
+A publishable key with no token produces `auth.kind = "anonymous"`, not an absence of `auth` — the context always has an `auth` object, even for anonymous callers. `{"kind": "anonymous"}` is occasionally useful for a policy that behaves differently for browsing-without-an-account versus a signed-in session, such as showing a "sign in to save this" prompt via a `403` with a specific reason on an otherwise-public route:
+
+```json
+{ "any": [ { "kind": "user" }, { "kind": "anonymous" } ] }
+```
+
+is equivalent to `public`, included here only to show that `kind` can express the same thing verbosely — the real value of `kind` is in *excluding* a specific caller type, not including all of them.
+
+### `scope`, in depth
+
+**Scenario: two integrations, two scopes, one route.**
+
+A logistics partner reads order data (`scope: "logistics:read"`) and a payments processor writes refund confirmations (`scope: "payments:write"`). Both hit the same webhook-acknowledgement route, but should be authorized differently depending on which scope their key carries:
+
+```json
+{ "any": [
+  { "all": [ { "scope": "logistics:read" }, { "in": ["$input.type", ["ship", "deliver"]] } ] },
+  { "all": [ { "scope": "payments:write" }, { "eq": ["$input.type", "refund_ack"]} ] }
+] }
+```
+
+A logistics key attempting to send a `refund_ack` is refused, even though it's a valid key with a valid scope — just not the scope this input type requires. This pattern (scope decides *which branch*, not just *whether to allow*) is common once an integration surface has more than one partner.
+
+**Scenario: scope creep from reusing a key.**
+
+A team mints one publishable key with `scope: ["partner:orders", "partner:invoices"]` and hands it to a single partner who only integrates with orders today. Six months later, a second, unrelated partner is onboarded and — to save a step — given the *same* key. Now both partners can read invoices, because the scope check only asks "does this key have the scope," not "does this key belong to the partner asking." Scopes authorize a **key**, not an **organization**; if partners must be isolated from each other, each needs its own key, and the policy should additionally check a partner identifier carried on the record or in a service-account role, not scope alone.
+
+### `aal`, in depth
+
+**Scenario: requiring 2FA for a specific field, not the whole operation.**
+
+A `users` resource lets any signed-in user update their own profile, but changing the registered email address should require `aal2`:
+
+```json
+// update
+{ "any": [
+  { "all": [ { "owner": "id" }, { "not": { "exists": "$input.email" } } ] },
+  { "all": [ { "owner": "id" }, { "aal": "aal2" } ] }
+] }
+```
+
+"Owner, and not touching email" **or** "owner, with 2FA" — either branch admits the update, but only the second covers a request that includes `email` in the patch. A request that changes `email` without `aal2` fails the first branch (because `$input.email` exists) and fails the second (no `aal2`), so it's refused; a request changing only `display_name` passes the first branch immediately.
+
+**Scenario: session freshness versus assurance level.**
+
+`aal` reflects **how** you signed in, not **when**. A user who authenticated with TOTP three months ago and has a long-lived refresh token still carries `aal2` today, even though the "moment" of proving the second factor is long past. If a workflow needs "confirmed 2FA in this session, recently" rather than "this token's aal claim says aal2," `aal` alone isn't enough — that's a step-up re-authentication flow at the application layer (prompting for the TOTP code again before a sensitive action), which Akountz supports but which isn't expressed as a policy condition. Don't try to encode a time window against `aal` in a policy; there's no timestamp on when the second factor was verified, only the resulting level on the current token.
 
 ## Shorthand implementation in the engine
 
@@ -492,4 +685,127 @@ For the `role` expansion, the `any` combinator means that having *any* of the li
 
 The `owner` expansion always includes `{"authenticated": True}` (note: Python's `True`, not the condition form — it's wrapped in the `all`). This is because the `_shorthand` function returns a condition object, and `{"authenticated": True}` is a boolean condition that's always `true` for authenticated callers. Without it, the `owner` check would pass for anonymous callers whose `user_id` is `null` and whose record's owner field is also `null`.
 
-All shorthand expansions are cached by the engine. When the `evaluate` function encounters a shorthand, it calls `_shorthand` to get the full condition, then recursively calls `evaluate` on the result. Since `_shorthand` is a pure function (no side effects, no I/O), the expansion is deterministic and fast.
+### No caching, anywhere
+
+Shorthand expansion is **not cached anywhere**. When the `evaluate` function encounters a shorthand, it calls `_shorthand` to get the full condition, then recursively calls `evaluate` on the result — every single time the condition is checked, for every request and every row. There is no memoisation of the expansion, no cache of resolved `Policy` objects keyed by reference string, and no cache of decisions keyed by context. `_shorthand` is a pure function (no side effects, no I/O) that runs in microseconds, so re-deriving the same expansion on every call is cheap enough that caching it would add complexity without a measurable benefit. It also means a shorthand's behaviour can never go stale within a request: `{"role": ["admin", "principal"]}` expands the same way whether it's the first condition evaluated in a cold process or the millionth in a long-running one, and there's no cache to invalidate when a stored policy, a Python policy, or an environment's role definitions change. The thing that does get rebuilt on change is the environment's **compiled configuration** (which policies exist, what they're named) — that's a version-driven recompilation of the whole environment, not a cache inside the policy engine itself, and it's covered in [references](/policies/references#promotion-and-environments).
+
+## Composing shorthands with full condition objects
+
+Every example so far nests shorthands inside `all`/`any`/`not`, but shorthands also mix freely with the raw comparison and check operators from the [condition language](/policies/conditions) and [operators](/policies/operators) reference. The rule of thumb: a shorthand is just another condition object, so anywhere a condition is expected, a shorthand fits.
+
+### Shorthand + comparison, in one `all`
+
+**Scenario: a discount code that only staff may apply, and only below a cap.**
+
+```json
+{ "all": [
+  { "role": ["cashier", "manager"] },
+  { "lte": ["$input.discount_percent", 25] },
+  { "any": [ { "role": "manager" }, { "lte": ["$input.discount_percent", 10] } ] }
+] }
+```
+
+Cashiers may apply up to 10%; managers up to 25%. The outer `role` check gates the operation to staff at all; the numeric `lte` caps it hard at 25% for anyone; the inner `any` narrows further for non-managers. Three shorthands and comparisons, one readable rule.
+
+### Shorthand + `exists`/`empty` for conditional requirements
+
+**Scenario: an update that's free-form for admins but must include a reason for everyone else.**
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [ { "authenticated": true }, { "not": { "empty": "$input.reason" } } ] }
+] }
+```
+
+`empty` (from the [operators](/policies/operators) list) checks for a missing or blank value; combined with `authenticated` this reads as "any signed-in user, provided they filled in a reason." Admins skip the requirement entirely via the first branch.
+
+### Shorthand + `matches` for format constraints as authorization
+
+**Scenario: only allow writes where the input's category matches an allowed prefix, scoped by role.**
+
+```json
+{ "any": [
+  { "role": "admin" },
+  { "all": [ { "role": "editor" }, { "matches": ["$input.category", "^public-"] } ] }
+] }
+```
+
+Editors may only create content in categories beginning with `public-`; admins have no such restriction. This isn't a validation rule (validation happens earlier, against the schema) — it's a business rule about *who* may write *what*, which is exactly what policies are for even when the check looks like a format constraint.
+
+### A composed policy end to end: a library system
+
+Pulling several shorthands and comparisons together for a `loans` resource in a library system, with roles `librarian`, `admin`, and an ordinary `patron`:
+
+```json
+// loans.update — librarians manage any loan; patrons may only renew their own,
+// and only if it isn't already overdue, and never more than twice
+{ "any": [
+  { "role": ["librarian", "admin"] },
+  { "all": [
+    { "owner": "patron_user_id" },
+    { "eq": ["$record.status", "active"] },
+    { "lt": ["$record.renewal_count", 2] },
+    { "eq": ["$input.due_date", null] },
+    { "not": { "eq": ["$record.status", "overdue"] } }
+  ] }
+] }
+```
+
+Reading it as a sentence: "librarians and admins may update any loan; a patron may update their own loan if it's active, has been renewed fewer than two times, isn't overdue, and the update doesn't try to set `due_date` directly" (renewal logic computes the new due date server-side, in a flow, rather than trusting a client-supplied date). Every clause here is either a shorthand (`role`, `owner`) or a plain comparison — no Python policy needed, and because the `role` branch is decided at plan time, librarians get an unrestricted list while patrons get a residual on their own loans.
+
+## Common combinations, as a lookup table
+
+A cheat-sheet for translating a requirement in English into a shorthand combination:
+
+| Requirement | Condition |
+| --- | --- |
+| Anyone signed in | `{"authenticated": true}` |
+| Only anonymous callers | `{"authenticated": false}` |
+| Exactly this role | `{"role": "librarian"}` |
+| Any of several roles | `{"role": ["librarian", "admin"]}` |
+| All of several roles at once (rare) | `{"all": [{"role": "a"}, {"role": "b"}]}` |
+| Has this one capability | `{"permission": "reports.publish"}` |
+| Has this capability, or is an admin | `{"any": [{"permission": "reports.publish"}, {"permission": "*"}]}` |
+| Owns the row (default column) | `{"owner": true}` or the built-in `"owner"` |
+| Owns the row (named column) | `{"owner": "author_id"}` |
+| Owner or staff | `{"any": [{"owner": "author_id"}, {"role": "staff"}]}` |
+| A server, never a person | `{"service": true}`, or `null` on a resource operation |
+| A human, even future credential types | `{"kind": "user"}` |
+| This API key was minted for a partner | `{"scope": "partner:orders"}` |
+| Signed in with a second factor | `{"aal": "aal2"}`, or the built-in `"mfa"` |
+| Staff, with 2FA, for a sensitive action | `{"all": [{"role": "admin"}, {"aal": "aal2"}]}`, or `["mfa", "role:admin"]` |
+| Owner, but not while archived | `{"all": [{"owner": "author_id"}, {"eq": ["$record.archived", false]}]}` |
+| Admin overrides everything else | `{"any": [{"role": "admin"}, <everything else>]}` |
+
+## Anti-patterns
+
+A short list of shorthand mistakes that pass code review but fail in production:
+
+<AccordionGroup>
+  <Accordion title="Writing owner's expansion by hand and forgetting `authenticated`">
+    `{"eq": ["$record.owner_id", "$auth.user_id"]}` alone passes for an anonymous caller on a row with a `null` owner_id, because `null == null` is `true` for `eq`. Use the `owner` shorthand, which includes the `authenticated` guard, rather than reimplementing it.
+  </Accordion>
+  <Accordion title="Treating role lists as AND">
+    `{"role": ["admin", "editor"]}` is "admin or editor," never "admin and editor." If a policy that should admit two different groups is refusing everyone, this is the first thing to check.
+  </Accordion>
+  <Accordion title="Assuming a role wildcard covers `permission`">
+    A role granted `finance.*` does not pass `{"permission": "finance.read"}`. Only the literal string `*` is treated as a wildcard by the shorthand.
+  </Accordion>
+  <Accordion title="Checking `scope` on an unrestricted key and expecting `true`">
+    An unrestricted key (no scopes set) fails every `scope` check, by design — it has no *specific* scopes granted, even though it can do everything the endpoint's built-in scope allows.
+  </Accordion>
+  <Accordion title="Expecting `aal` to reflect a fresh, in-session second factor">
+    `aal` is a property of the current token, set once at sign-in. It doesn't expire mid-session and it doesn't retroactively upgrade when a user enrols in MFA later — they need a fresh sign-in for their token to carry `aal2`.
+  </Accordion>
+  <Accordion title="Using `service` on a resource operation and expecting anything beyond the default">
+    A resource operation with `policy: null` already means secret keys and operators only. Writing `"service"` there is harmless but adds nothing — the two are equivalent for resource operations specifically (this is not true for routes, where `null` means `authenticated`).
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Context reference" icon="list-tree" href="/policies/context">Every path, per entry point.</Card>
+  <Card title="Roles and permissions" icon="users" href="/auth/roles-and-permissions">Defining the roles these shorthands check.</Card>
+</CardGroup>
