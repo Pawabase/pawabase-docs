@@ -1,137 +1,1500 @@
 ---
 title: "Your database"
-description: "How each environment connects to its database — SQLite by default, PostgreSQL or MySQL for production — and what Pawabase does and doesn't manage."
+description: "Where an environment's data lives, how Pawabase picks the database, how to point an environment at your own (SQLite, PostgreSQL or MySQL), and what happens when you switch or the connection fails."
 icon: "hard-drive"
 ---
 
-## Overview
+## Two databases, two jobs
 
-Every environment in a Pawabase project has its own database for Resource data — completely separate from the platform's own control-plane database (which stores your project's definitions, audit log, and sessions). Pawabase supports three dialects for an environment's database: **SQLite**, **PostgreSQL**, and **MySQL**. If you don't configure one, the environment defaults to a SQLite file — SQLite is the platform's actual default, not an afterthought, and it's a genuinely fine choice through early development. This page covers configuring each dialect, what Pawabase does and doesn't manage in your database, and how to choose between them.
+A Pawabase installation touches two kinds of database, and confusing them is the root of most questions on this page.
 
-## One database per environment
+| | Control-plane database | Environment database (this page) |
+| --- | --- | --- |
+| **Holds** | Projects, environments, every definition (resources, schemas, flows, policies, routes), keys, secrets (encrypted), the audit log | The **rows** your resources store: the tables created by [migrations](/data/migrations) |
+| **Configured by** | `PAWABASE_DATABASE_URL`, once per installation | `PAWABASE_DEFAULT_DATA_URL` for the whole installation, and optionally `infra.database_url` per environment |
+| **Count** | One | One per environment, which may be the same server |
+| **You read it through** | Studio | `/rest/v1`, the Records tab, and the **Database** page |
+| **Lose it and you lose** | Your definitions and history | That environment's records |
+
+Everything below is about the second column. A migration, a `GET /rest/v1/tickets`, the Records tab and the Database console all run against the **environment database** of the environment you are in.
+
+## How Pawabase picks the database
+
+For every request that touches data, Pawabase resolves the database in this order:
+
+1. If the environment has **`infra.database_url`**, use it. If the value is a secret reference (`secret://NAME`), resolve it first.
+2. Otherwise use **`PAWABASE_DEFAULT_DATA_URL`**, with `{project}` replaced by the project ref and `{env}` by the environment name.
+
+That is the entire rule. There is no per-resource database, no per-request choice and no fallback chain: one environment, one URL.
 
 ```text
 Project: shop
-├── development  →  sqlite file, managed automatically
-├── staging      →  PostgreSQL at db.staging.example.com
-└── production   →  PostgreSQL at db.prod.example.com
+├── development  →  no infra.database_url   →  PAWABASE_DEFAULT_DATA_URL, formatted for shop/development
+├── staging      →  infra.database_url      →  secret://STAGING_DB
+└── production   →  infra.database_url      →  secret://PROD_DB
 ```
 
-Each environment's database is completely independent: a table created in `development` doesn't exist in `staging` or `production` until you define the same Resource there and migrate it, and data inserted in one environment is invisible to every other. This is what makes it safe to experiment freely in `development` without any risk to `production` data.
+The dialect comes from the URL scheme, so there is no dialect setting to keep in step. `sqlite://` is SQLite, `postgres://` or `postgresql://` is PostgreSQL, and `mysql://` is MySQL.
 
-## The default: SQLite
+## What the default is
 
-If you don't set a database connection for an environment, Pawabase uses a SQLite file, one per project/environment pair, created automatically the first time the environment's database is touched. There's no setup step — no connection string, no server to run — which is why it's the default: it's the fastest path to a working environment, and it's a real, fully-supported dialect, not a stand-in that gets swapped out later. It just runs against a file rather than a server, so it's naturally suited to development and small deployments rather than a database several processes need to share concurrently.
+The default is a setting of your installation, so what it is depends on how you run Pawabase.
 
-You don't need to do anything to use it — it's simply what an environment gets until you configure something else in Studio under **Settings → Infrastructure → Database**.
-
-## Configuring PostgreSQL or MySQL
-
-For staging and production, or for development if you'd rather match production's dialect from the start, set a connection string per environment:
-
-1. Open your project in Studio.
-2. Go to **Settings → Infrastructure**.
-3. Under **Database**, enter the connection URL for this environment.
-
-```text
-postgresql://user:password@host:5432/database_name
-```
-
-```text
-mysql://user:password@host:3306/database_name
-```
-
-Pawabase detects the dialect from the connection URL itself — there's no separate "dialect" dropdown to also get right. Each environment's connection is independent: `staging` and `production` are two different URLs, typically two different database instances, configured separately in each environment's own Infrastructure settings.
+| How you run it | `PAWABASE_DEFAULT_DATA_URL` | Result |
+| --- | --- | --- |
+| `docker-compose.yml` (production layout) | `postgres://pawabase:<POSTGRES_PASSWORD>@postgres:5432/pawabase` unless you set it | **One shared PostgreSQL database** for every project and environment, with prefixed table names |
+| `docker-compose.dev.yml` | `sqlite:///data/envs/{project}__{env}.db` | **One SQLite file per environment**, created on first use |
+| API run directly with no setting | `postgres://pawabase:pawabase@127.0.0.1:5432/pawabase` (the setting's built-in default) | A local PostgreSQL that must exist |
 
 <Warning>
-The database user needs `CREATE`, `ALTER`, and `DROP TABLE` privileges (Pawabase never issues `DROP TABLE` itself today, but the permission set your provider offers usually bundles `CREATE`/`ALTER`/`DROP` together) on the schema it uses, since migrations run real DDL against this connection. It does not need superuser or database-admin privileges — scope it to the one database and schema this environment uses.
+Several other pages in this documentation describe SQLite as the platform default. That is true of the development compose file only. The built-in default and the production compose file both use PostgreSQL. Check `PAWABASE_DEFAULT_DATA_URL` in your own installation, and the **Database** page in Studio, which shows the dialect actually in use.
 </Warning>
 
-## What Pawabase creates — and when
+### Shared PostgreSQL and prefixed table names
 
-Nothing is created automatically on first write. **A table only exists after you explicitly run a migration for that Resource** (`POST .../resources/{name}/migrate`, or Studio's "Migrate" action) — see [Migrations](/data/migrations) for the full mechanics. Before that, the Resource can be fully defined and even have some operations enabled, but reads and writes against it fail because the underlying table doesn't exist yet.
+When the default URL is PostgreSQL and the environment has no `infra.database_url`, every environment of every project shares one database. To keep two environments' `tickets` tables from colliding, Pawabase gives the physical table a prefix:
 
-Once migrated, here's what a typical generated table looks like on PostgreSQL, for a Resource `orders` with a `uuid` primary key:
+```text
+pb_<first 12 hex characters of sha256("<project>:<environment>")>_<table>      (cut to 63 characters)
+```
+
+So `tickets` in `acme/production` is a table called something like `pb_9c41e0d27a1b_tickets`. The resource is still `tickets`, `/rest/v1/tickets` still works, and the prefix only matters when you connect with another tool. To find a physical name, read the `table` in the response of **Create / migrate table**, or compute the hash yourself:
+
+```python
+import hashlib
+print("pb_" + hashlib.sha256(b"acme:production").hexdigest()[:12] + "_tickets")
+```
+
+The prefix applies **only** to the shared default. With `infra.database_url` set, or with a SQLite default, tables keep the exact name you declared, because the database is yours alone.
+
+### SQLite files
+
+With the SQLite default, the file for `shop/development` is created at the path in the URL with `{project}` and `{env}` filled in, for example `/data/envs/shop__development.db`. Missing parent directories are created. The connection uses WAL journaling, which lets readers continue while a write happens.
+
+SQLite URLs have a trap in how many slashes they have:
+
+| URL | File |
+| --- | --- |
+| `sqlite:///data/envs/a__b.db` | **`/data/envs/a__b.db`**, an absolute path (three slashes) |
+| `sqlite://data/envs/a__b.db` | `data/envs/a__b.db`, relative to the API's working directory (two slashes) |
+| `sqlite://:memory:` | An in-memory database that disappears when the process stops |
+
+Inside a container, the three-slash form puts the file at the container's `/data`, which should be a mounted volume. A relative path written into a container with no volume loses its data when the container is replaced.
+
+## Where you see which database an environment uses
+
+Studio shows it in three places.
+
+**Overview.** The infrastructure panel lists the database as **configured** (the environment has its own `infra.database_url`) or **platform default**. It also lists storage, mail, cache, queue and events, so one glance tells you which pieces are real:
+
+```json
+{
+  "database": "configured",
+  "storage": "local",
+  "mail": "suppressed (not configured)",
+  "cache": "MemoryCache",
+  "queue": "SyncConnection",
+  "events": "memory"
+}
+```
+
+**Build → Database.** The page header reads *Browse the environment's database. Bring your own with a database URL in Settings.* and the **Tables** card lists every table, with a green badge naming the resource when the table's name equals the resource's declared `table`. A table with no badge is either not managed by a resource, or, on the shared PostgreSQL default, carries the `pb_<hash>_` prefix, which the badge lookup does not account for (this is read from the code, not run against PostgreSQL). It also shows the dialect and `your database` or `platform default` above the list. The platform API behind it returns the dialect and whether the database is the configured one:
+
+```json
+{
+  "dialect": "sqlite",
+  "configured": true,
+  "tables": [{ "name": "things", "resource": "things" }]
+}
+```
+
+**The platform overview.** `GET /platform/v1/overview` lists every open connection the API process holds:
+
+```json
+[
+  { "alias": "acme:development", "dialect": "sqlite", "connected": true },
+  { "alias": "acme:development", "dialect": "sqlite", "connected": false }
+]
+```
+
+Each entry is a connection **to a URL**. The alias is the environment that opened it first. After a URL is switched, the old connection stays in the list, still open, and an environment whose connection failed shows up with `connected: false`. See [the connection pool](#the-connection-pool).
+
+## Setting an environment's own database
+
+There are two honest facts to hold together:
+
+1. **The platform supports a database per environment.** The setting is `infra.database_url` on the environment, and the data plane honors it.
+2. **Studio has no form for it.** The **Settings** page has four sections (API documentation, CORS, Realtime, Custom settings), and its header says infrastructure is configured once for the whole installation through `.env`. The **Database** page's hint mentions Settings too, and there is nothing there.
+
+So you set a per-environment database through the **platform API**, and set the installation-wide default through the `.env` file. Neither is a Studio form.
+
+### Step 1: store the connection string as a secret
+
+Open **Secrets** in the environment's navigation, press **New secret**, and fill in:
+
+| Field | Value |
+| --- | --- |
+| **Name** | `PROD_DB`. UPPER_SNAKE_CASE, and the field uppercases what you type |
+| **Value** | `postgres://pawabase_app:<password>@db.prod.example.com:5432/shop?ssl=require` |
+| **Description** | Optional, for people |
+
+The page explains the rest: secrets are *encrypted at rest*, are referenced as `secret://NAME`, and *values are never shown again*. After saving, the list shows only a masked preview of the end of the value, such as `••••••••d.db`.
+
+The same thing through the API:
+
+```http
+PUT /platform/v1/projects/acme/envs/production/secrets/PROD_DB
+```
+
+```json
+{ "value": "postgres://pawabase_app:<password>@db.prod.example.com:5432/shop?ssl=require", "description": "Production data database" }
+```
+
+```json
+{ "name": "PROD_DB", "reference": "secret://PROD_DB" }
+```
+
+A name that is not upper snake case is refused with a 422 and the message `secret names are UPPER_SNAKE_CASE`. Every secret write bumps the environment's `version`, so the API recompiles on the next request.
+
+### Step 2: point the environment at the secret
+
+```http
+PATCH /platform/v1/projects/acme/envs/production
+```
+
+```json
+{ "infra": { "database_url": "secret://PROD_DB" } }
+```
+
+The response is the environment, with `infra` merged and `version` increased:
+
+```json
+{
+  "name": "production",
+  "infra": { "database_url": "secret://PROD_DB" },
+  "version": 3
+}
+```
+
+`infra` is **merged**, not replaced: keys you leave out are kept, and a key set to `null` is removed. To go back to the platform default, send `{"infra": {"database_url": null}}`.
+
+<Warning>
+A secret reference must be the **whole value**. `secret://PROD_DB` works. A URL with a secret inside it, such as `postgres://user:secret://DB_PASSWORD@host/db`, is **not** resolved, and the literal text is used as the URL. Put the entire connection string in one secret.
+</Warning>
+
+### Do not put the URL in `infra` directly
+
+It is possible to write a literal URL into `infra.database_url`, and it works, but the value is stored as plain text and **returned by the environment's GET**, password included:
+
+```json
+{ "infra": { "database_url": "postgres://dbuser:SuperSecret@127.0.0.1:1/x" } }
+```
+
+Anyone who can read the environment can read the password. A secret is encrypted at rest and shown only as a masked preview. Always use `secret://`, and if a literal URL was ever stored, rotate that password, because it has been readable.
+
+### Step 3: migrate in the new database
+
+The new database has no tables. Until you migrate, every read of a resource fails: a list on the empty database returned a **500**, which is what an unmigrated table looks like. Press **Create / migrate table** for each resource, or call the migrate endpoint for each. The statements run against the new database, and the table names there are the ones you declared (no prefix).
+
+```json
+{
+  "resource": "things",
+  "table": "things",
+  "statements": ["CREATE TABLE IF NOT EXISTS \"things\" (...)"]
+}
+```
+
+Nothing is copied from the old database. See [moving data](#moving-existing-data-to-a-new-database).
+
+### Step 4: confirm
+
+Open **Build → Database**. The tables you migrated are listed with their resources, and the dialect is the one you expect. On **Overview**, the infrastructure panel now says the database is **configured**.
+
+## Connection URL syntax
+
+The URL is parsed by the database layer under Pawabase (Tortoise), and these results were produced by running the parser on each form.
+
+| URL | Meaning |
+| --- | --- |
+| `postgres://user:pass@host:5432/dbname` | PostgreSQL, through asyncpg |
+| `postgresql://user:pass@host/dbname` | The same. Port defaults to 5432 |
+| `asyncpg://user:pass@host/dbname` | Also accepted, the same driver |
+| `postgres://user:pass@host/dbname?ssl=require` | PostgreSQL over TLS. `ssl=require` and `ssl=true` both turn it on |
+| `postgres://user:pass@host/dbname?minsize=2&maxsize=10` | Pool size hints are read from the query string, as text values |
+| `mysql://user:pass@host:3306/dbname` | MySQL. Port defaults to 3306 |
+| `mysql://user:pass@host/dbname?charset=utf8mb4` | MySQL with an explicit character set |
+| `sqlite:///data/envs/shop.db` | SQLite, absolute path `/data/envs/shop.db` |
+| `sqlite://relative/path.db` | SQLite, relative path |
+| `mariadb://...` | **Not recognised.** Use `mysql://` for MariaDB |
+| anything else | Refused with `invalid database URL: Unknown DB scheme: ...` |
+
+Special characters in a password must be percent-encoded: `p@ss` is `p%40ss`. The parser decodes `%40` back to `@` and the connection then authenticates correctly.
+
+<Note>
+`minsize` and `maxsize` come through the URL as strings. They are the driver's pool settings, and how a given driver version treats them is its own business, so test a value in a non-production environment before relying on it.
+</Note>
+
+### What an invalid or missing URL does
+
+| Situation | Data plane answers |
+| --- | --- |
+| A URL with an unknown scheme | **503** with `invalid database URL: Unknown DB scheme: ...` |
+| `secret://NAME` where no secret `NAME` exists | **503**. The reference cannot be resolved, so the text is not a valid URL |
+| A well-formed URL whose server refuses the connection | **503** with `could not connect to the environment database: ConnectionRefusedError: ...` |
+| A server that is up but rejects the login | **503**, with the driver's error in the message |
+| A database that is up and has no tables yet | **500**, a plain `Internal Server Error` on reads |
+
+A 503 from `/rest/v1` means Pawabase could not reach the database at all, and the body says so:
+
+```json
+{
+  "error": "database_unavailable",
+  "message": "could not connect to the environment database: ConnectionRefusedError: [Errno 61] Connect call failed ('127.0.0.1', 1)"
+}
+```
+
+That is the useful distinction in the table: **503 means the connection**, **500 on a read means the table or column**. A client can treat 503 as "retry later" and 500 as "something is wrong with the data".
+
+<Warning>
+Studio's **Database** page is less graceful than the data plane. When the environment's database is unreachable, the overview request fails with a plain 500 instead of the 503 body, so Studio shows an error rather than an explanation. Use the data plane's 503 message, or the platform overview's `connected: false`, to diagnose.
+</Warning>
+
+## The connection pool
+
+Pawabase keeps one connection object per **URL** in each API process.
+
+- **Keyed by the resolved URL.** Two environments that resolve to the same URL share one connection. Two environments with different URLs do not.
+- **Opened lazily.** The first request that needs the database connects. There is no connection at startup.
+- **Not closed on a switch.** Change an environment's `infra.database_url` and the new URL gets a new connection, while the old one stays open until the process stops. A project that rotates its database several times in a day accumulates open connections to the old ones.
+- **Per process.** Each API replica has its own pool. Three replicas against one PostgreSQL means three sets of connections, so a server's connection limit is something to budget for.
+- **Retried.** A connection that failed is recorded as not connected, and the next request tries again, so a database that was down comes back without restarting anything.
+
+The consequences for operations:
+
+| You do | Effect |
+| --- | --- |
+| Rotate a password by writing a new value to the same secret | The resolved URL changes, so a **new connection** opens with the new password. Nothing uses the old URL any more, but its connection stays open until the process restarts, so restart the API before you revoke the old password |
+| Switch two environments to the same URL | They share one connection |
+| Scale to more replicas | Connections to the database multiply by the replica count |
+| Restart the API | All pooled connections are closed |
+
+<Tip>
+Plan database `max_connections` as: (replicas) × (environments on that server) × (pool size per connection) plus whatever else connects. A small managed database with a low connection limit is the most common reason a scaled-out Pawabase starts failing with 503.
+</Tip>
+
+## Switching an environment's database
+
+What changes at the moment you save the new `infra.database_url`:
+
+| Before the switch | After the switch |
+| --- | --- |
+| Reads and writes go to the old database | They go to the **new** database, on the very next request |
+| Tables exist | **No tables exist** in the new database |
+| Rows are present | **No rows are present**, because nothing was copied |
+
+A migration always runs against the environment's **current** database, so you cannot migrate into the new database while the environment still points at the old one. The clean way to avoid an outage is to build the new database from a **scratch environment**: create an environment (for example `cutover`) that points at the new database, copy the definitions into it with **Promote**, migrate every resource there, load the data, verify, and only then set the real environment's `infra.database_url` to the same secret. The real environment's tables already exist and already hold the data, so the switch is instant.
+
+<Steps>
+  <Step title="Create the database and a role">
+    On the new server, create a database and a role that owns it. See [a role for Pawabase](#a-role-for-pawabase).
+  </Step>
+  <Step title="Store the URL as a secret">
+    Create `NEW_DB` in the **scratch** environment. Point the scratch environment at it with `infra.database_url`.
+  </Step>
+  <Step title="Promote definitions into the scratch environment">
+    Promote schemas and resources from the real environment. See [Environments and promotion](/operate/environments-and-promotion).
+  </Step>
+  <Step title="Migrate every resource there">
+    Press **Create / migrate table** for each resource in the scratch environment. The tables are created in the new database with your declared names.
+  </Step>
+  <Step title="Copy the data">
+    Dump from the old database and load into the new one, table by table. Keep the key column as it is, so related rows still line up.
+  </Step>
+  <Step title="Verify">
+    Compare row counts, read a few records in the Records tab, and run your application's tests against the scratch environment's keys.
+  </Step>
+  <Step title="Switch the real environment">
+    Create the same secret in the real environment and set `infra.database_url` to it. From the next request, reads and writes use the new database.
+  </Step>
+</Steps>
+
+### Going back
+
+Clearing the setting returns the environment to the platform default, and the data that was there is visible again, because it was never touched:
+
+```json
+{ "infra": { "database_url": null } }
+```
+
+Anything written to the new database while the switch was live is **not** in the old one. Switching back after live writes loses them unless you copy them back.
+
+## Moving existing data to a new database
+
+Pawabase has no export or import for row data. Use the database's own tools, and remember that the **physical table names** differ between the platform default and your own database: a table that is `pb_9c41e0d27a1b_tickets` in the shared default is `tickets` in yours.
+
+### From the shared PostgreSQL default to your own PostgreSQL
+
+```bash
+# 1. Find the physical table name: the `table` in a migrate response, or compute the hash.
+# 2. Dump only the data of that table from the shared database.
+pg_dump "$SHARED_URL" --data-only --table=pb_9c41e0d27a1b_tickets > tickets.sql
+
+# 3. Rename the table in the dump, then load into the new database,
+#    after the new tables have been created by migrating there.
+sed -i.bak 's/pb_9c41e0d27a1b_tickets/tickets/g' tickets.sql
+psql "$NEW_URL" < tickets.sql
+```
+
+Then reset the key sequence, because a data-only load does not advance it:
+
+```sql
+SELECT setval(pg_get_serial_sequence('tickets', 'id'), COALESCE(MAX(id), 1)) FROM tickets;
+```
+
+Without that, the next create reuses an existing id and fails with a plain 500 on the primary key.
+
+### From SQLite to PostgreSQL
+
+SQLite stores booleans as `0` and `1`, datetimes as text with offsets, and JSON as text, so a straight dump does not load. Use a tool that converts types (`pgloader` is the usual one), or export each table as CSV and load it with explicit casts:
+
+```sql
+\copy tickets (id, subject, status, created_at) FROM 'tickets.csv' WITH (FORMAT csv, HEADER)
+```
+
+Load into the columns Pawabase created, so the types are PostgreSQL's. Check boolean and datetime columns afterwards, and reset sequences as above.
+
+### What does not move by itself
+
+| Item | Where it lives |
+| --- | --- |
+| Definitions (resources, schemas, flows, policies) | Control-plane database. Unaffected by a data switch |
+| Records of every resource | **Moved by you** |
+| Uploaded files | Storage, not the database |
+| Secrets, keys, users | Control plane, and the auth service |
+| Cached lists | The cache. Entries from before the switch may show old data until they expire or a write invalidates them. See [Caching](/data/caching) |
+
+## A role for Pawabase
+
+Give Pawabase a role of its own, scoped to one database, and no more.
+
+### What the role needs
+
+Pawabase issues exactly these kinds of statement against an environment database:
+
+| Statement | When |
+| --- | --- |
+| `SELECT`, `INSERT`, `UPDATE`, `DELETE` | Every API request and the Records tab |
+| `CREATE TABLE IF NOT EXISTS` | A migration, for a new resource |
+| `ALTER TABLE ... ADD COLUMN` | A migration, for a new field |
+| `CREATE [UNIQUE] INDEX` | A migration, for indexed, unique and owner fields |
+| Table and column listing | Studio's Database page and every migration (it reads the catalog) |
+| Whatever you type in the console | Subject to the console's read-only default |
+
+It never issues `DROP`, `TRUNCATE`, `CREATE EXTENSION`, `GRANT`, or anything that changes roles. So the role does **not** need `DROP` or superuser rights, and an earlier version of this page was wrong to say it does.
+
+### PostgreSQL
+
+```sql
+CREATE ROLE pawabase_app LOGIN PASSWORD '<password>';
+CREATE DATABASE shop OWNER pawabase_app;
+```
+
+Owning the database is the simplest grant: the role can create tables and indexes in it and nothing outside it. If the database already exists and has other tables, grant narrowly instead:
+
+```sql
+GRANT CONNECT ON DATABASE shop TO pawabase_app;
+GRANT USAGE, CREATE ON SCHEMA public TO pawabase_app;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO pawabase_app;
+```
+
+Tables the role creates are owned by it, which gives it every privilege on them. Tables that already exist (a legacy table you map a resource onto) need an explicit grant:
+
+```sql
+GRANT SELECT, INSERT, UPDATE, DELETE ON legacy_customers TO pawabase_app;
+GRANT USAGE, SELECT ON SEQUENCE legacy_customers_id_seq TO pawabase_app;
+```
+
+The sequence grant is the one that is forgotten. Without it, inserts fail with a permission error on the sequence.
+
+### MySQL
+
+```sql
+CREATE DATABASE shop CHARACTER SET utf8mb4;
+CREATE USER 'pawabase_app'@'%' IDENTIFIED BY '<password>';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON shop.* TO 'pawabase_app'@'%';
+```
+
+Restrict the `'%'` host to your API's address range where you can.
+
+### SQLite
+
+There are no roles. The API process needs read and write access to the file and to its directory, because WAL mode creates `-wal` and `-shm` files next to the database.
+
+### A read-only role for people
+
+For analysts and reporting tools, create a separate role that can read only:
+
+```sql
+CREATE ROLE reporting LOGIN PASSWORD '<password>';
+GRANT CONNECT ON DATABASE shop TO reporting;
+GRANT USAGE ON SCHEMA public TO reporting;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO reporting;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO reporting;
+```
+
+This is the safe way to give someone a SQL connection. It bypasses policies and transformers like any direct connection, so it should still be limited to people allowed to see everything in those tables.
+
+## Choosing a dialect
+
+All three dialects run the same resources, the same API and the same console. What differs is what the database underneath is good at.
+
+| | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| **Setup** | None. A file | A server, a role, a database | A server, a user, a database |
+| **Concurrent writers** | One writer at a time (WAL lets readers continue) | Many | Many |
+| **Several API replicas** | **No.** A file on one disk | Yes | Yes |
+| **Native types** | Text, integer, real | `UUID`, `JSONB`, `TIMESTAMPTZ`, `BOOLEAN`, `BIGSERIAL` | `JSON`, `DATETIME(6)`, `BOOLEAN`, `CHAR(36)` for UUIDs |
+| **Column length limits** | None | `VARCHAR(n)` from `max_length`, default 255 | Same |
+| **Datetime storage** | ISO text, offset kept | Instant with time zone | Naive UTC |
+| **Unique text comparison** | Case-sensitive | Case-sensitive | **Case-insensitive** by default |
+| **Idempotent migrations** | Yes | Yes | **No** for indexes |
+| **Best for** | Development, small single-process deployments | Production | Production where MySQL is already what you run |
+
+### A recommendation
+
+- **Develop on the dialect you will run in production.** A resource that works on SQLite can fail on PostgreSQL in ways the API cannot warn you about: a string longer than 255 characters, a uuid column that rejects a malformed value, a unique check that behaves differently, a type that stores a value SQLite accepts and PostgreSQL does not. Running the same dialect in development finds these before production does.
+- **Use PostgreSQL for production** unless you already operate MySQL. It is the production layout of the compose file, every column type maps to a native type, and migrations are fully idempotent.
+- **Use SQLite for a first afternoon**, for tests that must start instantly, and for single-user tools. Move off it before you add a second API replica, because a SQLite file cannot be shared safely between processes on different machines, and two replicas on one machine each hold their own connection to the same file.
+
+### The environment can mix dialects
+
+Because each environment picks its own database, you can run SQLite in `development` and PostgreSQL in `production`. It works, and the cost is the class of surprises above. A common middle path is PostgreSQL everywhere, with `development` on a small local container.
+
+## SQLite in detail
+
+| Topic | What to know |
+| --- | --- |
+| **Where the file is** | Wherever the URL says, with `{project}` and `{env}` filled in. Absolute with three slashes, relative with two |
+| **Directories** | Created for you if missing |
+| **Journal** | WAL, with a small size limit. You will see `<file>-wal` and `<file>-shm` beside the database while it is open |
+| **Writes** | Serialized. One writer at a time, so a long write blocks other writes |
+| **Types** | Loosely typed. A column keeps whatever you store, which hides type errors that other dialects raise |
+| **Strings** | No length limit, so `max_length` is only an API check |
+| **Datetimes** | ISO text with the offset you sent. Sorting is by text |
+| **Booleans** | `0` and `1` |
+| **`ALTER TABLE`** | Can add columns, and drop them from 3.35. Cannot change a type, so a rebuild is needed |
+| **Replicas** | One only |
+
+### Backing up a SQLite environment
+
+Copy the file with the `.backup` command, not with `cp`, while the API is running, because a plain copy can miss data that is still in the `-wal` file:
+
+```bash
+sqlite3 /data/envs/shop__production.db ".backup '/backups/shop__production.db'"
+```
+
+Or stop the API, copy the file and the `-wal` and `-shm` files together, and start it again. Restoring is replacing the file while the API is stopped.
+
+### The limits of a single file
+
+A SQLite environment is bounded by one disk and one writer. Signs it is time to move: write latency that grows with traffic, a `database is locked` error in the logs, the need for a second API replica, or a database large enough that backups take noticeable time. Moving is a switch to PostgreSQL with a data copy, as described under [switching](#switching-an-environments-database).
+
+## PostgreSQL in detail
+
+| Topic | What to know |
+| --- | --- |
+| **Driver** | asyncpg. The URL schemes `postgres://`, `postgresql://` and `asyncpg://` are all accepted |
+| **TLS** | Add `?ssl=require` (or `ssl=true`) to the URL. Managed providers usually require it |
+| **Schema** | Pawabase uses the role's default schema, normally `public`. There is no schema setting |
+| **Tables** | On the shared default, prefixed `pb_<hash>_`. On your own database, as declared |
+| **Keys** | `BIGSERIAL` for integer keys, `UUID` for uuid keys. UUIDs are generated by Pawabase, not the database |
+| **JSON** | `JSONB` for `json`, `array`, `object` and `ref` fields |
+| **Time** | `TIMESTAMPTZ`, so values are instants and are returned with an offset |
+| **Migrations** | Fully idempotent: `IF NOT EXISTS` on every statement |
+| **Extensions** | Never created by Pawabase. Install what you need yourself |
+
+### Connection poolers
+
+Managed providers often put a pooler (PgBouncer or a vendor equivalent) in front of the database. Pawabase holds a connection per URL per process and issues ordinary statements, with transactions used for multi-step writes. A pooler in **transaction** mode works with that, provided the driver is not relying on server-side prepared statements across transactions, so test one write path and one transaction (a flow with `db.transaction`) against your pooler in a non-production environment before relying on it. A pooler in **session** mode is the safest.
+
+### Useful statements
+
+```sql
+-- Which tables belong to which environment on the shared default?
+SELECT tablename FROM pg_tables WHERE tablename LIKE 'pb\_%' ORDER BY tablename;
+
+-- How big is each table?
+SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) AS size
+FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC;
+
+-- Who is connected?
+SELECT usename, application_name, state, count(*) FROM pg_stat_activity GROUP BY 1, 2, 3;
+```
+
+The first lists the shared default's prefixed tables. Match one to an environment by computing the hash for `<project>:<environment>`.
+
+## MySQL in detail
+
+| Topic | What to know |
+| --- | --- |
+| **URL** | `mysql://user:pass@host:3306/db`. `mariadb://` is not a recognised scheme. Use `mysql://` for MariaDB |
+| **Character set** | Set `?charset=utf8mb4` so emoji and every script store correctly |
+| **SQL mode** | The connection runs in `STRICT_TRANS_TABLES`, so an oversize or invalid value is refused instead of being cut or coerced |
+| **Keys** | `BIGINT AUTO_INCREMENT` for integer keys. UUIDs are `CHAR(36)` |
+| **JSON** | The native `JSON` type |
+| **Time** | `DATETIME(6)` stored as **naive UTC**. A value sent as `10:00+02:00` is stored as `08:00` |
+| **Unique text** | Compared case-insensitively under the default collation |
+| **Migrations** | Table and column work is idempotent. Index statements are **not**, since MySQL has no `IF NOT EXISTS` for `CREATE INDEX` |
+| **Quoting** | Backticks |
+
+### Two behaviors to plan for
+
+1. **Index statements repeat.** Every migration re-issues the index statements for fields marked `indexed`, `unique` or `owner_field`. On MySQL the repeats fail. See [MySQL has no IF NOT EXISTS on indexes](/data/migrations#mysql-has-no-if-not-exists-on-indexes).
+2. **Case-insensitive uniqueness.** `Maya@acme.co` and `maya@acme.co` collide. If that is what you want, you get it for free. If you need them distinct, set a binary collation on the column yourself.
+
+## Layouts for several environments
+
+How you arrange the databases is a decision about blast radius and cost.
+
+| Layout | How | When it fits |
+| --- | --- | --- |
+| **Everything on the shared default** | No `infra.database_url` anywhere | Getting started. Tables are prefixed and the data is in one database |
+| **One server, one database per environment** | `infra.database_url` per environment, all on one PostgreSQL server | Most teams. Isolation by database, with one server to run |
+| **One server per environment** | `infra.database_url` per environment, each on its own server | Production separated from everything else, with its own backups and sizing |
+| **A scratch environment for rehearsals** | A short-lived environment with its own database | Testing migrations and data moves |
+
+Whatever you choose, **production gets its own database**, with its own role and its own backup schedule. A mistake in `development` cannot then touch it, even through a console write with the wrong environment selected.
+
+### A naming scheme
+
+```text
+shop_development     role: shop_dev_app
+shop_staging         role: shop_stg_app
+shop_production      role: shop_prod_app
+```
+
+One role per database means a leaked development credential reaches nothing in production, and the audit trail on the database server tells you which environment connected.
+
+## Capacity and what to measure
+
+Pawabase does not size your database for you, and it does not set a pool size beyond what the driver defaults to or what you pass in the URL. The numbers that matter:
+
+| Measure | Why it matters | Where to look |
+| --- | --- | --- |
+| **Connections** | Replicas multiply them | `pg_stat_activity`, or your provider's dashboard |
+| **Slow queries** | An unindexed filter or sort shows up here first | Your server's slow query log, plus `EXPLAIN` in the console |
+| **Table and index size** | Drives backup time and cache pressure | The statements above |
+| **Write rate** | SQLite's limit, and a replication budget elsewhere | Provider metrics |
+| **Disk headroom** | A full disk turns every write into a 500 | Provider alerts |
+
+Set an alert on disk and on connections. Both fail suddenly, and both are invisible from inside Pawabase until requests start failing.
+
+## Direct connections
+
+Sometimes you need to connect with your own tool: to import data, to back up, to investigate.
+
+```bash
+psql "postgres://pawabase_app:<password>@db.prod.example.com:5432/shop?sslmode=require"
+mysql -h db.prod.example.com -u pawabase_app -p shop
+sqlite3 /data/envs/shop__production.db
+```
+
+(`psql` uses `sslmode`, which is its own client's spelling. The `ssl=require` form is for the URL Pawabase reads.)
+
+A direct connection bypasses **every** layer Pawabase adds: validation, policies, transformers, the audit log, events, webhooks, realtime and cache invalidation. The write lands in the table and nothing else hears about it.
+
+| What you do directly | What does not happen |
+| --- | --- |
+| Insert a row | No `resource.created` event, no webhook, no realtime message, no audit entry. Cached lists may stay stale |
+| Update a row | The same, and `updated_at` is not touched unless you set it |
+| Delete a row | The same, and nothing cleans up rows that refer to it |
+| Change a column | The resource's definition does not follow |
+
+If the change should be visible to the rest of the system, either make it through the API, or finish by making any write to the resource through the API (which invalidates the cache tag), or use the [console](/data/database-console), whose writes are recorded in the audit log as `database.write` (with the SQL, cut to 2,000 characters) and invalidate every resource's cache.
+
+<Warning>
+Use a **separate role** for direct access, and give the role the least it needs. A direct connection with the application's own role can do anything the application can, with no checks.
+</Warning>
+
+## Keeping the connection secret
+
+The database URL carries a password, so treat it like one.
+
+| Practice | Why |
+| --- | --- |
+| Store it as a **secret** and reference it with `secret://NAME` | Encrypted at rest, masked in lists, never returned in full |
+| Make the reference the **whole** value | A secret embedded inside a longer string is not resolved |
+| Use one role per environment | A leaked credential reaches one database |
+| Never put a URL into `infra.database_url` directly | The environment's GET returns it, password included |
+| Require TLS (`?ssl=require`) | The URL travels from the API to the database on your network, and TLS keeps it private |
+| Restrict the database's network access to the API hosts | A password is the second line of defence, and the network is the first |
+
+### Who can read what
+
+| Reader | Sees |
+| --- | --- |
+| Someone who can read the environment | `infra.database_url` as stored. A `secret://NAME` reference reveals only the name |
+| Someone who can list secrets | The name, the description, who updated it and when, and a masked preview of the end of the value |
+| Someone with **platform operator** rights | Everything that can run through the console: any table's rows. They do not need the password |
+| Someone with a **publishable or secret API key** | Only what the policies of each resource allow |
+
+The last two rows are the important ones. An operator reaches the data without ever seeing the password, because the platform holds the connection. That is the model: **credentials stay with the platform, and people reach the data through audited paths**. A person with the URL bypasses all of it, which is why direct access deserves its own, narrower role.
+
+### Rotating the password
+
+Rotation is a secret update, plus a restart to close old connections.
+
+<Steps>
+  <Step title="Create the new credential">
+    On the database server, set a new password for the role, or create a second role. For zero-downtime rotation, create a second role with the same grants.
+  </Step>
+  <Step title="Replace the secret">
+    In **Secrets**, open the secret's **Replace** dialog and paste the new URL, or `PUT` the secret again. The environment's version bumps and the next request resolves the new URL.
+  </Step>
+  <Step title="Confirm traffic uses it">
+    Make a read through `/rest/v1`. Check the database's connection list: a new connection under the new role should appear.
+  </Step>
+  <Step title="Restart the API">
+    The previous connection to the old URL is still open in each process. Restarting closes it.
+  </Step>
+  <Step title="Revoke the old credential">
+    Drop the old role, or change its password. Nothing uses it now.
+  </Step>
+</Steps>
+
+Because the pool is keyed by the URL, a rotation never interrupts a request that is already running on the old connection: it finishes, and the next one connects with the new URL.
+
+### If a URL was exposed
+
+If a connection string with a password was stored in `infra.database_url` directly, pasted into a ticket, or committed anywhere, rotate the password. The step above applies, and so does one more: look at the database's connection log for connections you do not recognise, since the password may have been used before you noticed.
+
+## What to watch
+
+Pawabase reports one thing about the database: whether it can connect. Everything else is your database's own monitoring.
+
+| Signal | Where | What it means |
+| --- | --- | --- |
+| `503 database_unavailable` on `/rest/v1` | Responses, and the [Observability](/operate/observability) log | The connection failed. The message carries the driver's error |
+| `connected: false` in the platform overview | `GET /platform/v1/overview` | A URL whose connection failed and has not succeeded since |
+| 500 on a read for one resource only | Responses | That resource's table or a column is missing. See [Migrations](/data/migrations) |
+| 500 on creates only | Responses | A constraint: a unique index, a length, a type, a missing column |
+| Slow lists | Response times | An unindexed filter or sort. See [Filtering](/data/filtering) and [Sorting and pagination](/data/sorting-pagination) |
+| Disk full | Your provider | Writes fail as 500s |
+
+A simple external check is a read of one small resource with a publishable key, once a minute. A 200 means the whole path works (gateway, API, connection, table). A 503 says the database. A 500 says the data.
+
+## Troubleshooting
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| **503** `could not connect to the environment database: ConnectionRefusedError` | The host or port is wrong, the server is down, or a firewall blocks the API | Check the URL, the server, and that the API's address is allowed |
+| **503** `invalid database URL: Unknown DB scheme` | A scheme Pawabase does not know, such as `mariadb://`, or a malformed value | Use `postgres://`, `mysql://` or `sqlite://` |
+| **503** right after setting `secret://NAME` | The secret does not exist, so the reference is read as a literal and is not a URL | Create the secret with that exact name |
+| **503** with an authentication error in the message | Wrong user or password | Fix the secret. Special characters need percent-encoding |
+| **500** on every read after a switch | The new database has no tables | Migrate each resource |
+| Reads work and creates fail with 500 | The role lacks `INSERT`, or a sequence grant (PostgreSQL), or a unique index is violated | Check grants first, then the data |
+| Migrate fails with 500 | The role lacks `CREATE` or `ALTER`, or a unique index met duplicates | Check grants, then duplicates. See [Migrations](/data/migrations) |
+| Studio's Database page shows an error and the data plane shows 503 | The database is unreachable. Studio's overview is a plain 500 here | Fix the connection |
+| Data disappeared after a switch | The new database is empty. The old data is untouched | Clear `infra.database_url` to see it again, or copy it across |
+| Data reappeared after clearing the setting | It was never deleted. It was in the default database | Expected |
+| A SQLite environment loses data when the container is replaced | The file is inside the container's filesystem | Put it on a mounted volume, and use a three-slash absolute path |
+| Two environments show the same data | Both resolve to the same URL, so they share a connection and tables | Give each its own URL or database, or use the `{env}` placeholder |
+| A table has no resource badge in the Database page | Not managed by a resource, or a prefixed table on the shared PostgreSQL default | Match it by the hash. See [prefixed table names](#shared-postgresql-and-prefixed-table-names) |
+| `permission denied for sequence` (PostgreSQL) | The role can insert but lacks `USAGE` on the key sequence | `GRANT USAGE, SELECT ON SEQUENCE ...` |
+| Too many connections | Replicas multiplied the pool | Reduce replicas or pool size, or raise the server's limit |
+
+## A reproduced incident: switching to a database that is not ready
+
+This sequence was run on a clean API and every response below is what came back.
+
+<Steps>
+  <Step title="Start on the default">
+    A `things` resource is migrated and holds a row. `GET /rest/v1/things` answers 200. The Overview infrastructure panel shows the database as **platform default**.
+  </Step>
+  <Step title="Point the environment at an unreachable database, with the URL inline">
+    `PATCH` with `{"infra": {"database_url": "postgres://dbuser:SuperSecret@127.0.0.1:1/x"}}`. The save succeeds and the environment's `version` goes up to 2. The panel now says **configured**.
+  </Step>
+  <Step title="Read the environment">
+    `GET` on the environment returns `infra.database_url` with `SuperSecret` in it, in plain text. This is the reason to use a secret.
+  </Step>
+  <Step title="Call the data plane">
+    `GET /rest/v1/things` answers **503**: `database_unavailable`, `could not connect to the environment database: ConnectionRefusedError: [Errno 61] Connect call failed ('127.0.0.1', 1)`. The message tells you it is the connection, and the old data is not involved.
+  </Step>
+  <Step title="Do it properly: a secret that points at a real, empty database">
+    `PUT` a secret `DB_URL` whose value is a SQLite file URL, then `PATCH` `{"infra": {"database_url": "secret://DB_URL"}}`. The secrets list shows only `••••••••d.db`.
+  </Step>
+  <Step title="Read before migrating">
+    `GET /rest/v1/things` answers **500** `Internal Server Error`. The database is reachable, and the table is not there.
+  </Step>
+  <Step title="Migrate">
+    **Create / migrate table** runs the `CREATE TABLE` in the new database, and the resource works again. **Build → Database** lists `things` with its resource, and the dialect line reads `sqlite · your database`.
+  </Step>
+  <Step title="Look at the connections">
+    The platform overview lists three entries: the original, the failed one with `connected: false`, and the new one. Nothing was closed.
+  </Step>
+</Steps>
+
+Three lessons:
+
+- **503 and 500 mean different things.** 503 is the connection. 500 on a read is the table. The first tells you to fix the URL, the second to migrate.
+- **A literal URL is readable.** Use a secret from the start.
+- **The old data was never at risk.** Clearing the setting returns to it.
+
+## Scenarios
+
+### A new project, on the shared default
+
+You create resources, migrate, and build. Everything works with no database configuration, because the default does the work. This is the right place to start, and the layout the compose file gives you.
+
+### Moving production to a managed PostgreSQL
+
+Create the managed database and a role. Build a scratch environment against it, promote the definitions, migrate, copy the data, verify, then set the real environment's `infra.database_url` to a secret holding the same URL. Keep the old data in the default database until you are confident, then drop its prefixed tables.
+
+### Separating staging from production
+
+Give each its own database, and its own role and secret. Promote definitions between them as usual. Because promotion never creates tables, migrate in each. See [Environments and promotion](/operate/environments-and-promotion).
+
+### A legacy database you want to expose
+
+Point a **new environment** at the legacy database with a **read-only role** first, define resources over the tables with `table` set and `timestamps` off, and read them through the API. Add write access only for the resources that need it, with grants per table. Pawabase never alters an existing column and only adds columns that are missing, so exposing a legacy table through a resource is safe as long as the role cannot write where it should not. See [Defining resources](/data/defining-resources).
+
+### A database that has to be in a specific region
+
+`infra.database_url` can point anywhere the API can reach. Latency is the cost: every request makes one or more queries, so a database far from the API adds its round trip to every response. Place the API and the database in the same region.
+
+### Testing against a throwaway database
+
+For CI, point an environment at a fresh SQLite file or a container database per run. Create the resources, migrate, run the tests and delete the file. Because the pool is keyed by URL, a new URL per run opens a new connection without touching others.
+
+## A pre-flight checklist for a database change
+
+1. **Is the URL a secret reference, and is the secret the whole URL?**
+2. **Does the role have only the grants listed above?**
+3. **Is TLS on, and is the network path restricted?**
+4. **Does every resource have its table in the new database?** Compare the Database page's tables with the resource list.
+5. **Has the data been copied, with sequences reset on PostgreSQL?**
+6. **Is there a backup of both databases, taken after the copy?**
+7. **Is the cache a concern?** Entries from before the switch may serve old rows until they expire. See [Caching](/data/caching).
+8. **Do you know how to go back?** Clearing `infra.database_url` returns to the default.
+9. **Did you restart the API after rotating a credential?**
+10. **Did the platform overview show `connected: true` for the new URL after the first request?**
+
+## Environments and their databases
+
+Each environment has its own database setting, and the way environments are created and promoted never changes it.
+
+| Operation | What it does to the database setting |
+| --- | --- |
+| **Create an environment** | Starts with an empty `infra`, so it uses the platform default, even when you pass `copy_from` |
+| **Create with `copy_from`** | Copies definitions from the source. The source's `infra.database_url` is **not** copied |
+| **Promote** | Copies definitions. The target keeps its own `infra`. A staging environment promoted to from development still points at staging's database |
+| **Edit `infra`** | Changes only that environment, and bumps its `version` |
+| **Delete an environment** | Removes the definitions. The environment's database is not dropped |
+
+This is the behavior you want: a new environment cannot accidentally write into another environment's database. It also means a new environment starts on the default, and moves to its own database only when you set it.
+
+### Two environments on one URL share their tables
+
+The database is chosen by URL, not by environment. If two environments are given **the same** `infra.database_url`, they open one connection and use the same tables. A row written through one is read through the other, which was confirmed by writing in `development` and reading in `staging` after both were pointed at one SQLite file.
+
+```text
+development ─┐
+             ├──►  sqlite:///data/shared.db   (one connection, one set of tables)
+staging ─────┘
+```
+
+That is occasionally useful and usually a mistake. If two environments should be separate on one server, give them **different databases** (or, on the shared default, let the `{project}` and `{env}` placeholders and the prefix do it). Do not give two environments the same URL unless you want them to be one dataset.
+
+The same applies to the default. With `PAWABASE_DEFAULT_DATA_URL` set to a URL **without** the placeholders, every unconfigured environment of every project resolves to that single URL and shares one SQLite file or one set of unprefixed names. On PostgreSQL the `pb_<hash>_` prefix separates them anyway, and on SQLite the placeholders are the only separation. Keep `{project}` and `{env}` in a SQLite default.
+
+### One file per environment on SQLite
+
+With the SQLite default, each environment gets its own file, plus its WAL companions:
+
+```text
+acme__development.db
+acme__development.db-shm
+acme__development.db-wal
+acme__staging.db
+acme__staging.db-shm
+acme__staging.db-wal
+```
+
+Back up all three files of an environment together, or use `.backup` as shown earlier.
+
+## What Pawabase creates, and what it leaves alone
+
+| Pawabase creates | When |
+| --- | --- |
+| A table for each resource, with its indexes | When you press **Create / migrate table** |
+| Columns for fields added later | On the next migrate |
+| The SQLite file and its directories | On first connection |
+
+| Pawabase never | Notes |
+| --- | --- |
+| Creates a database, a schema, a role or a grant | You prepare the server |
+| Creates an extension | Install what you need yourself |
+| Creates a foreign key, a view, a trigger or a stored procedure | Relations are application-level |
+| Drops or alters anything | Migrations only add |
+| Copies data between databases | Switching starts empty |
+| Takes a backup | Backups are yours. See [Backups](/self-hosting/backups) |
+| Touches tables it did not create | A table with no resource is left entirely alone |
+
+Nothing is created on first write. A table exists after a migration, so before it, a resource is defined and its endpoints answer with a 500 on the missing table. See [Migrations](/data/migrations).
+
+### What a table looks like
+
+For a resource `orders` with a `uuid` key, on PostgreSQL:
 
 ```sql
 CREATE TABLE IF NOT EXISTS "orders" (
-    "id" UUID PRIMARY KEY,
-    "customer_id" BIGINT,
-    "status" VARCHAR(255),
-    "total_cents" BIGINT,
-    "created_at" TIMESTAMPTZ,
-    "updated_at" TIMESTAMPTZ
+  "id" UUID PRIMARY KEY,
+  "customer_id" BIGINT,
+  "status" VARCHAR(255),
+  "total_cents" BIGINT,
+  "created_at" TIMESTAMPTZ,
+  "updated_at" TIMESTAMPTZ
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS "ix_orders_customer_id" ON "orders" ("customer_id");
+CREATE INDEX IF NOT EXISTS "ix_orders_customer_id" ON "orders" ("customer_id");
 ```
 
-Notice there's no `DEFAULT gen_random_uuid()` on `id`, and no `NOT NULL` anywhere. Both are deliberate:
+There is no `DEFAULT gen_random_uuid()` on `id` and no `NOT NULL` anywhere. Both are deliberate:
 
-- **UUID primary keys are generated in Python, not by the database.** Pawabase calls `uuid.uuid4()` at the moment a record is created and inserts the value explicitly, rather than relying on a database-side default. This is why it works identically across all three dialects — SQLite and MySQL have no built-in random-UUID generator, so a database-side default wouldn't be portable across them, but a Python-side one is.
-- **`required` is never turned into a column-level `NOT NULL`.** It's enforced only on create requests, at the validation layer — see [Migrations](/data/migrations) for what this means for existing rows when you add a required field later.
+- **UUID keys are generated by Pawabase.** A `uuid4` is made in the API at the moment of creation and inserted explicitly. That is why uuid keys behave the same on SQLite, PostgreSQL and MySQL, none of which share a portable server-side generator.
+- **`required` is an API rule.** It never becomes `NOT NULL`. See [Migrations](/data/migrations).
 
-For an `integer` primary key, the generated column uses each dialect's own auto-increment mechanism: `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite, `BIGSERIAL PRIMARY KEY` on PostgreSQL, `BIGINT AUTO_INCREMENT PRIMARY KEY` on MySQL.
+For integer keys the column uses each dialect's own auto-increment: `INTEGER PRIMARY KEY AUTOINCREMENT` on SQLite, `BIGSERIAL PRIMARY KEY` on PostgreSQL and `BIGINT AUTO_INCREMENT PRIMARY KEY` on MySQL.
 
-## What Pawabase never creates or manages
+## How a request uses the database
 
-Pawabase does not manage:
+Knowing what each request costs helps you size and diagnose.
 
-- Tables you create yourself outside a Resource definition — they're left entirely alone.
-- Columns you add manually to a Resource's table — migrations never remove a column, whether you added it yourself or it was ever declared in the definition (see [Migrations](/data/migrations)).
-- Database users, roles, or grants.
-- Extensions — if your data needs one (`pgcrypto`, `postgis`, etc.), install it yourself against the database directly; Pawabase never issues `CREATE EXTENSION`.
-- Triggers, stored procedures, views, or foreign-key constraints — relations between Resources (`belongs_to`/`has_many`) are enforced at the application layer through policies and expansion, not as database foreign keys.
+| Request | Statements |
+| --- | --- |
+| `GET /rest/v1/<resource>` | One `SELECT` with the filters, policy conditions, sort and `LIMIT/OFFSET`, plus one `COUNT(*)` for `total` (skipped when a residual policy makes `total` null) |
+| `GET /rest/v1/<resource>/<id>` | One `SELECT` by key |
+| `GET` with `expand` | The list query, plus one query per expanded relation. A `has_many` expansion is one query capped at 200 rows across the page |
+| `POST`, `PATCH`, `DELETE` | A write statement, with the reads the policy and the response need. Every write also invalidates the resource's cache tag |
+| Create / migrate table | One catalog read, then the statements |
+| Studio Records tab | The same statements as the API |
+| Studio Database page | Catalog reads, `COUNT(*)` for a table's row total, and `SELECT *` with a limit |
 
-## Connecting to your database directly
+So a list page is typically **two queries**, and the count is often the more expensive of the two on a large table. See [Sorting and pagination](/data/sorting-pagination) for what that costs.
 
-For imports, backups, or debugging beyond what the [Database console](/data/database-console) offers, connect with your dialect's own client, using the connection string from **Settings → Infrastructure → Database**:
+### Where a value is converted
 
-```bash
-psql "postgresql://user:password@host:5432/database_name"
-```
+Values are encoded on the way in and decoded on the way out, per dialect, in one place, so what you read through the API is the same on all three:
 
-```bash
-mysql -h host -u user -p database_name
-```
+| Direction | What happens |
+| --- | --- |
+| In | Booleans become `0`/`1` on SQLite. Datetimes keep their offset on SQLite, become instants on PostgreSQL and naive UTC on MySQL. JSON values are serialised. UUIDs are strings except on PostgreSQL |
+| Out | JSON text is parsed back. Dates and datetimes are returned in ISO form. A JSON value that fails to parse is returned as the raw text |
 
-```bash
-sqlite3 storage/data/<project>__<env>.db
-```
+Because of this, comparing the API's output between two environments on different dialects is a fair test, and comparing raw SQL output is not. See [Migrations](/data/migrations#what-each-dialect-does-with-values).
 
-<Warning>
-Direct access bypasses every Resource-level policy, validation rule, transformer, and event. Changes you make this way are not reflected in audit logs or event subscriptions — nothing about Pawabase's application layer knows they happened. Prefer the resource API for anything routine, and the [Database console](/data/database-console) (which is at least audited and cache-invalidation-aware for writes) for anything ad hoc; reserve a fully direct connection for migration, backup, and recovery scenarios the console doesn't cover.
-</Warning>
+## The rest of an environment's infrastructure
 
-## Choosing a dialect for a new project
+The database is one of six things the Overview's infrastructure panel reports. The others are not set in the same way, but they are on the same panel, and a launch checklist should read all six.
 
-**SQLite** is the right choice for early development: zero setup, a single file you can inspect, back up, or throw away trivially, and it's the platform default so there's nothing to configure. Its limits show up around concurrent write throughput and multi-process access to the same file — it's not the dialect to reach for once several people or processes need to write to the same database at once under real load.
+| Key | Values you may see | Meaning |
+| --- | --- | --- |
+| `database` | `platform default`, `configured` | Whether the environment has its own `infra.database_url` |
+| `storage` | `local` | Where uploaded files go |
+| `mail` | `suppressed (not configured)` | Whether mail is actually sent. Suppressed means flows that send mail do not deliver it |
+| `cache` | `MemoryCache`, `RedisCache` | Where cached lists and records live. Memory is per process |
+| `queue` | `SyncConnection`, and others | How background work runs. `SyncConnection` runs it inline |
+| `events` | `memory`, and others | Where events are published |
 
-**PostgreSQL** is the platform's most complete production option: it's the dialect the DDL generator and value codecs were clearly built with the most headroom for (native `UUID`, `JSONB`, `TIMESTAMPTZ`, `BIGSERIAL`), and it's a reasonable default choice for a production environment unless you have a specific reason to prefer MySQL.
+A development install shows memory, sync and suppressed throughout, which is correct for development and wrong for production. A production environment should show a real queue, a shared cache, and a real mail setting, in addition to its own database. See [Caching](/data/caching) for the cache, and the self-hosting pages for the rest.
 
-**MySQL** is fully supported — the same migrate/query/console machinery works against it — with a few dialect-specific realities worth knowing going in: `datetime` values are stored timezone-naive (Pawabase normalizes to UTC before writing, but the column itself carries no offset, so all values in it are UTC by convention rather than by the database enforcing it), and its `JSON` column type is what every structured field (`json`, `array`, `object`, `ref`) uses in place of PostgreSQL's `JSONB`. Choose MySQL when it's already what your team runs and operates, rather than switching dialects specifically for Pawabase's sake.
-
-Whichever you choose for production, it's worth developing against the same dialect locally when your application depends on dialect-specific SQL through the [Database console](/data/database-console) — a query using PostgreSQL's `jsonb_array_elements` won't run against a SQLite development database, for instance.
-
-## Database requirements
-
-Pawabase itself has no hard version floor for any of the three dialects beyond what its dependencies (Tortoise's database drivers, PyPika) require — verify current driver compatibility for your target database version rather than assuming a specific minimum. Connection pool sizing, disk space, and backup cadence are entirely your responsibility to plan for your own data volume and traffic; Pawabase doesn't impose or enforce sizing defaults on a database you've configured yourself.
+<Note>
+`database: configured` only says the environment has its own URL. It does not say the URL works. A configured environment whose database is down looks the same on this panel as a healthy one, so confirm with a read through `/rest/v1` or the platform overview's `connected` flag.
+</Note>
 
 ## Backups and recovery
 
-You are responsible for backing up an environment's database — Pawabase manages schema migrations (additive DDL, on your request) but performs no backups of its own. For a self-hosted installation, see [Backups](/self-hosting/backups). For a managed database (RDS, Cloud SQL, a managed Postgres provider), use that provider's backup tooling.
+Pawabase never backs up an environment's data. Backups are a property of the database, and you are the owner of them.
 
-<Info>
-The platform's own control-plane database (project and environment definitions, audit log, sessions — configured separately from any environment's data database) is distinct from every environment's Resource database covered on this page. Back up both, but understand they're separate systems: losing the platform database loses your definitions and audit history; losing an environment's data database loses that environment's records.
-</Info>
+### What to back up
 
-## Database console
+| What | Lives in | Loss means |
+| --- | --- | --- |
+| Definitions, keys, secrets, audit log | The control-plane database | Your projects, resources and flows. Rebuilding means redefining everything |
+| Each environment's records | That environment's database | The data your application stores |
+| Uploaded files | Storage | The files, though not the records that refer to them |
+| Your `.env` and the encryption key for secrets | Your host | The ability to decrypt stored secrets |
 
-For inspecting data, running ad hoc queries, or one-off fixes without setting up a separate direct connection, use Studio's [Database console](/data/database-console) — it runs against whichever database you've configured for the environment, SQLite, PostgreSQL, or MySQL alike, with the same interface either way.
+Back up the first, second and fourth together. A restore of the control-plane database without its secrets key leaves every secret unreadable, including your database URLs.
+
+### Taking a backup
+
+```bash
+# PostgreSQL
+pg_dump --format=custom --file=shop_production_$(date +%F).dump "$DATABASE_URL"
+
+# MySQL
+mysqldump --single-transaction --routines --set-gtid-purged=OFF shop > shop_production.sql
+
+# SQLite
+sqlite3 /data/envs/shop__production.db ".backup '/backups/shop__production.db'"
+```
+
+On a shared PostgreSQL default, a dump of the whole database is a dump of every environment's tables together. To back up one environment, dump its prefixed tables only (`--table='pb_<hash>_*'`).
+
+### Restoring into a scratch environment
+
+The safest way to test a restore is to restore into a separate database and point a scratch environment at it:
+
+<Steps>
+  <Step title="Restore the dump into a new database">
+    `pg_restore --dbname="$SCRATCH_URL" shop_production.dump`
+  </Step>
+  <Step title="Create a scratch environment">
+    Copy definitions from production with **copy from**, and note it starts with the platform default database.
+  </Step>
+  <Step title="Point it at the restored database">
+    Store `$SCRATCH_URL` as a secret and set the scratch environment's `infra.database_url`.
+  </Step>
+  <Step title="Verify">
+    Open **Build → Database**. The tables are the ones restored. Open the Records tab and read recent rows. Run a query that proves the newest data is there.
+  </Step>
+</Steps>
+
+A backup you have never restored is a hope. Doing this once a quarter is what turns it into a backup.
+
+### Recovering from a bad console write
+
+A console write has no undo, so the recovery is a restore. If the damage is small, restore the affected table alone into a scratch database, and copy the rows back with a targeted `INSERT ... SELECT` or `UPDATE`. The audit log's `database.write` event holds the first 2,000 characters of the statement that did it, which tells you what to reverse.
+
+## A tour of Studio's Database page
+
+The page is the quickest way to see which database an environment is really using and what is in it. Open **Build → Database**.
+
+**The header.** The title is **Database**, with the description *Browse the environment's database. Bring your own with a database URL in Settings.* On the right is a **SQL** button, covered below. (As noted above, Settings has no such field, so read that hint as "through the platform API".)
+
+**The Tables card** on the left starts with a line that reads the dialect and where the database comes from:
+
+```text
+postgres · platform default
+sqlite · your database
+```
+
+That line is the answer to "which database is this environment on?" without opening any API. Under it is every table in the database, each with a green badge naming its resource when the table's name equals the resource's declared `table`. An empty database shows *No tables yet.*
+
+**The table view.** Click a table. The card is titled with the table's name and its row count (`tickets · 1204 rows`), with **Prev** and **Next** buttons that move 50 rows at a time. Above the rows is a strip with one badge per column, `name: type`, with a key mark on the primary key. Hover a badge for its full description (nullable, default, key). An empty table says *The table is empty.* Before you click anything, the right-hand side reads *Pick a table on the left, or click SQL to run a query.*
+
+**The SQL window.** The **SQL** button opens a window titled **SQL**. If a table was selected, the query box starts with:
+
+```sql
+SELECT *
+FROM "tickets"
+LIMIT 100
+```
+
+and otherwise with `SELECT 1 AS ok`. A **Query builder** section sits above it with a **Hide** and **Show** button. Each click in the builder rewrites the SQL, and your hand edits are replaced by the next click. At the bottom are an **allow writes** checkbox (off by default), **Close** and **Run**. Cmd or Ctrl and Enter also run the query.
+
+The result is a table of rows, with *No rows.* when empty, and *Showing the first 5000 rows.* when it was cut. A write shows *N row(s) affected.* The [Database console](/data/database-console) page covers the window in full.
+
+### Using the page to confirm a change
+
+After any database change, three checks on this page tell you the state:
+
+1. **The dialect line** says what you intended: `postgres · your database`.
+2. **Every resource has its table**, with a badge. A resource with no table is a resource whose reads will fail.
+3. **A table's columns** include the ones you expect, with the types the dialect table promises.
+
+## Common mistakes
+
+| Mistake | What it causes | The habit that prevents it |
+| --- | --- | --- |
+| Putting the URL in `infra` as plain text | The password is readable through the environment | Always a secret reference |
+| Embedding a secret inside a URL | The URL is used literally and fails to parse | The reference is the entire value |
+| Switching a database before migrating there | Reads fail with 500 until you migrate | Rehearse in a scratch environment |
+| Assuming the data moved | The new database is empty | Copy it yourself, then verify counts |
+| Giving two environments one URL | They share tables and rows | One database per environment |
+| Using the application's role for analysts | Direct, unchecked writes | A read-only role for people |
+| Forgetting the sequence grant or reset (PostgreSQL) | Inserts fail on a permission or a duplicate key | Grant it, and reset after a data load |
+| A relative SQLite path in a container | Data lost when the container is replaced | A three-slash path on a mounted volume |
+| Running SQLite with several replicas | Corruption risk and lock errors | PostgreSQL, or one replica |
+| Developing on SQLite, shipping on PostgreSQL | Length and type surprises in production | Develop on the production dialect |
+| Revoking the old password before restarting | Old connections fail | Restart first, then revoke |
+| Treating `configured` as healthy | A broken URL still reads configured | Probe with a read |
+| Expecting the console to be rolled back | A write cannot be undone | Restore from a backup |
+
+## Messages and what they mean
+
+Every message below comes from Pawabase itself or from the database through it.
+
+| Message | From | Meaning |
+| --- | --- | --- |
+| `database_unavailable` with `could not connect to the environment database: <Driver error>` | Data plane, 503 | The connection failed. The driver's own text follows, such as `ConnectionRefusedError` or an authentication failure |
+| `database_unavailable` with `invalid database URL: Unknown DB scheme: <x>` | Data plane, 503 | The URL's scheme is not `sqlite`, `postgres`, `postgresql`, `mysql` or `asyncpg` |
+| `Internal Server Error` on a read | Data plane, 500 | The table or a column does not exist, or a stored value no longer fits |
+| `Internal Server Error` on a create | Data plane, 500 | A unique violation, an oversize value, a type the column rejects, or a missing column |
+| `this statement writes; set allow_write to run it` | Console, 400 | The statement is not read-only and **allow writes** was off |
+| `<ExceptionType>: <message>` | Console, 400 | The database rejected the statement. The text is the database's own |
+| `the query timed out` | Console, 504 | The query exceeded the environment's `query_timeout` |
+| `no table '<name>'` | Database page, 404 | The table does not exist in this environment's database |
+| `no resource '<name>'` | Migrate, 404 | The resource name is not defined in this environment |
+| `secret names are UPPER_SNAKE_CASE` | Secrets, 422 | The secret's name has lowercase letters or other characters |
+
+Of these, the two to learn first are the 503 with a driver error, and the console's `<ExceptionType>: <message>`. Between them they turn almost every database problem from a guess into a message.
+
+## From zero to a production database: the whole sequence
+
+This is the complete sequence for giving a production environment its own PostgreSQL database, with every request spelled out. Run it in a scratch environment first if you can.
+
+### 1. On the database server
+
+```sql
+CREATE ROLE shop_prod_app LOGIN PASSWORD '<a long random password>';
+CREATE DATABASE shop_production OWNER shop_prod_app;
+```
+
+Confirm the role can connect from the API's host:
+
+```bash
+psql "postgres://shop_prod_app:<password>@db.prod.example.com:5432/shop_production?sslmode=require" -c "select 1"
+```
+
+If this fails from the API host, nothing Pawabase does will fix it. Resolve the network or the credentials first.
+
+### 2. Store the URL
+
+```http
+PUT /platform/v1/projects/shop/envs/production/secrets/PROD_DB
+```
+
+```json
+{
+  "value": "postgres://shop_prod_app:<password>@db.prod.example.com:5432/shop_production?ssl=require",
+  "description": "Production data database"
+}
+```
+
+```json
+{ "name": "PROD_DB", "reference": "secret://PROD_DB" }
+```
+
+### 3. Point the environment
+
+```http
+PATCH /platform/v1/projects/shop/envs/production
+```
+
+```json
+{ "infra": { "database_url": "secret://PROD_DB" } }
+```
+
+From this request on, `/rest/v1` reads and writes the new database. If the environment already has traffic, do this in a quiet window, because every read fails until step 4.
+
+### 4. Migrate every resource
+
+```bash
+for name in products tickets profiles; do
+  curl -fsS -X POST -H "Authorization: Bearer $OPERATOR_TOKEN" \
+    "https://api.example.com/platform/v1/projects/shop/envs/production/resources/$name/migrate"
+done
+```
+
+Each response lists the statements it ran. The `table` is the declared name, with no prefix, because the database is yours.
+
+### 5. Verify
+
+```http
+GET /platform/v1/projects/shop/envs/production/database
+```
+
+```json
+{
+  "dialect": "postgres",
+  "configured": true,
+  "tables": [
+    { "name": "products", "resource": "products" },
+    { "name": "tickets", "resource": "tickets" },
+    { "name": "profiles", "resource": "profiles" }
+  ]
+}
+```
+
+`dialect` is `postgres`, `configured` is `true`, and every resource has its table. Then read through the API with a publishable key to check the full path, and look at **Overview**: the database reads **configured**.
+
+### 6. Set up backups and monitoring
+
+Before real data arrives: a backup schedule on the server, an alert on disk and connections, and a read-only role for the people who will query it.
+
+### 7. Copy the data, if there was any
+
+Follow [moving existing data](#moving-existing-data-to-a-new-database). Do this **before** step 3 if you used the scratch-environment approach, so that step 3 is the last, instant change.
+
+## Other tools against the database
+
+Analysts and BI tools can connect to an environment's database with the read-only role from earlier. The settings are the same for every tool.
+
+| Setting | Value |
+| --- | --- |
+| Type | PostgreSQL, MySQL or SQLite, as the URL says |
+| Host, port | From the URL |
+| Database | The database name from the URL |
+| User, password | The **reporting** role, not the application's |
+| TLS | Required, matching the `ssl` setting |
+
+What the tool will see:
+
+- **Table names** as declared, or `pb_<hash>_` prefixed on the shared PostgreSQL default.
+- **Plain columns plus JSON.** `array`, `object` and `ref` fields are JSON columns, and each tool has its own way to extract values from them.
+- **Raw timestamps.** On MySQL they are UTC without an offset. On PostgreSQL they are instants.
+- **No policies.** Whatever the role can read, the tool shows, including rows an end user could never see through the API.
+
+For dashboards, create **views** in the database that join and shape what you need, and grant the reporting role `SELECT` on the views only. Pawabase never touches views, so they are safe from migrations.
+
+```sql
+CREATE VIEW reporting_open_tickets AS
+SELECT id, subject, status, priority, created_at
+FROM tickets
+WHERE status <> 'solved';
+
+GRANT SELECT ON reporting_open_tickets TO reporting;
+```
+
+## Read replicas and failover
+
+An environment has **one** database URL. Pawabase does not route reads to a replica, and it does not fail over by itself, so each of these is provided below Pawabase:
+
+| Need | How |
+| --- | --- |
+| Read scaling | Put a proxy or the provider's reader endpoint in front, and point `infra.database_url` at the writer. Pawabase will use the writer for everything |
+| Failover | Use the provider's failover, with a stable hostname that moves to the new primary. After a failover the pooled connections break, and the next request reconnects |
+| Maintenance windows | Expect 503 `database_unavailable` during them, and have clients retry |
+
+After a failover, connections opened before it are broken. A connection that **failed to open** is retried on the next request, but a connection that was open and then broke is the driver's to recover, and how quickly it does depends on the driver and the provider. If requests keep failing after the database is healthy, restart the API to rebuild the pool. If the hostname changed instead of moving, update the secret.
+
+## A health probe you can run
+
+A probe that tells the three failure kinds apart saves a lot of guessing. It reads one small resource with a publishable key and classifies the answer.
+
+```python
+import os
+import sys
+import requests
+
+URL = "https://api.example.com/rest/v1/feature_flags?per_page=1"
+HEADERS = {"apikey": os.environ["PUBLISHABLE_KEY"]}
+
+response = requests.get(URL, headers=HEADERS, timeout=10)
+
+if response.status_code == 200:
+    print("ok: gateway, API, database and table all work")
+elif response.status_code == 503:
+    detail = response.json().get("message", "")
+    print(f"DATABASE UNREACHABLE: {detail}")
+    sys.exit(2)
+elif response.status_code == 500:
+    print("DATA PROBLEM: the table or a column is missing, or a value is invalid")
+    sys.exit(3)
+else:
+    print(f"OTHER: {response.status_code} {response.text[:200]}")
+    sys.exit(1)
+```
+
+Run it from a scheduler and alert on any non-zero exit. The three codes map to three owners: 2 is the database team, 3 is whoever last changed a resource, and 1 is the gateway or a key.
+
+## Inspection cookbook
+
+Run these in the [Database console](/data/database-console) (reads need no **allow writes**) or in your own client.
+
+### PostgreSQL
+
+```sql
+-- table sizes, largest first
+SELECT relname AS table, pg_size_pretty(pg_total_relation_size(relid)) AS total,
+       pg_size_pretty(pg_relation_size(relid)) AS data, n_live_tup AS rows
+FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 20;
+
+-- indexes that are never used (candidates for removal)
+SELECT relname AS table, indexrelname AS index, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes WHERE idx_scan = 0 ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- long-running queries
+SELECT pid, now() - query_start AS running, state, left(query, 100) AS query
+FROM pg_stat_activity WHERE state <> 'idle' ORDER BY running DESC;
+
+-- locks that are waiting
+SELECT pid, wait_event_type, wait_event, left(query, 100) AS query
+FROM pg_stat_activity WHERE wait_event_type = 'Lock';
+```
+
+### MySQL
+
+```sql
+-- table sizes
+SELECT table_name, ROUND((data_length + index_length) / 1024 / 1024, 1) AS mb, table_rows
+FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY mb DESC;
+
+-- indexes on a table
+SHOW INDEX FROM tickets;
+
+-- running queries
+SHOW FULL PROCESSLIST;
+```
+
+### SQLite
+
+```sql
+-- every table and its definition
+SELECT name, sql FROM sqlite_master WHERE type = 'table' ORDER BY name;
+
+-- indexes
+SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' ORDER BY tbl_name;
+
+-- page and free-page counts (to see how much space a vacuum would return)
+PRAGMA page_count;
+PRAGMA freelist_count;
+```
+
+The `pg_stat_user_indexes` query is worth a look every few months. Pawabase creates an index for every `indexed`, `unique` and `owner_field`, and never removes one, so an index for a field nobody filters on keeps costing writes. Dropping an unused index is a manual change in the console, and then clearing `indexed` in the definition keeps the next migration from re-creating it.
+
+## Connection budget, worked through
+
+An example for the arithmetic. A deployment has:
+
+- 3 API replicas
+- 4 environments (development, staging, two production regions) on one PostgreSQL server, each with its own URL
+- Each connection object holding up to 10 driver connections (a `maxsize=10` hint in the URL)
+
+The worst case is `3 replicas × 4 URLs × 10 = 120` connections, before anything else connects. A managed database with a limit of 100 will refuse some of them, and the symptom is intermittent 503s under load that disappear when traffic drops.
+
+| Lever | Effect |
+| --- | --- |
+| Fewer replicas | Linear reduction |
+| Smaller `maxsize` hint | Linear reduction per URL, at the cost of waiting under load |
+| A pooler in front | Many client connections share few server connections |
+| Fewer environments on that server | Move staging to a smaller server |
+
+Measure with `pg_stat_activity` while the system is under load, and size the limit with headroom for your own tools.
+
+## Copying data, in more detail
+
+### Server to server on PostgreSQL
+
+When both databases are PostgreSQL, a pipe avoids a file:
+
+```bash
+pg_dump "$OLD_URL" --data-only --table=pb_9c41e0d27a1b_tickets \
+  | sed 's/pb_9c41e0d27a1b_tickets/tickets/g' \
+  | psql "$NEW_URL"
+```
+
+Do one table at a time, check the count, and keep the order that respects your own relations (nothing enforces one, but your application may).
+
+### Verify a copy
+
+Counts first, then a checksum of something stable:
+
+```sql
+-- run on both sides and compare
+SELECT COUNT(*) AS rows, MIN(id) AS first_id, MAX(id) AS last_id FROM tickets;
+SELECT md5(string_agg(id::text || coalesce(subject, ''), ',' ORDER BY id)) FROM tickets;
+```
+
+If the two results differ, the copy is not complete. Do not switch.
+
+### After the copy
+
+1. Reset sequences on PostgreSQL (shown earlier).
+2. Run `ANALYZE` so the planner has statistics: `ANALYZE tickets;`.
+3. Make a read through the API for a few known records.
+4. Check that a **create** works, since that is where a stale sequence shows up.
+
+## Putting the settings in `.env`
+
+For a self-hosted installation, the defaults belong in the environment file, where the compose file reads them:
+
+```bash
+# the control plane
+PAWABASE_DATABASE_URL=postgres://pawabase:<password>@postgres:5432/pawabase
+
+# the default for every environment with no database of its own
+PAWABASE_DEFAULT_DATA_URL=postgres://pawabase:<password>@postgres:5432/pawabase
+
+# for development with one SQLite file per environment
+# PAWABASE_DEFAULT_DATA_URL=sqlite:///data/envs/{project}__{env}.db
+```
+
+Restart the API after changing either. Environments with their own `infra.database_url` are unaffected by the second one.
+
+## Environment variables that decide the defaults
+
+Two installation-wide settings control where data lives before any environment sets its own:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `PAWABASE_DATABASE_URL` | The **control-plane** database | PostgreSQL in the compose file |
+| `PAWABASE_DEFAULT_DATA_URL` | The default **environment** database, formatted with `{project}` and `{env}` | The bundled PostgreSQL in `docker-compose.yml`. A SQLite file per environment in `docker-compose.dev.yml`. A local PostgreSQL if unset |
+
+Changing `PAWABASE_DEFAULT_DATA_URL` changes where **every unconfigured environment** looks. Existing data stays in the old database, and the environments see an empty one, with the 500s that follow. Change it only on a fresh install, or follow the same migrate-and-copy sequence as a per-environment switch for each environment. See [Configuration](/self-hosting/configuration).
+
+## Differences you will meet when you change dialect
+
+If you move an environment from one dialect to another, these are the places to check.
+
+| Area | What changes |
+| --- | --- |
+| **String length** | SQLite has none. PostgreSQL and MySQL cut at `max_length` or 255 |
+| **Datetimes** | Offset kept, instant, or naive UTC. Sorting and filtering follow |
+| **Booleans** | `0`/`1` or `true`/`false`. A filter `eq` on a boolean is wrong in every dialect, so use `is.true` and `is.false` |
+| **Case** | Text comparison and uniqueness differ. `like` is case-insensitive on SQLite as observed |
+| **JSON** | Text, `JSONB` or `JSON`. Whole-value equality on a JSON field never matches through the API in any case |
+| **UUID** | Text, `UUID` or `CHAR(36)`. A uuid filter must be lowercase and hyphenated on SQLite |
+| **Migrations** | MySQL index statements are not repeatable |
+| **Ordering ties** | Not defined by Pawabase. Add `id` to a sort to make it stable |
+| **Concurrency** | One writer on SQLite, many elsewhere |
+
+A move is a good moment to run your whole API test suite against the new dialect in a scratch environment before switching.
+
+## Worked example: from a SQLite file to PostgreSQL
+
+A team has run a `tickets` resource on SQLite in development and wants the same data in a PostgreSQL environment. The steps, with what each one handles.
+
+<Steps>
+  <Step title="Create the PostgreSQL database and the secret">
+    Follow the sequence above for a scratch environment. The scratch environment's `infra.database_url` is `secret://PG_DB`.
+  </Step>
+  <Step title="Promote and migrate in the scratch environment">
+    The tables are created in PostgreSQL with PostgreSQL's types: `BIGSERIAL`, `VARCHAR(160)`, `TIMESTAMPTZ`, `JSONB`.
+  </Step>
+  <Step title="Export from SQLite as CSV">
+    ```bash
+    sqlite3 -header -csv /data/envs/shop__development.db "SELECT * FROM tickets" > tickets.csv
+    ```
+  </Step>
+  <Step title="Load with explicit handling of the awkward types">
+    Load into a staging table of text columns, then insert with casts, so each type's conversion is visible:
+
+    ```sql
+    CREATE TEMP TABLE tickets_in (id text, subject text, status text, priority text, labels text, created_at text, updated_at text);
+    \copy tickets_in FROM 'tickets.csv' WITH (FORMAT csv, HEADER)
+
+    INSERT INTO tickets (id, subject, status, priority, labels, created_at, updated_at)
+    SELECT id::bigint, subject, status, NULLIF(priority, '')::bigint,
+           NULLIF(labels, '')::jsonb,
+           created_at::timestamptz, updated_at::timestamptz
+    FROM tickets_in;
+    ```
+  </Step>
+  <Step title="Reset the sequence">
+    ```sql
+    SELECT setval(pg_get_serial_sequence('tickets', 'id'), COALESCE(MAX(id), 1)) FROM tickets;
+    ```
+  </Step>
+  <Step title="Check for values PostgreSQL would have refused">
+    A SQLite column accepted anything, so look for what PostgreSQL's types do not: strings longer than the column, malformed JSON, a boolean stored as a word. The `INSERT` above fails loudly on any of them, which is the point of the staging table.
+  </Step>
+  <Step title="Compare, then switch the real environment">
+    Compare counts and a checksum, run your tests against the scratch environment, then set the real environment's database to the same secret.
+  </Step>
+</Steps>
+
+The conversions worth knowing:
+
+| SQLite value | PostgreSQL column | Conversion |
+| --- | --- | --- |
+| `0` / `1` in an `INTEGER` column | `BOOLEAN` | `value::int::boolean`, or `value = '1'` |
+| ISO text with an offset | `TIMESTAMPTZ` | `::timestamptz` keeps the instant |
+| ISO text, date only | `DATE` | `::date` |
+| JSON text | `JSONB` | `::jsonb`, which fails on invalid JSON |
+| Text uuid | `UUID` | `::uuid`, which fails on a malformed value |
+| Text longer than a limit | `VARCHAR(n)` | Fails. Shorten the value or raise `max_length` |
+
+## Where to start, by size
+
+These are starting points, not limits: Pawabase imposes none, and the right numbers come from measuring your own load.
+
+| Stage | Database | Layout |
+| --- | --- | --- |
+| Exploring | The default | One environment, nothing configured |
+| A small team | A single PostgreSQL | Development on the default, staging and production on their own databases |
+| A growing product | A managed PostgreSQL | Production on its own server, with backups, alerts and a reporting role |
+| High traffic | A managed PostgreSQL behind a pooler | Several API replicas, a connection budget, indexes on every filtered and sorted column |
+
+At each step the change is the same one: an `infra.database_url` that points somewhere better. Nothing in your resources changes.
+
+The one thing that does change with size is how much you rehearse. A small table can be copied in seconds and verified by eye. A large one needs a timed run in a scratch environment, a plan for the writes that arrive during the copy, and a decision about whether a short read-only window is acceptable.
+
+If a short outage is not acceptable, the usual pattern is: copy once, switch reads and writes to a maintenance response for the shortest possible moment, copy the difference since the first copy, then switch the URL. The copy of the difference is why every table should have an `updated_at` or a growing key that you can filter on.
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Do I have to configure a database?">
+    No. An environment with no `infra.database_url` uses the installation's default, which works out of the box. Configure your own when you need separation, your own backups, or access from other tools.
+  </Accordion>
+  <Accordion title="Is SQLite the default?">
+    Only in the development compose file. The built-in default and the production compose file use PostgreSQL. Check `PAWABASE_DEFAULT_DATA_URL`.
+  </Accordion>
+  <Accordion title="Where do I set a database in Studio?">
+    You do not. Studio's Settings page covers API documentation, CORS, realtime and custom settings. A per-environment database is set through the platform API as `infra.database_url`, and the installation default through `.env`. Create the secret in Studio's **Secrets** page.
+  </Accordion>
+  <Accordion title="Why is my password visible in the environment?">
+    You stored a literal URL in `infra.database_url`. A `secret://NAME` reference hides it. Rotate the password that was exposed.
+  </Accordion>
+  <Accordion title="Can I use two databases in one environment?">
+    No. One environment has one URL. Resources in one environment share it.
+  </Accordion>
+  <Accordion title="Does Pawabase copy data when I switch?">
+    No. The new database is empty, and the old data is untouched. Copy it with your database's tools.
+  </Accordion>
+  <Accordion title="What do 503 and 500 mean on a read?">
+    **503** is the connection: the database is unreachable or the URL is wrong. **500** is the table: it is missing, or a column is. Migrate.
+  </Accordion>
+  <Accordion title="Can I use MariaDB?">
+    Use a `mysql://` URL. The `mariadb://` scheme is not recognised.
+  </Accordion>
+  <Accordion title="Can two environments share a database?">
+    Yes, by giving them the same URL, and then they share tables and rows. Normally you want separate databases.
+  </Accordion>
+  <Accordion title="Does clearing the setting delete data?">
+    No. It returns the environment to the default database, where its old data was left.
+  </Accordion>
+  <Accordion title="Does the role need DROP?">
+    No. Pawabase never drops. It needs read and write on its tables, and `CREATE` and `ALTER` for migrations.
+  </Accordion>
+  <Accordion title="Does Pawabase run a connection pool?">
+    It keeps one connection object per URL per process and passes pool hints from the URL's query string to the driver. Size the database for the number of replicas.
+  </Accordion>
+</AccordionGroup>
+
+## What to remember
+
+- **Two databases.** The control plane holds definitions. Each environment's database holds rows.
+- **One environment, one URL.** An `infra.database_url`, or the installation default with `{project}` and `{env}`.
+- **The default is PostgreSQL** in the production layout, SQLite only in the dev compose file.
+- **Studio has no database form.** Set `infra.database_url` through the platform API, always as `secret://NAME`, and always the whole value.
+- **A literal URL leaks.** The environment returns it, password included.
+- **Switching starts empty.** Nothing is copied, and the old data stays where it was.
+- **503 is the connection. 500 is the table.**
+- **The role never needs `DROP`.** Give it one database and nothing else.
+- **Backups are yours.** Restore into a scratch environment to prove them.
+- **Promotion and copy-from never change an environment's database.**
+
+## Terms
+
+| Term | Meaning |
+| --- | --- |
+| **Control-plane database** | The one database that holds projects, definitions, keys and the audit log |
+| **Environment database** | The database holding an environment's resource rows |
+| **Platform default** | The database an environment uses when it has no `infra.database_url` |
+| **`infra.database_url`** | A per-environment override of the database, set through the platform API |
+| **Secret reference** | `secret://NAME` as the whole value, resolved to the secret's stored value |
+| **Physical table name** | The table's name in the database, which may carry a `pb_<hash>_` prefix on the shared default |
+| **Pool** | The set of open database connections in an API process, keyed by URL |
+| **Dialect** | SQLite, PostgreSQL or MySQL, taken from the URL scheme |
+| **Scratch environment** | A short-lived environment used to rehearse a database change |
 
 <CardGroup cols={2}>
   <Card title="Migrations" icon="arrow-right" href="/data/migrations" />
   <Card title="Database console" icon="terminal" href="/data/database-console" />
   <Card title="Defining resources" icon="table-properties" href="/data/defining-resources" />
-  <Card title="Field types" icon="type" href="/data/field-types" />
+  <Card title="Backups" icon="database-backup" href="/self-hosting/backups" />
 </CardGroup>
+

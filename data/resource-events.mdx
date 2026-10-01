@@ -1,162 +1,1530 @@
 ---
 title: "Resource events"
-description: "The events Pawabase emits when a resource is created, updated, or deleted — and how to subscribe to them."
+description: "What a resource write publishes, what the event contains, who can consume it (flows, subscriptions, webhooks, realtime), what guarantees it carries and where it leaks."
 icon: "zap"
 ---
 
-<Package icon="zap" />
+## The mental model: a write announces itself
 
-Every resource write — create, update, or delete — emits an event. These events are how the rest of your backend (flows, functions, webhooks, realtime subscribers) learns that data changed. They're guaranteed to fire if and only if the write succeeds, and their payload is the full record as it exists after the write.
+Every time Pawabase writes a row through a resource, it does three things after the write has succeeded:
 
-## The three resource events
+1. **Clears the resource's cache entries** (see [Caching](/data/caching)).
+2. **Publishes an event**, named after the resource and the change, if the resource's **Emit events** switch is on.
+3. **Broadcasts the change to realtime subscribers**, if the resource's **Broadcast changes** switch is on.
 
-| Event name | Triggered by | Payload |
+The event goes onto an event bus. An **event processor** reads it, records it, and routes it to everything that has asked to hear about it: flows triggered by it, **event subscriptions**, and **webhook endpoints**. Each of those runs from a queue, so a slow consumer never delays the others, and each retries on its own.
+
+```text
+write succeeds ──► after-write step ──┬─► cache tag cleared
+                                      ├─► event "orders.created" ──► bus ──► event processor
+                                      │                                         ├─► flows (Resource change / Event triggers)
+                                      │                                         ├─► subscriptions (flow, function, realtime)
+                                      │                                         └─► webhook endpoints (signed HTTP)
+                                      └─► realtime channel "resource:orders"
+```
+
+That is the whole mechanism. Resource events are not a separate feature you configure resource by resource. They are what makes the rest of the platform (automation, integrations, live UIs) react to data, and they are ordinary platform events, like `user.created` or `file.uploaded`, with a name, a payload and a log.
+
+Everything on this page was run against a real Pawabase API: resources were written through the API, the Records tab and flows, events were read back from the event log, and subscriptions and webhooks were created and observed. Where the behavior is read from code and not run, it says so.
+
+## What publishes an event, and what does not
+
+| Write | Event? | Notes |
 | --- | --- | --- |
-| `<resource>.created` | A record is inserted | The created record, including `id` and all declared fields |
-| `<resource>.updated` | A record is modified | The updated record, including `id` and all declared fields |
-| `<resource>.deleted` | A record is deleted | The record as it was **before** deletion, including `id` and all declared fields |
+| `POST`, `PATCH`, `DELETE` through `/rest/v1` | **Yes** | Actor is the signed-in user |
+| The **Records** tab in Studio | **Yes** | Actor is `studio`, and there is no request id |
+| A flow's `resource.create`, `resource.update`, `resource.delete` | **Yes** | Actor is the caller that started the flow |
+| A function's `ctx.runtime.resource_*` | **Yes** | The runtime goes through the same after-write step |
+| A write inside `db.transaction` | Yes, **after the transaction commits** | The block's effects are announced once, after the commit |
+| A **console** write (SQL) | **No.** It only clears caches and is audited | Observed: an `INSERT` in the SQL window produced no event |
+| A change made with SQL elsewhere | **No** | Pawabase is never told |
+| A **migration** | **No** | |
+| A write that **fails validation** (`422`) | **No** | Nothing was written, so nothing is announced |
+| A write on a resource with **Emit events** off | **No** | Observed: a resource with events off produced none |
 
-The `<resource>` part of the event name is the **resource name** you defined — the same name used in the URL (`/rest/v1/<resource>`). For example, a resource named `orders` emits `orders.created`, `orders.updated`, and `orders.deleted`.
+Two consequences. **A change made in the console or in SQL is invisible to every consumer**, so a webhook never hears about a bulk repair done that way, which is sometimes what you want. And **a consumer that must know about every change must be fed by writes that go through Pawabase**.
 
-<Note>
-Resource events are emitted **inside the same database transaction** as the write. If the write is rolled back, the event is not emitted. If the write succeeds, the event is guaranteed to be on the event bus.
-</Note>
+## The event's name
 
-## The event payload
+An event is named **`<resource>.<change>`**, where `<resource>` is the resource's name and `<change>` is `created`, `updated` or `deleted`:
 
-The payload is the full record, shaped exactly as it exists in the database after the write. This means:
+```text
+orders.created
+orders.updated
+orders.deleted
+```
 
-- **All declared fields** are present — not just the ones provided in the request.
-- **Computed fields** (defaults, generated columns) are included.
-- **Relational fields** are not embedded — only the foreign key values are present. If you need related data, join it in the flow or function that handles the event.
-- **Field types** are serialized as JSON values (strings, numbers, booleans, arrays, objects).
+<Warning>
+The Events page's filter box suggests the name `resource.todos.created`, and some older documents show names like that. Pawabase does **not** prefix resource events with `resource.`. The name that was recorded for a `todos` resource was `todos.created`. Match on `todos.created` or `todos.*`.
+</Warning>
 
-Example: a `students.updated` event:
+Patterns use shell-style wildcards on the whole name:
+
+| Pattern | Matches |
+| --- | --- |
+| `orders.created` | Exactly that |
+| `orders.*` | Every change to `orders` |
+| `*.created` | Every creation, of every resource |
+| `*` | Every event of every kind, including `user.created`, `file.uploaded` and custom ones |
+
+## What an event contains
+
+The stored event, as the Events tab and the API return it, newest first:
 
 ```json
 {
-  "id": "stu_001",
-  "name": "Ada Lovelace",
-  "email": "ada@example.com",
-  "grade": 12,
-  "enrollment_date": "2024-09-01",
-  "created_at": "2024-09-01T08:00:00+00:00",
-  "updated_at": "2026-09-28T10:00:00+00:00"
+  "name": "todos.created",
+  "source": "api",
+  "actor": "u-1",
+  "request_id": "6b77620d-40fe-4cd7-aae5-0b33d5af25d6",
+  "payload": {
+    "resource": "todos",
+    "change": "created",
+    "record": {
+      "id": 1,
+      "title": "one",
+      "done": null,
+      "created_at": "2026-10-01T22:13:35.494214+00:00",
+      "updated_at": "2026-10-01T22:13:35.494214+00:00"
+    }
+  },
+  "consumers": [
+    { "type": "flow", "target": "on_todo", "status": "queued", "ref": "38bfb037c8cd4cd7b6de38debecfafbf" }
+  ]
 }
 ```
 
-## The full event envelope
-
-The complete event you receive as a subscriber contains more than just the payload:
+And the full envelope, which is what a consumer receives:
 
 ```json
 {
-  "event": "students.updated",
-  "payload": { ... },
-  "id": "evt_abc123",
-  "published_at": "2026-09-28T10:00:00+00:00",
-  "project": "school",
+  "name": "todos.created",
+  "project": "acme",
+  "env": "development",
+  "payload": { "resource": "todos", "change": "created", "record": { "id": 1, "title": "one" } },
+  "source": "api",
+  "actor": "u-1",
+  "id": "5977bd30d884497ea0df5f629a28e7c9",
+  "occurred_at": "2026-10-01T22:13:35.494214+00:00",
+  "request_id": "6b77620d-40fe-4cd7-aae5-0b33d5af25d6",
+  "release_id": null,
+  "api_version": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | `<resource>.<change>` |
+| `project`, `env` | Where it happened |
+| `payload` | `{"resource", "change", "record"}`, described next |
+| `source` | The service that published it. `api` for resource events |
+| `actor` | Who caused it: the signed-in user's id for an API write, `studio` for the Records tab. Empty for a caller with no user |
+| `id` | A unique id. The event log uses it to process an event only once |
+| `occurred_at` | When it was published, as an ISO 8601 UTC time |
+| `request_id` | The request that caused it, so it can be found in **Observability**. `null` for the Records tab |
+| `release_id`, `api_version` | The release that was serving when the write happened, or `null` when the live definitions were |
+
+The `payload` is the same for every resource event:
+
+| Key | Value |
+| --- | --- |
+| `resource` | The resource's name |
+| `change` | `created`, `updated` or `deleted` |
+| `record` | The row, as a plain JSON object |
+
+<Warning>
+An earlier version of this page showed an envelope with `event`, `published_at` and `correlation_id`, and a payload that was the bare record. Those names are not what Pawabase sends. The envelope fields are the ones in the table above, and the record is under `payload.record`.
+</Warning>
+
+### The record, for each change
+
+| Change | `record` is |
+| --- | --- |
+| `created` | The row as stored, with its key, defaults filled in and timestamps |
+| `updated` | The **whole row after the update**, not only the fields that changed |
+| `deleted` | The row **as it was just before it was deleted**, including its last update |
+
+For an `updated` event there is no "before" value: the event does not say which fields changed. A consumer that needs to know compares the record with what it last saw, or reads a `changed` field you maintain yourself.
+
+A `deleted` record is the **last** state. In a run, a todo that had been marked done and then deleted arrived with `"done": true` and its latest `updated_at`.
+
+### The record is the raw row
+
+This is the part that matters for security. The record in an event is the row **as the database holds it**, and none of the response-shaping the API applies reaches it:
+
+| Applied to API responses | Applied to an event's record |
+| --- | --- |
+| A [transformer's](/data/transformers) `omit`, `pick`, `set` and `rename` | **No** |
+| `write_only` on a field | **No** |
+| `select` | **No** |
+| A related row's `expand` | No (nothing is expanded) |
+| Undeclared columns being returned | They are in the record too |
+
+This was run on a `vault` resource that declared a `secret` field as `write_only` and had a transformer that omitted `secret`. The create response had no `secret`:
+
+```json
+{ "id": 1, "label": "a", "created_at": "...", "updated_at": "..." }
+```
+
+and the event's record had it:
+
+```json
+{
+  "resource": "vault",
+  "change": "created",
+  "record": { "id": 1, "label": "a", "secret": "hunter2", "created_at": "...", "updated_at": "..." }
+}
+```
+
+So **everything that receives resource events receives the hidden fields**: subscriptions, flows, webhook endpoints, and realtime subscribers (when **Broadcast changes** is on). If a field is hidden from API readers because it is sensitive, it must also be kept out of the event, which means one of:
+
+| Option | How |
+| --- | --- |
+| Do not store it in this resource | Put the secret in a separate resource that has events off |
+| Turn **Emit events** off | For a resource that no consumer needs |
+| Turn **Broadcast changes** off | Realtime pushes the raw record to subscribers |
+| Shape the event in a flow | A flow on the event uses `transform.map` to build a safe payload, and **that** is what goes to the webhook. Do not subscribe the webhook to the raw event |
+
+See [What a transformer protects](/data/transformers#what-a-transformer-protects-and-what-it-does-not).
+
+## Seeing events: Events & runs
+
+Open **Events & runs** under the environment's navigation. The page is described as *Everything that happened: events on the bus, the flows they started, webhooks delivered and mail sent.* It has five tabs:
+
+| Tab | Shows |
+| --- | --- |
+| **Events** | Every event, newest first, refreshed every five seconds. Columns **Event**, **Source**, **Actor**, **Payload** and **When**. A filter box above takes an **exact** event name. Empty: *No events yet.* |
+| **Event map** | One row per event name, with its **Producers**, the event and its **Consumers**. Empty: *No producers or consumers defined yet.* |
+| **Flow runs** | Each flow run, with **Flow**, **Status**, **Trigger**, **Duration**, **Error** and **When**. A status filter offers *every status*, *succeeded*, *failed* and *running* |
+| **Webhook deliveries** | Each delivery, with **Endpoint**, **Event**, **Status**, **HTTP**, **Attempts** and **When**. Empty: *No deliveries yet.* |
+| **Mail** | A **Send a test message** box (an address and **Send**, toast *Test message queued*) and a **Mail log** with **To**, **Subject**, **Template**, **Status**, **Error** and **When**. Empty: *Nothing sent yet.* |
+
+Click a row for a **Details** window with the full record. (In the version of Studio this page was written against, opening an **event** row asked the API for the event by its numeric row id, and the API only accepts the event's own `event_id`, so the window could fail to open with *no such event*. If it does, read the event from the list's own columns, or from the API by `event_id`.) For an event it is the stored event, including the **consumers** it was routed to and the state of each:
+
+```json
+"consumers": [
+  { "type": "flow", "target": "on_todo", "status": "queued", "ref": "38bfb037c8cd4cd7b6de38debecfafbf" },
+  { "type": "realtime", "target": "alerts:x", "status": "failed", "error": "..." },
+  { "type": "webhook", "target": "endpoints", "status": "queued" }
+]
+```
+
+The `status` of a consumer is `queued` for a flow, a function or a webhook (the work is on a queue), `done` for a realtime publication that succeeded, and `failed` with an `error` when handing the work over itself failed. A `queued` flow then has its own run in **Flow runs**, and a `queued` webhook has deliveries in **Webhook deliveries**. An event with no consumers has an empty list, which is normal for an event nobody listens to.
+
+### The event map
+
+The **Event map** also lists **platform** events you did not create, such as `user.created`, `file.uploaded` and `session.revoked`, with the service that produces each (`service:akountz`, `service:storage`). A subscription or webhook for those appears as a consumer. Your resource events appear with the producer `service:api`.
+
+### Emitting a test event
+
+The **Emit test event** button opens **Emit an event**, with a **Name** (default `custom.test`) and a **Payload** (JSON, default `{"hello": "world"}`). **Emit** publishes it, and the toast says *Event emitted*. It goes through the same bus and the same routing as a real event, so it is the quickest way to test a subscription or a webhook without writing a record. Its `actor` is `studio` and its `source` is the same as a resource event's.
+
+Through the API:
+
+```http
+POST /platform/v1/projects/acme/envs/development/events
+```
+
+```json
+{ "name": "custom.test", "payload": { "kind": "x", "hello": "world" } }
+```
+
+```json
+{ "event_id": "5977bd30d884497ea0df5f629a28e7c9" }
+```
+
+Because a custom event carries any payload, a test event for a **resource** subscription needs the same shape as a real one: name it `todos.created` and give the payload `{"resource": "todos", "change": "created", "record": {...}}`, or the consumer's templates will not find what they read.
+
+## Who can listen
+
+There are four kinds of consumer, and they can be combined freely. Every one is routed from the same event, independently.
+
+| Consumer | What it does | Configured in |
+| --- | --- | --- |
+| **A flow with an event trigger** | Runs the flow, with the event as input | The flow itself |
+| **An event subscription** | Runs a flow or a function, or broadcasts to a realtime channel, optionally only when a condition holds | **Event subscriptions** |
+| **A webhook endpoint** | Sends the event to an external URL, signed, with retries | **Webhooks** |
+| **Realtime subscribers** | Receive the change on the channel `resource:<name>` | The resource's **Broadcast changes** switch |
+
+## Flows that start on an event
+
+A flow can start on an event in two ways.
+
+### The Resource change trigger
+
+The **Resource change** trigger (`trigger.resource`) names a **resource** and, optionally, the **operations** that start the flow:
+
+```json
+{ "block": "trigger.resource", "config": { "resource": "todos", "operations": ["created", "deleted"] } }
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `resource` | The resource's name. Required |
+| `operations` | A list of `created`, `updated`, `deleted`. Omit it for all three |
+
+This was run with `["created", "deleted"]`: a create and a delete started the flow, and an update did not (its event had no consumers). The trigger matches the **resource name and the change**, not a pattern.
+
+### The Event trigger
+
+The **Event** trigger (`trigger.event`) takes an **event name or pattern**, with the hint *Event name or pattern, e.g. order.**:
+
+```json
+{ "block": "trigger.event", "config": { "event": "todos.*" } }
+```
+
+Use it for patterns across resources (`*.deleted`), and for events that are not resource changes (`user.created`, or your own `custom.*`).
+
+### What the flow receives
+
+Both triggers start the flow with the event wrapped in one key:
+
+```json
+{
+  "event": {
+    "name": "todos.created",
+    "project": "acme",
+    "env": "development",
+    "payload": { "resource": "todos", "change": "created", "record": { "id": 2, "title": "from records tab" } },
+    "source": "api",
+    "actor": "studio",
+    "id": "5977bd30d884497ea0df5f629a28e7c9",
+    "occurred_at": "2026-10-01T22:13:36.259369+00:00",
+    "request_id": null,
+    "release_id": null,
+    "api_version": null
+  }
+}
+```
+
+so the flow's blocks read it with templates:
+
+| In the flow | Value |
+| --- | --- |
+| `{{ input.event.name }}` | `todos.created` |
+| `{{ input.event.payload.change }}` | `created` |
+| `{{ input.event.payload.record.title }}` | The record's title |
+| `{{ input.event.actor }}` | Who made the change |
+| `{{ input.event.id }}` | The event's id, for de-duplication |
+
+The run is queued, so it starts a moment after the write, and **not as the writer**: the flow runs with a system identity (`authenticated: false, kind: "system"`). A flow that needs to know who made the change reads `input.event.actor`.
+
+<Warning>
+**Loops.** A flow that updates the same resource it listens to publishes another `updated` event, which starts the flow again, and so on. Pawabase does not detect this. Break the cycle with a condition (act only when a field has a particular value), with `operations` that exclude the change you make, or by writing through a path that does not publish (a different resource that has events off).
+</Warning>
+
+## Event subscriptions
+
+A **subscription** connects an event name to a **target**, without putting a trigger in the flow. Open **Event subscriptions**, described as *Run a flow or function, or broadcast to a realtime channel, when an event is emitted.* The form has these parts:
+
+| Section | Field | Meaning |
+| --- | --- | --- |
+| (name) | **Name** | Placeholder `on_signup` |
+| **When** | **Event** | A name or pattern, placeholder `user.created`, with suggestions. The section reads *Wildcards match a family: todos.* or user.** |
+| | **Only when…** | A switch. Hint: *Filter on the event with rules over $event.* Turns on a condition builder |
+| **Then** | The target | A **flow**, a **function** or **realtime**, and which one |
+| | **Enabled** | |
+
+The starting example (**Use example**) is a subscription called `on_signup` for `user.created`, to the flow `welcome`.
+
+| Target | What happens |
+| --- | --- |
+| **Flow** | The flow is queued, with the event as its input (`{"event": {...}}`), exactly as for a trigger |
+| **Function** | The function is queued with the same input |
+| **Realtime** | The event's **payload** is published on a channel. The target is the channel, and it may be a template. With no target the channel is `events:<name>` |
+
+A realtime target can be built from the event: a target of `alerts:{{ event.payload.kind }}` published to `alerts:x` for an event whose payload had `"kind": "x"`. If the realtime service cannot be reached, the consumer's status is `failed`, as it was when this was run in a test installation with no realtime service.
+
+### The condition, and a trap in the default
+
+**Only when…** adds a condition over the event, written with `$event`. The condition is evaluated against the **envelope** shown above, so the paths are `$event.name`, `$event.payload`, `$event.payload.record.status`, `$event.actor` and so on.
+
+<Warning>
+Turning on **Only when…** fills in the condition `{"exists": "$event.data"}`. The envelope has **no `data` key** (the data is under `payload`), so that condition is never true and the subscription **never fires**. This was run: a subscription for `todos.*` with `{"exists": "$event.data"}` produced no consumer for a create or an update, while one for `todos.created` with `{"exists": "$event.payload.record"}` fired on the create. After turning the switch on, **change the condition** before you save, and test the subscription with **Emit test event**.
+</Warning>
+
+Conditions use the same language as policies. Useful ones:
+
+| Want | Condition |
+| --- | --- |
+| Only orders over a threshold | `{"gte": ["$event.payload.record.total", 1000]}` |
+| Only a status | `{"eq": ["$event.payload.record.status", "paid"]}` |
+| Only changes made by a person, not a flow | `{"exists": "$event.actor"}` |
+| Only changes not made from the Records tab | `{"ne": ["$event.actor", "studio"]}` |
+
+### Subscription or trigger?
+
+| | Flow trigger | Subscription |
+| --- | --- | --- |
+| Lives in | The flow | A definition of its own |
+| Can target a function or realtime | No | Yes |
+| Can filter with a condition | Only inside the flow | Yes, before anything is queued |
+| One flow, many events | Several triggers in the flow | Several subscriptions |
+| Promoted | With the flow | As its own definition |
+
+Use a trigger when a flow exists for one event. Use a subscription when the wiring should be separate from the flow, or the target is a function or a channel.
+
+## Webhooks: sending events to other systems
+
+A **webhook endpoint** delivers events to an external URL as signed HTTP `POST` requests, with retries. Open **Webhooks** (*Deliver events to external URLs, signed, with retries.*). The form:
+
+| Section | Field | Meaning |
+| --- | --- | --- |
+| (name) | **Name** | Placeholder `crm` |
+| **Delivery** | **Endpoint URL** | Placeholder `https://example.com/hooks/pawabase`. Must be `http` or `https` |
+| | **Events** | The events to send. Hint *\* sends everything.* Suggestions are `*`, `user.*` and `<resource>.*` for each resource |
+| | **Extra headers** (optional) | Header and value pairs sent on every delivery. **Add header** |
+| **Reliability & signing** | **Attempts** | Hint *Retries back off exponentially.* A number from 1 to 10, default 5 |
+| | **Signing secret** (optional) | New endpoint: *Leave empty to generate one; it is shown once.* Existing: *Leave empty to keep the current secret.* At least 16 characters if you supply one. A generated secret looks like `whsec_...` and is returned **once**, in the response that creates the endpoint. Reading the endpoint afterwards does not include it |
+| | **Enabled** | |
+
+The starting example is a `crm` endpoint for `todos.*` and `user.created`.
+
+### What is sent
+
+One delivery per event per endpoint, as a `POST` with a JSON body:
+
+```json
+{
+  "id": "5977bd30d884497ea0df5f629a28e7c9",
+  "event": "todos.created",
+  "project": "acme",
   "env": "production",
-  "actor": "usr_001",
-  "correlation_id": "req_xyz789"
+  "data": { "resource": "todos", "change": "created", "record": { "id": 1, "title": "one" } },
+  "sent_at": 1790000000
 }
 ```
 
-| Field | Description |
+| Key | Meaning |
 | --- | --- |
-| `event` | The event name: `<resource>.<action>` |
-| `payload` | The full record (see above) |
-| `id` | Unique event identifier |
-| `published_at` | When the event was emitted, as an ISO 8601 timestamp |
-| `project` / `env` | Which project and environment emitted this event |
-| `actor` | The user ID or service account that triggered the write. `system` if no user context. |
-| `correlation_id` | Links the event to the original request |
+| `id` | The **event's** id, the same on every attempt and every endpoint. Use it to de-duplicate |
+| `event` | The event name |
+| `project`, `env` | Where it happened |
+| `data` | The event's **payload**: `resource`, `change` and the **raw** `record` |
+| `sent_at` | When the delivery was made, as epoch seconds |
 
-## Subscribing to resource events
+Note that `data` is the payload, so the record is at `data.record`, and that it carries the hidden fields. The body is compact JSON, so verify signatures against the exact bytes you receive.
 
-You can react to resource events in several ways:
+The request headers are your extra headers plus:
 
-### In a flow
+| Header | Value |
+| --- | --- |
+| `Content-Type` | `application/json` |
+| `Pawabase-Signature` | `t=<unix time>,v1=<hex HMAC-SHA256 of "<time>." followed by the body>` |
+| `Pawabase-Event` | The event name |
+| `Pawabase-Delivery` | The delivery's id, which changes per endpoint |
 
-Add an **Event trigger** to a flow:
-1. Create or open a flow in Studio.
-2. Click the trigger block → **Choose trigger** → **Event**.
-3. Enter the event name: `orders.created` (or use `orders.*` to catch all events for the `orders` resource).
-4. The flow's `$input` will have the full event envelope:
-   ```text
-   $input.event          → "orders.created"
-   $input.payload        → the record
-   $input.id             → the event ID
-   $input.actor          → who made the change
-   ```
+### Verifying the signature
 
-### In a webhook
+The signature proves the request came from Pawabase and is fresh. The signed text is the timestamp, a dot, and the raw body:
 
-Create a subscription that sends the event to an external URL:
-1. Go to **Automate → Webhooks**.
-2. Create a new webhook targeting the event `orders.created`.
-3. Set the URL to your external endpoint.
-4. The webhook receives the full event envelope as the JSON body.
-
-### In realtime
-
-Subscribe to resource events over WebSocket:
-```javascript
-const ws = new WebSocket('wss://api.your-app.pawabase.io/realtime');
-ws.onopen = () => {
-  ws.send(JSON.stringify({
-    type: 'subscribe',
-    channel: 'resource:orders'
-  }));
-};
-ws.onmessage = (msg) => {
-  const event = JSON.parse(msg.data);
-  console.log('Order changed:', event);
-};
-```
-
-### In a function or code
-
-Use the EventBus client:
 ```python
-from pawabase_kit.events import EventBus
+import hashlib
+import hmac
+import time
 
-bus = EventBus.from_env()
-bus.subscribe("orders.created", handle_order_created)
+
+def verify(secret: str, body: bytes, header: str, tolerance: int = 300) -> bool:
+    parts = dict(item.split("=", 1) for item in header.split(",") if "=" in item)
+    try:
+        timestamp = int(parts.get("t", ""))
+    except ValueError:
+        return False
+    if abs(time.time() - timestamp) > tolerance:
+        return False                                   # too old, or too far in the future
+    expected = hmac.new(secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, parts.get("v1", ""))
 ```
 
-## Event delivery guarantees
+```js
+import { createHmac, timingSafeEqual } from "node:crypto"
 
-| Guarantee | What it means |
+export function verify(secret, rawBody, header, tolerance = 300) {
+  const parts = Object.fromEntries(header.split(",").map((part) => part.split("=", 2)))
+  const timestamp = Number(parts.t)
+  if (!Number.isFinite(timestamp) || Math.abs(Date.now() / 1000 - timestamp) > tolerance) return false
+  const expected = createHmac("sha256", secret).update(`${timestamp}.`).update(rawBody).digest("hex")
+  const given = Buffer.from(parts.v1 ?? "", "hex")
+  const wanted = Buffer.from(expected, "hex")
+  return given.length === wanted.length && timingSafeEqual(given, wanted)
+}
+```
+
+Three rules for a receiver:
+
+1. **Verify before you parse.** Read the raw bytes, check the signature, and only then decode the JSON.
+2. **Reject old timestamps.** Five minutes is the tolerance Pawabase itself uses.
+3. **Answer fast with a `2xx`.** Do the work afterwards. A slow or failing receiver is retried, and the retries arrive again.
+
+### Delivery and retries
+
+Each delivery is a job, with a record in **Webhook deliveries**:
+
+| Status | Meaning |
 | --- | --- |
-| **At-least-once** | An event is delivered at least once. If the consumer fails, the event is retried. |
-| **Ordered within a resource** | For a single resource, events for the same record are delivered in the order they occurred. |
-| **Transactional** | The event is only emitted if the database write commits successfully. |
-| **No ordering across resources** | Events from different resources or different records may arrive in any order. |
+| `pending` | Created, not yet attempted |
+| `retrying` | An attempt failed and another will follow. The record shows the error: `HTTP 500`, or a connection error such as `ConnectError: All connection attempts failed` |
+| `delivered` | A `2xx` answer. The HTTP status, the first 2,000 characters of the response body and the delivery time are recorded |
+| `failed` | Given up, or refused before sending |
 
-<Note>
-If you need exactly-once processing (e.g., financial transactions), design your consumer to be idempotent. Use the event `id` or `correlation_id` to deduplicate.
-</Note>
+The record also shows **Attempts**, the response status and the duration of the last attempt. Each row has a **Redeliver** button that queues the delivery again (the toast reads *Redelivery queued*), which is how you resend after you have fixed the receiver.
 
-## Configuring event delivery
+A non-`2xx` answer, a timeout or a connection failure all count as a failed attempt, and the delivery is retried with an exponential backoff that starts at two seconds and is capped at a minute. Any `2xx` is success.
 
-Event subscriptions control where resource events go. You can subscribe to:
-- A specific event: `orders.created`
-- All events for a resource: `orders.*`
-- All events in a domain: `*.created`
-- All events: `*`
+<Warning>
+The **Attempts** setting has **no effect today**. The form stores a number from 1 to 10, but the delivery job always makes **five** attempts with its own backoff. This was run with an endpoint set to 2: the delivery to an unreachable address kept retrying and had made four attempts, still `retrying`, when it was read. Treat 5 as the real number, and do not rely on 1 to mean "once".
+</Warning>
 
-Each subscription has its own retry policy and failure handling. See [Event subscriptions](/events/subscriptions) for details on configuring delivery, retries, and dead-letter handling.
+### Addresses that are refused
 
-## Resource events in the audit log
+Webhooks and flows are configured by developers, and could be pointed at the platform's own network. Outside a local or test installation, a delivery is **refused before it is sent** when the URL:
 
-Every emitted resource event is recorded in the environment's audit log. If a flow or function fails to process an event, you can find the failed delivery in the audit log and retry it manually from Studio.
+| URL | Result |
+| --- | --- |
+| Is not `http` or `https` | `failed`, `only http and https URLs are allowed` |
+| Has a host that cannot be resolved | `failed`, `cannot resolve <host>` |
+| Resolves to a private, loopback, link-local, reserved or multicast address | `failed`, `<host> resolves to a private address` |
 
-## Disabling resource events
+A refused delivery is not retried. So `http://localhost:3000/hook` and `http://10.0.0.5/hook` work in development and are **refused in production**. Use a public HTTPS address, or a tunnel, for a receiver that sits on a private network.
 
-You can disable event emission for a specific resource in Studio:
-1. Open the resource.
-2. Go to the **Events** tab.
-3. Toggle **Emit events** to off.
+### Which events to send
 
-This is rarely needed — it's mainly useful for bulk import flows that would flood the event bus. When events are disabled, the resource still works through the API; it just doesn't notify subscribers.
+An endpoint's **Events** are patterns on the event name, the same as a subscription's. A few combinations:
+
+| Events | Sends |
+| --- | --- |
+| `orders.*` | Every change to orders |
+| `orders.created`, `orders.updated` | Creations and updates, not deletions |
+| `*.deleted` | Every deletion, of everything |
+| `*` | **Everything**, including platform events like `user.created` and `session.revoked` |
+
+`*` is the default for a new endpoint. Narrow it, since every event the endpoint matches costs a delivery, and an endpoint that receives user and session events may receive more personal data than it needs.
+
+### A safe webhook for a sensitive resource
+
+Because a delivery's `data` is the raw record, do not point an endpoint at a resource with hidden fields. Send a **shaped** event instead:
+
+1. Leave the endpoint's **Events** to a **custom** name, such as `public.vault.created`.
+2. A flow with a **Resource change** trigger on `vault` builds a safe payload with a **Transform** block (`transform.map`, with a transformer that picks the fields to share).
+3. The flow emits the custom event with that payload (the **Emit event** block, or the runtime's `emit`).
+4. The endpoint, subscribed to `public.vault.created`, delivers only what the flow chose.
+
+The raw event still reaches the event log and any other consumer, so it is not hidden, only kept off the wire to the third party.
+
+## Realtime
+
+A resource's **Broadcast changes** switch (*Push row changes to realtime subscribers.*) publishes each change to the channel **`resource:<name>`**, as the event `created`, `updated` or `deleted`, with the same payload as the event:
+
+```json
+{ "resource": "orders", "change": "created", "record": { "id": 12, "status": "new" } }
+```
+
+Realtime is **best effort**: if the realtime service cannot be reached, the failure is logged and the write is unaffected. A client that must not miss a change should treat realtime as a hint to re-read, not as the data.
+
+The record is **raw**, as for every other consumer. Whoever may subscribe to `resource:<name>` receives hidden fields, so the channel's subscribe rule matters as much as the resource's own policy. Channel rules are set under **Settings → Realtime**, with a default policy of *authenticated*. A resource whose rows are private to their owners should either keep **Broadcast changes** off, or have a channel rule that admits only the right callers. See [Realtime](/realtime/overview).
+
+A subscription can also publish an event to a channel of your choosing, with the target type **realtime**. That is the way to publish a **shaped** payload, or to a channel per tenant (`org:{{ event.payload.record.org_id }}`).
+
+## What delivery guarantees you actually have
+
+An event has to travel from the write to each consumer, and each hop has its own guarantee. Reading them together shows where an event can be late, repeated or missed.
+
+| Hop | Guarantee | Notes |
+| --- | --- | --- |
+| **Write to event** | The event is published **after** the write succeeds, in the same request | It is **not** part of the database transaction. A crash between the write and the publish loses the event, and the row stays |
+| **Event to the processor** | In development, in-process. With `PAWABASE_REDIS_URL` set, a durable Redis backlog with **at-least-once** delivery | Events published while the processor is down wait for it |
+| **Processor to the log** | Each event id is recorded **once** | A repeat delivery of the same id is skipped |
+| **Log to consumers** | Each consumer is **queued** as its own job | A slow or failing consumer does not hold up the others |
+| **Consumer to completion** | A flow or function job retries per its own settings. A webhook delivery retries up to five times with backoff | A consumer that keeps failing ends up `failed` and is visible in **Events & runs** |
+
+Three practical readings:
+
+**Events can be late.** Consumers run from a queue, so a flow starts a moment after the write, not inside it. A client that writes a record and immediately reads something a consumer updates may read it too early. This was seen directly: after three comments were created, the post's counter, maintained by a flow, reached 3 only after the queue had run.
+
+**Events can repeat, in the sense that a consumer may run again.** A flow job or a webhook delivery that fails after doing part of its work is retried, so the work may run twice. Consumers should be safe to run again (see [idempotent consumers](#idempotent-consumers)).
+
+**Events can, in rare failures, be lost.** The publish is not in the write's transaction. If the process dies after the row is written and before the event is published, no event exists for that change. There is no outbox that replays missing events. If a consumer must never miss a change, treat events as a **prompt to reconcile**, and let it also read the source of truth on a schedule.
+
+### Ordering
+
+Events are published in the order the writes happened, but they reach consumers as **independent jobs**, which can run in any order and in parallel. So:
+
+| Question | Answer |
+| --- | --- |
+| Are two events for the **same record** processed in order? | **Not guaranteed.** An `updated` flow can finish before the `created` flow of the same record |
+| Across resources? | No |
+| Can I rely on arrival order in a webhook receiver? | No. Use the record's `updated_at`, or a version field, to decide which state is newer |
+
+An earlier version of this page promised ordering per record. The platform does not provide it. A receiver that applies events in the order it receives them can end up with an older state, so compare `record.updated_at` (or your own version number) before overwriting.
+
+### What the event log keeps
+
+Every processed event is recorded, with its payload, source, actor, request id and the **consumers** it was routed to and their status. The **Events** tab reads that log, newest first, and the API serves it at `GET .../events` and `GET .../events/<id>`.
+
+The log itself is not a replay queue: there is no button that re-sends an **event** to every consumer. Replay works at the level of each consumer instead:
+
+| To redo | How |
+| --- | --- |
+| A **webhook delivery** | The **Redeliver** button at the end of its row in **Webhook deliveries**. The toast reads *Redelivery queued* |
+| A **flow run** or **function** that failed | **Jobs & queues**: open the job, and a failed or retrying one has a **Retry** button (*Retry queued*). The page is described as *Background work on Sillo's queue: flow runs, function calls, webhook deliveries, mail. Failed jobs retry with backoff, then land here.* |
+| Everything an event would have done | **Emit test event** with the same name and payload, which routes it to every current consumer again |
+
+The log is also data, with no documented retention period, so for a busy environment watch its size, and treat its payloads as sensitive: they contain the raw records, hidden fields included.
+
+## Idempotent consumers
+
+A consumer that can run twice must produce the same result. Four techniques, from easiest:
+
+| Technique | How |
+| --- | --- |
+| **Recompute, do not increment** | A counter is set to `COUNT(*)`, not `count + 1`. Running twice gives the same answer. This is the recipe below |
+| **Upsert by key** | Write a row keyed by the event id or the record id, so a second write replaces the first |
+| **Check, then act** | Look for the result of a previous run before doing the work |
+| **De-duplicate on the event id** | Store the ids you have handled, and skip a repeat. The webhook body's `id` is the event's id on every attempt |
+
+For a webhook receiver, the last one is the standard:
+
+```python
+def handle(delivery):
+    if already_processed(delivery["id"]):
+        return 200                       # acknowledge a repeat, do nothing
+    apply(delivery["data"])
+    mark_processed(delivery["id"])
+    return 200
+```
+
+Record the id in the same transaction as the effect, so a crash between them does not leave one without the other.
+
+## Recipes
+
+Each of these was built and run. The flows are shown as nodes and edges, ready to paste into a flow's **JSON** tab.
+
+### A counter that stays correct
+
+A `posts` resource has `comment_count`, and every comment created or deleted should update it. **Recompute** from the table, so a repeat is harmless.
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "comments", "operations": ["created", "deleted"] } } },
+    { "id": "q", "data": { "block": "db.query", "config": {
+        "sql": "SELECT COUNT(*) AS n FROM comments WHERE post_id = ?",
+        "params": ["{{ input.event.payload.record.post_id }}"]
+    } } },
+    { "id": "u", "data": { "block": "resource.update", "config": {
+        "resource": "posts",
+        "id": "{{ input.event.payload.record.post_id }}",
+        "data": { "comment_count": "{{ steps.q.output.0.n }}" }
+    } } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "t", "target": "q" },
+    { "id": "e2", "source": "q", "target": "u" }
+  ]
+}
+```
+
+Run: three comments were created through the API, and after the queue ran the post's `comment_count` was `3`. One comment was deleted, and it became `2`. The query block returns a **list of rows**, so the count is read as `steps.q.output.0.n`.
+
+Two things to note. The flow works from the **deleted** event's record, which still has the `post_id`, because a deleted event carries the row as it was. And the `resource.update` it makes is itself a write, so it publishes `posts.updated`, which any other consumer of `posts` will receive. See [event chains](#event-chains).
+
+### An audit trail
+
+A flow that records every change to `posts` in an `audit_log` resource:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.event", "config": { "event": "posts.*" } } },
+    { "id": "c", "data": { "block": "resource.create", "config": {
+        "resource": "audit_log",
+        "data": {
+          "event": "{{ input.event.name }}",
+          "actor": "{{ input.event.actor }}",
+          "record_id": "{{ input.event.payload.record.id }}",
+          "snapshot": "{{ input.event.payload.record }}"
+        }
+    } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "c" }]
+}
+```
+
+with `audit_log` declared as a resource with the fields `event`, `actor`, `record_id` and a `json` field `snapshot`, and its own **Emit events** switched **off** so that the audit rows do not generate events of their own. A run produced rows such as:
+
+```json
+{
+  "event": "posts.updated",
+  "actor": null,
+  "record_id": 1,
+  "snapshot": { "id": 1, "title": "P", "comment_count": 3, "created_at": "...", "updated_at": "..." }
+}
+```
+
+The whole record went into the `json` field as an object. Notice `"actor": null`: that update was made by the counter flow above, and **a write made by a flow that an event started has no actor**, because the flow runs as the system. The audit trail therefore says who made a change only for changes made by a person.
+
+Because `snapshot` holds the raw record, the audit resource holds hidden fields. Give it a tight read policy, or leave `snapshot` out.
+
+### A notification when something happens
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "orders", "operations": ["created"] } } },
+    { "id": "m", "data": { "block": "mail.send", "config": {
+        "to": ["sales@example.com"],
+        "subject": "New order {{ input.event.payload.record.id }}",
+        "text": "Total: {{ input.event.payload.record.total }}"
+    } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "m" }]
+}
+```
+
+Check the Overview's `mail` entry: an installation with no mail configured reports `suppressed (not configured)`, and a flow that sends mail then delivers nothing. This recipe is a pattern assembled from blocks that were run separately, so test the mail path in your environment.
+
+### Only react to some changes
+
+Use a subscription with a condition, which filters **before** anything is queued, so a flow does not start for events it would ignore:
+
+```json
+{
+  "name": "big_orders",
+  "event": "orders.created",
+  "target_type": "flow",
+  "target": "review_order",
+  "condition": { "gte": ["$event.payload.record.total", 1000] },
+  "enabled": true
+}
+```
+
+All of these conditions were run on `orders.*` subscriptions, and each fired as expected for an API write and for a Records-tab write:
+
+| Condition | Fires for |
+| --- | --- |
+| `{"gte": ["$event.payload.record.total", 1000]}` | Orders of 1000 or more |
+| `{"eq": ["$event.payload.record.status", "paid"]}` | Paid orders |
+| `{"exists": "$event.actor"}` | Changes that have an actor (a person, or `studio`) |
+| `{"ne": ["$event.actor", "studio"]}` | Everything except Records-tab writes |
+| `{"eq": ["$event.name", "orders.created"]}` | Creations only |
+| `{"eq": ["$event.payload.change", "created"]}` | The same, by the payload's `change` |
+
+### Keeping a cached expand fresh
+
+A cached `posts` list that expands `author` does not follow a change to the author. A flow can clear it:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "authors", "operations": ["updated"] } } },
+    { "id": "c", "data": { "block": "cache.invalidate", "config": { "tags": ["resource:posts"] } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "c" }]
+}
+```
+
+Run: after the author was renamed through the API, the cached `?expand=author` list showed the new name, and the run's output was `1`, the number of entries it removed. See [Caching](/data/caching#a-cached-expand-does-not-follow-the-related-resource).
+
+### Cascading a delete
+
+There are no foreign keys, so deleting a parent leaves its children. A flow on the parent's `deleted` event can remove them. The flow reads `input.event.payload.record.id`, lists the children with a `resource.list` (filter `author_id` equal to that id) and removes them. Remember that each child deletion publishes its own `deleted` event.
+
+### Forwarding a shaped event
+
+To hand a third party a record without its hidden fields, build the payload in a flow and emit it as a custom event, which an endpoint then delivers:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "vault", "operations": ["created"] } } },
+    { "id": "s", "data": { "block": "transform.map", "config": {
+        "value": "{{ input.event.payload.record }}",
+        "transformer": { "pick": ["id", "label"], "case": "camel" }
+    } } },
+    { "id": "e", "data": { "block": "event.emit", "config": { "event": "public.vault.created", "payload": "{{ steps.s.output }}" } } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "t", "target": "s" },
+    { "id": "e2", "source": "s", "target": "e" }
+  ]
+}
+```
+
+A webhook endpoint subscribed to `public.vault.created` receives only `id` and `label`. The raw `vault.created` event still exists in the log, so this narrows what leaves, and does not erase what was recorded.
+
+## Event chains
+
+A consumer that writes to a resource publishes **more events**, which can start more consumers. This is how the counter flow above led to the audit flow: the counter's update published `posts.updated`, and the audit flow, listening to `posts.*`, recorded it. Chains are useful, and they have a failure mode:
+
+| Chain | Result |
+| --- | --- |
+| A flow on `orders.updated` that updates the same order | **A loop.** Each update publishes another `updated`. Nothing stops it |
+| Two flows, each updating the resource the other listens to | The same loop, longer |
+| A flow on `comments.created` that updates `posts` | A chain of two, ending where `posts` has no matching consumer |
+
+Pawabase does not detect loops. Prevent them:
+
+- **Switch events off** on resources that consumers write only for bookkeeping (the audit log above).
+- **Narrow the trigger's `operations`** so the flow's own change is not one of them.
+- **Add a condition**: act only when a field is in a particular state, so the second pass finds nothing to do.
+- **Make the write a no-op the second time.** The counter recomputes a value that does not change, but it still publishes an `updated` event on each write, so it relies on nothing else listening to `posts.updated` in a way that updates comments.
+- **Watch Flow runs.** A loop shows up as the same flow succeeding in a rapid stream.
+
+## The two switches on a resource
+
+Whether a resource announces its changes is decided by two switches, in the **Behaviour** section of the resource's sheet:
+
+| Switch | Hint | Default | Effect when on |
+| --- | --- | --- | --- |
+| **Emit events** | `<name>.created / updated / deleted` | **On** | Each successful write publishes an event |
+| **Broadcast changes** | *Push row changes to realtime subscribers.* | **Off** | Each successful write is published to the channel `resource:<name>` |
+
+In the stored definition they are `events` (default `true`) and `realtime` (default `false`):
+
+```json
+{ "name": "orders", "events": true, "realtime": false }
+```
+
+There is no separate **Events** tab on the resource: the switch is on the main sheet, and the sheet's tabs are **Configure**, **Records** (for an existing resource) and **JSON**.
+
+### Turning events off
+
+With **Emit events** off, a write publishes nothing, and no consumer, webhook or subscription hears about it. This was run: a resource with events off accepted a create and the event log gained no entry.
+
+| Turn it off for | Why |
+| --- | --- |
+| A resource that holds **secrets** or hidden fields that no consumer needs | The raw record never leaves the table |
+| **Bookkeeping** resources that consumers write: audit logs, counters, caches | Their writes would otherwise publish events and start chains |
+| A resource that is **bulk loaded** through the API | A thousand writes would be a thousand events, a thousand queued consumers and perhaps a thousand webhook deliveries |
+| A resource with **no consumers** at all | One less thing to publish and log |
+
+Turning events off does not affect the API, the cache clearing, validation or policies: the resource works exactly as before and simply stays silent. The switch is read **at write time**, so turning it back on affects the next write, and nothing is published retroactively for writes made while it was off.
+
+### Bulk loads
+
+A load of 50,000 rows through the API publishes 50,000 events, and each is recorded and routed. Three ways to avoid the flood:
+
+1. **Turn events off, load, turn them on.** Simple, and consumers miss the loaded rows, which may be what you want.
+2. **Load with SQL**, in the console or outside Pawabase. No events at all, and the cache needs a manual clear. See [Database console](/data/database-console).
+3. **Load through a function** and publish **one** summary event at the end (`await ctx.runtime.emit("orders.imported", {"count": 50000})`), after switching the resource's events off. Consumers react to the summary.
+
+### Broadcast changes
+
+Realtime has its own switch because it is a different audience: browsers and apps that hold a live connection. With **Broadcast changes** on, each write publishes the same payload as the event (`resource`, `change`, `record`) to `resource:<name>`.
+
+| | Event | Realtime broadcast |
+| --- | --- | --- |
+| Needs the switch | **Emit events** | **Broadcast changes** |
+| Goes to | Flows, subscriptions, webhooks | Subscribers of `resource:<name>` |
+| Recorded in the event log | Yes | No |
+| Retried | By each consumer's own job | Not at all. **Best effort** |
+| A failure fails the write? | No | No. It is logged |
+| Record is raw | Yes | **Yes** |
+
+The two are independent: a resource can broadcast without emitting events, and the other way round. A resource with only **Broadcast changes** on updates live clients and starts no flow.
+
+## Events and the other parts of the platform
+
+| Part | Relationship to resource events |
+| --- | --- |
+| **The cache** | The same after-write step clears the resource's entries and publishes the event. A cache clear and an event always happen together for a write through Pawabase |
+| **Policies** | A write is checked by its policy before it happens. Consumers are **not** checked: they run as the system and can read and write any resource |
+| **Transformers** | Not applied to events. See above |
+| **Validation** | Runs before the write. A write that fails validation publishes nothing. A write made by a flow or a function skips validation, and still publishes |
+| **Migrations** | Publish nothing |
+| **The Database console** | Publishes nothing. It clears caches and is audited |
+| **The Records tab** | Publishes, with the actor `studio` |
+| **Releases** | An event carries the id of the release that was serving, and queued work started by it keeps that release, so a flow started by an event runs the **definitions of that release**, not the latest edits |
+| **Promotion** | Subscriptions and webhooks are definitions and are copied by **promote**. A webhook's signing secret is not something to assume was copied: check the target, and set one if it was not |
+| **Environments** | Events belong to one environment. A write in `development` never reaches a consumer in `production` |
+
+The **Policies** row is worth a moment. A flow started by an event runs with `authenticated: false, kind: "system"`: it is not the person who made the change, and it is not subject to the resource policies. What it may do is limited only by the blocks it contains. Review event-triggered flows with the same care as routes.
+
+## A reproduced session
+
+This sequence ran on a clean API, and shows each rule above in order.
+
+<Steps>
+  <Step title="Create a resource and a flow that listens">
+    A `todos` resource with `title` and `done`, authenticated policies on every operation. A flow `on_todo` with a **Resource change** trigger on `todos` for `created` and `deleted`, and a **Transform** block that returns the event.
+  </Step>
+  <Step title="Add two subscriptions">
+    One for `todos.*` with the condition `{"exists": "$event.data"}` (what **Only when…** fills in), and one for `todos.created` with `{"exists": "$event.payload.record"}`. Both target `on_todo`.
+  </Step>
+  <Step title="Create a todo through the API">
+    `POST /rest/v1/todos` as `u-1`. The Events tab gained `todos.created` with the payload `{"resource": "todos", "change": "created", "record": {...}}`, the actor `u-1` and a request id. Its consumers were **two** flow runs: one from the **Resource change** trigger and one from the subscription whose condition read `$event.payload.record`. The `$event.data` subscription did not fire.
+  </Step>
+  <Step title="Update and delete it">
+    The `updated` event had **no consumers**: the trigger listened for `created` and `deleted` only, and the `$event.data` subscription never matches. The `deleted` event had one consumer, and its record was the row **as it was before deletion**, with `"done": true`.
+  </Step>
+  <Step title="Send an invalid create">
+    `POST` with no `title` answered `422`, and **no event** was recorded.
+  </Step>
+  <Step title="Create through the Records tab and through SQL">
+    The Records-tab create published `todos.created` with the actor `studio` and no request id. An `INSERT` in the SQL window with **allow writes** published **nothing**.
+  </Step>
+  <Step title="Read the flow's input">
+    Each run's input was `{"event": {"name": "todos.created", "project": "acme", "env": "development", "payload": {...}, "source": "api", "actor": "studio", ...}}`.
+  </Step>
+  <Step title="Hide a field and check the event">
+    A `vault` resource with a `write_only` `secret` and a transformer that omits it returned no `secret` from the API. Its `vault.created` event's record contained `"secret": "hunter2"`.
+  </Step>
+  <Step title="Turn events off">
+    A resource with **Emit events** off accepted a create, and the log had no new entry.
+  </Step>
+  <Step title="Emit a test event and add a webhook">
+    **Emit test event** with `custom.test` and `{"kind": "x"}` was routed to a realtime subscription (`alerts:x`, which failed in this installation for lack of a realtime service) and to a webhook endpoint pointing at an unreachable address. The delivery showed `retrying`, with the error `ConnectError: All connection attempts failed`, and kept retrying beyond the `2` attempts the endpoint was set to.
+  </Step>
+</Steps>
+
+## Choosing a consumer
+
+| You want to | Use | Because |
+| --- | --- | --- |
+| Do something in Pawabase every time a record changes | A flow with a **Resource change** trigger | One flow, one resource, the simplest wiring |
+| React to a family of events across resources | A flow with an **Event** trigger and a pattern | One flow for `*.deleted` |
+| React only when the event matches a condition | A **subscription** with a condition | Filtered before anything is queued |
+| Run Python | A subscription to a **function** | Functions are not triggers |
+| Push to browsers and apps | **Broadcast changes**, or a subscription to **realtime** | Live clients |
+| Tell another system | A **webhook** | Signed, retried, with a delivery log |
+| Build a safe payload for a third party | A flow that emits a **custom event**, and a webhook on that | The raw event carries hidden fields |
+| Keep two tables consistent | A flow that recomputes | Idempotent by construction |
+| Keep a history | A flow that writes an audit resource, with its events off | Records what changed and when |
+| Notify people | A flow with **Send mail** | Subject and body from the record |
+
+## Volume and cost
+
+Every write through Pawabase to a resource with events on does this extra work:
+
+| Step | Cost |
+| --- | --- |
+| Publish the event | One bus message |
+| Record it | One database row in the event log, holding the whole payload |
+| Route it | One check per subscription, per flow trigger and per webhook endpoint |
+| Each matching consumer | One queued job, and for a webhook one delivery row and one HTTP request |
+
+A resource written 100 times a second with five consumers is 600 extra operations a second. That is fine for most workloads, and it is the reason to keep **Emit events** off for write-heavy resources nobody listens to, to narrow patterns (`orders.created`, not `*`), and to keep payloads small by keeping rows small.
+
+The event log grows with every event. Watch it on a busy environment, and remember that each row holds a raw record.
+
+## Custom events
+
+Resource events are one kind of event. Your own flows, functions and the Events page can publish others, and the same consumers hear them.
+
+| Publisher | How |
+| --- | --- |
+| A flow | The **Emit event** block (`event.emit`), with an `event` name and a `payload` |
+| A function | `await ctx.runtime.emit("order.shipped", {...})` |
+| Studio | **Emit test event** |
+| The API | `POST .../events` with `{"name": ..., "payload": ...}` |
+| An inbound hook | Verified third-party calls can be emitted as events |
+
+### Naming
+
+Resource events use `<resource>.<change>`. For custom events, follow the same shape, `<noun>.<verb>`, so that patterns keep working:
+
+| Name | Reads as |
+| --- | --- |
+| `order.shipped` | An order was shipped |
+| `invoice.paid` | An invoice was paid |
+| `import.finished` | An import finished |
+| `public.vault.created` | The shaped, public version of a vault creation |
+
+Use the past tense, so the name states a fact that has happened. Avoid names that collide with a resource's own events: a custom event called `orders.created` is indistinguishable from the real one, and a consumer cannot tell them apart. Prefix custom domains instead, such as `shop.order_shipped`.
+
+### A good payload
+
+A payload is read by many consumers, some you have not written yet. Keep it:
+
+| Property | Why |
+| --- | --- |
+| **Small** | It is stored in the log and sent to every endpoint. Send ids and the facts a consumer needs, and let it fetch the rest |
+| **Self-contained for the common case** | A consumer should not have to fetch just to learn what happened. Include the new status, the amount, the id |
+| **Free of secrets and personal data it does not need** | The log and every webhook keep it |
+| **Stable** | Add keys freely. Do not rename or remove them. Consumers depend on them |
+| **Versioned when it must change** | Add a `version` key, or a new event name |
+
+Compare a resource event, which carries a whole raw row because it cannot know what you need, with a custom event, where you decide. For anything sent outside your system, prefer the custom event.
+
+## A walkthrough: order created to customer notified
+
+A shop wants three things to happen when an order is created: the stock is reduced, the customer is emailed, and the CRM is told. This is one way to build it from the pieces above.
+
+<Steps>
+  <Step title="Decide what the order resource announces">
+    `orders` keeps **Emit events** on, so every creation publishes `orders.created`. It does **not** carry card or address data, so its raw events are safe to send within the system. The CRM, an outside party, will get a shaped event instead.
+  </Step>
+  <Step title="Reduce stock from a flow">
+    A flow with a **Resource change** trigger on `orders` (operation `created`) reads the order's lines and writes the new stock. It recomputes the stock from its source of truth rather than subtracting, so a retry is harmless.
+  </Step>
+  <Step title="Email the customer from a subscription">
+    A subscription for `orders.created` with the condition `{"exists": "$event.payload.record.email"}` runs a `notify_customer` flow, so the flow does not start for orders without an address. The flow sends mail with a template, filling it from `input.event.payload.record`.
+  </Step>
+  <Step title="Tell the CRM with a shaped event">
+    A third flow, on `orders.created`, builds `{ "order": id, "total": total, "customer": customer_id }` with **Transform**, and emits `shop.order_created` with that payload. A **webhook** endpoint for the CRM is subscribed to `shop.order_created` only.
+  </Step>
+  <Step title="Watch it in Events & runs">
+    Create an order. The **Events** tab shows `orders.created` with three consumers, then `shop.order_created` with one webhook. **Flow runs** shows the three flows, and **Webhook deliveries** shows the CRM delivery with its HTTP status.
+  </Step>
+  <Step title="Plan for failure">
+    If the mail provider is down, the `notify_customer` run fails and appears in **Jobs & queues**, where **Retry** runs it again. If the CRM is down, the delivery retries with backoff and can be **Redeliver**ed. Neither failure touches the order, because the order was written before any consumer ran.
+  </Step>
+</Steps>
+
+The properties of the design are the properties of the platform: the order write is fast, because consumers run later; each consumer fails and retries alone; the CRM never sees a raw order; and any of the three can be changed without touching the others.
+
+## Testing a consumer
+
+A consumer is a flow, a subscription or an endpoint, so a test emits an event and checks what happened. Use a development environment.
+
+```python
+import time
+import requests
+
+BASE = "https://api.example.com/platform/v1/projects/acme/envs/development"
+HEADERS = {"Authorization": f"Bearer {OPERATOR_TOKEN}"}
+
+
+def emit(name, payload):
+    response = requests.post(f"{BASE}/events", headers=HEADERS, json={"name": name, "payload": payload})
+    response.raise_for_status()
+    return response.json()["event_id"]
+
+
+def event(event_id):
+    return requests.get(f"{BASE}/events/{event_id}", headers=HEADERS).json()
+
+
+def wait_for(predicate, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.5)
+    raise AssertionError("timed out")
+
+
+def test_big_orders_reach_the_review_flow():
+    payload = {"resource": "orders", "change": "created", "record": {"id": 99, "total": 2500, "status": "paid"}}
+    event_id = emit("orders.created", payload)
+
+    consumers = wait_for(lambda: event(event_id)["consumers"])
+    assert any(c["target"] == "review_order" and c["status"] == "queued" for c in consumers)
+
+    runs = wait_for(lambda: [r for r in requests.get(f"{BASE}/flow-runs?limit=20", headers=HEADERS).json()["data"]
+                             if r["flow"] == "review_order" and r["status"] == "succeeded"])
+    assert runs
+```
+
+What the test shows: an event with the **same name and payload shape** as a real one is routed exactly as one would be, so it exercises conditions, triggers and endpoints. It does **not** exercise the write itself (validation, policy, the actor), so keep one end-to-end test that creates a real record.
+
+Check three things for each consumer:
+
+1. **It fires when it should**: the event's `consumers` lists it.
+2. **It stays quiet when it should**: a payload that fails the condition leaves `consumers` empty.
+3. **It does the right thing twice**: emit the same payload again and confirm the result is unchanged.
+
+## A security review for events
+
+| Question | What to check |
+| --- | --- |
+| **What is in the raw record?** | Hidden, `write_only` and undeclared columns are in it. Read one event's `payload.record` |
+| **Who reads the event log?** | Anyone with operator access to the environment's Events tab. It holds raw records |
+| **Where do webhooks go?** | Every endpoint receives raw records for the events it matches. Confirm each endpoint's owner and its **Events** list |
+| **Is `*` used?** | A `*` endpoint receives user and session events as well. Narrow it |
+| **Who may subscribe to the realtime channel?** | Its channel rule. The record in it is raw |
+| **Can a consumer do more than it should?** | Flows run as the system and bypass resource policies. Review what each can write |
+| **Is the receiver verifying signatures?** | On the raw body, with a five-minute tolerance |
+| **Are secrets in payloads?** | Never put a secret in a custom event's payload |
+| **Can a loop cost money?** | A loop that sends mail or calls a paid API repeats without bound. Add conditions and rate limits to anything that costs |
+| **Is the signing secret safe?** | It is returned once. Store it as a secret, and rotate it by creating a new endpoint and removing the old |
+
+### Rotating a webhook secret
+
+The signing secret of an endpoint cannot be read back, so rotate by replacement:
+
+1. Create a second endpoint with the same URL and events, and let Pawabase generate a secret. Store it.
+2. Make the receiver accept **either** secret for a short time.
+3. Remove the first endpoint.
+4. Make the receiver accept only the new secret.
+
+Alternatively, edit the endpoint and supply a new secret yourself (at least 16 characters), then update the receiver at the same moment.
+
+## Reconciliation: when an event must not be missed
+
+Events are best used as a prompt. For anything where a missed event is costly (money, stock, entitlements), pair them with a periodic check against the source of truth:
+
+| Layer | Job |
+| --- | --- |
+| **Event** | Reacts within seconds |
+| **Schedule** | Every hour or night, a flow recomputes the derived value from the table and writes it if it differs |
+| **Alert** | The reconciliation counts the corrections it makes, and a rising count means events are being lost |
+
+The counter recipe is already a reconciliation, since it recomputes. For a webhook receiver, the equivalent is a nightly list of the source's records since a checkpoint, compared with what the receiver has. See [Schedules](/jobs/schedules).
+
+Events make a system responsive, and reconciliation makes it correct. Use both where it matters, and either alone where it does not.
+
+## Tracing one change from write to consumer
+
+Every step carries the **request id** of the write that started it, so you can follow a change end to end.
+
+<Steps>
+  <Step title="Start from the request">
+    In **Observability**, find the write by its path (`/orders`). Open its **Request trace**. The HTTP request's notes list the events it published, such as `orders.created`, and the **Events** section of the trace shows them.
+  </Step>
+  <Step title="Open the event">
+    On **Events & runs → Events**, find the event by name. Its **Actor** is the caller, and its `request_id` matches the trace you came from. Its **consumers** list says what it was routed to and whether each hand-off worked.
+  </Step>
+  <Step title="Follow a flow consumer">
+    On **Flow runs**, find the run by flow name. Its **Trigger** is `event`, and its input is the event envelope. Open it for the step-by-step trace, with each block's input and output, and any error.
+  </Step>
+  <Step title="Follow a webhook consumer">
+    On **Webhook deliveries**, find the delivery by endpoint and event. Its status, attempts, last HTTP status and error say where it stands. **Redeliver** sends it again.
+  </Step>
+  <Step title="Follow the chain">
+    If the flow wrote a resource, that write published its own event, with a `request_id` of its own (or none, for a system flow). Look for the next event after the flow run, with the actor empty.
+  </Step>
+</Steps>
+
+Three habits make this routine: **name flows for what they do** (so Flow runs reads like a sentence), **keep payloads small** (so the Events tab is readable), and **look at the consumers list first** (so you know within seconds whether the problem is "nothing was routed" or "the consumer failed").
+
+## Which trigger gives which input
+
+A flow can start in several ways, and the shape of its `input` differs. The ones that matter for events:
+
+| Trigger | `input` is | A value is read as |
+| --- | --- | --- |
+| **Resource change** (`trigger.resource`) | `{"event": {...}}` | `{{ input.event.payload.record.title }}` |
+| **Event** (`trigger.event`) | `{"event": {...}}` | `{{ input.event.payload.record.title }}`, or `{{ input.event.payload.kind }}` for a custom event |
+| A subscription with a flow target | `{"event": {...}}` | The same |
+| **HTTP trigger** (a route) | `{"params", "query", "body"}` | `{{ input.body.reason }}` |
+
+So the three event paths give a flow the same input, and the only difference is how the flow was started. A flow that serves both an event and a route needs to read from different places, and is usually better as two flows that share a third.
+
+## Event patterns, at a glance
+
+| You want | Pattern in a trigger or subscription | Pattern in a webhook |
+| --- | --- | --- |
+| Creations of one resource | `orders.created` | `orders.created` |
+| Every change to one resource | `orders.*` | `orders.*` |
+| Every deletion | `*.deleted` | `*.deleted` |
+| Several resources | Several triggers or subscriptions | `["orders.*", "customers.*"]` |
+| Everything | `*` | `*` |
+| A custom family | `shop.*` | `shop.*` |
+
+A **Resource change** trigger does not take a pattern: it takes a resource and a list of operations.
+
+## Reference
+
+### Resource event names and payloads
+
+| Event | `payload.record` | Published when |
+| --- | --- | --- |
+| `<resource>.created` | The new row | An insert succeeds |
+| `<resource>.updated` | The whole row after the update | An update succeeds |
+| `<resource>.deleted` | The row as it was before deletion | A delete succeeds |
+
+### Consumer statuses, on an event
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | A flow, function or webhook job was queued |
+| `done` | A realtime publication was made |
+| `failed` | Handing the work over failed. The consumer carries an `error` |
+
+### Delivery statuses, on a webhook delivery
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Queued, not attempted |
+| `retrying` | An attempt failed, another will follow |
+| `delivered` | Answered with a `2xx` |
+| `failed` | Given up, or refused before sending |
+
+### Where things are set
+
+| Setting | Where |
+| --- | --- |
+| Whether a resource publishes events | The resource, **Behaviour**, **Emit events** |
+| Whether a resource broadcasts to realtime | The resource, **Behaviour**, **Broadcast changes** |
+| A flow that starts on an event | The flow's trigger: **Resource change** or **Event** |
+| A rule that routes an event to a flow, a function or realtime | **Event subscriptions** |
+| An outside receiver | **Webhooks** |
+| What may subscribe to a resource's channel | **Settings**, **Realtime**, channel rules |
+| Seeing events, runs, deliveries and mail | **Events & runs** |
+| Retrying a failed job | **Jobs & queues** |
+
+### Limits and defaults
+
+| Item | Value |
+| --- | --- |
+| **Emit events** default | On |
+| **Broadcast changes** default | Off |
+| Webhook delivery tries | 5 (the **Attempts** field is stored and unused) |
+| Webhook backoff | Exponential from two seconds, capped at a minute |
+| Webhook request timeout | Fifteen seconds per attempt |
+| Signature tolerance | Five minutes |
+| Stored response body | The first 2,000 characters |
+| Webhook **Events** default | `*` |
+
+## What changes when you promote
+
+Event wiring is made of definitions, and **Promote** carries them.
+
+| Definition | Promoted | Check after |
+| --- | --- | --- |
+| A resource's `events` and `realtime` switches | With the resource | That the target's resource has the switches you intend |
+| Flows and their triggers | With the flows | That the target has the resources the flows name |
+| Event subscriptions | Yes | That the target flow, function or channel exists there |
+| Webhook endpoints | Yes | The **URL** (development URLs must not reach production), the events, and the **signing secret** |
+| A webhook's **extra headers** | With the endpoint | That no development token is in them |
+
+Two mistakes to avoid. **A promoted webhook pointing at a development receiver** sends production data to the wrong place, so change the URL in the target after promoting. And **a promoted subscription whose flow was not promoted** is a consumer that fails every time, which shows as a `failed` consumer on every event.
+
+Because promote never deletes, a subscription or endpoint you removed in the source stays in the target until you remove it there.
+
+## Definitions you can copy
+
+### A subscription to a flow
+
+```json
+{
+  "name": "review_big_orders",
+  "description": "Send big paid orders to a human",
+  "event": "orders.created",
+  "target_type": "flow",
+  "target": "review_order",
+  "condition": { "all": [
+    { "gte": ["$event.payload.record.total", 1000] },
+    { "eq": ["$event.payload.record.status", "paid"] }
+  ] },
+  "enabled": true
+}
+```
+
+### A subscription to a function
+
+```json
+{
+  "name": "sync_search",
+  "event": "products.*",
+  "target_type": "function",
+  "target": "index-product",
+  "condition": null,
+  "enabled": true
+}
+```
+
+The function is queued with `{"event": {...}}` as its input, so it reads `ctx.input["event"]["payload"]["record"]`.
+
+### A subscription to a realtime channel
+
+```json
+{
+  "name": "tenant_feed",
+  "event": "orders.*",
+  "target_type": "realtime",
+  "target": "org:{{ event.payload.record.org_id }}",
+  "enabled": true
+}
+```
+
+The channel is built from the event, so each tenant's changes go to its own channel. The target is rendered with `event` in scope, which is how `alerts:{{ event.payload.kind }}` became `alerts:x` in a run.
+
+### A webhook endpoint
+
+```json
+{
+  "name": "crm",
+  "description": "Customer records to the CRM",
+  "url": "https://crm.example.com/hooks/pawabase",
+  "events": ["shop.order_created", "customers.created", "customers.updated"],
+  "headers": { "x-source": "pawabase" },
+  "enabled": true,
+  "max_attempts": 5
+}
+```
+
+### A flow that starts on a resource change
+
+```json
+{
+  "name": "welcome_new_customer",
+  "definition": {
+    "nodes": [
+      { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "customers", "operations": ["created"] } } },
+      { "id": "m", "data": { "block": "mail.send", "config": {
+          "to": ["{{ input.event.payload.record.email }}"],
+          "subject": "Welcome, {{ input.event.payload.record.name }}",
+          "text": "Thanks for joining."
+      } } }
+    ],
+    "edges": [{ "id": "e1", "source": "t", "target": "m" }]
+  }
+}
+```
+
+Mail is one of the things that does nothing visible in a development install that has no mail configured (the Overview shows it as suppressed), so confirm the mail path where mail is real before relying on it.
+
+## What events are not
+
+A few jobs look like events and are better done another way.
+
+| It is not | Because | Use |
+| --- | --- | --- |
+| **A guaranteed work queue** | It is at least once but not transactional, and unordered | A queued job (`queue.flow`, `dispatch_flow`) that you start deliberately |
+| **A replication stream** | An update carries no "before", and a crash can drop an event | Database replication, or reconciliation |
+| **An audit trail** | Only changes made through Pawabase, only with the raw state, and the log has no stated retention | An audit resource written by a flow, plus the platform's audit log for management actions |
+| **A transaction** | The consumer runs after the write, and can fail alone | `db.transaction` for steps that must succeed together |
+| **A way to read data** | The payload is a snapshot at the moment of the change | Read the resource |
+| **A secure channel** | Raw records, to every consumer | A shaped event, to a named audience |
+| **A scheduler** | It fires on a change, not on time | **Schedules** |
+
+Used for what they are, a prompt that something changed, with enough data to react, they are the simplest and most reliable way to connect the parts of a Pawabase system.
+
+## Common design mistakes
+
+| Mistake | What goes wrong | Instead |
+| --- | --- | --- |
+| Pointing a webhook at a resource with secrets | The secrets leave in every delivery | A shaped custom event |
+| Using `*` for a webhook | It receives unrelated events and personal data | A short list of patterns |
+| A flow that updates its own trigger resource | An endless loop | Narrow the operations, add a condition, or switch events off on the written resource |
+| An incrementing counter | A retry counts twice | Recompute |
+| Trusting arrival order | A late `updated` overwrites a newer state | Compare `updated_at` |
+| Treating a missing event as impossible | A crash can lose one | Reconcile on a schedule |
+| Writing through SQL and expecting consumers | SQL publishes nothing | Write through the API, or emit an event |
+| Leaving **Emit events** on for a bulk load | A flood of consumers | Switch it off, or load with SQL |
+| A subscription with **Only when…** left at its default | It never fires | Change `$event.data` to a path under `$event.payload` |
+| A webhook URL on a private address | Refused outside development | A public HTTPS address |
+| Verifying a signature on parsed JSON | The bytes differ, and it fails | Verify the raw body |
+| Assuming **Attempts** limits retries | The job makes five | Plan for five |
+
+Each row is a small decision made once, in a form or a flow. They are the difference between events that quietly connect a system and events that surprise it.
+
+## The API for events
+
+Everything the Events & runs page does is a platform API call, so scripts can do it too. All of these are under `/platform/v1/projects/{ref}/envs/{env}` and need an operator.
+
+| Call | Purpose | Notes |
+| --- | --- | --- |
+| `GET /events?name=<exact>&limit=<n>` | List events, newest first | `name` is an **exact** match, not a pattern. Returns `{"data": [...]}` |
+| `GET /events/<event_id>` | One event | Takes the event's `event_id` (the long hex id). The numeric `id` answers `404`, `no such event` |
+| `POST /events` | Emit an event | Body `{"name": "...", "payload": ...}`. Returns `{"event_id": "..."}` |
+| `GET /events-graph` | The event map | Producers and consumers per event name |
+| `GET /flow-runs?status=&limit=` | Flow runs | |
+| `GET /flow-runs/<id>` | One run, with its input, output and step trace | |
+| `GET /webhook-deliveries` | Deliveries | |
+| `POST /webhook-deliveries/<id>/redeliver` | Queue a delivery again | |
+| `GET`, `POST`, `PUT`, `DELETE /subscriptions` | Event subscriptions | |
+| `GET`, `POST`, `PUT`, `DELETE /webhooks` | Webhook endpoints | The creating response carries the generated signing secret once |
+| `POST /jobs/<id>/retry` | Retry a failed job | |
+
+A stored event, from the list, has these fields:
+
+```json
+{
+  "id": 2,
+  "event_id": "6373a07067cb4ca4b9c8cecf971a8186",
+  "project": "acme",
+  "env": "development",
+  "name": "todos.created",
+  "source": "api",
+  "actor": "u-1",
+  "payload": { "resource": "todos", "change": "created", "record": { "id": 2, "title": "b" } },
+  "request_id": "d58bf986-52d9-4bed-acfb-4698dea7b70a",
+  "occurred_at": "2026-10-01T22:19:50.907549+00:00",
+  "consumers": [],
+  "created_at": "2026-10-01T22:19:50.910240+00:00",
+  "updated_at": "2026-10-01T22:19:50.910263+00:00"
+}
+```
+
+Two ids are present: `id` is the row's number in the log, and `event_id` is the event's own id, which is the one the webhook body carries as `id` and the one the detail route takes.
+
+Creating a webhook endpoint:
+
+```http
+POST /platform/v1/projects/acme/envs/production/webhooks
+```
+
+```json
+{
+  "name": "crm",
+  "url": "https://crm.example.com/hooks/pawabase",
+  "events": ["orders.*", "customers.created"],
+  "headers": { "x-source": "pawabase" },
+  "max_attempts": 5
+}
+```
+
+```json
+{
+  "id": 2,
+  "name": "crm",
+  "url": "https://crm.example.com/hooks/pawabase",
+  "events": ["orders.*", "customers.created"],
+  "headers": {},
+  "enabled": true,
+  "max_attempts": 5,
+  "secret": "whsec_zTu2ami8KglRg7u8SZNRretOTMQ0XSs4"
+}
+```
+
+The `secret` is the signing secret. Store it where the receiver can read it, because it is not returned again.
+
+## Troubleshooting
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| No event appeared after a write | The write did not go through Pawabase (SQL, the console, a migration), or the resource's **Emit events** is off, or the write failed validation | Check how the write was made, and the switch |
+| An event appeared with no consumers | Nothing matches: a subscription's pattern or condition, a flow trigger's resource and operations, or an endpoint's events | Compare the event name with each consumer's pattern. Use **Emit test event** |
+| A subscription never fires | Its condition is `{"exists": "$event.data"}`, the default **Only when…** fills in. The envelope has no `data` | Change it to a path under `$event.payload` |
+| A flow did not start on an `updated` event | The **Resource change** trigger's `operations` list does not include `updated` | Add it, or omit `operations` |
+| A flow starts, and cannot find the record's fields | The template reads `input.payload...` instead of `input.event.payload...` | The event is under `input.event` |
+| The webhook receives the secret field | Events carry the raw record | Stop sending the raw event. Send a shaped custom event |
+| A webhook delivery is `failed` with `resolves to a private address` | The URL points at a private or loopback host and the installation is not local | Use a public HTTPS address |
+| A webhook delivery keeps `retrying` | The receiver is down, slow, or answering non-`2xx` | Fix the receiver, then **Redeliver** |
+| A delivery makes more attempts than the endpoint's **Attempts** | That setting is not used. The job makes five | Plan for five |
+| The receiver rejects the signature | It hashed a parsed body, or the wrong secret, or the clock is more than five minutes off | Hash the raw bytes, and check the secret and the clock |
+| The receiver gets events out of order | Consumers run as independent jobs | Compare `record.updated_at` before overwriting |
+| The same event arrives twice | A retry after a timeout, or an endpoint registered twice | De-duplicate on the body's `id` |
+| A flow ran, and the record it read is old | The flow ran after later writes | Read the record by id inside the flow, or compare `updated_at` |
+| A counter is wrong | The flow increments, and ran twice | Recompute from the table |
+| Flow runs stream endlessly | An event loop: a flow updates the resource it listens to | Narrow the trigger, add a condition, or switch the written resource's events off |
+| A realtime consumer shows `failed` | The realtime service could not be reached | Check the realtime service. The write was not affected |
+| A resource event is missing for a bulk load | Events were switched off, or the load used SQL | Expected |
+| The Events tab filter finds nothing | It matches the name **exactly**, and a suggested name `resource.todos.created` is not a name | Filter by `todos.created` |
+| An event's Details window will not open | The row's numeric id was sent where the `event_id` is needed | Read it by `event_id` through the API |
+
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Is every write guaranteed to publish an event?">
+    Not guaranteed. A write through Pawabase publishes after it succeeds, but the publish is not inside the database transaction, so a crash between the two loses the event. A write that does not go through Pawabase, or a resource with events off, publishes nothing.
+  </Accordion>
+  <Accordion title="What is the name of a resource event?">
+    `<resource>.created`, `<resource>.updated` or `<resource>.deleted`. There is no `resource.` prefix, whatever a placeholder in Studio suggests.
+  </Accordion>
+  <Accordion title="Where is the record in an event?">
+    Under `payload.record`. The envelope also has `name`, `project`, `env`, `source`, `actor`, `id`, `occurred_at` and `request_id`.
+  </Accordion>
+  <Accordion title="Does an update event say what changed?">
+    No. It carries the whole row after the update. Compare it with what you last saw.
+  </Accordion>
+  <Accordion title="What does a delete event contain?">
+    The row as it was before the delete, including its last update.
+  </Accordion>
+  <Accordion title="Does the event respect my transformer or `write_only`?">
+    No. The record is the raw row. Hidden fields are in it, for flows, subscriptions, webhooks and realtime.
+  </Accordion>
+  <Accordion title="Do events fire for console or SQL writes?">
+    No. They are audited and clear caches, and publish nothing.
+  </Accordion>
+  <Accordion title="Do events fire for Records-tab writes?">
+    Yes, with the actor `studio`.
+  </Accordion>
+  <Accordion title="Do events fire for writes made by flows?">
+    Yes, with the caller as the actor when a person started the flow, and no actor when an event started it. A flow's writes can start other flows.
+  </Accordion>
+  <Accordion title="Are events ordered?">
+    They are published in order, and consumed as independent jobs, so arrival order is not guaranteed. Use `updated_at` or a version number.
+  </Accordion>
+  <Accordion title="Are events delivered exactly once?">
+    No. The bus is at-least-once and each consumer retries, so a consumer can run more than once. Make it idempotent.
+  </Accordion>
+  <Accordion title="How do I stop an infinite loop?">
+    Switch events off on the resource the flow writes, narrow the trigger's operations, or add a condition. Pawabase does not detect loops.
+  </Accordion>
+  <Accordion title="Why did my webhook get five attempts when I set two?">
+    The **Attempts** field is stored and not used. The delivery job makes five attempts with backoff.
+  </Accordion>
+  <Accordion title="Can a webhook go to localhost?">
+    In a local or test installation, yes. In any other, the delivery is refused as a private address.
+  </Accordion>
+  <Accordion title="How do I resend a webhook?">
+    Press **Redeliver** on its row in **Webhook deliveries**.
+  </Accordion>
+  <Accordion title="Can I subscribe from my own code?">
+    Through a webhook, which is the supported way to hear about events outside Pawabase. Inside Pawabase, use flows, subscriptions and functions.
+  </Accordion>
+  <Accordion title="Can I send events from outside Pawabase into it?">
+    Yes, with an inbound hook, which can emit an event or run a flow. See [Inbound webhooks](/webhooks/inbound).
+  </Accordion>
+  <Accordion title="Do events cross environments?">
+    No. An event belongs to the environment where the write happened.
+  </Accordion>
+  <Accordion title="Do I pay for events I do not use?">
+    Each event is recorded and routed. A resource nobody listens to is cheaper with **Emit events** off.
+  </Accordion>
+</AccordionGroup>
+
+## How this page differs from earlier versions
+
+If you have seen older documentation for resource events, these are the corrections.
+
+| Earlier claim | What actually happens |
+| --- | --- |
+| The event is emitted inside the database transaction and is guaranteed if the write commits | It is published **after** the write, outside the transaction, and can be lost in a crash |
+| The payload is the bare record | The payload is `{"resource", "change", "record"}` |
+| The envelope has `event`, `published_at`, `correlation_id` | It has `name`, `occurred_at`, `request_id`, `source`, `actor`, `id`, `project`, `env`, `release_id` and `api_version` |
+| The flow input has `$input.event`, `$input.payload` | The flow input is `{"event": {...}}`: `input.event.payload.record` |
+| Events are ordered within a resource | Consumers are independent jobs. No ordering is guaranteed |
+| The record is "shaped as it exists in the database" and hidden fields are not an issue | That is the problem: hidden fields are in every event |
+| The resource has an **Events** tab with a toggle | The **Emit events** switch is on the main sheet, in **Behaviour** |
+| Webhooks are under **Automate → Webhooks** | They are under **Webhooks** in the environment's navigation |
+| Subscribe from code with an `EventBus` client | There is no client for external code. Use a webhook |
+| A webhook receives the full event envelope | It receives `{id, event, project, env, data, sent_at}`, where `data` is the payload |
+| Every emitted event is in the audit log | Events are in the **event log** (the Events tab). The audit log records management actions |
+| A failed delivery is retried manually from the audit log | **Redeliver** on **Webhook deliveries**, and **Retry** on **Jobs & queues** |
+| Retries follow each subscription's policy | A webhook endpoint's **Attempts** is stored and unused. Jobs retry with their own backoff |
+
+## Before you rely on an event
+
+1. **Does every writer go through Pawabase?** If not, the event is not the whole story.
+2. **Is the consumer safe to run twice?**
+3. **Does it cope with events arriving out of order?** Does it compare `updated_at`?
+4. **What does the event contain that it should not?** Hidden fields, secrets, personal data.
+5. **Is the webhook's address public,** and does the receiver verify the signature on the raw bytes?
+6. **Can the flow loop?** Does it write a resource it listens to?
+7. **Is the subscription's condition real?** Has it been tested with **Emit test event**, and does it avoid `$event.data`?
+8. **Are the switches right?** Events on only where something listens, broadcast on only where clients need it.
+9. **Who can see the event log?** It holds raw records.
+10. **What happens if the event is lost?** Is there a periodic reconciliation?
+
+## What to remember
+
+- **A write through Pawabase publishes `<resource>.<change>`** after it succeeds, if **Emit events** is on.
+- **The payload is `{resource, change, record}`**, and the record is **raw**: hidden fields included.
+- **SQL, the console and migrations publish nothing.** The Records tab does.
+- **Consumers are flows, subscriptions, webhooks and realtime**, each a queued job.
+- **Delivery is at least once, unordered and not inside the transaction.** Write idempotent consumers.
+- **A flow reads the event at `input.event`.**
+- **A subscription's default condition never matches.** Use `$event.payload...`.
+- **A webhook is signed, retried five times, and refused for private addresses** outside development. Its **Attempts** field is not used.
+- **A flow can write, and writes publish events.** Break loops deliberately.
+- **To share a record safely, share a shaped event,** not the raw one.
+
+## Terms
+
+| Term | Meaning |
+| --- | --- |
+| **Event** | A named fact with a payload, published on the platform bus |
+| **Resource event** | An event for a change to a resource, named `<resource>.<change>` |
+| **Envelope** | The event with its name, project, environment, source, actor, id, time and request id |
+| **Payload** | For a resource event, `{resource, change, record}` |
+| **Raw record** | The row as the database holds it, before any transformer or `select` |
+| **Event processor** | The part of the API that records an event and routes it to consumers |
+| **Event log** | The record of processed events, shown on the Events tab |
+| **Consumer** | A flow, subscription target, webhook endpoint or realtime channel that receives an event |
+| **Subscription** | A stored link from an event pattern, with an optional condition, to a flow, a function or a realtime channel |
+| **Webhook endpoint** | A stored URL that receives matching events as signed HTTP requests |
+| **Delivery** | One attempt series to send one event to one endpoint |
+| **Idempotent** | Safe to run again with the same result |
+
+<CardGroup cols={2}>
+  <Card title="Transformers" icon="wand" href="/data/transformers" />
+  <Card title="Caching" icon="clock" href="/data/caching" />
+  <Card title="Custom routes" icon="route" href="/data/custom-routes" />
+  <Card title="Flows" icon="workflow" href="/flows/overview" />
+</CardGroup>

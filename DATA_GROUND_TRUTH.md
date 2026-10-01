@@ -68,29 +68,59 @@ not in here or that you have confirmed by reading source yourself.
 - Section label "Resources", description: "Tables exposed as REST at /rest/v1/<name>, guarded per
   operation by policies."
 - Button: **"New resource"**; empty state: **"No resources yet"** / "Create the first one".
-- `ResourceForm` sections in order: **Details**, **Fields**, **Operations**, **Relations**,
-  **Caching & limits**, **Events & realtime**.
-  - Details: **Name** (mono input, autofocused, disabled once created — "Fixed once created; other
-    definitions refer to it by name"), **Table** (optional; "Defaults to the resource name"),
-    **Description** (optional, "What is this for?").
-  - Fields: a `FieldsEditor`; **Add field** button; rows reorderable (chevrons), deletable
-    (trash); "More options" collapses the constraints panel.
-  - Operations: a **Which operations are public?** toggle (all/none), then one row per operation
-    with an **On/Off** switch and a **Who may** `PolicyPicker`. Exact operation labels:
-    `list` → **List**, `get` → **Get one**, `create` → **Create**, `update` → **Update**,
-    `delete` → **Delete**.
-  - Relations: a relations builder listing each relation.
-  - Caching & limits: **Cache responses** (seconds, min 0 max 86400, "0 turns caching off"),
-    **Rate limit** switch → "requests per / seconds" number inputs (when switched on the default is
-    `{limit: 60, window: 60}`), hint "Per caller, counted across all gateway instances."
-  - Events & realtime: **Emit events on change** (default on),
-    **Publish changes to realtime** (default off).
-  - Also on the form: **Owner field** (a field picker; "Set this field to the signed-in user's id
-    on create") and **Timestamps** (maintain created_at/updated_at).
+- `ResourceForm` sections, in order: **Details**, **Fields**, **Access**, **Relations**,
+  **Behaviour**.
+  - **Details**: **Name** (mono, autofocused, placeholder `todos`, disabled once created; hint is
+    `Served at /rest/v1/<name>` while new, "The URL segment; fixed once created." afterwards);
+    **Table** (optional, mono, hint "Defaults to the name.", stores `null` when cleared);
+    **Primary key** (mono, placeholder `id`); **ID type** — a `Segmented` control with exactly two
+    options: **Auto-increment** (`integer`) and **UUID** (`uuid`); **Description** (optional,
+    placeholder "What rows live here?").
+  - **Fields**: section description reads `The primary key and created_at / updated_at are added
+    for you.` (or `The primary key is added for you.` when Timestamps is off). Contains the
+    `FieldsEditor`.
+  - **Access**: description "Which endpoints exist, and who may call each." One row per operation
+    in `OPS` order, each row = an On/Off `Switch` + the HTTP method badge + the operation key
+    (`list`, `get`, `create`, `update`, `delete`). When a row is on, a `PolicyPicker` appears whose
+    empty label is **"Secret keys only"**; when off, the row shows the hint
+    **"Off: the endpoint is not served."** There is no all/none toggle.
+  - **Relations**: description "Include related rows with ?expand=name." One sunken card per
+    relation with **Name** (mono, placeholder `author`), **Kind** — a `Segmented` of
+    **Belongs to** / **Has many** —, **Resource** (a `RefSelect` over resources), and a **Foreign
+    key** field whose label changes with the kind: **"Foreign key here"** for belongs_to,
+    **"Foreign key on <resource>"** for has_many. A trash button labelled "Remove relation", and an
+    **"Add relation"** row button.
+  - **Behaviour**: a form-grid containing **Emit events** (checked unless `events === false`, hint
+    `<name>.created / updated / deleted`), **Broadcast changes** ("Push row changes to realtime
+    subscribers."), **Timestamps** ("Maintain created_at and updated_at."), **Owner field**
+    (optional `RefSelect` over this resource's own fields, empty label "None", hint "Filled with
+    the caller's user id on create."), **Transformer** (optional `RefSelect` over transformers,
+    hint "Reshapes rows in responses."), **Cache responses** (the `CacheTtl` control), the
+    **Rate limit** control, and **Tags** (optional `TagInput`, hint "Groups endpoints in the API
+    docs.", placeholder `billing`).
 - The `Definitions.jsx` sheet has a **JSON** tab beside the form, and it is the *same body* the
   API stores — the form and the JSON never disagree.
 - Client-side `problem()` guard: name required; unnamed fields (including nested `object` fields)
   block save with "Every field needs a name."
+- `RouteForm` sections, in order: **Endpoint**, then the input/response/handler sections. The
+  **Endpoint** section has one **"Method and path"** control — a method `<select>`
+  (GET/POST/PUT/PATCH/DELETE, default POST) plus a literal `/rest/v1` addon and a path input, with
+  the hint "Served under /rest/v1. Use {param} for path parameters."
+
+### Data-plane error bodies (api/app/compiler/errors.py) — important and often gotten wrong
+
+The data plane **does not wrap errors in an envelope**. The JSON body is exactly the exception's
+`detail`:
+- **401 / 403 / 404 / 409 and most other non-validation errors**: a bare JSON **string**, e.g.
+  `"Not found"`. Not `{"detail": ...}`.
+- **422**: a bare JSON **array** of Pydantic error items, each `{type, loc, msg, input, url}` —
+  e.g. `[{"type":"missing","loc":["title"],"msg":"Field required", ...}]`.
+- The `{"error": ..., "message": ..., "details": ...}` shape is used by the **platform/management
+  plane** and by flow error bodies, not by resource routes.
+- Do not claim a `409 Conflict` on the resource write path: the resource compiler registers no
+  `IntegrityError` mapping, so a unique-constraint violation surfaces as the driver's own error
+  (a 400 from `SqlError`-adjacent handling or a 500), not a mapped 409. `CONFLICT` exists in
+  `errors.py` as a reusable group but is not wired into the resource routes.
 
 ### Field row UI (components/definitions/FieldsEditor.jsx) — exact labels
 

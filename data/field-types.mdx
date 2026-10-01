@@ -1,272 +1,1502 @@
 ---
 title: "Field types"
-description: "The fourteen field types a Resource or Schema field can declare, how each validates, stores, and appears in JSON and OpenAPI."
+description: "The fourteen field types, what each accepts and returns, how each is stored on SQLite, PostgreSQL and MySQL, and the places where the type does less than you might expect."
 icon: "type"
 ---
 
-## Overview
+## The mental model: a type is a contract at four layers
 
-Every field you add to a Resource or a reusable Schema in Studio — a text box, a number, a toggle, a nested object — declares a `type`. That single value decides four things at once, because Pawabase compiles the same field definition into all four places where types matter:
+When you add a field in Studio and pick **Text (short)**, **Integer** or **Date & time** from the type menu, you are not choosing a label. You are choosing one value, `type`, that Pawabase reads in four separate places and turns into four different behaviors. Keeping the four layers apart is the single most useful thing to understand about field types, because almost every surprise in this area happens when someone assumes a rule that holds at one layer also holds at another.
 
-1. **The validation model.** Pawabase compiles your fields into a Pydantic model. The type picks the Python type the incoming JSON value is checked against (`str`, `int`, `float`, `dt.datetime`, and so on).
-2. **The response shape.** The same field, compiled in "read" mode, decides what a client sees back in JSON.
-3. **The OpenAPI document.** Whatever Pydantic types the model, Atlas (Pawabase's generated docs) describes — so the schema you configure in Studio is exactly the schema published at `/docs`.
-4. **The database column.** When you run a migration, the field's type picks a column type for the dialect your environment's database uses (SQLite, PostgreSQL, or MySQL).
+| Layer | Where it happens | What the type decides | What it cannot decide |
+| --- | --- | --- | --- |
+| **Request validation** | Before your policy or your database sees the body | Which JSON values are accepted for the field, and what Python type they are converted to | Anything about who may write the field |
+| **Response shape** | When a record is serialized back to the client | How the stored value is rendered in JSON (for example `Z` or `+00:00` on timestamps) | Whether the field is returned at all, see [Schemas](/data/schemas) for `write_only` |
+| **The API document** | The generated OpenAPI reference that Studio's **API Explorer** and the public docs page show | The JSON Schema fragment for the field: `type`, `format`, `enum`, `pattern`, limits | Runtime behavior the document does not describe |
+| **The database column** | When you run **Create / migrate table** | The column type, per dialect, for a table Pawabase creates | The type of a column in a table that already exists, because migration never retypes a column |
 
-This page documents all fourteen types precisely as Pawabase implements them, including two places where it's easy to guess wrong: `number` fields validate as ordinary IEEE-754 floats (not a fixed-point decimal), and every structured type — `array`, `object`, `json`, and `ref` — stores as a single JSON/JSONB/TEXT column, never a native array or composite column type.
+A field that passes validation can still fail at the database. A column that exists in the database can be returned to clients even though no field declares it. The type is a promise made at the HTTP boundary; the table is whatever the database says it is. The rest of this page describes each type through all four layers, and the pages on [Validation](/data/validation), [Schemas](/data/schemas) and [Migrations](/data/migrations) describe what happens around them.
+
+<Note>
+Everything on this page was checked against a running Pawabase API: each accepted and rejected input below was sent as a real request, and each response body is the body the API returned. Where the behavior is surprising, the page says so directly instead of describing the intended behavior.
+</Note>
+
+## Where field definitions live
+
+A field is one JSON object inside a list. The same list shape is used in four places, and the same compiler reads all four.
+
+| Where the list lives | Studio location | What reads it |
+| --- | --- | --- |
+| A resource's `fields` | **Resources**, then a resource, then **Fields** | The request models for `POST` and `PATCH`, the response model for reads, and the migration |
+| A reusable schema's `fields` | **Schemas**, then a schema, then **Fields** | Any field of type **Schema reference** that names it, plus any route that uses it as `input_schema` or `response_schema` |
+| A custom route's `input_fields` | **Routes**, then a route, then **Request & response** | The request model for that route only. No table is involved |
+| A nested `object` field's `fields` | The **Nested fields** panel inside an object field | The parent field's compiled model |
+
+Only the first location creates a column. A schema or a route input describes the shape of JSON and never touches the database, which is why `unique` and `indexed` mean nothing there.
 
 ## The fourteen types at a glance
 
-| Type | Python/validation type | JSON shape | Column (sqlite / postgres / mysql) |
+| `type` | Studio menu label | Validated as | JSON you send | JSON you get back | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `string` | Text (short) | text | string | string | `TEXT` | `VARCHAR(n)` | `VARCHAR(n)` |
+| `text` | Text (long) | text | string | string | `TEXT` | `TEXT` | `TEXT` |
+| `integer` | Integer | whole number | number or numeric string | number | `INTEGER` | `BIGINT` | `BIGINT` |
+| `number` | Number | 64-bit float | number or numeric string | number | `REAL` | `DOUBLE PRECISION` | `DOUBLE` |
+| `boolean` | Yes / no | true or false | `true`, `false`, and several strings | `true` / `false` | `INTEGER` | `BOOLEAN` | `BOOLEAN` |
+| `datetime` | Date & time | timestamp | ISO 8601 string, date string, Unix seconds | ISO 8601 string | `TEXT` | `TIMESTAMPTZ` | `DATETIME(6)` |
+| `date` | Date | calendar day | `YYYY-MM-DD` or midnight timestamp | `YYYY-MM-DD` | `TEXT` | `DATE` | `DATE` |
+| `uuid` | UUID | UUID | hyphenated or plain hex | lowercase hyphenated | `TEXT` | `UUID` | `CHAR(36)` |
+| `email` | Email | text with a pattern | string | string | `TEXT` | `VARCHAR(320)` | `VARCHAR(320)` |
+| `url` | URL | text with a pattern | `http(s)://` string | string | `TEXT` | `TEXT` | `TEXT` |
+| `json` | JSON | anything | any JSON value | the same value | `TEXT` | `JSONB` | `JSON` |
+| `array` | List | list of one item type | JSON array | JSON array | `TEXT` | `JSONB` | `JSON` |
+| `object` | Object | nested model | JSON object | JSON object | `TEXT` | `JSONB` | `JSON` |
+| `ref` | Schema reference | a stored schema's model | JSON object | JSON object | `TEXT` | `JSONB` | `JSON` |
+
+A field with no `type` is a `string`. Two groups matter more than the rest of the table suggests. The **text group** (`string`, `text`, `email`, `url`) all validate as text and differ only in constraints and column type. The **JSON group** (`json`, `array`, `object`, `ref`) is stored in one column each as serialized JSON, and the database cannot filter on what is inside them.
+
+## The keys a field definition accepts
+
+A definition is a JSON object. Only `name` is required, and `type` falls back to `string`. The editor in Studio writes these keys when you flip the matching control; the **JSON** tab on the sheet writes them directly.
+
+| Key | Applies to | Enforced where | Studio control |
 | --- | --- | --- | --- |
-| `string` | `str` | string | `TEXT` / `VARCHAR(n)` / `VARCHAR(n)` |
-| `text` | `str` | string | `TEXT` / `TEXT` / `TEXT` |
-| `integer` | `int` | number (integer) | `INTEGER` / `BIGINT` / `BIGINT` |
-| `number` | `float` | number | `REAL` / `DOUBLE PRECISION` / `DOUBLE` |
-| `boolean` | `bool` | `true` / `false` | `INTEGER` / `BOOLEAN` / `BOOLEAN` |
-| `datetime` | `dt.datetime` | ISO-8601 string | `TEXT` / `TIMESTAMPTZ` / `DATETIME(6)` |
-| `date` | `dt.date` | `YYYY-MM-DD` string | `TEXT` / `DATE` / `DATE` |
-| `uuid` | `uuid.UUID` | string | `TEXT` / `UUID` / `CHAR(36)` |
-| `email` | `str` (pattern-checked) | string | `TEXT` / `VARCHAR(320)` / `VARCHAR(320)` |
-| `url` | `str` (pattern-checked) | string | `TEXT` / `TEXT` / `TEXT` |
-| `json` | `Any` | any JSON value | `TEXT` / `JSONB` / `JSON` |
-| `array` | `list[...]` | JSON array | `TEXT` / `JSONB` / `JSON` |
-| `object` | nested model | JSON object | `TEXT` / `JSONB` / `JSON` |
-| `ref` | referenced Schema's model | JSON object | `TEXT` / `JSONB` / `JSON` |
+| `name` | every type | Validation and the database | The monospace name input on the field row |
+| `type` | every type | Everywhere | The type menu on the field row |
+| `required` | every type | Create validation only | The **Required** checkbox |
+| `nullable` | every type | Validation | The **Nullable** switch under **More options** |
+| `default` | scalar types | Create validation, and the store when a flow creates a row | **Default** under **More options** |
+| `enum` | `string` and numeric types | Validation | **Allowed values** under **More options** |
+| `min_length`, `max_length` | text group | Validation, and `max_length` also sizes the column on PostgreSQL and MySQL | **Min length**, **Max length** |
+| `minimum`, `maximum` | `integer`, `number` | Validation | **Minimum**, **Maximum** |
+| `pattern` | `string` (and replaces the built-in pattern on `email` and `url`) | Validation | **Pattern** (string fields only in the editor) |
+| `description` | every type | The API document | **Description** |
+| `example` | every type | The API document | **Example** |
+| `read_only` | every type | Which request models include the field | **Read only** |
+| `write_only` | every type | Which response model includes the field | **Write only** |
+| `unique` | column-backed types in resources | The database | JSON tab only |
+| `indexed` | column-backed types in resources | The database | JSON tab only |
+| `items` | `array` | Validation | **Item type** |
+| `fields` | `object` | Validation | **Nested fields** |
+| `schema` | `ref` | Validation | **Schema** menu |
 
-If you omit `type` on a field, it defaults to `string`.
+<Warning>
+`unique` and `indexed` have no switch in Studio's field editor. The editor carries unknown keys through untouched, so a definition written with them keeps them when you edit other things in the form, but the form itself never shows them. Add them on the **JSON** tab of the resource sheet. See [Defining resources](/data/defining-resources) for the tab.
+</Warning>
 
-<Note>
-`array`, `object`, `json`, and `ref` are collectively the platform's **JSON types**. All four are stored the same way: as a single JSON/JSONB/TEXT column, encoded with `json.dumps` on the way in and `json.loads` on the way out. There is no native array column (`TEXT[]`, PostgreSQL arrays) and no composite/row column anywhere in Pawabase. If you need to filter or index on one element of an array or one key of an object, model it as its own field or its own related Resource instead.
-</Note>
+### How a key is ignored
 
-## String-like types
+A key that does not apply to the type is stored but has no effect. `max_length` on an `integer` does nothing, `minimum` on a `string` does nothing, `pattern` on a `boolean` does nothing. Pawabase does not reject these combinations on save. The one exception is `pattern`: a pattern that is not a valid regular expression is refused when you save, with the offending field named.
+
+```text
+fields[0]: invalid pattern: missing ), unterminated subpattern at position 0
+```
+
+That message is the real `422` body for a resource whose first field declares `"pattern": "("`.
+
+### One definition using every key
+
+This field is not realistic. It is here so each key appears once, in the form Studio stores it.
+
+```json
+{
+  "name": "handle",
+  "type": "string",
+  "required": true,
+  "nullable": false,
+  "default": "guest",
+  "enum": ["guest", "member", "staff"],
+  "min_length": 3,
+  "max_length": 24,
+  "pattern": "^[a-z]+$",
+  "description": "Shown in the API document",
+  "example": "member",
+  "read_only": false,
+  "write_only": false,
+  "unique": true,
+  "indexed": true
+}
+```
+
+The keys interact, and not every combination is meaningful. With `enum` set, the type becomes a fixed list and `min_length`, `max_length` and `pattern` are unused. With `required` and a `default`, an omitted key takes the default. With `unique` and `indexed` together, migration emits one unique index, so `indexed` adds nothing. The duplicate-index case is a `unique` field that is also the resource's **Owner field**. A `read_only` field with a `default` is filled by the default on create, which is the supported way to give a field a server-chosen starting value that clients can neither set nor change.
+
+For a container type, the structure goes in its own keys:
+
+```json
+{
+  "name": "lines",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "fields": [
+      {"name": "sku", "type": "string", "required": true},
+      {"name": "qty", "type": "integer", "required": true, "minimum": 1},
+      {"name": "note", "type": "string", "max_length": 200}
+    ]
+  }
+}
+```
+
+A list of objects is the nearest thing to a child table inside one row. It is validated line by line, with errors located by index (`["lines", 0, "qty"]`), and stored as a single JSON value. Reach for [a relation](/data/relations) as soon as you need to query the lines on their own.
+
+## The Studio field editor, row by row
+
+Open **Resources**, click a resource (or **New resource**), and scroll to the **Fields** section. Its description reads "The primary key and created_at / updated_at are added for you." when timestamps are on. Each field is one row.
+
+| Part of the row | What it does | What it writes |
+| --- | --- | --- |
+| Up and down arrows (**Move up**, **Move down**) | Reorders the field | Position in the `fields` list, which is also column order on a new table and field order in the API document |
+| Type dot | Shows the type as a colored mark: `Aa` for short text, `¶` for long text, `12` for integer, `1.5` for number, a check for yes/no, a clock for date and time, `D` for date, `id` for UUID, `@` for email, an arrow for URL, `{}` for JSON, `[ ]` for list, `{ }` for object, an arrow for schema reference | Nothing, display only |
+| Name input | The field's name. It turns invalid (red) as soon as the text does not start with a letter or underscore followed by letters, digits and underscores | `name` |
+| Type menu | Lists the fourteen labels | `type` |
+| **Required** checkbox | Marks the field required on create | `required: true`, or removes the key |
+| **More options** (gear) / **Collapse** | Opens the details card for the field | Nothing |
+| **Remove field** (trash) | Deletes the row | Removes the entry from `fields` |
+
+Below the rows, **Add field** appends a row with an empty name and type `string`, and the new row takes focus. The sheet refuses to save while any row has no name; the message is "Every field needs a name." That check also covers nested object fields.
+
+### What the **More options** card contains
+
+The card's contents change with the type. Studio only shows controls that apply, which is a quick way to see what each type supports.
+
+| Control | Shown for | Notes |
+| --- | --- | --- |
+| **Description** | all types | "Shown in the API docs" |
+| **Default** | all scalar types | A segmented control **None / Yes / No** for booleans, a text or number input otherwise. For `json`, `array`, `object` and `ref` the card says "Set defaults for this type in JSON view." |
+| **Example** | all types | A single value shown in the API document |
+| **Min length**, **Max length** | `string`, `text`, `email`, `url` | Numbers, 0 or more |
+| **Pattern** | `string` only | "A regular expression the value must match." The placeholder is `^[a-z0-9-]+$` |
+| **Minimum**, **Maximum** | `integer`, `number` | Numbers |
+| **Allowed values** | `string`, `integer`, `number` | A tag input; "Leave empty to allow any value." The placeholder is `draft, published, archived`. For numeric types the entries are converted to numbers and non-numeric entries are dropped |
+| **Schema** | `ref` | A menu of the environment's schemas, with no empty choice |
+| **Item type** | `array` | A menu of every type except `array`, plus a schema menu when the item type is `ref` |
+| **Nullable**, **Read only**, **Write only** | all types | Three switches |
+| **Nested fields** | `object` | A full field editor, one level deeper |
+
+Two behaviors of the editor are worth knowing before you rely on it. Turning a value off removes the key rather than storing `false` or an empty value, so the stored definition stays small and a missing key means "not set". And every control writes straight into the definition: there is no separate apply step, the **Save** button on the sheet is the only commit.
+
+## Reading a definition the way the compiler does
+
+The compiler reads the list once for each of four modes, and the mode changes how the same keys are interpreted.
+
+| Mode | Used for | `required` | Unknown properties | `read_only` fields | `write_only` fields |
+| --- | --- | --- | --- | --- | --- |
+| `create` | The body of `POST` | Enforced, unless a `default` exists | Rejected | Left out of the model, so rejected as unknown | Included |
+| `update` | The body of `PATCH` and `PUT` | Not enforced, every field optional | Rejected | Left out | Included |
+| `read` | The documented response | Not applicable | Allowed at runtime | Included | Left out of the document |
+| `any` | Checking that a schema compiles at all | Not enforced | Rejected | Included | Included |
+
+`required` and `default` are the two keys that behave differently in each mode, and the page on [Validation](/data/validation) takes them apart in full. For field types, the point is narrower: the type decides what a *value* may look like, and the mode decides whether the value must be present. The sections that follow describe values.
+
+## Text types: `string`, `text`, `email`, `url`
+
+The four text types validate the same way: the incoming JSON value must be a string, and nothing else is converted. Sending the number `5`, the boolean `true` or a list to a text field fails with a `string_type` error, which is stricter than the number types, where strings are converted.
+
+```json
+{"name": "title", "type": "string", "required": true, "min_length": 2, "max_length": 60}
+```
+
+```text
+POST /rest/v1/t  {"s": 5}        ->  422  [{"type":"string_type","loc":["s"],"msg":"Input should be a valid string", ...}]
+POST /rest/v1/t  {"s": ["a"]}    ->  422  string_type
+POST /rest/v1/t  {"s": "abcde"}  ->  422  string_too_long  "String should have at most 4 characters"
+POST /rest/v1/t  {"s": "a"}      ->  422  string_too_short "String should have at least 2 characters"
+```
+
+Length is measured in characters, not bytes. A four-character limit accepts four emoji and rejects five. Whitespace is never trimmed: the empty string `""` and the two-space string `"  "` are both valid values and are stored as sent. If you want to reject blank input, say so with a `pattern` or `min_length`, not with `required`, because `required` only checks that the key is present and not null.
 
 ### `string`
 
-The default type. Validates as a Python `str` with no length limit unless you set one.
+The default type, meant for short single-line values: names, slugs, codes, statuses.
 
-```json
-{"name": "title", "type": "string", "required": true, "max_length": 200}
-```
+| Aspect | Behavior |
+| --- | --- |
+| Constraints | `min_length`, `max_length`, `pattern`, `enum` |
+| Column on PostgreSQL and MySQL | `VARCHAR(n)`, where `n` is `max_length` if set when the table is created, otherwise `255` |
+| Column on SQLite | `TEXT`, which has no length limit; `max_length` is enforced by validation only |
+| `max_length` changed later | The existing column is not widened or narrowed. See [Migrations](/data/migrations) |
+| `pattern` | A Python regular expression, applied with Pydantic's pattern check; it must match the whole use you intend, so anchor it with `^` and `$` |
 
-- `max_length` — maximum characters. A longer value fails validation with a 422.
-- `min_length` — minimum characters.
-- `pattern` — a regular expression the value must fully match (compiled with Python's `re`; invalid patterns are rejected when you save the field, not at request time).
-- `enum` — a list of allowed values. When `enum` is set, the field's underlying type is overridden entirely: Pawabase compiles it as a `Literal` of exactly those values, regardless of what `type` says. This is the only way to restrict a field to a fixed set of choices — there is no dedicated "enum" or "select" type.
-
-Column: `VARCHAR(n)` on PostgreSQL and MySQL, where `n` is `max_length` if set or `255` otherwise (the column width is fixed at migration time from whatever `max_length` was set then — raising `max_length` later does not widen an existing column; see [Migrations](/data/migrations)). SQLite has no length-limited text type, so it's always `TEXT` regardless of `max_length` — SQLite still enforces the length limit at the application layer during validation, it just doesn't enforce it in the column itself.
+The column width is fixed when the table is created, from whatever `max_length` said at that moment. Raising `max_length` to 500 afterwards makes validation accept 500 characters while a PostgreSQL `VARCHAR(100)` column still rejects anything over 100, and that rejection surfaces as an unhandled database error (a `500`), not a `422`. If a string might grow, set `max_length` generously the first time or use `text`.
 
 ### `text`
 
-Identical validation to `string` (a plain `str`, honoring the same `max_length`, `min_length`, `pattern`, and `enum` constraints) but always stored as `TEXT` on every dialect, never a bounded `VARCHAR`. Use it for content you don't want an arbitrary column-width ceiling on: descriptions, notes, article bodies, HTML fragments.
+Long free-form content: descriptions, notes, bodies, Markdown.
 
-```json
-{"name": "body", "type": "text", "required": false}
-```
+| Aspect | Behavior |
+| --- | --- |
+| Constraints | `min_length`, `max_length`, `pattern` through the JSON tab, `enum` is not offered in Studio for this type |
+| Column | `TEXT` on every dialect |
+| Size | A 100,000-character value was accepted and stored. The practical ceiling is the request body limit, see [Limits](/reference/limits) |
+| Studio's Record editor | A multi-line text area, four rows tall |
+
+`text` and `string` differ in the column and in how Studio renders them. They do not differ in validation, so a `text` field with `max_length` set behaves exactly like a `string` with the same limit, except that nothing sizes a column from it.
 
 ### `email`
 
-A `str` that must match `^[^@\s]+@[^@\s]+\.[^@\s]+$` — a deliberately loose email shape check, not full RFC 5321 validation. It does **not** verify the address exists or is deliverable. If you supply your own `pattern`, it overrides this default; otherwise the email pattern applies automatically.
+A `string` with a built-in pattern.
 
-```json
-{"name": "contact_email", "type": "email", "required": true}
+```text
+^[^@\s]+@[^@\s]+\.[^@\s]+$
 ```
 
-Column: `VARCHAR(320)` on PostgreSQL/MySQL (320 is the maximum theoretical email length), `TEXT` on SQLite.
+| Input | Result |
+| --- | --- |
+| `maya@acme.co` | Accepted |
+| `jose@exämple.com` | Accepted, because the pattern only forbids whitespace and extra `@` signs in the three parts |
+| `a b@x.co` | `422` `string_pattern_mismatch` |
+| `a@b` | `422`, there is no dot after the `@` |
+| `""` (empty string) | `422`, the pattern needs at least one character in each part |
+
+The pattern checks shape, not deliverability. It does not verify that a domain exists, and it does not normalize case, so `Maya@Acme.co` and `maya@acme.co` are different values and a `unique` index will treat them as two. If you set your own `pattern` on an email field, it replaces the built-in one rather than adding to it. The column is `VARCHAR(320)` on PostgreSQL and MySQL, the longest address the standard allows, and `TEXT` on SQLite. `max_length` still applies as a validation limit on top of the pattern.
+
+<Info>
+Authentication in Pawabase keeps its own user records in Akountz. An `email` field on a resource is plain application data. It has no connection to a sign-in identity unless you build one, see [Managing users](/auth/managing-users).
+</Info>
 
 ### `url`
 
-A `str` that must match `^https?://[^\s]+$`. Only `http://` and `https://` schemes pass; anything else (`ftp://`, `mailto:`, a bare domain with no scheme) fails validation. As with `email`, an explicit `pattern` on the field overrides this default.
+A `string` that must start with `http://` or `https://`.
 
-```json
-{"name": "website", "type": "url"}
+```text
+^https?://[^\s]+$
 ```
 
-Column: `TEXT` on every dialect — URLs have no natural bound and PostgreSQL/MySQL gain nothing from `VARCHAR` here.
+| Input | Result |
+| --- | --- |
+| `https://x.co/a?b=1` | Accepted |
+| `http://localhost:3000` | Accepted |
+| `x.co` | `422`, no scheme |
+| `ftp://x.co` | `422`, only `http` and `https` |
+| `mailto:a@b.co` | `422` |
 
-## Numeric types
+The pattern is deliberately loose: it accepts `https://` followed by any run of non-whitespace characters, so `https://not a url` fails only because of the space, and `https://!!!` passes. Use `url` to keep obviously wrong values out, not to prove a URL is reachable. The column is `TEXT` on every dialect.
+
+## Number types: `integer` and `number`
+
+Number fields accept JSON numbers and, unlike text, also accept strings that look like numbers. That is Pydantic's default conversion, and it is useful for clients that send form data, but it means a field typed `integer` will happily take `"5"`.
 
 ### `integer`
 
-Validates as a Python `int`. JSON numbers with a fractional part (`1.5`) are rejected — Pydantic does not silently truncate.
-
 ```json
-{"name": "quantity", "type": "integer", "required": true, "minimum": 1}
+{"name": "stock", "type": "integer", "minimum": 0, "default": 0}
 ```
 
-- `minimum` / `maximum` — inclusive bounds, compiled to Pydantic's `ge` / `le`.
+| Input | Result |
+| --- | --- |
+| `5` | `5` |
+| `"5"` | `5` |
+| `" 7 "` | `7`, surrounding spaces are tolerated |
+| `"5.0"` | `5` |
+| `5.0` | `5` |
+| `true` | `1` (a boolean is accepted as 0 or 1) |
+| `5.5` | `422` `int_from_float`, "got a number with a fractional part" |
+| `"abc"`, `""`, `"1e3"` | `422` `int_parsing` |
+| `[1]` | `422` `int_type` |
+| `2^70` (a number above 64 bits) | `500` |
+| `9007199254740993` | Accepted and returned exactly |
 
-Column: `INTEGER` on SQLite, `BIGINT` on PostgreSQL and MySQL. There is no separate "small integer" or "big integer" type to choose in Studio — every integer field gets the same column width per dialect.
+The last two rows show where the layers part ways. Validation accepts any Python integer, but the column is a 64-bit integer (`INTEGER` on SQLite, `BIGINT` on the others), so a value that does not fit passes validation and fails at the database. Keep a `maximum` on any integer a client can influence. The value `9007199254740993` is larger than JavaScript can represent exactly (`2^53`); Pawabase stores and returns it intact, but a browser parsing the JSON will round it. For identifiers that can exceed `2^53`, use a `string` or a `uuid`.
 
-<Warning>
-An `integer` primary key is declared `INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite), `BIGSERIAL PRIMARY KEY` (PostgreSQL), or `BIGINT AUTO_INCREMENT PRIMARY KEY` (MySQL) — the database assigns the value. A non-key `integer` field has no such generator; if you want one you populate it yourself (in a create request, a flow, or a default).
-</Warning>
+| Aspect | Behavior |
+| --- | --- |
+| Constraints | `minimum`, `maximum`, `enum` |
+| Column | `INTEGER` on SQLite, `BIGINT` on PostgreSQL and MySQL |
+| `enum` | The values must be numbers, and the input must be a number: with `"enum": [1, 2, 3]`, the string `"2"` is rejected with "Input should be 1, 2 or 3" |
+| OpenAPI | `type: integer` with `minimum` and `maximum` when set |
 
 ### `number`
 
-Validates as a Python `float`. **This is the fact most worth getting right: `number` is an ordinary IEEE-754 double-precision float, not a fixed-point decimal.** Pawabase does not use Python's `Decimal` anywhere in the compiled model or the value codec — the field compiles to `float`, and the value that comes back out of the database is coerced to `float` as well (even the rare case of a driver returning a `Decimal` is converted straight to `float` on the way out).
+A 64-bit floating-point value.
 
 ```json
-{"name": "amount", "type": "number", "minimum": 0}
+{"name": "price", "type": "number", "required": true, "minimum": 0}
 ```
 
-For money, this has a real consequence: floats cannot represent every decimal fraction exactly, so repeated arithmetic on `number` fields can accumulate rounding error. The common workaround is to store money as an `integer` count of the smallest unit (cents, not dollars) rather than as a `number` of dollars — `amount_cents: 1999` instead of `amount: 19.99`. This sidesteps floating-point rounding entirely because integers are exact.
+| Input | Result |
+| --- | --- |
+| `9.5` | `9.5` |
+| `"2.5"` | `2.5` |
+| `"1e3"` | `1000.0` |
+| `true` | `1.0` |
+| `0.30000000000000004` | Stored and returned as `0.30000000000000004` |
+| `""` | `422` `float_parsing` |
+| `"inf"` | `500`, accepted by validation and refused by the database |
 
-Column: `REAL` (SQLite), `DOUBLE PRECISION` (PostgreSQL), `DOUBLE` (MySQL) — all binary floating-point, consistent with the `float` validation type. There is no `DECIMAL`/`NUMERIC` column type available for `number` fields in Pawabase today.
+`number` is a binary float, not a decimal. It cannot represent most decimal fractions exactly, which is why `0.1 + 0.2` comes back as `0.30000000000000004`. Do not store money as `number`. Store the amount in the smallest unit as an `integer` (cents, pence, kobo) and keep the currency in a separate `string` field, or convert at the edge. Sums of floats also drift, so totals computed from many `number` rows can differ in the last digits between runs.
 
-## Boolean
+| Aspect | Behavior |
+| --- | --- |
+| Constraints | `minimum`, `maximum`, `enum` |
+| Column | `REAL`, `DOUBLE PRECISION`, `DOUBLE` |
+| Whole numbers | `2` is returned as `2.0`, because the response model converts to a float |
+| Out-of-range | `1e308` is accepted; values that overflow a double become infinity and fail at the database |
 
-### `boolean`
-
-Validates as `True`/`False`. No additional constraints apply (`minimum`, `maximum`, `pattern`, and `enum` are meaningless here and are simply ignored by the compiler if present).
+## `boolean`
 
 ```json
-{"name": "is_published", "type": "boolean", "default": false}
+{"name": "published", "type": "boolean", "default": false}
 ```
 
-Column: `INTEGER` (0/1) on SQLite — SQLite has no native boolean column type, so the value layer encodes `True`/`False` to `1`/`0` on the way in and decodes back to a real Python `bool` on the way out, so API responses always show `true`/`false`, never `1`/`0`. PostgreSQL and MySQL use a genuine `BOOLEAN` column.
+Pydantic's boolean conversion is generous. These inputs were accepted:
 
-## Temporal types
+| Input | Stored as |
+| --- | --- |
+| `true`, `false` | The same |
+| `"true"`, `"TRUE"`, `"t"`, `"yes"`, `"on"`, `"1"`, `1` | `true` |
+| `"false"`, `"no"`, `"0"`, `0` | `false` |
+| `2` | Rejected, `bool_parsing` |
+| `""` | Rejected, `bool_parsing` |
+| `null` | Accepted when the field is not required, stored as `NULL` |
 
-### `date`
+A boolean column holds three states, not two: `true`, `false` and `NULL`. A field without a `default` that the client omits is stored as `NULL`, and a record read back shows `"published": null`. If "never set" must mean "no", give the field a `default`. Defaults apply when the key is omitted, not when the client sends an explicit `null`.
 
-Validates as a Python `date` from a `YYYY-MM-DD` string. No time-of-day component.
+| Aspect | Behavior |
+| --- | --- |
+| Column | `INTEGER` (0 or 1) on SQLite, `BOOLEAN` on PostgreSQL and MySQL |
+| Studio's Record editor | A `true` / `false` menu |
+| Studio's **Default** control | A **None / Yes / No** segmented control |
 
-```json
-{"name": "due_on", "type": "date"}
-```
+<Warning>
+Filtering on a boolean with a plain value does not behave the way it reads. `?filter[published]=false`, `?filter[published]=eq.false` and `?filter[published]=0` all returned the rows where the field is **true** in testing, because any non-empty string converts to true on the way to the query. Use the `is` operator instead: `?filter[published]=is.false` and `?filter[published]=is.true` return the right rows, and `is.null` finds the rows that were never set. See [Filtering](/data/filtering).
+</Warning>
 
-`minimum` / `maximum` compile to `ge`/`le` on the underlying `date`, so you can bound a date field to a range the same way you bound a number.
+## Time types: `datetime` and `date`
 
-Column: stored as an ISO date string (`TEXT`) on SQLite, a native `DATE` on PostgreSQL and MySQL.
+Both types accept ISO 8601 strings. The differences are in what else they accept and in what each database stores.
 
 ### `datetime`
-
-Validates as a Python `datetime`, parsed from an ISO-8601 string. Pawabase normalizes every `datetime` value to UTC before it reaches the database: a timestamp you send with no timezone is assumed to be UTC and stamped with it; one with an explicit offset is converted to UTC. On MySQL, which has no timezone-aware column type, the UTC value is stored with its timezone info stripped (the column itself carries no offset, but every value in it is understood to be UTC by convention).
 
 ```json
 {"name": "published_at", "type": "datetime"}
 ```
 
-Column: ISO string (`TEXT`) on SQLite, `TIMESTAMPTZ` on PostgreSQL, `DATETIME(6)` (microsecond precision, timezone-naive) on MySQL.
+| Input | Result on create |
+| --- | --- |
+| `"2026-10-01T10:00:00Z"` | Stored as `2026-10-01T10:00:00+00:00` |
+| `"2026-10-01T10:00:00+02:00"` | Offset kept, `2026-10-01T10:00:00+02:00` |
+| `"2026-10-01 10:00"` (no zone) | Treated as UTC, `2026-10-01T10:00:00+00:00` |
+| `"2026-10-01"` | Midnight UTC, `2026-10-01T00:00:00+00:00` |
+| `1790000000` (a number) | Unix seconds, `2026-09-21T14:13:20+00:00` |
+| `"01/10/2026"` | `422` |
 
-`created_at` and `updated_at`, when a Resource has `timestamps: true` (the default — see [Defining resources](/data/defining-resources)), are ordinary `datetime` fields maintained by the platform: set on `create`, and `updated_at` refreshed on every `update`.
+A value without a zone is read as UTC, not as the server's local time or the caller's. Send an offset or `Z` whenever the zone matters.
 
-### `uuid`
+What the database does with the value depends on the dialect, and this is where the types of layer four show through.
 
-Validates as a Python `uuid.UUID`, accepting any of the standard UUID string forms.
+| Dialect | Column | What is stored | Consequence |
+| --- | --- | --- | --- |
+| SQLite | `TEXT` | The ISO string exactly as normalized, offset included | Comparisons are text comparisons. Two values with different offsets do not sort chronologically |
+| PostgreSQL | `TIMESTAMPTZ` | An absolute instant | Comparisons and sorting are chronological |
+| MySQL | `DATETIME(6)` | The instant converted to UTC with the zone dropped | Chronological, always UTC, microsecond precision |
+
+If your application will run on PostgreSQL or MySQL in production and SQLite in development, normalize to UTC (`Z`) on the client. Then text comparison on SQLite and chronological comparison on the other two agree.
+
+On a read, a **declared** `datetime` field is serialized by the response model, and the automatic `created_at` and `updated_at` columns are returned as the stored string. In practice that shows up as `…T10:00:00Z` for a declared field in a list and `…+00:00` for the timestamps. Both are valid ISO 8601, and a client that parses timestamps handles either.
+
+### `date`
+
+A calendar day with no time and no zone.
 
 ```json
-{"name": "external_ref", "type": "uuid"}
+{"name": "released", "type": "date"}
 ```
 
-Column: `TEXT` (SQLite), native `UUID` (PostgreSQL), `CHAR(36)` (MySQL).
+| Input | Result |
+| --- | --- |
+| `"2026-10-01"` | `2026-10-01` |
+| `"2026-10-01T00:00:00"` | `2026-10-01`, a midnight timestamp is accepted |
+| `"2026-10-01T10:30:00"` | `422` `date_from_datetime_inexact`, "Datetimes provided to dates should have zero time" |
+| `20261001` (a number) | `422` same error, a number is read as a timestamp |
+| `"01/10/2026"` | `422` |
 
-<Warning>
-When a Resource's `id_type` is `uuid`, Pawabase does **not** rely on a database-side default (there is no `gen_random_uuid()` or equivalent in the generated DDL). The primary key column is declared as a plain `UUID`/`TEXT`/`CHAR(36)` `PRIMARY KEY` with no default, and the value is generated in Python — with `uuid.uuid4()` — at the moment a record is created, then inserted explicitly along with the rest of the row. This means UUID generation works identically across all three dialects, including SQLite and MySQL, neither of which has a built-in random-UUID function.
-</Warning>
+A `date` never shifts with a time zone, which is the reason to choose it over a `datetime` for birthdays, due dates and billing days. The column is `TEXT` on SQLite and `DATE` on PostgreSQL and MySQL. A `YYYY-MM-DD` string sorts and compares correctly as text, so filters like `gte.2026-03-01` work on every dialect. Passing a full timestamp in a **filter** on a date field is a different story: `?filter[released]=eq.2026-01-01T00:00:00` returned a `500` in testing, because the filter value is parsed as a date. Filter dates with dates.
 
-## Structured (JSON) types
+## `uuid`
 
-These four types all compile to `TEXT`/`JSONB`/`JSON` — never a native array or object column — and are all encoded with `json.dumps(value, default=str)` going in and decoded with `json.loads` coming out.
+```json
+{"name": "external_id", "type": "uuid"}
+```
+
+| Input | Result |
+| --- | --- |
+| `123e4567-e89b-12d3-a456-426614174000` | Stored and returned as sent |
+| `123E4567-E89B-12D3-A456-426614174000` (uppercase) | Returned lowercase |
+| `123e4567e89b12d3a456426614174000` (no hyphens) | Returned with hyphens |
+| `xyz` | `422` `uuid_parsing` |
+
+A `uuid` field is validated as a real UUID and normalized to lowercase with hyphens before it is stored. The column is `TEXT` on SQLite, a native `UUID` on PostgreSQL and `CHAR(36)` on MySQL.
+
+Filtering behaves differently from validation. On SQLite, a filter value is compared as text after the field's encoder runs, and the encoder for a UUID on that dialect does not lowercase the filter value. In testing, `?filter[external_id]=123E4567-…` (uppercase) and the hyphen-less form returned nothing, while the lowercase hyphenated form matched. On PostgreSQL the native type normalizes both sides. Send lowercase hyphenated UUIDs in filters and the question never arises.
+
+A resource's own primary key can be a UUID with the **ID type** control set to **UUID**. That is a property of the resource, not a field, and Pawabase generates a version 4 UUID on create. A `uuid` field is for any other identifier, such as a foreign key to another resource whose key is a UUID. See [Relations](/data/relations) and [Defining resources](/data/defining-resources).
+
+## The JSON group: `json`, `array`, `object`, `ref`
+
+These four types hold structured values. They differ in how much of the structure Pawabase validates, and they share one storage rule: each is serialized to JSON text on write and parsed back on read, in a single column (`TEXT` on SQLite, `JSONB` on PostgreSQL, `JSON` on MySQL).
+
+| Type | What is validated | Unknown keys | Studio **Default** |
+| --- | --- | --- | --- |
+| `json` | Nothing; any JSON value | Not applicable | Set in the JSON tab |
+| `array` | That it is a list, and each item against `items` when `items` is set | Depends on the item type | Set in the JSON tab |
+| `object` | The nested `fields`, one by one | Rejected | Set in the JSON tab |
+| `ref` | The referenced schema's fields | Rejected | Set in the JSON tab |
 
 ### `json`
 
-An escape hatch: any JSON-serializable value, unconstrained. Validates as Python's `Any` — Pawabase performs no shape checking on it at all beyond "this is valid JSON".
+An escape hatch for values whose shape you do not control: arbitrary metadata, a third-party payload you want to keep as received.
 
 ```json
-{"name": "metadata", "type": "json", "default": {}}
+{"name": "meta", "type": "json"}
 ```
 
-Use `json` when a field's shape genuinely varies per record and you don't want to model it. Prefer `object` (below) whenever the shape is actually fixed — you get real validation and an accurate OpenAPI schema instead of an opaque blob.
+Every JSON value is accepted: an object, a list, a number, a string, `true` and `null`. `42`, `"text"` and `{"a":[1,{"b":null}]}` were all stored and returned unchanged. Nothing is validated and no keys are checked, so the API document shows the field as "any". Use it sparingly. A `json` field gives you no validation, no filtering and no documentation of what is inside it.
 
 ### `array`
 
-A JSON array whose elements are described by `items` — itself a field-like spec (it takes a `type` and that type's own constraints, but never a `name`; the compiler assigns it one internally).
+A list, optionally of one item type.
 
 ```json
-{"name": "tags", "type": "array", "items": {"type": "string", "max_length": 40}}
+{"name": "tags", "type": "array", "items": {"type": "string"}}
 ```
 
-```json
-{"name": "scores", "type": "array", "items": {"type": "integer"}}
-```
+| Input | Result |
+| --- | --- |
+| `["a", "b"]` | Accepted |
+| `[]` | Accepted, an empty list |
+| `"a,b"` | `422` `list_type`, "Input should be a valid list" |
+| `{"a": 1}` | `422` `list_type` |
+| `["1", "2"]` with `items` of type `integer` | Accepted and converted to `[1, 2]` |
+| `[1, "x"]` with `items` of type `integer` | `422` `int_parsing` at `loc: ["arr", 1]` |
 
-If you omit `items` entirely, elements default to `json` (i.e., an array of anything).
+A list with no `items` accepts anything inside: `[1, "a", null, {"x": 1}]` was accepted as is. The error location for a bad item includes its index, so a client can point at the exact element. The item type can be any type except another `array`, including an `object` or a `ref`, so a list of structured records is `{"type": "array", "items": {"type": "object", "fields": [ … ]}}` or `{"type": "array", "items": {"type": "ref", "schema": "Address"}}`.
 
-Arrays can be nested (an array of arrays) and can hold `object` or `ref` items. There is no minimum/maximum element-count constraint available on `array` itself.
-
-<Warning>
-Because the whole array is one JSON column, you cannot filter on "array contains value" through the standard `filter[field]=...` query parameter the way you can filter a scalar column — filtering matches the encoded column value, not an individual element. To query by membership, run SQL through the [Database console](/data/database-console) using your dialect's native JSON functions (`json_each` on SQLite, `@>`/`jsonb_array_elements` on PostgreSQL, `JSON_CONTAINS` on MySQL), or model the relationship as a separate Resource with a `belongs_to`/`has_many` relation instead of an array.
-</Warning>
+An `array` default is written in the JSON tab, and an empty list default (`"default": []`) is the right way to make a missing list come back as `[]` instead of `null`. An explicit `null` from the client is still accepted and overrides the default, so a client can store `null` where you expected a list. If code downstream assumes a list, treat `null` and `[]` the same way, or mark the field `"nullable": false`.
 
 ### `object`
 
-A JSON object with a fixed, validated shape, described by a nested `fields` list — the same field-definition syntax as a Resource's top-level `fields`, recursively.
+A nested structure with its own fields.
 
 ```json
 {
-  "name": "address",
+  "name": "dims",
   "type": "object",
   "fields": [
-    {"name": "line1", "type": "string", "required": true},
-    {"name": "city", "type": "string", "required": true},
-    {"name": "postal_code", "type": "string"}
+    {"name": "w", "type": "number", "required": true},
+    {"name": "h", "type": "number"}
   ]
 }
 ```
 
-Each nested field gets its own compiled Pydantic model (named after the parent field), so `required`, `enum`, `pattern`, `read_only`, and every other field property apply at any nesting depth. Nesting can go arbitrarily deep — an `object` field can itself contain fields of type `object` or `array` of `object`.
+The nested `fields` are a full field list, so they can carry their own constraints, and the nested `required` is enforced when the parent is present:
+
+| Input | Result |
+| --- | --- |
+| `{"w": 2}` | Accepted, returned as `{"w": 2.0, "h": null}` |
+| `{}` | Accepted when no nested field is required, returned with every nested field as `null` |
+| `{"h": 1}` with `w` required | `422` `missing` at `loc: ["dims", "w"]` |
+| `{"w": 2, "z": 1}` | `422` `extra_forbidden` at `loc: ["dims", "z"]` |
+| `[1]` or `"x"` | `422` `model_type` |
+
+<Note>
+The `model_type` message names the compiled model, for example "Input should be a valid dictionary or instance of TCreateO". That name is internal. Clients should key on the error `type` (`model_type`) and the `loc`, not on the message text.
+</Note>
+
+Because unknown keys are rejected and missing ones are filled with `null`, an `object` is a closed shape. If clients send keys you have not declared, either declare them or use `json`.
 
 ### `ref`
 
-Points at a reusable [Schema](/data/schemas) defined in the same environment, by name, via the `schema` property (required — a `ref` field with no `schema` is rejected when you try to save it).
+A field whose structure is defined once, in a reusable schema.
 
 ```json
-{"name": "billing_address", "type": "ref", "schema": "address"}
+{"name": "home", "type": "ref", "schema": "Address", "required": true}
 ```
 
-This is how you share one shape (an address, a line item, a money amount) across several Resources or Schemas without repeating the field list everywhere. See [Schemas](/data/schemas) for how the reference is resolved and what happens if the named Schema doesn't compile.
+A `ref` behaves like an `object` whose `fields` come from the named schema, and it reports errors with the full path, for example `loc: ["person", "home", "zip"]` or `["person", "others", 0, "zip"]`. A `ref` without a `schema` is refused on save: "a ref field names a schema". A `ref` to a schema that does not exist is accepted on save and reported later as a compile problem, and a schema that refers to itself is more serious than that. Both cases, and everything else about schemas, are covered in [Schemas](/data/schemas).
 
-## Constraints reference
+## What each type does with each kind of JSON value
 
-Not every constraint applies to every type. Constraints outside a type's supported set are silently ignored by the compiler rather than rejected — so a typo (setting `maximum` on a `string` field, say) will not surface as a save-time error; it just does nothing.
+The per-type sections above read left to right: given a type, what does it accept. This table reads the other way. Given a JSON value a client might send, which types take it. It is the quickest way to predict what a loosely typed client will get away with.
 
-| Constraint | Applies to | Effect |
+| JSON value sent | `string` family | `integer` | `number` | `boolean` | `datetime` | `date` | `uuid` | `array` | `object` / `ref` | `json` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `"text"` | stored | rejected unless numeric | rejected unless numeric | accepted for a fixed list of words | accepted if ISO 8601 | accepted if ISO 8601 date | accepted if a UUID | rejected | rejected | stored |
+| `"5"` | stored | `5` | `5.0` | rejected | rejected | rejected | rejected | rejected | rejected | stored |
+| `5` | rejected | `5` | `5.0` | rejected unless `0` or `1` | Unix seconds | rejected | rejected | rejected | rejected | stored |
+| `5.5` | rejected | rejected | `5.5` | rejected | Unix seconds | rejected | rejected | rejected | rejected | stored |
+| `true` | rejected | `1` | `1.0` | `true` | rejected | rejected | rejected | rejected | rejected | stored |
+| `null` | stored as `NULL` unless required | same | same | same | same | same | same | same | same | stored |
+| `[ … ]` | rejected | rejected | rejected | rejected | rejected | rejected | rejected | accepted | rejected | stored |
+| `{ … }` | rejected | rejected | rejected | rejected | rejected | rejected | rejected | rejected | accepted if the shape matches | stored |
+
+The pattern worth noticing: the text group is the strictest about type and the loosest about content. The number and boolean types are loose about type (strings convert) and strict about content. The structured types are strict about both. If an endpoint is called by a form-encoded client that sends every value as a string, expect `integer`, `number` and `boolean` fields to work and `array`, `object` and `uuid` fields to need JSON.
+
+## `required`, `nullable` and `default` together
+
+The three keys interact, and the interaction is the source of most "why did that save" and "why was that rejected" questions. These are the verified results for a create request. Each row names a field definition and what happens when the client leaves the key out or sends `null`.
+
+| Definition | Key omitted | Explicit `null` |
 | --- | --- | --- |
-| `required` | any type | Enforced only on create; a create request missing the field fails with a 422 unless `default` is set |
-| `default` | any type | Value substituted when the field is absent on create; also makes the field effectively optional even if `required: true` |
-| `nullable` | any type | Whether `null` is an accepted value; defaults to `true` for optional fields and `false` for required ones, and is forced `true` regardless on update/read responses |
-| `enum` | any type, typically `string` | Overrides the field's type entirely with a fixed `Literal` of allowed values |
-| `pattern` | `string`, `text`, `email`, `url` | Regex the value must match (auto-set for `email`/`url` if you don't supply one) |
-| `min_length` / `max_length` | `string`, `text`, `email`, `url` | Character-count bounds |
-| `minimum` / `maximum` | `integer`, `number`, `date`, `datetime` | Inclusive value bounds |
-| `items` | `array` | Field spec describing each element |
-| `fields` | `object` | Nested field list |
-| `schema` | `ref` | Name of the referenced Schema |
-| `description` | any type | Shown in the OpenAPI document |
-| `example` | any type | Shown in the OpenAPI document as a sample value |
-| `read_only` | any type | Excluded from create/update request bodies; included in read responses |
-| `write_only` | any type | Accepted in create/update request bodies; excluded from read responses |
-| `indexed` | any type | An index is created for this column the next time you migrate |
-| `unique` | any type | A unique index is created for this column the next time you migrate |
+| Plain (not required, no default) | Stored as `NULL` | Accepted, stored as `NULL` |
+| `"nullable": false` | Stored as `NULL` | `422` `string_type` |
+| `"required": true` | `422` `missing`, "Field required" | `422` `string_type` |
+| `"required": true, "nullable": true` | `422` `missing` | Accepted, stored as `NULL` |
+| `"required": true, "default": "dflt"` | The default is used | Accepted and stored as `NULL`, the default is **not** used |
+| `"default": "dflt"` (not required) | The default is used | Accepted and stored as `NULL` |
 
-`read_only`, `write_only`, `indexed`, and `unique` are covered in depth in [Defining resources](/data/defining-resources) and [Migrations](/data/migrations), since they affect the compiled request/response models and the generated DDL rather than validation itself.
+Three rules fall out of that table.
 
-## Choosing between similar-looking types
+**A required field is non-nullable unless you say otherwise.** `required: true` means "present and not null". If a field must be present but may carry an explicit `null`, set `"nullable": true` as well. Studio's **Nullable** switch under **More options** writes that key.
 
-**`string` vs `text`.** Same validation. Choose `text` for content with no natural length ceiling (article bodies, free-form notes); choose `string` when you want the platform to cap length at the database layer via `max_length` (on PostgreSQL/MySQL — SQLite enforces it only at validation time either way).
+**A default only fills in absence.** It applies when the key is missing from the body. A client that sends `"status": null` has said something, and the null is stored. If your code needs a guaranteed non-null value, add `"nullable": false` and let the client get a `422`, which is clearer than silently accepting a null the default would have replaced.
 
-**`number` vs `integer`.** If the value should never have a fractional part — a count, an ID, a quantity — use `integer`; you get exact arithmetic and no accidental `1.0` where you expected `1`. Reach for `number` only for genuinely fractional values, and remember it's a binary float, not a decimal — for money, an `integer` count of the smallest currency unit is usually the safer choice than a `number` of major units.
+**`required` is not enforced on update.** That is the next section.
 
-**`json` vs `object`.** `object` gives you real validation, a real OpenAPI schema, and lets nested fields be `required`, `read_only`, etc. `json` validates nothing. Use `object` whenever the shape is actually known ahead of time; reserve `json` for genuinely free-form data (arbitrary client-supplied metadata, a webhook payload you're storing verbatim).
+### On `PATCH`, everything is optional and everything is nullable
 
-**`array` vs `ref` to a Schema with `type: object` items, vs a related Resource.** An `array` of scalars (tags, numeric scores) is fine as-is. An array of structured items (line items on an order) is better modeled as `array` with `items: {"type": "ref", "schema": "..."}` if the item shape is reused elsewhere, or `items: {"type": "object", "fields": [...]}` if it's local to this one field. If the "items" need their own identity, their own lifecycle (created, updated, deleted independently), or need to be queried/filtered on their own, model them as a separate Resource with a `has_many` relation instead — see [Defining resources](/data/defining-resources).
+`PATCH` builds its request model in `update` mode, where every field is optional and every field accepts `null`, regardless of `required` and `nullable`. That includes a field marked `required` and a field marked `nullable: false`:
 
-<CardGroup cols={2}>
-  <Card title="Defining resources" icon="table-properties" href="/data/defining-resources" />
-  <Card title="Schemas" icon="code-2" href="/data/schemas" />
-  <Card title="Migrations" icon="arrow-right" href="/data/migrations" />
-  <Card title="Your database" icon="hard-drive" href="/data/your-database" />
+```text
+PATCH /rest/v1/m/1  {"c": null}   ->  200  {"a": null, "b": null, "c": null, "d": "x", "e": "dflt", "id": 1}
+PATCH /rest/v1/m/1  {"b": null}   ->  200  (b is "nullable": false, and it is still accepted)
+PATCH /rest/v1/m/1  {"a": "y"}    ->  200  (omitted fields are left as they were)
+```
+
+In that example `c` was `"required": true`, and a `PATCH` set it to `null` without complaint. If a column must never become empty, the type and `required` cannot guarantee it on update. Enforce it with a database `NOT NULL` constraint on an existing table you own, with an input policy that inspects `$input` (see [Policies](/policies/overview)), or by routing the change through a custom route, see [Custom routes](/data/custom-routes). The same holds for an empty body: `PATCH {}` returns `200`, changes nothing except `updated_at`, and counts as an update, which means it emits a `<resource>.updated` event. See [Resource events](/data/resource-events).
+
+## Defaults
+
+A `default` is a value Pawabase supplies when a create request leaves a field out. It is stored in the field definition, and the compiled create model uses it. It is not a database default, and the difference has consequences.
+
+| Question | Answer |
+| --- | --- |
+| Is there a `DEFAULT` clause in the generated `CREATE TABLE`? | No. The DDL for a field with a default is identical to the DDL without one |
+| Who applies it? | The compiled create model, for requests through `POST /rest/v1/<name>`, and the resource store, for rows a flow or function creates with the `resource.create` block |
+| Is it applied on update? | Never. `PATCH` leaves omitted fields alone |
+| Is it applied to rows that already exist? | No. Adding a field with a default to a table that has rows adds a column that is `NULL` for every old row |
+| Is it validated against the type? | No. It is stored as written on save |
+| Can it be an object or a list? | Yes, but you set it in the **JSON** tab, since Studio's **Default** control only offers scalars |
+
+The third and fourth rows are the ones that catch people. A real run with a resource `ev` that had one row, then gained `status` (default `"new"`) and `qty` (default `0`):
+
+```text
+migrate  ->  ALTER TABLE "ev" ADD COLUMN "status" TEXT
+             ALTER TABLE "ev" ADD COLUMN "qty" INTEGER
+
+GET  /rest/v1/ev   (old row)  ->  {"a": "old", "status": null, "qty": null, "id": 1, ...}
+POST /rest/v1/ev   {"a":"new"} ->  {"id": 2, "a": "new", "status": "new", "qty": 0, ...}
+PATCH /rest/v1/ev/1 {"a":"old2"} ->  {"a": "old2", "status": null, "qty": null, ...}
+GET /rest/v1/ev?filter[status]=new  ->  only the new row
+```
+
+The default exists for new rows only. To give old rows the value, run an `UPDATE` in the **Database** console, see [Database console](/data/database-console). Until you do, code that reads the field must handle `null` as well as the default.
+
+<Warning>
+A default is not checked when you save the definition. A `default` of `"abc"` on an `integer` field saves without complaint and then fails every create request that relies on it, with a `500`. The same is true of an `enum` default that is not in the list and a string default longer than `max_length`. After setting a default, send one create request that omits the field.
+</Warning>
+
+## `enum`: allowed values
+
+`enum` restricts a field to a fixed list. Pawabase compiles it as a literal type, which has three consequences you should know before using it for anything that will change.
+
+| Behavior | Detail |
+| --- | --- |
+| The list overrides the type | A field with `"type": "string"` and `"enum": ["a", "b"]` accepts only `"a"` and `"b"`, whatever the string constraints say |
+| Matching is exact | Case-sensitive for strings, and exact for numbers: with `"enum": [1, 2, 3]` the string `"2"` is rejected, "Input should be 1, 2 or 3" |
+| `null` passes when the field is not required | An enum field with no `required` accepts `null` and stores it |
+| It applies on create and update | A `PATCH` that sets a value outside the list is a `422` |
+| It is used for reading too | The response model checks stored values against the list |
+
+The last row is the dangerous one. Because reads are validated against the current list, **shrinking an enum while rows still hold a removed value breaks reads**. In testing, a resource whose `st` field allowed `a` and `b` held two rows, one of each. After the list was changed to `b` and `c`:
+
+```text
+GET   /rest/v1/en            ->  500  {"error":"Internal Server Error","detail":"Response validation failed"}
+GET   /rest/v1/en/1          ->  500  (the row whose value is "a")
+PATCH /rest/v1/en/1 {"st":"a"} -> 422  [{"type":"literal_error","loc":["st"],"msg":"Input should be 'b' or 'c'", ...}]
+```
+
+The list request failed because one row on the page held a value that is no longer allowed, and so does every page that contains such a row. Adding a value to an enum is safe. Removing or renaming one is a data migration: update the stored values first (in the **Database** console), then change the list.
+
+Studio's **Allowed values** input is a tag input. Type a value and press Enter or comma to add it. For an integer or number field the values are converted to numbers and anything that does not parse is discarded without a message, so check the saved list after typing numbers.
+
+## Names
+
+A field's name is more than a label: it becomes a JSON key, a column name, a filter key and a `select` entry at once. The rules reflect that.
+
+| Rule | Detail |
+| --- | --- |
+| Pattern | A letter or underscore, then letters, digits and underscores, up to 63 characters |
+| Uniqueness | A name may appear once in a field list; a second use is refused: `fields[1]: duplicate field 'a'` |
+| Case | Names are case-sensitive and stored as written. `Name` and `name` are different fields, and on PostgreSQL different columns |
+| SQL keywords | Safe. Every identifier is quoted, so `order`, `group`, `select` and `page` all work as field names and as filter, sort and select keys |
+| `id` | Not allowed on a resource whose primary key is `id`. The compiler adds the primary key itself, and a second `id` produces `duplicate field 'id'` as a problem on the **Overview** page, after which every route of that resource returns `404` |
+| `created_at`, `updated_at` | Declaring them yourself collides with the timestamp columns. Pawabase does not refuse it, and the declared field and the managed column become the same column. Leave them to the timestamp setting |
+
+A hyphen, a space or a leading digit fails the name check in the editor before you can save: the input turns red as you type. The server enforces the same pattern, with this message for the first offending field:
+
+```text
+fields[0]: name must be a letter or underscore followed by letters, digits or underscores
+```
+
+## The automatic fields: primary key and timestamps
+
+Three columns exist on a resource without you declaring them, as long as you leave the defaults alone.
+
+| Column | Type | Set by | Writable by clients |
+| --- | --- | --- | --- |
+| The primary key (default name `id`) | An auto-incrementing integer, or a UUID when **ID type** is **UUID** | The database, or Pawabase for UUIDs | No. `PATCH {"id": 99}` returns `422` `extra_forbidden` |
+| `created_at` | `datetime` | Pawabase, once, on create | No. `POST` with `created_at` returns `422` |
+| `updated_at` | `datetime` | Pawabase, on every update | No. `PATCH` with `updated_at` returns `422` |
+
+The **Timestamps** switch under **Behaviour** controls the last two. With it off, a new table has no timestamp columns and responses omit them. The primary key's name and type are set under **Details**, as **Primary key** and **ID type**. See [Defining resources](/data/defining-resources). Both timestamps are written in UTC, and on SQLite they are stored as ISO strings with a `+00:00` offset, which is how they appear in responses. A declared `datetime` field of your own may be written by clients, the automatic ones may not.
+
+## `read_only` and `write_only`
+
+These two keys decide which request and response models include a field. They are not mirror images, and one of them does less than its name suggests.
+
+| Key | Create and update models | Documented response model | What actually happens at runtime |
+| --- | --- | --- | --- |
+| `read_only` | The field is left out, so a client that sends it gets `422` `extra_forbidden` | The field is included | Works as described: clients cannot write it, and it is returned |
+| `write_only` | The field is included | The field is left out of the **API document** | The value is still returned. In testing, a `write_only` field named `cost` came back in list, get and create responses |
+
+The second row is a known gap between the document and the behavior. The read model allows extra properties and rows are read with `SELECT *`, so a column that exists in the table is serialized whether or not the document lists it. Treat `write_only` as documentation, not as protection. To keep a column out of responses, add it to the `omit` step of a [transformer](/data/transformers), or limit what callers can read with `?select=`. The behavior is explained in full on [Schemas](/data/schemas), along with the related case of a column the definition no longer lists.
+
+## How the database stores each type
+
+The column a type maps to is chosen once, when **Create / migrate table** creates the table, from the dialect of the environment's database. The mapping table near the top of the page lists the column names. This section shows what the generated statements look like and how values are encoded on their way in, because the encoding explains several behaviors above (the offset kept on SQLite, the integer `1` for a boolean, the UTC conversion on MySQL).
+
+### The generated `CREATE TABLE` on each dialect
+
+Take one resource, `products`, with a representative field of each kind, with `sku` marked `unique` and `stock` marked `indexed`. These are the statements migration generates, verbatim.
+
+<CodeGroup>
+
+```sql SQLite
+CREATE TABLE IF NOT EXISTS "products" (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "sku" TEXT UNIQUE,
+  "title" TEXT,
+  "price" REAL,
+  "stock" INTEGER,
+  "active" INTEGER,
+  "released" TEXT,
+  "published_at" TEXT,
+  "ext" TEXT,
+  "email" TEXT,
+  "site" TEXT,
+  "bio" TEXT,
+  "meta" TEXT,
+  "tags" TEXT,
+  "dims" TEXT,
+  "home" TEXT,
+  "created_at" TEXT,
+  "updated_at" TEXT
+);
+```
+
+```sql PostgreSQL
+CREATE TABLE IF NOT EXISTS "products" (
+  "id" BIGSERIAL PRIMARY KEY,
+  "sku" VARCHAR(20) UNIQUE,
+  "title" VARCHAR(255),
+  "price" DOUBLE PRECISION,
+  "stock" BIGINT,
+  "active" BOOLEAN,
+  "released" DATE,
+  "published_at" TIMESTAMPTZ,
+  "ext" UUID,
+  "email" VARCHAR(320),
+  "site" TEXT,
+  "bio" TEXT,
+  "meta" JSONB,
+  "tags" JSONB,
+  "dims" JSONB,
+  "home" JSONB,
+  "created_at" TIMESTAMPTZ,
+  "updated_at" TIMESTAMPTZ
+);
+```
+
+```sql MySQL
+CREATE TABLE IF NOT EXISTS `products` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `sku` VARCHAR(20) UNIQUE,
+  `title` VARCHAR(255),
+  `price` DOUBLE,
+  `stock` BIGINT,
+  `active` BOOLEAN,
+  `released` DATE,
+  `published_at` DATETIME(6),
+  `ext` CHAR(36),
+  `email` VARCHAR(320),
+  `site` TEXT,
+  `bio` TEXT,
+  `meta` JSON,
+  `tags` JSON,
+  `dims` JSON,
+  `home` JSON,
+  `created_at` DATETIME(6),
+  `updated_at` DATETIME(6)
+);
+```
+
+</CodeGroup>
+
+The statements are shown wrapped for reading; Pawabase runs each as one line. Four things are worth reading off them.
+
+| Observation | What it means |
+| --- | --- |
+| No column has `NOT NULL` | `required` is a validation rule only. The database accepts a row with every column `NULL`, and anything that writes to the table without going through the API (a script, the SQL console, an import) is not held to it |
+| No column has a `DEFAULT` | Defaults are applied by Pawabase when it builds the row. A direct `INSERT` that omits a column stores `NULL` |
+| Only `unique` appears inline, and only on a new table | `unique` becomes `UNIQUE` in `CREATE TABLE` and as a separate `CREATE UNIQUE INDEX` statement. `indexed` becomes a plain `CREATE INDEX` |
+| The key and timestamps are last or first by construction | The primary key is first, then your fields in order, then `created_at` and `updated_at`, which is also why field order in Studio is column order on a new table |
+
+A UUID-keyed resource changes only the key line: `"id" TEXT PRIMARY KEY` on SQLite, `"id" UUID PRIMARY KEY` on PostgreSQL and `` `id` CHAR(36) PRIMARY KEY`` on MySQL.
+
+### Index statements
+
+```sql
+-- SQLite and PostgreSQL
+CREATE UNIQUE INDEX IF NOT EXISTS "ix_products_sku" ON "products" ("sku");
+CREATE INDEX IF NOT EXISTS "ix_products_stock" ON "products" ("stock");
+
+-- MySQL (no IF NOT EXISTS clause)
+CREATE UNIQUE INDEX `ix_products_sku` ON `products` (`sku`);
+CREATE INDEX `ix_products_stock` ON `products` (`stock`);
+```
+
+Index names follow `ix_<table>_<column>` and are cut to 60 characters. The index statements run every time you migrate, whether the table is new or not, which is why a second migrate of an unchanged resource still reports the index statements and nothing else. A resource with an **Owner field** gets an index on that column automatically. The behavior on MySQL, where the statements omit `IF NOT EXISTS`, is described on [Migrations](/data/migrations).
+
+### Adding a column later
+
+```sql
+ALTER TABLE "products" ADD COLUMN "gift_note" TEXT          -- SQLite
+ALTER TABLE "products" ADD COLUMN "gift_note" VARCHAR(255)  -- PostgreSQL
+ALTER TABLE `products` ADD COLUMN `gift_note` VARCHAR(255)  -- MySQL
+```
+
+An added column never carries `UNIQUE`, even if the field is marked `unique`. The separate index statement that follows is what enforces uniqueness, and it fails if the existing rows already contain duplicates.
+
+### How values are encoded on write
+
+Before a value reaches the driver, Pawabase converts it to the form the column expects. This is where the same JSON value becomes three different stored values.
+
+| Type | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| `boolean` `true` | `1` | `true` | `true` |
+| `datetime` `2026-10-01T10:00:00+02:00` | The string `2026-10-01T10:00:00+02:00` | A timestamp with that offset, stored as an absolute instant | `2026-10-01 08:00:00`, converted to UTC, zone dropped |
+| `date` `2026-10-01` | The string `2026-10-01` | A `DATE` | A `DATE` |
+| `uuid` | A string | A native `UUID` | A 36-character string |
+| `json`, `array`, `object`, `ref` `{"a": 1}` | The string `{"a": 1}` | The same JSON text, cast by `JSONB` | The same JSON text, cast by `JSON` |
+| `integer` `"5"` | `5` | `5` | `5` |
+| `number` `"2.5"` | `2.5` | `2.5` | `2.5` |
+
+A datetime written with an offset keeps that offset on SQLite and is normalized on the other two. This is the reason the time-type section recommends sending UTC. On a read, values are decoded back: JSON text is parsed, SQLite integers become booleans for boolean fields, dates and timestamps become ISO strings, UUIDs become strings and decimal numbers become floats.
+
+### What the JSON group costs you
+
+Because `json`, `array`, `object` and `ref` fields live in one column as serialized text, the filter operators see the serialized form and not the structure.
+
+| Question | Answer |
+| --- | --- |
+| Can I filter `tags` for the value `"x"`? | Not with `filter[tags]=…`. An equality filter on a JSON field is compared against the JSON-encoded form of the filter value, so `?filter[meta]={"k":1}` matched nothing in testing even though a row held exactly that object |
+| Can I test for presence? | Yes. `is.null` and `isnot.null` work: `?filter[meta]=is.null` returned the rows where the field was unset |
+| Can I sort by a value inside a field? | No. `sort` takes field names |
+| Can the database index the contents? | Not through the field editor. A `JSONB` or `JSON` column can be indexed by hand in the **Database** console, but Pawabase will not use that index to answer a filter |
+
+If you need to query by a value, give it a column of its own: a `tags` array you must search belongs in a related resource (`post_tags` with a `post_id` and a `tag`), see [Relations](/data/relations). Keep `json` for data you store and return as a unit.
+
+## Mapping a table that already exists
+
+Pointing a resource at a table you did not create is supported. Set **Table** and **Primary key** on the **Details** section, turn **Timestamps** off if the table has no such columns, and declare the fields you want. Migrating such a resource adds only the columns that are missing and changes nothing else, see [Migrations](/data/migrations). Two consequences matter for field types.
+
+**Declared types are not compared to the column types.** Pawabase never inspects whether the column called `price` is numeric. It trusts the definition. A table whose `price` column is `TEXT` and holds `'12'` is read correctly through an `integer` field, because the value converts. A row holding `'abc'` in that column is not: the response model refuses to convert it, and the request fails.
+
+```text
+legacy table:  price TEXT  ('12' in row 1, 'abc' in row 2),  field price: integer
+
+GET /rest/v1/legacy/1  ->  200  {"price": 12, ...}
+GET /rest/v1/legacy/2  ->  500  {"error":"Internal Server Error","detail":"Response validation failed"}
+GET /rest/v1/legacy    ->  500  (the same, for every page that includes row 2)
+```
+
+One bad row makes every list page that contains it fail. Before you expose a table you have not controlled, run a query in the **Database** console for values that will not convert (for example rows where a numeric column is not numeric) and clean them first.
+
+**Undeclared columns are still returned.** A column that the definition does not list is not hidden. The example table also had an `extra_secret` column that no field declared:
+
+```json
+{"price": 12, "flag": true, "doc": {"a": 1}, "born": "2020-05-05", "n": 2, "id": 1, "extra_secret": "shh"}
+```
+
+Reads select every column and the response allows properties the definition does not name. If a legacy table has columns you must not expose, say so with `?select=` on the client (which only protects clients that follow it), or with a transformer that uses `pick` to list exactly what may leave the server. A transformer is the only server-side control, see [Transformers](/data/transformers).
+
+## How types appear in the API document
+
+Studio's **API Explorer** and the public docs page (when **Publish generated API docs** is on under **Settings**) are generated from the compiled models. Each field becomes a JSON Schema fragment inside the resource's response schema. Every property is nullable in the response (an `anyOf` with `{"type": "null"}`), because a read can return a column that was never set.
+
+```json
+{
+  "title": {
+    "anyOf": [{"type": "string", "minLength": 2, "maxLength": 60}, {"type": "null"}],
+    "description": "Display name",
+    "examples": ["Blue mug"]
+  },
+  "price": {
+    "anyOf": [{"type": "number", "minimum": 0.0, "maximum": 10000.0}, {"type": "null"}]
+  },
+  "status": {
+    "anyOf": [{"type": "string", "enum": ["draft", "live"]}, {"type": "null"}]
+  },
+  "email": {
+    "anyOf": [{"type": "string", "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"}, {"type": "null"}]
+  },
+  "d": {"anyOf": [{"type": "string", "format": "date"}, {"type": "null"}]},
+  "dt": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+  "u": {"anyOf": [{"type": "string", "format": "uuid"}, {"type": "null"}]},
+  "tags": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "null"}]},
+  "meta": {"anyOf": [{}, {"type": "null"}]}
+}
+```
+
+| Field setting | Where it shows in the document |
+| --- | --- |
+| `min_length`, `max_length` | `minLength`, `maxLength` |
+| `minimum`, `maximum` | `minimum`, `maximum`, written as decimals |
+| `pattern`, and the built-in `email` and `url` patterns | `pattern` |
+| `enum` | `enum` |
+| `description` | `description` |
+| `example` | `examples`, a one-element list |
+| `date`, `datetime`, `uuid` | `format: date`, `format: date-time`, `format: uuid` |
+| `object` with fields | A named component such as `WidgetsDims`, referenced with `$ref` |
+| `write_only` | Absent from the response schema (but see the warning above about runtime) |
+| `read_only` | Present in the response schema, absent from the request schema |
+
+The document marks the response object as accepting additional properties, which is how undeclared columns can appear in a response without contradicting it. The list operation documents the query parameters `page` (minimum 1, default 1), `per_page` (maximum 200, default 20), `sort`, `select` and `expand`, and the error responses `401`, `403` and `422`. When a resource has a transformer, the response schema is omitted, because the transformer decides the shape and Pawabase cannot describe it. See [Transformers](/data/transformers).
+
+## What the API Explorer builds from your types
+
+**API Explorer** in the **Build** group lists every endpoint of the active API version and lets you send real requests with Studio supplying the project context, so no API key is needed. For a `POST` or `PATCH` endpoint it pre-fills the **JSON body** card from the request schema, and the way it does that is a direct consequence of the types.
+
+The schema for the `products` create endpoint, as the API document states it, marks `sku`, `title` and `price_minor` as required and forbids any other key (`additionalProperties: false`). Optional fields are wrapped in an "either this type or null" form. The Explorer builds its starting body by taking, for each property, a singular `example` if the schema has one, else the `default`, else the first `enum` value, else a placeholder by type: `0` for numbers, `false` for booleans, an empty list for arrays, and the empty string for anything it cannot classify.
+
+```json
+{
+  "sku": "",
+  "title": "",
+  "description": "",
+  "price_minor": 0,
+  "currency": "USD",
+  "status": "draft",
+  "stock": 0,
+  "released": "",
+  "tags": [],
+  "specs": ""
+}
+```
+
+Reading that starting body against the types explains most first-try failures in the Explorer:
+
+| Property | Starting value | Why | What happens if you send it unchanged |
+| --- | --- | --- | --- |
+| `sku`, `title` | `""` | A required string has no default or example | `422`: `sku` fails its `pattern`, and `title` fails `min_length` |
+| `price_minor` | `0` | A required integer with no default | Accepted, which may not be what you intended |
+| `currency`, `status`, `stock`, `tags` | The field's `default` | The default is in the schema | Accepted |
+| `description` | `""` | An optional text field with nothing to go on | Accepted, and stored as an empty string, not `NULL` |
+| `released` | `""` | A date's `format` is not used to pick a sample | `422` `date_from_datetime_parsing` |
+| `specs` | `""` | An object wrapped in the nullable form is not recognized as an object | `422` `model_type` |
+
+The **Example** control in the field editor does not change the starting body. It is published in the document under the plural `examples`, which the Explorer does not read, so it documents the field for readers and does not fill the form. Three habits make the Explorer faster. Edit the placeholder values before sending, since a `date`, a `uuid` or a `pattern` field will not accept an empty string. Delete optional properties you do not want to send instead of editing them, because an absent key is not an empty value. And sign in as a project user under **User authentication** when you want to test an owner or role policy, since requests are anonymous by default.
+
+## Changing a field's type after data exists
+
+Migration is additive, so Pawabase will not retype a column. What changing `type` in the definition does is change validation and serialization immediately, while the column stays what it was. The risk depends on what the stored values look like.
+
+| Change | What stays the same | What changes immediately |
+| --- | --- | --- |
+| `string` to `text` | The column. On PostgreSQL and MySQL it is still `VARCHAR(n)` with the old `n` | Validation drops the length limit you removed, but the column still enforces its own width |
+| `integer` to `number` | The column is still `INTEGER` or `BIGINT` | Validation accepts fractions that a whole-number column cannot hold faithfully |
+| `string` to `integer` | The column is still text | Reads convert numeric text to numbers and fail on any row that is not numeric |
+| Any type to `json` | The column is still text-typed or numeric | Values are encoded as JSON text on write, which an old non-JSON column may not hold, and old plain values may not parse on read |
+| `boolean` to `integer` | The column is still a flag column | SQLite hands back `0` and `1`; a native `BOOLEAN` column on PostgreSQL or MySQL is not an integer column |
+
+In every row the database keeps the column it has, and the definition decides what Pawabase expects to find in it. The two disagree until you change the column yourself.
+
+The safe route for a real type change is a new field with the new type, a one-time `UPDATE` in the **Database** console to copy and convert the values, a deploy of clients that use the new field, and then removal of the old one from the definition. The old column stays in the table, and, as noted above, remains visible in responses until you remove it or add it to a transformer's `omit` list. Migrations never drop columns, see [Migrations](/data/migrations).
+
+## Choosing types for real data
+
+The sections above explain each type on its own. In practice you choose types for a whole resource at once, and the right choice depends on what the data will do later: whether it will be summed, sorted, compared, joined or indexed. The five resources below were each saved, migrated and sent a sample record against a running Pawabase API, so the definitions are known to compile and the responses shown are the responses returned.
+
+### A product catalog: money, codes and a closed shape
+
+```json
+{
+  "name": "products",
+  "description": "Items we sell",
+  "fields": [
+    {"name": "sku", "type": "string", "required": true, "max_length": 24, "pattern": "^[A-Z0-9-]+$", "unique": true},
+    {"name": "title", "type": "string", "required": true, "min_length": 2, "max_length": 120},
+    {"name": "description", "type": "text"},
+    {"name": "price_minor", "type": "integer", "required": true, "minimum": 0,
+     "description": "Price in the smallest currency unit"},
+    {"name": "currency", "type": "string", "enum": ["USD", "EUR", "GBP", "NGN"], "default": "USD"},
+    {"name": "status", "type": "string", "enum": ["draft", "live", "archived"], "default": "draft"},
+    {"name": "stock", "type": "integer", "minimum": 0, "default": 0, "indexed": true},
+    {"name": "released", "type": "date"},
+    {"name": "tags", "type": "array", "items": {"type": "string"}, "default": []},
+    {"name": "specs", "type": "object", "fields": [
+      {"name": "weight_g", "type": "integer", "minimum": 0},
+      {"name": "color", "type": "string"}
+    ]}
+  ]
+}
+```
+
+Creating a product with only the required fields and a few optional ones:
+
+```json
+POST /rest/v1/products
+{"sku": "MUG-01", "title": "Blue mug", "price_minor": 1250, "tags": ["kitchen"],
+ "specs": {"weight_g": 300, "color": "blue"}}
+
+201
+{
+  "id": 1, "sku": "MUG-01", "title": "Blue mug", "description": null,
+  "price_minor": 1250, "currency": "USD", "status": "draft", "stock": 0,
+  "released": null, "tags": ["kitchen"], "specs": {"weight_g": 300, "color": "blue"},
+  "created_at": "2026-10-01T20:19:28.881329+00:00", "updated_at": "2026-10-01T20:19:28.881329+00:00"
+}
+```
+
+| Choice | Reason |
+| --- | --- |
+| `price_minor` is an `integer`, not a `number` | Money in a binary float drifts. 1250 stays 1250, and sums of integers are exact. The currency is a separate field, so a price is a pair |
+| `currency` is an `enum` with a default | A closed list that the database never checks. The default fills new rows only |
+| `sku` has a `pattern` and `unique` | The pattern keeps spaces and lowercase out. `unique` becomes an index, and a duplicate create returns `500` rather than a `409`, see the note below |
+| `stock` is `indexed` | A column clients filter and sort by gets an index at migration time |
+| `tags` is a list of strings with a `[]` default | The default makes an omitted list read as `[]`, though an explicit `null` is still accepted |
+| `specs` is an `object`, not `json` | The shape is known and closed, so unknown keys are rejected and the API document lists the fields |
+
+<Note>
+A duplicate `sku` is refused by the database, not by validation, and the API reports an unhandled database error: `500 "Internal Server Error"`. If the client needs to tell "already exists" from a real failure, check first with `?filter[sku]=MUG-01` or put the create behind a [custom route](/data/custom-routes) that returns a `409` you control.
+</Note>
+
+### Support tickets: owner stamping, closed numbers and optional links
+
+```json
+{
+  "name": "tickets",
+  "owner_field": "requester_id",
+  "fields": [
+    {"name": "subject", "type": "string", "required": true, "max_length": 160},
+    {"name": "body", "type": "text", "required": true},
+    {"name": "status", "type": "string", "enum": ["open", "pending", "solved"], "default": "open", "indexed": true},
+    {"name": "priority", "type": "integer", "enum": [1, 2, 3], "default": 2},
+    {"name": "requester_id", "type": "string", "read_only": true},
+    {"name": "requester_email", "type": "email"},
+    {"name": "assignee_id", "type": "uuid"},
+    {"name": "due", "type": "date"},
+    {"name": "labels", "type": "array", "items": {"type": "string"}},
+    {"name": "extra", "type": "json"}
+  ]
+}
+```
+
+A signed-in caller whose user id is `u-1` creates a ticket, and the record comes back with the id stamped into `requester_id`:
+
+```json
+POST /rest/v1/tickets
+{"subject": "Cannot log in", "body": "The reset email never arrives",
+ "priority": 1, "requester_email": "maya@acme.co", "labels": ["login"]}
+
+201
+{"id": 1, "subject": "Cannot log in", "body": "The reset email never arrives",
+ "status": "open", "priority": 1, "requester_id": "u-1", "requester_email": "maya@acme.co",
+ "assignee_id": null, "due": null, "labels": ["login"], "extra": null, ...}
+```
+
+| Choice | Reason |
+| --- | --- |
+| `requester_id` is a `string` marked `read_only`, and is the **Owner field** | Pawabase fills it from the caller's identity on create, and `read_only` keeps clients from sending a value. An identity is not always a number, so `string` is the safe type |
+| `priority` is an integer `enum` | Sorting by `priority` is numeric, and the list `[1, 2, 3]` is exact. Send numbers, not `"1"` |
+| `assignee_id` is a `uuid` | A staff identifier from a system that issues UUIDs. Validation rejects anything else, and the value is normalized to lowercase hyphenated form |
+| `due` is a `date`, not a `datetime` | A due day has no time zone. Filtering `lt.2026-10-15` works on every dialect |
+| `extra` is `json` | A bag for integration data. Nothing inside it is validated or searchable |
+
+### An append-only audit log: no timestamps, an indexed time
+
+```json
+{
+  "name": "audit_events",
+  "timestamps": false,
+  "fields": [
+    {"name": "occurred_at", "type": "datetime", "required": true, "indexed": true},
+    {"name": "actor", "type": "string", "max_length": 128},
+    {"name": "action", "type": "string", "required": true, "max_length": 64},
+    {"name": "level", "type": "string", "enum": ["info", "warn", "error"], "default": "info"},
+    {"name": "payload", "type": "json"}
+  ]
+}
+```
+
+```json
+201
+{"id": 1, "occurred_at": "2026-10-01T09:30:00+00:00", "actor": "maya@acme.co",
+ "action": "invoice.sent", "level": "info", "payload": {"invoice": "INV-204", "total_minor": 8400}}
+```
+
+With **Timestamps** off, the table has no `created_at` or `updated_at` and neither appears in responses. The event time is a field the caller supplies, `occurred_at`, because for a log the moment the thing happened is the data and the moment the row was written is not. It is indexed, since the dominant query is "events since a time". Send it in UTC. On PostgreSQL and MySQL a `datetime` index sorts chronologically; on SQLite it sorts as text, which is chronological only when every value uses the same offset.
+
+### A profile: a shared address schema and a nested preferences object
+
+```json
+{
+  "name": "profiles",
+  "owner_field": "user_id",
+  "fields": [
+    {"name": "user_id", "type": "string", "read_only": true, "unique": true},
+    {"name": "display_name", "type": "string", "required": true, "max_length": 60},
+    {"name": "website", "type": "url"},
+    {"name": "born", "type": "date"},
+    {"name": "home", "type": "ref", "schema": "Address"},
+    {"name": "other_addresses", "type": "array", "items": {"type": "ref", "schema": "Address"}},
+    {"name": "preferences", "type": "object", "fields": [
+      {"name": "theme", "type": "string", "enum": ["light", "dark"], "default": "light"},
+      {"name": "newsletter", "type": "boolean", "default": false}
+    ]}
+  ]
+}
+```
+
+This resource refers to a schema named `Address` with required `street` and `city` and an optional `postcode`, created under **Schemas**. A create that gives only part of the nested objects fills in the rest:
+
+```json
+POST /rest/v1/profiles
+{"display_name": "Maya", "website": "https://maya.example", "born": "1994-03-12",
+ "home": {"street": "1 Main St", "city": "Lagos"}, "preferences": {"theme": "dark"}}
+
+201
+{"id": 1, "user_id": "u-1", "display_name": "Maya", "website": "https://maya.example",
+ "born": "1994-03-12",
+ "home": {"street": "1 Main St", "city": "Lagos", "postcode": null},
+ "other_addresses": null,
+ "preferences": {"theme": "dark", "newsletter": false}, ...}
+```
+
+Two details in that response are worth reading closely. The nested `postcode` appears as `null` because a nested object is filled to its full shape, and `newsletter` appears as `false` because a nested field's default applies when its parent is present. `other_addresses` is `null` rather than `[]`, because the array has no default and the key was omitted.
+
+<Warning>
+Here `user_id` is both `unique` and the **Owner field**. Migration adds an index for each reason, and both statements carry the same name, `ix_profiles_user_id`. On SQLite and PostgreSQL the second statement is skipped because of `IF NOT EXISTS`. MySQL has no such clause in the statements Pawabase generates, so the second one fails there with a duplicate key name. A field that is the owner field already gets an index, so on MySQL leave `unique` off it, and enforce one profile per user with a policy or a custom route.
+</Warning>
+
+### Feature flags: a strict boolean and a flexible value
+
+```json
+{
+  "name": "feature_flags",
+  "fields": [
+    {"name": "key", "type": "string", "required": true, "max_length": 64, "pattern": "^[a-z0-9_.-]+$", "unique": true},
+    {"name": "enabled", "type": "boolean", "default": false, "nullable": false},
+    {"name": "rollout_percent", "type": "integer", "minimum": 0, "maximum": 100, "default": 0},
+    {"name": "value", "type": "json"}
+  ]
+}
+```
+
+`enabled` combines a default with `"nullable": false`, which is the way to stop a flag from ever being stored as `NULL` on create: omitted means `false`, and an explicit `null` is a `422`. Remember that `PATCH` accepts a `null` for any field, so the guarantee covers create only. `rollout_percent` carries both bounds, so out-of-range values fail at the boundary, and `value` is `json` because each flag's payload has a different shape.
+
+## Request and response catalog
+
+Each row is one request that was sent to a resource with the field shown, and the result. The rows are intended as a regression list: if you change a definition, re-run the rows that touch it.
+
+| Field definition | Request body | Result |
+| --- | --- | --- |
+| `{"name":"s","type":"string","min_length":2,"max_length":4}` | `{"s": "abcd"}` | `201` |
+| same | `{"s": "abcde"}` | `422` `string_too_long`, `loc: ["s"]` |
+| same | `{"s": "a"}` | `422` `string_too_short` |
+| same | `{"s": 5}` | `422` `string_type` |
+| `{"name":"i","type":"integer"}` | `{"i": "5"}` | `201`, stored as `5` |
+| same | `{"i": 5.5}` | `422` `int_from_float` |
+| same | `{"i": ""}` | `422` `int_parsing` |
+| same | `{"i": true}` | `201`, stored as `1` |
+| `{"name":"n","type":"number"}` | `{"n": "1e3"}` | `201`, stored as `1000.0` |
+| same | `{"n": ""}` | `422` `float_parsing` |
+| `{"name":"b","type":"boolean"}` | `{"b": "yes"}` | `201`, stored as `true` |
+| same | `{"b": 2}` | `422` `bool_parsing` |
+| same | `{"b": null}` | `201`, stored as `NULL` |
+| `{"name":"level","type":"integer","enum":[1,2,3]}` | `{"level": 2}` | `201` |
+| same | `{"level": "2"}` | `422` `literal_error`, "Input should be 1, 2 or 3" |
+| `{"name":"dt","type":"datetime"}` | `{"dt": "2026-10-01"}` | `201`, `2026-10-01T00:00:00+00:00` |
+| same | `{"dt": 1790000000}` | `201`, `2026-09-21T14:13:20+00:00` |
+| `{"name":"d","type":"date"}` | `{"d": "2026-10-01T10:30:00"}` | `422` `date_from_datetime_inexact` |
+| same | `{"d": "2026-10-01T00:00:00"}` | `201`, `2026-10-01` |
+| `{"name":"u","type":"uuid"}` | `{"u": "123e4567e89b12d3a456426614174000"}` | `201`, `123e4567-e89b-12d3-a456-426614174000` |
+| same | `{"u": "xyz"}` | `422` `uuid_parsing` |
+| `{"name":"e","type":"email"}` | `{"e": "a b@x.co"}` | `422` `string_pattern_mismatch` |
+| `{"name":"url","type":"url"}` | `{"url": "x.co"}` | `422` `string_pattern_mismatch` |
+| `{"name":"arr","type":"array","items":{"type":"integer"}}` | `{"arr": ["1", "2"]}` | `201`, `[1, 2]` |
+| same | `{"arr": [1, "x"]}` | `422` `int_parsing`, `loc: ["arr", 1]` |
+| same | `{"arr": "1,2"}` | `422` `list_type` |
+| `{"name":"o","type":"object","fields":[{"name":"a","type":"string"}]}` | `{"o": {"z": 1}}` | `422` `extra_forbidden`, `loc: ["o", "z"]` |
+| same | `{"o": {}}` | `201`, stored as `{"a": null}` |
+| `{"name":"j","type":"json"}` | `{"j": 42}` | `201`, returned as `42` |
+
+## Mistakes that cost time
+
+| Mistake | What you see | The cause | The fix |
+| --- | --- | --- | --- |
+| Storing money as `number` | Totals that end in `…0000001`, equality checks that fail | A binary float cannot hold most decimal fractions | Store minor units as `integer` |
+| Filtering a boolean with `false` | The result contains only `true` rows | A non-empty string converts to true before the query | Use `is.false`, see [Filtering](/data/filtering) |
+| Expecting `required` to guard updates | A `PATCH` sets a required field to `null` and succeeds | `PATCH` makes every field optional and nullable | Guard with a policy on `$input`, a `NOT NULL` constraint, or a custom route |
+| Relying on `write_only` to hide a column | The value appears in list responses | The runtime serializes every selected column | Add the field to a transformer's `omit` step |
+| Shrinking an `enum` | Lists and gets return `500` "Response validation failed" | Stored values are checked against the current list | Update the rows first, then change the list |
+| A bad `default` | Creates that rely on it return `500` | Defaults are not validated on save | Send one create that omits the field right after saving |
+| Raising `max_length` on PostgreSQL | A long value passes validation and then returns `500` | The `VARCHAR(n)` width was fixed at migration | Alter the column in the **Database** console |
+| Sending local times without an offset | Times shift by the server's difference from UTC | A value with no zone is read as UTC | Send `Z` or an explicit offset |
+| Declaring a field called `id` | Every route of the resource returns `404` | The compiler adds the key itself and reports a duplicate | Remove the field, and set **Primary key** under **Details** if you need another name |
+| Using `json` for something you will search | Equality filters on it never match | The column is serialized text | Move the searchable value into its own field or resource |
+| Mapping a table you did not create without checking | `500` on rows with unexpected values, and extra columns in responses | Declared types are trusted and every column is returned | Clean the data first, and add a transformer that picks the fields to return |
+
+## Checking your work
+
+Before relying on a resource's types, send these four requests. They take a minute and catch most of the problems above.
+
+| Check | Request | What a healthy result looks like |
+| --- | --- | --- |
+| A minimal create | A body with only the required fields | `201`, with every default present and every unset optional field `null` |
+| A maximal create | A body with every field at its limit | `201`, with values unchanged, and numbers and dates in the form you expect |
+| One bad value per constraint | A body that breaks one constraint at a time | `422`, with a `loc` that names the field and a `type` you can branch on |
+| A list and a get after an enum or type change | `GET /rest/v1/<name>` and one `GET /rest/v1/<name>/{id}` | `200`, not `500` |
+
+## Where types are enforced, and where they are not
+
+Everything above describes the HTTP boundary: a `POST`, `PATCH` or `PUT` to `/rest/v1/<name>`, or a custom route with an input definition. That is where the compiled model runs. Several other paths write to the same table, and they do not run it. This is the most important limit of field types, because a value that gets into the table by one of those paths still has to be read back through a model that does enforce them.
+
+| Write path | Constraints (`required`, `min_length`, `maximum`, `enum`, `pattern`) | Type conversion | Unknown fields | Events, cache invalidation |
+| --- | --- | --- | --- | --- |
+| `POST` / `PATCH` / `PUT` on `/rest/v1/<name>` | Enforced, `422` with details | Yes, as described above | Rejected, `422` | Yes |
+| A custom route's `input_fields` or `input_schema` | Enforced on the route's body only | Yes | Rejected | Whatever the handler does |
+| A flow's `resource.create` / `resource.update` block | Not enforced | Only what the database encoder does | Rejected, the run fails | Yes |
+| A Python function writing through the runtime | Not enforced | Same as the flow blocks | Rejected | Yes |
+| **Resources**, then the **Records** tab | Not enforced | Only what the database encoder does | Rejected, `400` | Yes |
+| **Database** console SQL | Not applicable, SQL goes straight to the table | None | Not applicable | Cache only |
+
+Flows, functions and the Studio Records tab are the developer's own server-side code and operator tools, which is why Pawabase trusts them with direct writes. But trusting them does not mean their data is checked. Real runs against a resource with `title` (maximum length 5), `qty` (minimum 0) and `status` (enum `a`, `b`):
+
+```text
+Studio Records tab, POST …/resources/items/records
+  {"title": "waytoolong", "qty": 1}     ->  created  (title is 10 characters, limit is 5)
+  {"qty": -5, "title": "x"}             ->  created  (below the minimum)
+  {"title": "x", "status": "zzz"}       ->  created  (not in the enum)
+  {"qty": 1}                            ->  created  (required title missing, stored as NULL)
+  {"title": "x", "bogus": 1}            ->  400 "unknown fields: bogus"
+  {"title": "x", "qty": "7"}            ->  created, qty stored as 7
+  {"title": "x", "qty": "abc"}          ->  500
+
+Flow with resource.create, called through a custom route
+  {"title": "waytoolong", "qty": -9, "status": "zzz"}  ->  201, stored as sent
+  {"title": "x", "bogus": 1}                            ->  500 {"error":"block_failed","message":"unknown fields: bogus"}
+```
+
+### Why this matters when something reads the data back
+
+Those rows are now in the table, and the public list request validates every row it returns against the read model. The read model enforces the same `enum`, length and range constraints as the create model. After the rows above were written:
+
+```text
+GET /rest/v1/items  ->  500  {"error":"Internal Server Error","detail":"Response validation failed"}
+```
+
+One row that violates its own definition fails the whole page it is on, for every caller, including callers who could never have written such a row. The error body does not name the row or the field, which makes it hard to diagnose from the client side. If a list endpoint starts returning `500` "Response validation failed" and the definition has not changed, look for rows that were written by something other than the REST API.
+
+Three habits prevent this:
+
+- Use the `validate.schema` flow block, or an explicit `policy.check`, when a flow writes data that came from outside, see [Flow data blocks](/flows/data-blocks). The block takes the same field definitions as a resource.
+- In a function, validate with the same field list before calling the runtime, see [Python extensions](/code/python-extensions).
+- Treat the **Records** tab as a repair tool, not an import path. If you need to load many rows, load them through the REST API with a secret key, which runs the models, and see [Database console](/data/database-console) for the cases where raw SQL is right.
+
+## The Studio Records editor, input by input
+
+The **Records** tab on a resource's sheet lists up to twenty records and opens a form per record. The form builds one input per declared field, chosen from the field's type, and anything else in the row that the definition does not declare is shown under the field's raw name with the hint `raw`.
+
+| Field type | Input in the form | What it sends |
+| --- | --- | --- |
+| `boolean` | A menu with `true` and `false` | A boolean |
+| `integer`, `number` | A number input | A number, or `null` when you clear it |
+| `datetime` | A date-and-time picker, minute precision | The picker's value, no zone |
+| `date` | A date picker | `YYYY-MM-DD` |
+| `text` | A four-row text area | A string |
+| `json`, `array`, `object` | A monospace text area that parses JSON when you leave it | The parsed value. Text that is not valid JSON is ignored and the previous value is kept |
+| `string`, `email`, `url`, `uuid`, `ref` | A single-line text input | A string. `ref` falls back to this single-line input in the form, so write structured values through the API |
+
+A new record starts from a blank form: each field is pre-filled with its `default` if it has one, `false` if it is a boolean, and the empty string otherwise. An input you never touch therefore sends an empty string, and that matters:
+
+| Field type | Untouched blank form sends | Result on the server |
+| --- | --- | --- |
+| `string`, `text` | `""` | Stored as an empty string, not `NULL` |
+| `integer`, `number` | `""` | `500`, the toast says the request failed |
+| `date`, `datetime` | `""` | `500` |
+| `boolean` | `false` | Stored as `false` |
+| `uuid` | `""` | Stored as an empty string, not validated |
+| `json` | `""` | Stored as the JSON string `""` |
+
+If a number or date field is optional and you want it empty, type a value and clear it, which sends `null`, or leave the field out by creating the record through the API. A datetime picked in the form carries no zone, and the server reads it as UTC, so a time entered as 09:00 is stored as 09:00 UTC whatever your browser's zone is.
+
+## Sorting, comparison and case by type
+
+Which values come first, whether `a` equals `A`, and where `NULL` goes are decided by the database, so they differ by dialect. The type determines the comparison, and these are the cases that surface in `sort` and `filter`.
+
+| Type | Sorts as | Notes |
+| --- | --- | --- |
+| `string`, `text`, `email`, `url` | Text | SQLite compares bytes, so `B` sorts before `a`, and equality filters were case-sensitive in testing. PostgreSQL and MySQL follow the database's collation. MySQL's default collations are usually case-insensitive, so a filter `?filter[s]=alpha` can match `Alpha` there and a `unique` index treats the two as one value |
+| `integer`, `number` | Numerically | `NULL` first or last depends on the dialect |
+| `boolean` | `false` before `true` | Stored as 0 and 1 on SQLite |
+| `date` | Chronologically, on every dialect | The `YYYY-MM-DD` text form sorts correctly |
+| `datetime` | Chronologically on PostgreSQL and MySQL | On SQLite it sorts as text, so mixed offsets do not order correctly |
+| `uuid` | As text on SQLite and MySQL, by native ordering on PostgreSQL | UUIDs have no meaningful order either way |
+| JSON group | Cannot be sorted | `sort` takes a field name and compares the stored text, which is not meaningful |
+
+`NULL` placement is the one that surprises people moving between databases. SQLite and MySQL treat `NULL` as the smallest value, so an ascending sort puts unset values first. PostgreSQL treats `NULL` as the largest, so an ascending sort puts them last. Pawabase does not add a `NULLS FIRST` or `NULLS LAST` clause. If your clients depend on where nulls fall, give the field a `default` so it is never null, or filter with `isnot.null` before sorting. See [Sorting and pagination](/data/sorting-pagination).
+
+## Time zones, from request to column and back
+
+Time handling touches three of the layers at once, so it is worth following one value all the way through. The client sends `"2026-10-01T10:00:00+02:00"` to a `datetime` field.
+
+| Stage | What happens |
+| --- | --- |
+| Validation | The string is parsed into a timestamp that carries a `+02:00` offset |
+| Encoding for SQLite | The timestamp is written back as an ISO string with the offset it had: `2026-10-01T10:00:00+02:00` |
+| Encoding for PostgreSQL | The timestamp is passed as is, and `TIMESTAMPTZ` stores the absolute instant, which is 08:00 UTC |
+| Encoding for MySQL | The timestamp is converted to UTC and the zone is dropped: `2026-10-01 08:00:00` |
+| The create response | The record is read back from the table. On SQLite that is the string as stored |
+| A later list | A declared `datetime` field is parsed and serialized by the response model, with `Z` for UTC |
+
+Three practices keep this predictable. Send UTC, using `Z`. Store instants (`datetime`) for things that happened and calendar days (`date`) for things that are scheduled by the calendar, and never for the same field. And compare in the client after parsing, not as text, if a field might hold different offsets.
+
+A timestamp filter works with `Z` or with an offset written as `%2B02:00` (the `+` must be URL-encoded), and with a plain date, for example `?filter[published_at]=gte.2026-03-01`. The parsed value is compared with what is stored, so on SQLite two instants that are equal but written with different offsets are not equal as text. See [Filtering](/data/filtering).
+
+## Text, Unicode and sizes
+
+| Topic | Behavior |
+| --- | --- |
+| Encoding | JSON bodies are UTF-8. Characters outside the basic plane, such as emoji, are stored and returned intact, and each counts as one character toward `min_length` and `max_length` |
+| Normalization | None. `é` written as one code point and as `e` plus a combining accent are different strings, and neither a filter nor a `unique` index treats them as equal |
+| Trimming | None. Leading and trailing spaces are part of the value |
+| Control characters | Accepted. Validation does not reject newlines or tabs in a `string`; use a `pattern` if you need single-line values |
+| Large values | A single `text` value of 100,000 characters was stored and returned. The request body limit applies to the whole request, see [Limits](/reference/limits) |
+| `VARCHAR` width | `VARCHAR(n)` limits characters on PostgreSQL and MySQL, the same unit `max_length` uses, so keep `max_length` at or below the column width |
+
+If case should not matter for uniqueness (usernames, email addresses, slugs), normalize on the way in. A transformer shapes responses and does not touch writes, so the normalization has to happen in the client, in a custom route, or in a flow with a `transform` block before the `resource.create`. Do not rely on `unique` alone to deduplicate `Maya@acme.co` and `maya@acme.co` on a case-sensitive database.
+
+## Types in places that are not resources
+
+The same field definitions describe a route's request body and a flow's `validate.schema` block. A few things differ when no table is involved.
+
+| Place | What is the same | What differs |
+| --- | --- | --- |
+| A custom route's `input_fields` | Every type, constraint, default and error shape | `unique` and `indexed` do nothing. Only the body is validated; path and query values arrive as strings and are not typed. See [Custom routes](/data/custom-routes) |
+| A route's `input_schema` or `response_schema` | The schema's field list, compiled the same way | The response schema is only applied when the route has no transformer |
+| A reusable schema referenced by `ref` | The same models, with errors that include the nesting path | The schema itself has no table, so nothing is created by migrating |
+| A flow's `validate.schema` block | The same field definitions, run against a value from the flow | The block follows an `invalid` branch or fails the run with `422`, see [Flow data blocks](/flows/data-blocks). It cannot resolve a `ref` to a stored schema, so nested shapes must be written inline |
+
+That symmetry is deliberate. A field list you have debugged for a resource moves to a route unchanged, and a schema you build for one route can serve a resource, a second route and a flow check.
+
+## Reading validation errors by type
+
+When a body fails, the response is a bare JSON array with one entry per problem. The `type` code is stable and is the right thing for a client to branch on; the `msg` text is for people and can change. These are the codes returned by the types on this page, each from a real request.
+
+| Code | Raised by | Meaning | Typical `loc` |
+| --- | --- | --- | --- |
+| `missing` | any required field | The key is absent | `["sku"]`, `["dims", "w"]`, `["objs", 0, "k"]` |
+| `extra_forbidden` | any model | A key the model does not declare, including a `read_only` field, `id`, `created_at` and `updated_at` | `["bogus"]`, `["o", "z"]` |
+| `string_type` | text group, and any non-nullable field sent `null` | The value is not a string | `["s"]` |
+| `string_too_short`, `string_too_long` | text group | `min_length` or `max_length` broken | `["title"]` |
+| `string_pattern_mismatch` | `string` with `pattern`, `email`, `url` | The value does not match the regular expression | `["email"]` |
+| `int_parsing` | `integer` | A string that is not a whole number | `["i"]`, `["arr", 1]` |
+| `int_from_float` | `integer` | A number with a fractional part | `["n"]` |
+| `int_type` | `integer` | A list, object or other non-number | `["i"]` |
+| `float_parsing` | `number` | A string that is not a number | `["price"]` |
+| `bool_parsing` | `boolean` | A value outside the accepted words and `0` and `1` | `["b"]` |
+| `greater_than_equal`, `less_than_equal` | `integer`, `number` | `minimum` or `maximum` broken | `["stock"]` |
+| `literal_error` | `enum` | The value is not in the list | `["status"]` |
+| `date_from_datetime_parsing` | `date` | Not a date or datetime | `["d"]` |
+| `date_from_datetime_inexact` | `date` | A timestamp with a non-zero time, or a number | `["d"]` |
+| `uuid_parsing` | `uuid` | Not a UUID | `["u"]` |
+| `list_type` | `array` | Not a list | `["arr"]` |
+| `model_type` | `object`, `ref` | Not an object | `["dims"]` |
+
+A single request can return several entries, one per field, so a client can mark every bad input at once. Real response for a body that breaks four rules:
+
+```json
+[
+  {"type": "string_pattern_mismatch", "loc": ["sku"], "msg": "String should match pattern '^[A-Z0-9-]+$'",
+   "input": "a b", "ctx": {"pattern": "^[A-Z0-9-]+$"}},
+  {"type": "string_too_short", "loc": ["title"], "msg": "String should have at least 2 characters",
+   "input": "M", "ctx": {"min_length": 2}},
+  {"type": "float_parsing", "loc": ["price"], "msg": "Input should be a valid number, unable to parse string as a number",
+   "input": "abc"},
+  {"type": "literal_error", "loc": ["status"], "msg": "Input should be 'draft' or 'live'",
+   "input": "nope", "ctx": {"expected": "'draft' or 'live'"}}
+]
+```
+
+Each entry also carries a `url` pointing at the Pydantic documentation for the code, which is omitted above. The `ctx` object names the limit that was broken, so a client can show "at most 4 characters" without parsing the message. The complete picture of error shapes, including the different shape for bad query parameters, is on [Validation](/data/validation).
+
+## Writing a client that matches the types
+
+A typed client has to handle two facts at once: the types are strict at the boundary, and every field can come back `null`.
+
+| Pawabase type | TypeScript | Python | Swift | Kotlin |
+| --- | --- | --- | --- | --- |
+| `string`, `text`, `email`, `url` | `string \| null` | `str \| None` | `String?` | `String?` |
+| `integer` | `number \| null`, or a string for ids above 2^53 | `int \| None` | `Int64?` | `Long?` |
+| `number` | `number \| null` | `float \| None` | `Double?` | `Double?` |
+| `boolean` | `boolean \| null` | `bool \| None` | `Bool?` | `Boolean?` |
+| `datetime` | `string \| null`, parse with `new Date(…)` | `datetime \| None` | `Date?` through an ISO 8601 decoder | `Instant?` |
+| `date` | `string \| null`, keep as text | `date \| None` | `String?` | `LocalDate?` |
+| `uuid` | `string \| null` | `UUID \| None` | `UUID?` | `UUID?` |
+| `json` | `unknown` | `Any` | `AnyCodable?` | `JsonElement?` |
+| `array` | `T[] \| null` | `list[T] \| None` | `[T]?` | `List<T>?` |
+| `object`, `ref` | an interface or `null` | a model or `None` | a struct or `nil` | a data class or `null` |
+
+Every response property is nullable in the generated document, because a column can hold `NULL` whether or not the field was required: required is enforced on create only, an old row can predate the field, and a `PATCH` can null anything. A client that treats a required field as non-null is trusting something the server does not promise. Decode it as optional, and apply your own default at the edge.
+
+```typescript
+// The products resource, as a client type. Every property is nullable on read.
+interface Product {
+  id: number;
+  sku: string | null;
+  title: string | null;
+  description: string | null;
+  price_minor: number | null;
+  currency: "USD" | "EUR" | "GBP" | "NGN" | null;
+  status: "draft" | "live" | "archived" | null;
+  stock: number | null;
+  released: string | null;            // "2026-10-01"
+  tags: string[] | null;
+  specs: { weight_g: number | null; color: string | null } | null;
+  created_at: string;                 // ISO 8601
+  updated_at: string;
+}
+
+// What you send on create is narrower: required fields are required, and nothing else is writable.
+interface ProductInput {
+  sku: string;
+  title: string;
+  price_minor: number;
+  description?: string;
+  currency?: Product["currency"];
+  status?: Product["status"];
+  stock?: number;
+  released?: string;
+  tags?: string[];
+  specs?: { weight_g?: number; color?: string };
+}
+```
+
+```python
+from datetime import date
+from pydantic import BaseModel
+
+
+class Specs(BaseModel):
+    weight_g: int | None = None
+    color: str | None = None
+
+
+class Product(BaseModel):
+    id: int
+    sku: str | None = None
+    title: str | None = None
+    price_minor: int | None = None
+    currency: str | None = None
+    status: str | None = None
+    stock: int | None = None
+    released: date | None = None
+    tags: list[str] | None = None
+    specs: Specs | None = None
+    # Undeclared columns can arrive too, so ignore extras instead of forbidding them.
+    model_config = {"extra": "ignore"}
+```
+
+Two points in those snippets come from the behavior described earlier. The `extra` setting is `ignore` because the server returns every column of the table, so a client that forbids unknown properties breaks the moment someone adds a column. And dates stay as text in the TypeScript type, because a `date` has no zone and `new Date("2026-10-01")` reads it as midnight UTC, which becomes the previous day in zones west of Greenwich.
+
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Is there a decimal, money or currency type?">
+    No. The fourteen types are the complete list. Store money as an `integer` in the smallest unit, with a `string` currency code next to it. Values that need exact fractions beyond that, such as rates, can be stored as `string` and parsed by the client, at the cost of losing numeric sorting and range filters.
+  </Accordion>
+  <Accordion title="Can a field hold a file or binary data?">
+    No type holds binary data. Store the file in a storage bucket and keep its key, or a signed link you generate on demand, in a `string` field. See [Storage](/storage/overview).
+  </Accordion>
+  <Accordion title="Can two fields be unique together?">
+    The field editor and the definition support `unique` per field only. A composite unique constraint has to be created by hand with an index statement in the **Database** console, and a duplicate then surfaces as a `500`, not a `422`.
+  </Accordion>
+  <Accordion title="Why does my datetime come back with Z in lists and +00:00 on create?">
+    Both are the same instant. A declared `datetime` is serialized by the response model on reads, which uses `Z`. A create returns the row as it was stored, and the stored string uses an explicit offset. The automatic `created_at` and `updated_at` are returned as stored strings everywhere.
+  </Accordion>
+  <Accordion title="Can I make an array hold unique items, or limit its length?">
+    The definition has no `min_items`, `max_items` or uniqueness key. If the limit matters, enforce it in a custom route, or add a policy that inspects `$input`, see [Policies](/policies/overview).
+  </Accordion>
+  <Accordion title="Why was my number rejected when I sent it as a string?">
+    Strings are converted for `integer`, `number` and `boolean`, but only when they look like the target: `"5"` and `" 7 "` convert and `"abc"`, `""` and `"1e3"` (for integers) do not. The text group does not convert in the other direction, so a number sent to a `string` field is rejected.
+  </Accordion>
+  <Accordion title="How do I make a field immutable after create?">
+    Mark it `read_only` only if the server should set it (a `read_only` field cannot be written at all, so it must come from an **Owner field**, a default, or a flow). For a client-supplied value that must not change, use an update policy that compares `$input` with `$record`, or expose updates through a route that omits the field.
+  </Accordion>
+  <Accordion title="Can I rename a field?">
+    Renaming creates a new field name. Migration adds a column with the new name and leaves the old column in place, with its data, and the old column keeps appearing in responses until you remove it with a transformer or in the database. Rename in the database first with `ALTER TABLE … RENAME COLUMN` in the **Database** console, then change the name in the definition.
+  </Accordion>
+  <Accordion title="Why does a PATCH with an empty body succeed?">
+    Every field is optional on update, so `{}` is valid. It changes nothing but `updated_at`, and it still counts as an update: the cached lists are invalidated and a `<resource>.updated` event is emitted. Reject empty updates in the client if the events matter.
+  </Accordion>
+  <Accordion title="Are field names case-sensitive in filters and sort?">
+    Yes. `?filter[Name]=x` and `?filter[name]=x` refer to different fields, and an unknown one returns `400` with `cannot filter on unknown field`.
+  </Accordion>
+</AccordionGroup>
+
+## Choosing a type, quickly
+
+| You are storing | Use | Add | Why |
+| --- | --- | --- | --- |
+| A name, title or label | `string` | `max_length` | Short and sortable. Sizes the column on PostgreSQL and MySQL |
+| A paragraph, comment or Markdown body | `text` | nothing | No width to outgrow |
+| A status with a fixed set of values | `string` with `enum` | `default` | Readable in the database and in responses. Plan for the shrink problem |
+| A rating, count or small whole number | `integer` | `minimum`, `maximum` | Exact, sortable, indexable |
+| A price or any amount of money | `integer` in minor units | a `currency` string | Floats drift |
+| A measurement, score or ratio | `number` | `minimum`, `maximum` | A float is fine when exactness is not the point |
+| A yes/no switch | `boolean` | `default`, `nullable: false` | Three states by default, so close the third |
+| A moment something happened | `datetime` | `indexed` | An instant; send UTC |
+| A calendar day with no time | `date` | nothing | Never shifts with a zone |
+| An identifier issued elsewhere | `uuid` | nothing | Validated and normalized |
+| A contact address | `email` | `unique` if needed | Shape-checked. Case is not normalized |
+| A link | `url` | `max_length` | `http` and `https` only |
+| A short list of simple values | `array` of `string` | `default: []` | Stored together. Not searchable |
+| A small fixed-shape group | `object` | `required` inside | Closed and documented |
+| A group repeated across resources | `ref` to a schema | the schema's own constraints | One definition, many uses |
+| Anything else you cannot describe | `json` | nothing | No validation. Use as a last resort |
+| A file | a `string` holding a storage key | nothing | No binary type, see [Storage](/storage/overview) |
+
+## What the type system does not do
+
+A short list of things people expect from a typed field that Pawabase does not provide. None is hidden; each is a consequence of how the layers work, and each has a workaround on this page.
+
+- **It does not guarantee the table matches.** A definition describes what Pawabase will send and accept. The table is whatever the database holds, and a mismatch surfaces as a `500`.
+- **It does not guard updates the way it guards creates.** `required` and `nullable` apply to `POST` only.
+- **It does not validate writes from flows, functions or the Records tab.** Only HTTP bodies run the models.
+- **It does not hide fields.** `write_only` changes the API document, not the response, and a column the definition does not list is still returned.
+- **It does not enforce uniqueness itself.** `unique` is an index, and a violation is a `500`.
+- **It does not retype or drop columns.** Migration is additive.
+- **It does not give you decimals, binary data, or searchable JSON.** Choose the nearest type and the workaround above.
+
+<CardGroup cols={3}>
+  <Card title="Validation" icon="badge-check" href="/data/validation">
+    The models behind these types, the exact error shapes, and the order in which checks run.
+  </Card>
+  <Card title="Schemas" icon="code-2" href="/data/schemas">
+    Reusable field sets, `ref` fields, and the cycle that takes an environment down.
+  </Card>
+  <Card title="Migrations" icon="arrow-right" href="/data/migrations">
+    What running **Create / migrate table** does with these types, and what it never does.
+  </Card>
 </CardGroup>
