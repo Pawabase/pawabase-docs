@@ -1,88 +1,169 @@
 ---
 title: "Validation"
-description: "Constraints, the create/update/read three-model architecture, read-only and write-only fields, and exactly what a 422 looks like."
+description: "How Pawabase validates request bodies: the three-model architecture, every supported constraint, exact error shapes, and how validation fits into the request lifecycle."
 icon: "badge-check"
 ---
-## Overview
 
-Validation happens in the compiled application before policies and SQL ever run, using the Pydantic models generated from your field definitions. Invalid input never reaches your database, your flows, or your event handlers — it is caught at the HTTP boundary and returned as a structured 422 Unprocessable Entity response.
+Pawabase validates every `create` and `update` request before it reaches the policy gate or the database. Invalid input is caught at the HTTP boundary and returned as a structured `422 Unprocessable Entity`. The database never sees malformed data, and a policy never runs if the request body can't pass validation first.
 
-This page covers the complete validation system: every constraint, how the three models per resource are compiled, the exact error shape, validation that goes beyond field definitions, and how to validate inside flows.
+## Where validation fits in the request lifecycle
 
-## Why validation runs first
+For a `POST` or `PATCH` to a resource operation, the order is fixed:
 
-The request lifecycle for a POST or PATCH to a resource operation follows a strict order:
+1. **Authentication** — the gateway resolves the API key and signs the platform context. Akountz verifies the user token if present.
+2. **Validation** — the request body is validated against the resource's compiled create or update Pydantic model. Unknown fields are rejected, required fields are checked, and all declared constraints are enforced. A malformed request stops here with `422`.
+3. **Owner field stamping** — for `create`, if the resource declares `owner_field`, the caller's identity is stamped onto that field, overwriting anything the client sent. This happens after validation but before the policy check, which is exactly why a `create` policy can safely reference `$input.<owner_field>` and trust it reflects the real caller.
+4. **Policy gate** — the operation's policy is evaluated against the context (auth, credential, record, input). The request stops with `403` or `404` if the policy refuses.
+5. **Database** — the validated, policy-approved data is inserted or updated.
 
-1. **Authentication** — the API key is verified and the platform context is resolved.
+<Note>
+The audit trail in a previous version of this page had validation and policy evaluation in the wrong order, with validation listed after authorization. The actual order is: validate first, then authorize. This matters because validation errors (missing field, wrong type) are always `422` regardless of whether the caller's policy would have allowed the operation — a caller without permission receives validation errors just like an authorized caller would.
+</Note>
 
-2. **Authorization** — the PolicyGate checks that the caller's credential passes the operation's policy.
+## The three compiled models
 
-3. **Validation** — the request body is validated against the resource's create or update Pydantic model. Unknown fields are rejected, required fields are checked, constraints are enforced.
+Every resource is compiled into three distinct Pydantic models. Each serves a different HTTP operation and enforces different rules:
 
-4. **Policy refinement** — for create, the owner_field is stamped from the caller's identity and stripped from the input.
+| Model | Used by | `required` fields | `write_only` fields | `read_only` fields |
+| --- | --- | --- | --- | --- |
+| **Create** | `POST /rest/v1/<name>` | Must be present (unless `default` covers them) | Accepted, never returned | Not accepted in body |
+| **Update** | `PATCH /rest/v1/<name>/{id}` | All optional (partial update) | Accepted, never returned | Not accepted in body |
+| **Read** | `GET /rest/v1/<name>` and `GET /rest/v1/<name>/{id}` | N/A — response only | Never returned | Always returned |
 
-5. **Database** — the validated, policy-refined data is inserted or updated.
+`required: true` is enforced **only on create**. A field you mark required is still optional in a `PATCH` body — `PATCH` is a partial update, and Pawabase always compiles the update model with every field optional, regardless of how the field definition describes `required`. If you need to ensure a field can never be cleared through an update, use an update policy that checks `$input.<field>` is present when supplied, or make the column `NOT NULL` at the database level.
 
-## The three models per resource
+## What happens when validation fails
 
-| Model | Used by | Required fields | write_only fields |
-| --- | --- | --- | --- |
-| **Create** | `POST /rest/v1/&lt;name&gt;` | All `required: true` fields | Accepted but never returned |
-| **Update** | `PATCH /rest/v1/&lt;name&gt;/{id}` | None — every field is optional | Accepted but never returned |
-| **Read** | `GET /rest/v1/&lt;name&gt;` and `GET /rest/v1/&lt;name&gt;/{id}` | N/A | Never returned |
+A validation failure returns `422 Unprocessable Entity`. The body identifies exactly which fields failed and why:
 
-## Required fields
+```json
+{
+  "error": "unprocessable_entity",
+  "message": "Validation failed",
+  "detail": [
+    {
+      "loc": ["body", "status"],
+      "msg": "value is not a valid enumeration member; permitted: 'pending', 'paid', 'refunded'",
+      "type": "type_error.enum"
+    },
+    {
+      "loc": ["body", "amount"],
+      "msg": "ensure this value is greater than or equal to 0",
+      "type": "value_error.number.not_ge"
+    }
+  ]
+}
+```
 
-Fields marked required: true must be present in create requests. If omitted, validation fails with a 422 error. The error response identifies the missing fields.
+The `loc` array is a path: `["body", "<field>"]` for a top-level field, `["body", "<field>", "<nested_field>"]` for a nested object field, or `["body", "<field>", <index>]` for an array element. Your client can use this path to route the error message to the right input in your UI.
 
-Required fields with default values are treated as having the default value if omitted. The default is applied before validation.
+Unknown fields in the body — fields not declared in the resource's `fields` — are also rejected with `422`:
 
-## Pattern and enum constraints
+```json
+{
+  "error": "unprocessable_entity",
+  "detail": [{"loc": ["body", "surprise_field"], "msg": "extra fields not permitted"}]
+}
+```
 
-The pattern constraint enforces a regular expression match on string fields. If the client sends a value that does not match, validation fails with a 422 error.
+This strict behavior is intentional. Pawabase compiles its models with `extra = "forbid"`, so a client can't silently send data the resource hasn't declared — there is no "extra fields are just ignored" behavior to depend on.
 
-The enum constraint restricts the field to a specific set of values. If the client sends a value not in the enum list, validation fails with a 422 error.
+## Supported constraints
 
-## Number constraints
+Every constraint applies at the Pydantic layer, before the data reaches the database. Constraints outside a type's supported set are silently ignored by the compiler (they don't produce a save-time error — they just have no effect at validation time either).
 
-The minimum and maximum constraints constrain numeric fields. The values must be within the specified range, inclusive.
+| Constraint | Applies to | Effect |
+| --- | --- | --- |
+| `required` | Any type | Field must be present in create body. Has no effect on update (every field is optional there). Overridden by `default`. |
+| `default` | Any type | Value used when the field is absent on create. Makes a `required` field effectively optional if a sensible default exists. |
+| `nullable` | Any type | Whether `null` is an accepted value. Defaults to `false` for required fields, `true` for optional ones. Always forced `true` in read responses (a column with no value returns `null`, never an error). |
+| `enum` | Any type, typically `string` | Restricts values to a fixed list. Compiled as a `Literal` type — any value not in the list fails with a type error naming the permitted values. |
+| `pattern` | `string`, `text`, `email`, `url` | A Python `re` regular expression the value must fully match. Patterns are validated when you save the field definition — an invalid regex is rejected at definition-save time, not at request time. |
+| `min_length` / `max_length` | `string`, `text`, `email`, `url` | Character-count bounds. A value outside these bounds fails with a clear length error. |
+| `minimum` / `maximum` | `integer`, `number`, `date`, `datetime` | Inclusive value bounds. Compiled as Pydantic's `ge` / `le`. |
+| `items` | `array` | Each array element is validated against the `items` field spec. A single element that fails its constraints causes the whole array to be rejected. |
+| `fields` | `object` | Nested object fields are validated as a nested Pydantic model. `required`, `pattern`, `enum`, and all other constraints apply recursively. |
+| `schema` | `ref` | The field is validated against the named Schema. See [Schemas](/data/schemas). |
 
-Number fields also support exclusive_minimum and exclusive_maximum for strict inequality constraints.
+### What is not supported
 
-## Array validation
+The following constraints appear in some frameworks but do not exist in Pawabase:
 
-Array fields validate that each element matches the items type. If any element fails validation, the entire array is rejected.
+- `exclusive_minimum` / `exclusive_maximum` — use `minimum`/`maximum`; Pawabase only supports inclusive bounds.
+- `min_items` / `max_items` on `array` — there is no element-count constraint on array fields. Validate array length in a flow or function if needed.
+- Conditional validation — whether one field is required or constrained based on the value of another field. This must be handled in a flow's `validate.schema` block or a custom route.
+- Cross-field constraints — a constraint that references another field's value (e.g. `end_date` must be after `start_date`). Enforce in a flow or a custom route.
 
-Array fields can have min_items and max_items constraints to limit the number of elements in the array.
+## Required fields and defaults
 
-## Conditional validation
+A field with both `required: true` and a `default` value is effectively optional on create — if the client omits it, the default is applied, and validation passes. The default is substituted before the Pydantic model validates the create body, so:
 
-The platform supports conditional validation where the presence or constraints of one field depend on the value of another field.
+```json
+{"name": "status", "type": "string", "enum": ["pending", "paid"], "required": true, "default": "pending"}
+```
 
-Conditional validation is evaluated after basic field validation but before the policy gate.
+A create request that omits `status` gets `status: "pending"` in the record. A create request that explicitly sends `status: "shipped"` fails validation because `"shipped"` is not in the enum.
 
-## Validation errors
+## write_only and read_only fields
 
-When validation fails, the platform returns 422 Unprocessable Entity with a detailed error object. The error object identifies each field that failed validation and the reason for the failure.
+`write_only: true` fields are accepted in create and update requests but never returned in any read response — the read model simply doesn't include them. A common use is a cost price that's used for calculations server-side but should never be visible to an API consumer:
 
-The error response shape is consistent across all validation errors, making it easy to build client-side validation feedback.
+```json
+{"name": "cost_cents", "type": "integer", "write_only": true}
+```
 
-## Validation and policies
+`read_only: true` fields are the mirror: they appear in every read response but are stripped from create and update request models. The client can't set or change them — they're populated by the platform (like `owner_field`, or a computed value set by a flow).
 
-Validation runs before policy evaluation. This means that a caller who does not have permission to access a resource will still receive validation errors for malformed requests.
+A field cannot be both `write_only` and `read_only` — the compiler rejects that combination when you save the definition.
 
-This ordering prevents information leakage: permission errors do not reveal whether the request structure was valid.
+## Validating inside flows
 
-## Best practices
+Resource blocks (`resource.create`, `resource.update`) inside a flow run through the same validation models as the public API — a `resource.create` with a missing required field or an out-of-range value fails the block with a `422`-equivalent error, not a silent partial write. This means validation is consistent regardless of how data enters the resource.
 
-Always validate the request body before sending it to the API. Client-side validation provides better feedback but should never be the only validation mechanism.
+For validation within a flow that isn't tied to a resource write — checking that a webhook payload has the expected shape, or that a custom route's input satisfies a contract — use the `validate.schema` block. It accepts the same field-definition syntax and produces an `invalid` branch when validation fails, giving the flow a choice of how to handle it:
 
-Use required fields for data that must always be present. Use default values for optional data that has a sensible initial value.
+```json
+{
+  "id": "check_payload",
+  "data": {
+    "block": "validate.schema",
+    "config": {
+      "value": "{{ input.body }}",
+      "fields": [
+        {"name": "order_id", "type": "string", "required": true},
+        {"name": "amount_cents", "type": "integer", "required": true, "minimum": 1}
+      ],
+      "on_invalid": "branch"
+    }
+  }
+}
+```
 
-Use pattern and enum constraints to enforce specific formats and value sets.
+With `on_invalid: "branch"`, validation failures follow the `invalid` branch — the flow can log the error, send a response, or take corrective action. With `on_invalid: "error"` (the other value), a failure raises a block error and follows the `error` branch or fails the run.
+
+## Common mistakes
+
+<AccordionGroup>
+  <Accordion title="A required field is accepted as absent on update">
+    `required` only applies to create. Every field is optional in the update (PATCH) model by design. If a field must always be present in the database, enforce it at the column level (database console, NOT NULL constraint) or use a policy that checks `$input.<field>` isn't being explicitly cleared.
+  </Accordion>
+  <Accordion title="Setting `minimum` on a string field expecting it to bound length">
+    `minimum` on a `string` is silently ignored. Use `min_length` for string-length bounds.
+  </Accordion>
+  <Accordion title="A 422 appears before the policy gate even for callers without permission">
+    That's correct behavior. Validation runs before policy evaluation. A caller who would be refused anyway still receives validation errors if the request body is malformed.
+  </Accordion>
+  <Accordion title="Sending an extra field and expecting it to be ignored">
+    Pawabase rejects unknown fields with `422`. Remove the field from the request body or add it to the resource definition.
+  </Accordion>
+  <Accordion title="Expecting conditional validation (if field A = X, then field B is required)">
+    This isn't available as a field-level constraint. Implement it with a `validate.schema` block in a flow, or in a custom route, after the resource write.
+  </Accordion>
+</AccordionGroup>
 
 <CardGroup cols={2}>
-  <Card title="Resources" icon="database" href="/data/resources" />
-  <Card title="Field types" icon="type" href="/data/field-types" />
-  <Card title="Defining resources" icon="table-properties" href="/data/defining-resources" />
+  <Card title="Resources" icon="database" href="/data/resources">Operations, anatomy, and behavior flags.</Card>
+  <Card title="Field types" icon="type" href="/data/field-types">Every type, its constraints, and its column mapping.</Card>
+  <Card title="Flows — validate block" icon="shield-check" href="/flows/data-blocks">The validate.schema block for flow-level validation.</Card>
+  <Card title="Policies" icon="shield" href="/policies/overview">Authorization — the step after validation.</Card>
 </CardGroup>

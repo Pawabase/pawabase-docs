@@ -1,55 +1,167 @@
 ---
 title: "Transformers"
-description: "How transformers work."
+description: "Reshape every read response for a resource using a declarative JSON transformer: field selection, renaming, case conversion, and computed fields."
 icon: "wand"
 ---
-## Overview
 
-Transformers rewrite resource responses. A transformer is a Python function that receives the record data and returns a modified version of it.
+A **transformer** is an optional declarative configuration attached to a resource that reshapes every read response — `list` and `get` — before it leaves the API. Transformers run after the policy gate produces the permitted rows and after a response is shaped from the read model. They are not Python code and do not execute inside a flow; they are a stored JSON configuration the compiled app applies to every outgoing response for that resource.
 
-Transformers are configured in the resource definition's transformer field. They run after the policy gate but before the response is returned to the caller.
+<Callout>
+Transformers affect only API read responses. Events emit the raw, pre-transformation record. The database console returns raw SQL results with no transformation applied.
+</Callout>
 
-## Transformer function signature
+## Configuring a transformer in Studio
 
-The transformer function receives the record as a dictionary and returns a modified dictionary. The function has access to all fields in the record and can add, remove, or modify fields.
+In Studio, open a resource and navigate to **Settings → Transformer**. You can also set the `transformer` key directly in the resource definition body via the Platform API:
 
-```python
-def transformer(record):
-    # Add a computed field
-    record["display_price"] = record["cost"] * 1.2
-    # Remove sensitive fields
-    record.pop("internal_cost", None)
-    return record
+```json
+{
+  "name": "products",
+  "transformer": {
+    "pick": ["id", "title", "price_cents", "active"],
+    "rename": {"price_cents": "price"},
+    "case": "camel"
+  }
+}
 ```
 
-## Use cases
+The `transformer` value is a JSON object. It accepts up to three keys, all optional and applied in this order: `pick`, then `rename`, then `case`.
 
-Transformers are useful for: adding computed fields, formatting dates and numbers, hiding internal data from API consumers, and enriching responses with additional context.
+## The three transformer steps
 
-For example, a transformer can add a display_price field that is cost * 1.2 while keeping the cost field completely hidden from the response.
+### `pick` — select which fields to include
 
-## Transformer and caching
+`pick` is a list of field names to include in the response. All other fields are dropped. If `pick` is absent or empty, all fields the read model exposes are returned.
 
-Transformer output is included in the cached response. When cache_ttl is enabled, the transformed response is cached per-caller. Cache invalidation happens automatically on every write operation.
+```json
+{
+  "transformer": {
+    "pick": ["id", "title", "price_cents", "active", "created_at"]
+  }
+}
+```
 
-## Transformer and events
+Use `pick` when a resource has fields that are genuinely internal — a `cost_cents` field the public API should never expose, or a `sync_status` field meaningful only to a background job — and `write_only: true` on the field definition alone isn't enough (for example, because an admin-facing route for the same resource should see the field). Note that `write_only: true` on a field is the more structural tool — it strips the field from the read model entirely, which means no transformer is needed at all. `pick` in a transformer is most useful when the field is legitimately readable by some callers but you want the public-facing shape to omit it by default.
 
-Events emit the original record data, not the transformed data. The transformer only affects the API response, not the event payload.
+### `rename` — map field names in the response
 
-## Transformer and the database console
+`rename` is an object mapping `original_name` → `new_name`. The renaming happens on the outgoing JSON key, not on the underlying column name.
 
-Transformers only apply to API responses. The database console returns raw SQL results without transformation. This means you can see the original data through the console even if the API response is transformed.
+```json
+{
+  "transformer": {
+    "rename": {
+      "price_cents": "price",
+      "created_at": "createdAt"
+    }
+  }
+}
+```
 
-## Best practices
+Renaming is applied after `pick` — if a field was excluded by `pick`, renaming it has no effect. The original field name is the column name (or the resource field name) — not a camel-cased version even if `case` is also set.
 
-Keep transformer functions simple and focused. They should not make external API calls or perform expensive computations.
+Renamed fields are reflected in the OpenAPI document, so the generated API reference shows `price`, not `price_cents`.
 
-Use transformers for presentation logic, not for business logic. Business logic belongs in policies or custom routes.
+### `case` — convert all key names
 
-Test transformer functions thoroughly. They affect every response for the resource.
+`case` converts all keys in the response to a target naming convention. Two values are supported:
+
+| Value | Effect | Example |
+| --- | --- | --- |
+| `"camel"` | Convert `snake_case` to `camelCase` | `student_id` → `studentId` |
+| `"snake"` | Convert to `snake_case` (no-op for already-snake keys) | `studentId` → `student_id` |
+
+`case` is applied last, after `pick` and `rename`. If you both `rename` a field and set `case`, the renamed name is case-converted — so `rename: {"price_cents": "unitPrice"}` with `case: "camel"` produces `unitPrice` unchanged (it's already camelCase), but `rename: {"price_cents": "unit_price"}` with `case: "camel"` produces `unitPrice`.
+
+`case` applies to every key in the response, including keys produced by expanded relations. If the `products` resource has `case: "camel"` and you `?expand=variants`, the `variants` array's field names are also camelCased.
+
+## Combining the three steps
+
+A common pattern for a public-facing API that uses camelCase names and strips internal fields:
+
+```json
+{
+  "name": "orders",
+  "transformer": {
+    "pick": ["id", "customer_id", "status", "total_cents", "created_at"],
+    "rename": {"total_cents": "totalCents"},
+    "case": "camel"
+  }
+}
+```
+
+Given a raw row `{"id": 1, "customer_id": 4, "status": "paid", "total_cents": 4900, "created_at": "...", "internal_ref": "..."}`:
+
+1. `pick` drops `internal_ref`, keeps the rest.
+2. `rename` maps `total_cents` → `totalCents`.
+3. `case: "camel"` converts `customer_id` → `customerId`, `created_at` → `createdAt`. `totalCents` stays `totalCents` (already camelCase).
+
+Response: `{"id": 1, "customerId": 4, "status": "paid", "totalCents": 4900, "createdAt": "..."}`.
+
+## What transformers don't do
+
+Transformers are intentionally a small, declarative set of operations. They do not:
+
+- Add computed fields (a `full_name` derived from `first_name` + `last_name`, for example). Computed fields belong in a custom route backed by a flow, or in the database as a generated/computed column.
+- Format values (converting a timestamp to a human-readable string, formatting currency). Do this in the application consuming the API, or in a custom route.
+- Filter rows (excluding rows based on a condition). That's the policy's job.
+- Make external calls or database queries. A transformer is synchronous, in-process, and purely structural.
+- Transform the request body on create or update — only read responses.
+
+If you need response shaping beyond what `pick`, `rename`, and `case` provide, a [custom route](/data/custom-routes) backed by a flow can return any shape you need from the same underlying data.
+
+## Transformers and caching
+
+The cached response is the response **after** the transformer runs — the stored cache entry is the transformed shape, not the raw record. See [Caching](/data/caching#cache-and-transformers) for the implication of changing a transformer on a resource with active cache entries.
+
+## Transformers and events
+
+Resource events (`<name>.created`, `<name>.updated`, `<name>.deleted`) carry the **raw record** — the data before any transformer runs. The transformer only affects the API response. If a downstream consumer of the event expects a camelCase payload, it is responsible for its own transformation; the event payload is always the flat, snake_case record as it exists in the database.
+
+## Transformers and the database console
+
+The [database console](/data/database-console) returns raw SQL results with no transformer applied, regardless of what the resource definition says. This is by design — the console is a direct window into the database, not the API. If you see `price_cents` in the console but `price` in the API response, that's the transformer working correctly.
+
+## Transformers and write_only fields
+
+A field marked `write_only: true` is excluded from the read model before the transformer runs — it is never present in the data the transformer sees. Adding `write_only` to a field and adding it to a `pick` list are not in conflict (pick just silently ignores a field that isn't in the read model), but `write_only` is the more robust mechanism if you want a field permanently invisible to read operations, because it removes the field at the model level rather than at the presentation level.
+
+## Setting a transformer via the Platform API
+
+```bash
+curl -X PUT "$STUDIO/studio/api/platform/projects/acme/envs/production/resources/products" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{
+    "transformer": {
+      "pick": ["id", "title", "price_cents", "active"],
+      "rename": {"price_cents": "price"},
+      "case": "camel"
+    }
+  }'
+```
+
+Saving a transformer definition does not run a migration and does not touch the database. It takes effect on the next request.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="A field I listed in `pick` is missing from the response">
+    Either the field is `write_only: true` (it's not in the read model, so `pick` has nothing to include) or the field name in `pick` doesn't match the resource field name exactly (check case and spelling).
+  </Accordion>
+  <Accordion title="The transformer I saved doesn't seem to take effect">
+    Saving a resource definition immediately recompiles the routes for the new version; the very next request uses the updated transformer. If responses still look old, check that the request actually hit after the save, and that you're not looking at a cached response (see [Caching](/data/caching)).
+  </Accordion>
+  <Accordion title="The event payload uses the old field names even though the transformer renamed them">
+    Events carry the raw record before transformation. If downstream event consumers need a different shape, they need to transform it themselves.
+  </Accordion>
+  <Accordion title="I need to add a computed field to the response">
+    Computed fields require a custom route. A transformer can only pick, rename, and case-convert — it cannot add new keys with derived values.
+  </Accordion>
+</AccordionGroup>
 
 <CardGroup cols={2}>
-  <Card title="Resources" icon="database" href="/data/resources" />
-  <Card title="Caching" icon="clock" href="/data/caching" />
-  <Card title="Resource events" icon="zap" href="/data/resource-events" />
+  <Card title="Resources" icon="database" href="/data/resources">The resource definition that hosts the transformer field.</Card>
+  <Card title="Field types" icon="type" href="/data/field-types">write_only and read_only as field-level alternatives to transformer picks.</Card>
+  <Card title="Caching" icon="clock" href="/data/caching">How transformer output interacts with cached responses.</Card>
+  <Card title="Custom routes" icon="route" href="/data/custom-routes">When you need response shaping beyond what a transformer can express.</Card>
 </CardGroup>
