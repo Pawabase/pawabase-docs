@@ -1,422 +1,338 @@
 ---
 title: "Python policies"
-description: "The escape hatch for rules a JSON condition can't express: writing, loading and referencing @policy functions, what they receive, their limits, and how to keep them fast and safe."
+description: "The escape hatch for rules a JSON condition cannot express: writing and loading @policy functions, what they receive and return, where they can and cannot be used, what they do to lists, and how code reloads behave."
 icon: "code"
 ---
 
-JSON conditions cover the vast majority of access rules, and they have big advantages: they're readable in Studio, validated before saving, and planned into SQL. But some rules need a **language**: calling another service, walking a hierarchy, checking a rate or a feature flag, computing something. For those, register a **Python policy**.
+## When a condition is not enough
 
-## How Python policies appear in Studio
+A JSON condition compares values it is given. It cannot look anything up, count, call another service, parse a date, or walk a hierarchy. When a rule needs any of that, you write it in Python and register it as a **Python policy**: an ordinary function that receives the same context a condition would read and answers true or false.
 
-Python policy code is authored in the project, then made available to the environment through **Project → Reload code** in Studio. After project code has loaded, its registered name appears alongside saved policy names in a policy-aware form's **Policy** picker. It is not edited in **Build → Policies** because its source of truth is code, not a stored condition.
+```python
+from pawabase_kit.policies import policy
 
-This separation matters during review. **Build → Policies** → **Who passes** can show and structurally edit a JSON policy. A Python policy attachment can show its name, but Studio cannot render its internal branches, validate its data-access strategy, or make it push down into a resource list. Give it a descriptive name and keep its attachment narrow enough that those limits remain visible.
+
+@policy("nonempty-title", description="A title must be sent and not empty")
+async def nonempty_title(context):
+    return bool((context.get("input") or {}).get("title"))
+```
+
+A registered policy is referenced **by name**, exactly like a stored policy (`"nonempty-title"` in a resource operation's **Access** section, a route's policy, or a function's `policy=`). The rest of the platform does not know or care that it is Python.
+
+Python policies are a cost as well as a power, and the cost is concentrated in three places: they are **opaque to the planner** (lists become per-row), they are **code** (deployed with your project, not edited in Studio), and they can **fail** in ways a condition cannot. This page covers all three. Everything here was run, including the reload behavior.
 
 ## When to reach for Python
 
-| Rule | JSON? | Python? |
+| The rule | Condition? | Python? |
 | --- | --- | --- |
-| Owner, role, tenant, published | ✅ | overkill |
-| Compare two record fields | ✅ | |
-| "Is the caller the record's manager's manager?" (a hierarchy) | | ✅ |
-| "Is this feature enabled for the caller's plan?" (an external service) | | ✅ |
-| "Has the caller made fewer than 5 of these today?" (a count) | | ✅, or a rate limit |
-| "Is the IP in our allowlist of CIDR ranges?" | | ✅ |
+| Owner, role, tenant, published | Yes | Overkill |
+| Compare two columns | Yes | |
+| "A field was **sent**, even as `null`" | **No.** A condition cannot tell "sent as null" from "not sent" | Yes: `"price" in context["input"]` |
+| "The caller manages the record's owner" (a hierarchy) | No | Yes |
+| "This plan includes this feature" from another service | No | Yes |
+| "The caller has made fewer than five of these today" | No | Yes, or a rate limit |
+| "The address is in one of these networks" | No | Yes, with the proxy caveat |
+| "The date is in the past" | **No** (`$now` cannot be compared with text) | Yes |
+| A regular expression built from data | Fails at evaluation | Yes |
+
+The "was it sent as `null`" row is worth remembering. It is the one guard that conditions cannot express and that comes up in field-level rules, and it is a good reason for a Python policy that has nothing to do with a lookup.
 
 <Warning>
-Python policies are opaque to the planner. On **list** requests they always run as a per-row residual: no SQL pushdown, and `total` is `null`. Use them for single-record operations and routes, or narrow lists with a JSON policy first.
+Python policies are opaque to the planner. On a **list** request a Python policy always runs **per row**, after the query: nothing is pushed into SQL, pages come back short, `total` is `null`, and a `select` that omits a column the function reads changes what it sees. Use them for single-record operations and routes, and keep list access rules in conditions. See [SQL pushdown](/policies/pushdown).
 </Warning>
 
-## Writing one
+## Where the code lives
 
-Create `policies.py` in your project's code folder, `code/<project-ref>/policies.py`:
+A project's code is a folder the API loads, one per project:
 
-```python code/school/policies.py
-from ipaddress import ip_address, ip_network
+```text
+code/
+  acme/
+    policies.py        # @policy("name") ...
+    functions/         # @function("name") ...
+    transformers.py    # @transformer("name") ...
+    routes.py          # extension routes
+```
 
-from pawabase_kit.policies import policy
+`code` is the API's `code_path` setting, resolved where the API process runs. Getting the folder onto the API's filesystem (an image layer, a mounted volume, a checkout) is part of your deployment. See [Code](/code/overview). Policies go in `policies.py`, and a Python policy is **registered when the module is imported**: the `@policy` decorator stores the function in a registry under its name.
 
-OFFICE_NETWORKS = [ip_network("10.20.0.0/16"), ip_network("41.58.12.0/24")]
+Because the code is part of the deployment and not of the environment, **Promote never carries a Python policy.** Deploy the same code to every environment that needs it.
 
+## What a policy receives and returns
 
-@policy("school_office_network", description="Requests from the school's office networks")
-def school_office_network(context):
+The function receives **one argument**, a plain dictionary: the same context a condition reads.
+
+| Key | Content |
+| --- | --- |
+| `auth` | The caller: `authenticated`, `user_id`, `email`, `roles`, `permissions`, `org`, `org_role`, `aal`, `claims` |
+| `credential` | The key: `role`, `is_service`, `scopes`, `key_id` |
+| `request` | `method`, `path`, `ip`, `params`, `query` |
+| `project`, `env` | Where it runs |
+| `record` | The row, per the operation (empty for a route) |
+| `input` | The submitted data, per the operation |
+
+See [the context reference](/policies/context) for what each is at each entry point. The function may be **synchronous or `async`**, and it **returns anything**: the result is converted with Python's truthiness, so `True`, a non-empty string and a non-empty list allow, and `None`, `False`, `0` and `""` refuse. This was run: a policy that returned the string `"yes"` allowed the request.
+
+```python
+@policy("is-owner", description="The caller owns the record")
+async def is_owner(context):
+    record = context.get("record") or {}
+    return record.get("owner_id") == context["auth"].get("user_id")
+```
+
+Return **exactly** `True` or `False`. A function that returns a value by accident (a list, a dict) allows, and one that returns nothing refuses.
+
+## Loading and reloading
+
+A Python policy exists only after its module has been **loaded**. Three things control that, and each was run.
+
+**It loads once, when the project's code is first used**, and Studio's **Reload code** loads it again. The button is on the **project** page and on **Build → Functions** (the toast reads *Code reloaded*), and the equivalent call is `POST /platform/v1/projects/{ref}/code/reload`, which answers with what it loaded:
+
+```json
+{ "modules": ["pawabase_code.acme.policies"], "errors": [], "router": false }
+```
+
+| Situation | What happens |
+| --- | --- |
+| You **edit** the file | **Nothing**, until you reload. Requests keep using the old code. A policy that returned `True` kept allowing until the reload, then refused |
+| You reload, and the module **raises** on import | `errors` lists it (`policies.py: RuntimeError: syntax mishap`), `modules` is empty, and **the previously registered policies keep working** |
+| You **remove** a policy from the file and reload | The old name **stays registered** until the process restarts. A removed policy kept refusing requests |
+| You attach a policy name **before** the code has loaded | The save is refused: `operations.create.policy: unknown policy 'nonempty-title'`. Reload the code first, then attach |
+
+Three things follow. A **bad deploy does not take down the policies you already have**, which is good. A policy you meant to retire **keeps enforcing** until a restart, which is surprising: do not rely on deleting the function to remove the rule, detach it from every reference as well. And the registry is **per process**, so with several API processes each one loads and reloads its own copy: roll the code out to all of them before you depend on a change.
+
+A reload also forgets cached environment states so the engines are rebuilt, which is why the new code takes effect on the next request.
+
+## Referencing
+
+A Python policy is named like any other:
+
+```json
+{
+  "operations": {
+    "create": { "enabled": true, "policy": "nonempty-title" },
+    "list": { "enabled": true, "policy": "authenticated" }
+  }
+}
+```
+
+The reference is validated when you save the resource, against stored, Python and built-in names together, which is why the name must be loaded first. Details that differ from a stored policy:
+
+| | Stored | Python |
+| --- | --- | --- |
+| Edited in | Studio's rule builder | Your code |
+| Listed on **Build → Policies** | **Yes** | **No.** The page lists stored policies only |
+| Offered in the **picker** | Yes, under **This project** | **No.** Set the name in the **JSON** tab. A name the picker does not know is shown as `name (unknown)`, which is expected for a Python policy |
+| Validated | Shape, when saved | Not at all: it is code |
+| Used in a **list** of references | Yes | **No.** `Python policies cannot be combined in a list; call them from Python` |
+| Used for a **bucket** | Yes | **No.** Bucket policies must be JSON conditions |
+| Used for a **realtime channel rule** | Yes | **No.** The realtime service has only stored and built-in policies |
+| Promoted | Yes | No (it is code) |
+| Wins a name clash | **Over Python** | Loses to a stored policy of the same name |
+
+The last row is the registry's merge order: **built-in, then Python, then stored**, so a stored policy named like a Python one replaces it. Pick distinct names, and a prefix helps (`acme-same-team`).
+
+### Combining a Python policy with others
+
+A list cannot contain one, so to combine, call the other rule from inside it, or give the resource a Python policy that does all the work:
+
+```python
+@policy("acme-owner-or-manager")
+async def owner_or_manager(context):
+    auth, record = context["auth"], context.get("record") or {}
+    if not auth.get("authenticated"):
+        return False
+    if record.get("owner_id") == auth.get("user_id"):
+        return True
+    return await is_manager_of(auth["user_id"], record.get("owner_id"))
+```
+
+Always check `authenticated` first, as the `owner` shorthand does. A function that compares two values without it has the same fail-open as a bare `eq`: `None == None`. See [the overview](/policies/overview#a-plain-eq-on-an-owner-column-fails-open).
+
+## What a Python policy does at run time
+
+These were run with a Python policy `is-weekday-owner` (the owner test above) on a resource whose `list`, `get` and `update` named it.
+
+| Request | Answer |
+| --- | --- |
+| A user lists | `200`, only their own rows, and **`"total": null`** |
+| A user gets someone else's row | `404`, `Not found` |
+| A user updates someone else's row | `403`, `policy '<name>' refused` |
+| A secret key lists | `200`, every row: the **service bypass happens before the function is called** |
+
+On a **list**, the engine cannot see inside the function, so it plans "allowed, with a per-row check": the query runs unfiltered, the page is fetched, and the function is called **once per row of the page**. Whatever survives is returned. That is the same residual path as any non-pushable condition, with `total` reported as `null`, and it has the same hazards: short pages, empty pages, and rows that depend on which columns were selected.
+
+On a **single record** (`get`, `create`, `update`, `delete`) the function is called once, with the full context.
+
+### Service credentials never reach the function
+
+A secret key or operator passes before the policy is resolved, so a Python policy is **never called** for them. That matters for testing: a policy that raises an exception answered `500` to a signed-in user and `200` to a secret key. If you test your function through the API with a secret key, it was never run.
+
+## When the function fails
+
+A Python policy is code, and code can raise. A condition cannot.
+
+| Situation | What happens |
+| --- | --- |
+| The function **raises** | **`500`**, `Internal Server Error`, for a list and for a `get`. This was run with a function that raised `RuntimeError` |
+| The function returns a **falsy** value | A refusal (`403` or `404` or `401`, as for any policy) |
+| The function returns a **truthy** value, of any type | An allow |
+| The function **hangs** | The request hangs. There is no timeout on a policy |
+| The function calls something **slow** | Every request (and, for a list, every row) pays for it |
+| The module **does not load** | The policy is not registered, and references to it fail at save time, or with a `500` at request time |
+
+So a Python policy fails **open or closed depending on how you wrote it**, and when it fails by raising it fails as a `500`, not as a refusal. Two defensive habits:
+
+- **Catch what you expect and return `False`.** A policy that cannot decide should refuse.
+- **Let truly unexpected errors raise.** A `500` is loud, which is better than a silent allow. Do not wrap the whole function in a bare `except` that returns `True`.
+
+```python
+@policy("acme-office-network", description="Requests from the office networks")
+def office_network(context):
     ip = (context.get("request") or {}).get("ip")
     if not ip:
         return False
     try:
         return any(ip_address(ip) in net for net in OFFICE_NETWORKS)
     except ValueError:
-        return False
+        return False        # a malformed address is a refusal, not an error
 ```
-
-The decorator takes:
-
-<ParamField path="name" type="string" required>
-  The name you'll reference. Use a project prefix to avoid collisions (see [naming](#naming-and-isolation)).
-</ParamField>
-<ParamField path="description" type="string">
-  Shown in Studio's pickers. Defaults to the function's docstring.
-</ParamField>
-
-The function receives the [evaluation context](/policies/context) as a plain `dict` and returns something truthy (allowed) or falsy (refused). It may be a regular function or `async def`.
-
-### Async policies
-
-```python
-import httpx
-
-from pawabase_kit.policies import policy
-
-
-@policy("plan_allows_exports", description="The caller's organization plan includes exports")
-async def plan_allows_exports(context):
-    org = context["auth"].get("org")
-    if not org:
-        return False
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        r = await client.get(f"https://billing.internal/orgs/{org}/features")
-    return r.status_code == 200 and "exports" in r.json().get("features", [])
-```
-
-Keep network calls short and **fail closed**: a timeout or error should return `False`, not raise.
-
-## Loading and reloading
-
-Project code lives at `<PAWABASE_CODE_PATH>/<project-ref>/`. In the Docker setup that's the `/code` mount (the repository's `examples/code` by default):
-
-```text
-code/
-  school/
-    policies.py        # @policy
-    transformers.py    # @transformer
-    routes.py          # router = Router(...)
-    functions/
-      billing.py       # @function
-```
-
-After changing code, reload it: **Studio → Project → Reload code**, or:
-
-```bash
-POST /platform/v1/projects/school/code/reload
-# {"modules": ["pawabase_code.school.policies", …], "errors": [], "router": false}
-```
-
-The response lists loaded modules and any import errors. Code is also loaded when the API starts.
-
-<Note>
-Project code runs **inside the API and worker processes**, with their permissions. Only mount code you trust, and review it like any server code.
-</Note>
-
-## Referencing it
-
-Once loaded, the name works like any policy reference:
-
-```json
-"operations": { "delete": { "enabled": true, "policy": "school_office_network" } }
-```
-
-```json
-{ "method": "POST", "path": "/exports/students", "policy": "plan_allows_exports", "…": "…" }
-```
-
-### Where Python policies can't be used
-
-| Place | Allowed? | Why |
-| --- | --- | --- |
-| Resource operations | ✅ | |
-| Custom routes, functions, flow HTTP triggers | ✅ | |
-| `policy.check` in flows | ✅ | |
-| **Lists of references** (`["mfa", "my_python_policy"]`) | ❌ | Lists merge conditions; a function isn't a condition |
-| **Storage buckets** | ❌ | Storage decisions are synchronous and condition-based |
-| Realtime channel rules | ❌ | Channel rules take conditions |
-
-To combine a Python policy with others, do it in Python:
-
-```python
-from pawabase_kit.policies import evaluate, policy
-
-
-@policy("finance_on_site", description="Finance staff on the office network, with 2FA")
-async def finance_on_site(context):
-    is_finance = evaluate({"role": ["bursar", "principal"]}, context)
-    has_mfa = evaluate({"aal": "aal2"}, context)
-    return is_finance and has_mfa and school_office_network(context)
-```
-
-`evaluate(condition, context)` runs any JSON condition against a context, so you can mix both styles.
-
-## What the context contains
-
-Exactly what JSON conditions see: `auth`, `credential`, `request`, `record`, `input`, `project`, `env`. On lists it's called **once per row** with that row as `record`.
-
-```python
-@policy("same_department")
-def same_department(context):
-    mine = context["auth"].get("claims", {}).get("app", {}).get("department_id")
-    theirs = (context.get("record") or {}).get("department_id")
-    return mine is not None and str(mine) == str(theirs)
-```
-
-Normalise ids with `str()` when comparing: tokens carry strings, databases return integers.
-
-## Naming and isolation
-
-Python policies are registered in a **process-wide** registry when project code loads. If two projects on the same installation register the same name, the last loaded wins for both. Prefix names with the project reference:
-
-```python
-@policy("school.office_network")
-```
-
-Stored (JSON) policies are per environment and never collide; this caveat applies only to Python policies.
 
 ## Performance
 
-| Tip | Why |
+A policy runs for every request that names it, and for a list, for every row on the page:
+
+| Factor | Effect |
 | --- | --- |
-| Return early on cheap checks | Most calls are decided by role or authentication |
-| Cache external lookups (`functools.lru_cache` for static data, the platform cache for shared data) | A list of 100 rows calls the policy 100 times |
-| Keep timeouts short (≤ 2 s) and fail closed | A slow policy slows every request it guards |
-| Don't use on big lists | Always a residual; prefer a JSON policy with an equality |
+| Pure Python on the context | Microseconds. Fine, even per row |
+| A database query per call | A query per request, or per **row** of a list. Avoid: a page of 20 means 20 queries |
+| A network call | Added to every request. Cache the answer, or move the check into a flow or route |
+| Per-row on a large page | `per_page` rows times the function's cost. Keep pages small |
+| An `async` function | May await I/O, and still runs sequentially across rows |
+
+Rules of thumb: do the **expensive lookup once** per request (cache it in a module-level dictionary with an expiry, keyed by the caller), keep the per-row part to a comparison, and prefer a **flag column** that a flow keeps up to date over a lookup in the policy. A policy that has to ask another service should usually be a route with its own check instead.
+
+## Where a Python policy cannot be used
+
+Three entry points only accept JSON conditions or stored policies:
+
+| Entry point | What happens with a Python policy |
+| --- | --- |
+| **Lists of references** | Refused when you save: `Python policies cannot be combined in a list; call them from Python` |
+| **Buckets** | Bucket policies must be JSON conditions. A Python name resolves at save time but cannot run in the storage layer: the code states `storage policies must be JSON conditions`. Treat it as unsupported |
+| **Realtime channel rules** | The realtime service builds its engine from stored policies only, so a Python name is not available there |
+
+If a bucket or a channel needs a rule a condition cannot express, enforce it in a route (a flow that checks, then uploads or publishes) and keep the bucket or channel closed.
 
 ## Testing
 
-Python policies are plain functions, so unit-test them directly:
+A Python policy is a function of a dictionary, so it is the easiest kind of policy to test: no API, no database, no token.
 
 ```python
-from policies import same_department
-
-
-def test_same_department():
-    ctx = {"auth": {"claims": {"department_id": 3}}, "record": {"department_id": "3"}}
-    assert same_department(ctx)
-    assert not same_department({"auth": {"claims": {}}, "record": {"department_id": 3}})
-```
-
-Then test end to end: call the endpoint as a user who should pass and one who shouldn't.
-
-## Errors
-
-If a Python policy **raises**, the request fails (a `500` with the error logged) rather than being silently allowed. That's fail-closed, but noisy: catch expected errors and return `False`.
-
-## Python policies vs flows
-
-Sometimes the right answer isn't a policy at all. If the rule is really part of a **workflow** ("refuse if the invoice is already paid"), express it in the flow that implements the workflow, with `control.if` and `error.raise`: the rule then lives next to the logic it protects and appears in run traces. Use policies for "may this caller do this at all", and flows for "is this action valid right now".
-
-## Compared with Supabase and Firebase
-
-| | Pawabase Python policies | Supabase | Firebase |
-| --- | --- | --- | --- |
-| Escape hatch | Python functions, any library | PL/pgSQL / SQL functions in `USING` clauses | Rules functions (no external calls); Cloud Functions for everything else |
-| External calls | Yes (keep them fast) | Via extensions like `http`, discouraged in RLS | No |
-| Applies to | Resources, routes, functions, flows | Tables | Documents |
-
-## The registration mechanism, in depth
-
-It's worth understanding exactly what `@policy` does, because the mechanism explains every behavior in the sections above — the process-wide collision, the reload requirement, the inability to use Python policies in lists.
-
-`@policy(name, description=...)` is a decorator defined in `pawabase_kit.policies.registry`. When Python imports a module containing a `@policy`-decorated function, the decorator runs immediately and inserts a `Policy` object into a single module-level dictionary, `_registry`, keyed by the name you gave it:
-
-```python
-_registry: dict[str, Policy] = {}
-
-def policy(name, *, description=""):
-    def decorator(func):
-        _registry[name] = Policy(
-            name=name, handler=func, description=description or (func.__doc__ or "").strip()
-        )
-        return func
-    return decorator
-```
-
-Three consequences follow directly from this being a plain dict with no per-project or per-environment key:
-
-1. **Registration happens at import time, not at call time.** The function itself isn't invoked when the module loads — only the decorator runs, which just stores a reference to the function alongside its name. The function executes later, once per policy check, when the engine calls `python_policies()` to build the engine's combined policy map and then calls the resulting `Policy.handler`.
-2. **The registry is process-wide, not project-scoped.** There's no namespacing by project or environment baked into `_registry` itself — namespacing is a *convention* you apply through the name you choose (`school.office_network` rather than `office_network`), not something the registry enforces for you.
-3. **Registration is idempotent per name, last-write-wins.** Calling `@policy("x")` twice — whether from the same module reloaded, or from two different projects' code sharing one process — simply overwrites `_registry["x"]` with the second definition. There's no error, no warning; the first policy silently stops existing.
-
-### What "reload code" actually does
-
-When you click **Studio → Project → Reload code** (or `POST /platform/v1/projects/<ref>/code/reload`), the platform re-imports your project's Python modules. Because `@policy` runs its registration logic as a side effect of import, reloading `policies.py` re-executes every `@policy(...)` call in it, which re-inserts (or newly inserts, for a policy you just added) entries into `_registry`. If you remove a `@policy` from the source file and reload, the **old registration stays in `_registry`** until the process restarts or another reload happens to overwrite that specific name — reloading doesn't clear the registry first, it only re-runs the imports, so a policy function you deleted from the file remains callable (and stale) until something replaces its name or the process restarts. In practice this rarely bites you, because deleting a Python policy without also removing every reference to it would break those references anyway (the engine would try to resolve a name that no stored definition mentions and simply never call it) — but it's worth knowing that "remove the function" and "the name stops resolving" are not the same moment.
-
-### Why lists can't include Python policies
-
-`PolicyEngine.resolve_ref` builds a list reference by resolving every item to a `Policy` and then merging their **conditions** into one `{"all": [...]}`:
-
-```python
-if isinstance(ref, list):
-    resolved = [self.resolve_ref(item) for item in ref]
-    if any(p.handler for p in resolved):
-        raise PolicyError(
-            "Python policies cannot be combined in a list; call them from Python"
-        )
-    return Policy("+".join(p.name for p in resolved), {"all": [p.condition for p in resolved]})
-```
-
-A Python policy's `Policy` object has `handler` set and `condition` set to `None` — there's nothing to put inside the `{"all": [...]}` for it. The engine detects this (`any(p.handler for p in resolved)`) and refuses to build the list at all, raising a `PolicyError` rather than silently dropping the Python policy or silently treating it as always-true. This is a **fail-loud** design choice: a list containing a Python policy is refused outright — you can't accidentally ship a list reference that quietly ignores one of its members.
-
-**Concrete example of hitting this limit.** A finance resource needs "MFA, and passes the office-network check" as its delete policy. The natural-looking first attempt:
-
-```json
-"operations": { "delete": { "enabled": true, "policy": ["mfa", "school_office_network"] } }
-```
-
-fails validation when the resource is saved, with an error naming the field: `operations.delete.policy: Python policies cannot be combined in a list; call them from Python`. The fix, exactly as shown earlier in [where Python policies can't be used](#where-python-policies-cant-be-used), is to write the combination as a new Python policy that calls `evaluate()` for the JSON half and the other Python function directly for its half:
-
-```python
-from pawabase_kit.policies import evaluate, policy
-
-@policy("finance_delete_guard")
-async def finance_delete_guard(context):
-    return evaluate({"aal": "aal2"}, context) and await school_office_network(context)
-```
-
-then reference `"finance_delete_guard"` alone. The combining logic moves from the reference site (a list) into the function body (an `and`), which is the general pattern: whenever you want to combine a Python policy with anything else, the combination lives in Python, never in a reference.
-
-### Why storage buckets refuse Python policies at save time
-
-`PolicyStorage.__init__` resolves both the read and write references eagerly, in the constructor, and checks for a handler:
-
-```python
-self.read_policy = engine.resolve_ref(read)
-self.write_policy = engine.resolve_ref(write)
-for resolved in (self.read_policy, self.write_policy):
-    if resolved.handler is not None:
-        raise ValueError("storage policies must be JSON conditions")
-```
-
-The reason is architectural, not arbitrary: Sillo's underlying storage bucket calls `allows(action, key, user)` **synchronously**, and `PolicyStorage.allows` calls `evaluate(policy.condition, context)` directly — there's no `await` anywhere in that path. A Python policy's handler may be `async def`, which `evaluate()` has no way to run inline (it isn't an event loop). Rather than support only synchronous Python policies for buckets (a confusing, easy-to-get-wrong half-measure), the platform refuses **any** Python policy on a bucket, at the point the bucket definition is saved, with a clear error, so the limitation shows up during authoring rather than as an unexplained crash the first time someone uploads a file.
-
-**Concrete example of hitting this limit.** A `contracts` bucket needs read access gated by whether the caller's organization has an active subscription, checked via `plan_allows_exports` from earlier in this page — an async function that calls a billing service. Setting:
-
-```json
-{ "name": "contracts", "read_policy": "plan_allows_exports", "write_policy": "service" }
-```
-
-is refused when the bucket is saved: `read_policy: storage policies must be JSON conditions`. There is no way to make an async, network-calling check run for a storage read — the fix is to restructure the requirement so it's decided somewhere synchronous. Two real options:
-
-1. **Denormalize the fact onto the token or the object key.** If "plan includes exports" changes rarely, grant a role or permission (`exports_enabled`) when the plan is set, and check `{"permission": "exports_enabled"}` on the bucket instead of calling billing live on every read.
-2. **Front the bucket with a route.** Instead of letting clients hit `/storage/v1/object/contracts/{key}` directly, expose `GET /contracts/{key}` as a custom route whose policy can be a Python policy (routes accept them), which calls `plan_allows_exports` and then, if allowed, returns a short-lived **signed URL** it creates with a secret key. The signed URL's own grant is checked once, at creation time, by whatever policy the bucket read is configured with (which can now safely be `service`, since only your route creates signed URLs).
-
-## When *not* to reach for Python, revisited
-
-The table near the top of this page is the quick version; here are three cases teams commonly get wrong in each direction.
-
-**Reached for Python, should have used JSON:**
-
-A "does the caller belong to this organization" check is sometimes written as a Python policy that does a database lookup:
-
-```python
-@policy("in_org")
-async def in_org(context):
-    org_id = context.get("record", {}).get("org_id")
-    membership = await db.fetchrow(
-        "SELECT 1 FROM memberships WHERE org_id = $1 AND user_id = $2", org_id, context["auth"]["user_id"]
-    )
-    return membership is not None
-```
-
-If organization membership is already in the caller's token as `$auth.org` (which Akountz's organization support provides for exactly this reason), the entire function collapses to a JSON equality: `{"eq": ["$record.org_id", "$auth.org"]}` — no database round-trip per check, no per-row Python call on lists, full SQL pushdown. Reach for a Python policy only once you've confirmed the fact you need genuinely isn't available in the token or on the record; check [what the context contains](/policies/context) before writing one.
-
-**Reached for JSON, should have used Python:**
-
-A rota system tries to express "the caller is scheduled to work today" by pre-computing a `working_today` boolean column via a nightly job, then checking `{"eq": ["$record.working_today", true]}`. This works, but the nightly job is now a second system that can drift from reality (someone's shift changes at 9am, `working_today` isn't updated until the next nightly run). If the true rule is "is there a shift record overlapping right now for this user," a Python policy that queries shifts directly is more honest about what's actually being decided, and simpler than maintaining a derived column whose only purpose is to make the policy expressible in JSON. Precomputing into a boolean is the right move when the source of truth changes rarely (a subscription plan, a verified-email flag); it's the wrong move when correctness genuinely depends on "right now."
-
-**A genuine judgment call:** rate limiting a specific action per user (`"has the caller submitted fewer than 3 support tickets today"`). Either a Python policy with a `SELECT count(*)` (simple, but a query per check, and unusable on lists), or a dedicated rate-limiting mechanism at the gateway layer, if the platform's rate limits can be scoped that granularly for your case; or a denormalized daily counter column updated by a flow, checked with `{"lt": ["$record.tickets_today", 3]}`. There's no universally right answer — the choice depends on how exact the count needs to be and how often the policy runs.
-
-## A complete worked module
-
-Here's a realistic `policies.py` for a logistics platform that needs three Python policies, showing how they're organized, named, and composed with each other and with JSON:
-
-```python code/logistics/policies.py
-from datetime import UTC, datetime, timedelta
-from ipaddress import ip_address, ip_network
-
-import httpx
-
-from pawabase_kit.policies import evaluate, policy
-
-DEPOT_NETWORKS = [ip_network("10.4.0.0/16")]
-
-
-@policy("logistics.depot_network", description="Requests from a depot's local network")
-def depot_network(context):
-    ip = (context.get("request") or {}).get("ip")
-    if not ip:
-        return False
-    try:
-        return any(ip_address(ip) in net for net in DEPOT_NETWORKS)
-    except ValueError:
-        return False
-
-
-@policy("logistics.driver_on_shift", description="The caller is a driver currently clocked in")
-async def driver_on_shift(context):
-    user_id = context["auth"].get("user_id")
-    if not user_id:
-        return False
-    async with httpx.AsyncClient(timeout=1.5) as client:
-        try:
-            r = await client.get(f"http://shifts.internal/active/{user_id}")
-        except httpx.RequestError:
-            return False  # fail closed on a timeout or connection error
-    return r.status_code == 200
-
-
-@policy("logistics.depot_staff_on_site", description="Depot staff, physically at a depot, on shift")
-async def depot_staff_on_site(context):
-    is_staff = evaluate({"role": ["depot_staff", "admin"]}, context)
-    if not is_staff:
-        return False
-    return depot_network(context) and await driver_on_shift(context)
-```
-
-Three things this module demonstrates that are easy to miss in a single isolated example:
-
-- **Names are prefixed** (`logistics.depot_network`, not `depot_network`) precisely because this registry is process-wide — see [naming and isolation](#naming-and-isolation).
-- **A sync policy can be called directly from an async one** (`depot_network(context)`, no `await`), while an async policy must be awaited (`await driver_on_shift(context)`). Mixing sync and async Python policies is fine; just call each the way it needs to be called.
-- **`evaluate()` bridges JSON and Python inside a single function**, so a composite policy like `depot_staff_on_site` can lead with a cheap JSON role check before falling through to two more expensive calls — one of which makes a network request. Ordering cheap checks first, as this page's [performance](#performance) section recommends, applies just as much inside a Python policy's own logic as it does to combining shorthands in JSON.
-
-## Testing patterns in depth
-
-The unit test shown earlier checks a pure function directly. Two more patterns are worth having in a real test suite.
-
-**Testing the fail-closed behavior of a network-calling policy**, using a mock that simulates a timeout:
-
-```python
-import httpx
 import pytest
-from unittest.mock import AsyncMock, patch
 
-from policies import plan_allows_exports
+from acme_policies import is_owner  # import the function from your project's policies module
+
+
+def context(user_id, owner_id):
+    return {
+        "auth": {"authenticated": user_id is not None, "user_id": user_id},
+        "record": {"owner_id": owner_id},
+        "input": None,
+    }
 
 
 @pytest.mark.asyncio
-async def test_plan_allows_exports_fails_closed_on_timeout():
-    ctx = {"auth": {"org": "acme"}}
-    with patch("httpx.AsyncClient.get", AsyncMock(side_effect=httpx.TimeoutException("slow"))):
-        with pytest.raises(httpx.TimeoutException):
-            await plan_allows_exports(ctx)
+async def test_owner_passes():
+    assert await is_owner(context("u-1", "u-1"))
+
+
+@pytest.mark.asyncio
+async def test_stranger_is_refused():
+    assert not await is_owner(context("u-2", "u-1"))
+
+
+@pytest.mark.asyncio
+async def test_signed_out_is_refused_even_for_an_unowned_row():
+    assert not await is_owner(context(None, None))   # None == None must not allow
 ```
 
-If this test raises rather than returning `False`, it's telling you the function doesn't actually fail closed yet — the function shown earlier in this page catches nothing around its `httpx` call, so a real timeout would propagate up and the request would fail with a `500`, not a policy refusal. Whether a `500` or a policy-refusal `403` is the right behavior for a downstream timeout is a judgment call (fail-closed-with-an-error is still fail-closed, just noisier, as the [errors](#errors) section notes) — but the test makes the actual behavior explicit rather than assumed.
+The third test is the one that earns its keep: it is the `None == None` case that makes a hand-written ownership comparison fail open.
 
-**Testing through the engine, not just the bare function**, to catch registration mistakes:
+Test the **data your policies see** too: a record with `null` in every column the function reads, and a missing `record` for a route. Then test **through the API** once, with a publishable key and user tokens, to prove the reference, the reload and the status codes. Never with a secret key.
 
-```python
-from pawabase_kit.policies import PolicyEngine, build_policy_context
+## Security
 
-def test_registered_under_expected_name(app_context):
-    engine = PolicyEngine(python=python_policies())
-    decision = await engine.check("logistics.driver_on_shift", build_policy_context(app_context))
-    assert decision.policy == "logistics.driver_on_shift"
-```
+| Concern | Guidance |
+| --- | --- |
+| **Fail closed** | Refuse when a value is missing or malformed |
+| **Check `authenticated` first** | A comparison of two missing values is true |
+| **Do not trust `request.query` or `params`** | The caller controls them |
+| **Do not trust `auth.claims.meta`** | Users edit it. Use `claims.app` |
+| **Do not leak** | A policy's return value is a bool. Do not raise exceptions that include data, since a `500` body is a plain string but logs are not |
+| **Do not mutate the context** | It is a shallow copy, so nested values are shared. Treat it as read-only |
+| **Do not do writes** | A policy decides. It must not change anything: it may run more than once per request, and per row |
+| **Keep it deterministic** | The same context should give the same answer |
+| **Do not depend on the order of calls** | A list runs a policy per row, in row order, and a get runs it once |
 
-This catches the class of bug where the function itself is correct but the `@policy("...")` name doesn't match what a resource or route actually references — a mismatch that a bare unit test of the function can never catch, because it calls the function directly rather than going through name resolution.
+A Python policy has **no sandbox**: it is your code, running in the API process, with the API's authority. Review it like any code that runs with that privilege, and keep third-party calls to a minimum.
 
-## Next
+## Python policies, flows and routes
+
+When a rule needs more than a function of the context, there are better homes:
+
+| You need | Use |
+| --- | --- |
+| A check that depends on data in several resources | A **route** with a flow that queries, then acts or refuses (`error.raise`) |
+| A check before a particular action | The **Check policy** block in a flow, which evaluates a named policy, Python included |
+| A check that must hold for a whole table | A **flag column** maintained by a flow, and a condition on it |
+| A rate or count limit | A resource or route **rate limit** |
+
+A flow's **Check policy** block can name a Python policy (it resolves like any reference), which makes it a way to test one inside Studio, with a context you assemble. See [Testing and debugging](/policies/debugging#evaluating-a-condition-with-policycheck).
+
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Can a Python policy read the database?">
+    The function is plain Python in the API process, so it can import your own client. The platform does not hand it a database handle. A query per call is expensive, and per row on a list it is multiplied.
+  </Accordion>
+  <Accordion title="Why is my Python policy not in the picker?">
+    The picker lists stored policies. Set a Python policy's name in the **JSON** tab. A name Studio does not know is shown as `name (unknown)`.
+  </Accordion>
+  <Accordion title="Why did my edit not take effect?">
+    The code is loaded once. Press **Reload code**, or restart the API. A reload re-imports the module and registers the names again.
+  </Accordion>
+  <Accordion title="I deleted the function and the policy still applies. Why?">
+    Reloading does not unregister names that are no longer in the file. Detach the policy from every reference, and restart the API to clear the registry.
+  </Accordion>
+  <Accordion title="Can I use async code and await I/O?">
+    Yes. The function may be `async`. It is awaited for each call.
+  </Accordion>
+  <Accordion title="Why does a list under a Python policy have a null total?">
+    Because the engine cannot push a function into SQL, so every row is checked after the query.
+  </Accordion>
+  <Accordion title="Is a Python policy slower than a condition?">
+    A pure comparison is not meaningfully slower. The difference is the list: a condition can become SQL, and a function cannot.
+  </Accordion>
+  <Accordion title="Can two environments use different Python policies?">
+    Not by environment: the code is per project, and the registry is per process. A stored policy of the same name wins in the environment that defines it, which is a way to override.
+  </Accordion>
+</AccordionGroup>
+
+## What to remember
+
+- **A Python policy is a function of the context dictionary, registered with `@policy`, referenced by name.**
+- **Truthy allows. Falsy refuses. Raising is a `500`.**
+- **It is never called for secret keys.**
+- **On a list it is per row, `total` is `null`, and `select` changes what it sees.**
+- **It cannot be in a list of references, a bucket policy or a realtime rule.**
+- **Edits need a reload. Removed names persist until restart. A bad reload keeps the old policies.**
+- **Attach a policy only after its code has loaded.**
+- **It is code: fail closed, check `authenticated` first, test it as a function.**
 
 <CardGroup cols={2}>
-  <Card title="Debugging policies" icon="bug" href="/policies/debugging">Finding out why a request was refused.</Card>
-  <Card title="Project code" icon="folder-code" href="/code/overview">Functions, routes and transformers in Python.</Card>
+  <Card title="References" icon="at-sign" href="/policies/references" />
+  <Card title="SQL pushdown" icon="arrow-down-to-line" href="/policies/pushdown" />
+  <Card title="Code" icon="code" href="/code/overview" />
+  <Card title="Testing and debugging" icon="bug" href="/policies/debugging" />
 </CardGroup>

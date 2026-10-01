@@ -1,293 +1,309 @@
 ---
 title: "SQL pushdown"
-description: "How list requests stay correct and fast: partial evaluation, equality pushdown, residuals, what they mean for pages and totals, and how to design policies that scale to millions of rows."
+description: "How a list request is planned: partial evaluation, which conditions become SQL filters, what a per-row residual does to pages and totals, how a select can bypass a residual, and how to write policies that stay in SQL."
 icon: "arrow-down-to-line"
 ---
 
-Checking a policy on **one** record is easy: load it, evaluate, allow or refuse. Checking a policy on a **list** is where most backends quietly go wrong. Pawabase solves it by **planning** the policy before running the query. This page explains the problem, the three-stage planner, exactly which conditions become SQL, what happens to the rest, and how to design policies that stay fast at scale.
+## The problem a list creates
 
-## Design pushdown where the policy is edited
+A policy answers one question about one record: may this caller touch it? A list asks that question about **every row of a table**, and returns one page of the ones that pass. There are two ways to do that, and only one of them is correct.
 
-In **Build → Policies**, the **Who passes** panel is where a list policy's query shape begins. A rule comparing a direct `$record.<column>` path with a caller value is legible both to a reviewer and to the planner; a deeply nested, computed, or Python-only rule may still be correct but leaves more work for the residual evaluator. The editor does not promise that a rule will push down, because pushdown depends on the complete condition and request context.
-
-Attach a list policy from **Build → Resources** → a resource's **Access** panel, on the `list` row. The policy selected there governs which rows are eligible; it is not merely a UI filter. That distinction matters for pagination, totals, API clients, and exports: treat a residual as a property of the resource's authorization contract, not as an implementation detail a client can repair.
-
-## The problem with filtering after the fact
-
-Imagine `GET /notes?per_page=20` where the policy is "your own notes", implemented the naive way:
-
-1. `SELECT * FROM notes ORDER BY created_at DESC LIMIT 20` returns 20 rows, of which 3 are yours;
-2. drop the 17 you can't see and return 3 rows;
-3. report `total: 51,203` (every note in the table).
-
-That's three bugs at once:
-
-- **Short pages.** Page 1 shows 3 notes; page 2 might show 0 even though you have 60 notes.
-- **Wrong totals.** The count reveals how many notes *other people* have, and breaks "page 1 of N" UIs.
-- **Wasted work.** The database reads rows only to have them thrown away.
-
-Frameworks usually "fix" this by making every list endpoint remember to add the right `WHERE` clause by hand, which is exactly the kind of duplication that eventually leaks data.
-
-## How Pawabase plans a list
-
-```mermaid
-flowchart TB
-  A[List request + policy reference] --> B{Service credential?}
-  B -- yes --> U[Plan: unrestricted]
-  B -- no --> C[Resolve the reference<br/>name · list · inline]
-  C --> D{Python policy?}
-  D -- yes --> R1[Plan: residual = the Python policy<br/>checked per row]
-  D -- no --> E[Partial evaluation:<br/>decide everything not about $record]
-  E -->|true| U
-  E -->|false| F[403, no query]
-  E -->|a residual condition| G[Pushdown: split the residual]
-  G --> H[AND-ed eq on $record.field → SQL WHERE]
-  G --> I[Everything else → per-row residual]
-  H --> Q[(SELECT … WHERE your filters AND policy filters)]
-  I --> Q
-```
-
-### Stage 1: service shortcut
-
-Secret keys and operators bypass policies, so their plan is unrestricted: the query runs with just the client's own filters.
-
-### Stage 2: partial evaluation
-
-The planner evaluates everything in the condition that **doesn't mention `$record`**: authentication, roles, permissions, scopes, `$input`, `$request`, `$credential`, `$now`. Groups simplify as it goes:
-
-| Group | Rule |
-| --- | --- |
-| `all` | any child **false** → the whole `all` is false; **true** children disappear |
-| `any` | any child **true** → the whole `any` is true; **false** children disappear |
-| `not` | inverts a decided child; keeps an undecided one wrapped |
-
-Three outcomes are possible:
-
-| Outcome | Meaning | What happens |
+| Approach | How | What goes wrong |
 | --- | --- | --- |
-| `true` | The caller may see every row | The query runs with only the client's filters |
-| `false` | The caller may see no row | `403` before any SQL runs |
-| a smaller condition | Depends on the rows | Continue to stage 3 |
+| **Filter afterwards** | Read a page of rows, drop the ones the caller may not see | Pages come back **short** (a page of twenty with five allowed rows returns five), the **total** is unknown, an unlucky page is **empty** while later pages are full, and rows are fetched that the caller never sees |
+| **Filter in the database** | Add the policy to the `WHERE` clause, so the database returns only allowed rows | Nothing. Pages are full, `total` is exact, and the database does the work |
 
-### Stage 3: pushdown
+Pawabase does the second whenever it can, and the first only for what it cannot express in SQL. Understanding which is which is the whole of this page, because the difference shows up in your product: a list that **stays in SQL** behaves like an ordinary query, and a list with a **residual** behaves differently in ways that matter to a client.
 
-The remaining condition mentions only record fields. The planner looks at it as a conjunction (the parts of a top-level `all`, or the single condition) and moves every part of this exact shape into SQL:
+Everything below was run. The plans come from the engine, and the pages and totals from a running API.
 
-```json
-{ "eq": ["$record.<column>", <a value known now>] }
-```
+## How a request is planned
 
-- the record path must be **one level** (`$record.user_id`, not `$record.address.city`);
-- the other side must already be known: a literal, or something from `$auth`, `$credential`, `$request` (resolved during stage 2);
-- either side may be the record path.
+For a list, the engine does not call the policy once. It runs a **plan** in three steps:
 
-Each such part becomes `column = value` in the `WHERE` clause. Everything else stays as a **residual** condition, evaluated on each row the query returns.
-
-## Worked examples
-
-<Tabs>
-  <Tab title="1. Owner">
-    Policy: `{"owner": "user_id"}` → expands to `all(authenticated, eq($record.user_id, $auth.user_id))`.
-    Caller: Ada, `user_id = "7"`.
-    ```text
-    stage 2: authenticated → true (dropped); eq($record.user_id, "7") stays
-    stage 3: eq on a one-level record path vs a known value → pushed
-    SQL:     … WHERE user_id = '7'
-    residual: none
-    ```
-    Pages are full, `total` is exact, and the database uses the index on `user_id`.
-  </Tab>
-  <Tab title="2. Tenant and state">
-    ```json
-    { "all": [
-      { "eq": ["$record.org_id", "$auth.org"] },
-      { "eq": ["$record.archived", false] },
-      { "role": ["member", "admin"] }
-    ] }
-    ```
-    Caller: a member of `acme`.
-    ```text
-    stage 2: role → true (dropped); two eq's remain
-    stage 3: both pushed
-    SQL:     … WHERE org_id = 'acme' AND archived = false
-    ```
-  </Tab>
-  <Tab title="3. Role shortcut">
-    ```json
-    { "any": [ { "role": "admin" }, { "owner": "author_id" } ] }
-    ```
-    - **An admin:** `role` → true, so `any` → true. The plan is unrestricted, with no `WHERE`.
-    - **Anyone else:** `role` → false (dropped), leaving `owner` → `WHERE author_id = '<id>'`.
-
-    One policy, two very different queries, both optimal.
-  </Tab>
-  <Tab title="4. Anonymous">
-    Policy `owner`, caller anonymous.
-    ```text
-    stage 2: authenticated → false, so all(...) → false
-    result:  403, no query at all
-    ```
-  </Tab>
-  <Tab title="5. Residual">
-    ```json
-    { "any": [
-      { "owner": "user_id" },
-      { "contains": ["$record.guardian_user_ids", "$auth.user_id"] }
-    ] }
-    ```
-    Caller: a guardian.
-    ```text
-    stage 2: authenticated → true inside owner; remaining: any(eq(user_id,"8"), contains(...))
-    stage 3: the top level is an OR, not an AND → nothing can be pushed
-    SQL:     no policy WHERE
-    residual: the whole any(...) is checked per row; total = null
-    ```
-  </Tab>
-  <Tab title="6. Mixed">
-    ```json
-    { "all": [
-      { "eq": ["$record.school_id", "$auth.claims.app.school_id"] },
-      { "any": [ { "eq": ["$record.published", true] }, { "role": "teacher" } ] }
-    ] }
-    ```
-    Caller: a student.
-    ```text
-    stage 2: role → false, so the inner any becomes eq($record.published, true)
-    stage 3: both parts are AND-ed eq's → pushed
-    SQL:     … WHERE school_id = '3' AND published = true
-    ```
-    Partial evaluation turned an OR into a plain equality for this caller, so everything was pushed.
-  </Tab>
-</Tabs>
-
-## Residuals: what they mean for you
-
-When a residual remains, Pawabase still returns **only permitted rows**. Correctness is never at stake. What changes is how the page is assembled:
-
-- the query runs with your filters and any pushed-down equalities;
-- each returned row is checked against the residual and kept or dropped;
-- `total` is reported as `null`, because counting permitted rows would require reading every candidate row.
-
-For clients this means:
-
-| Behaviour | What to do |
-| --- | --- |
-| A page may have **fewer** than `per_page` rows | Keep paging until a page is shorter than `per_page`, or empty |
-| `total` is `null` | Don't show "page X of Y"; show "load more" |
-| Very selective residuals are slow on big tables | Narrow with client filters, or redesign the policy (below) |
-
-```js
-async function* pages(path, params) {
-  for (let page = 1; ; page++) {
-    const r = await get(path, { ...params, page, per_page: 100 });
-    yield r.data;
-    if (r.data.length < 100) return;
-  }
-}
-```
-
-<Note>
-`get` requests also use the plan: a pushed-down equality that doesn't match the row, or a residual that fails, returns `404`, exactly as if the row didn't exist.
-</Note>
-
-## Designing for pushdown
-
-The single most effective rule: **put the weight of every list policy on an AND-ed equality with an indexed column.**
-
-<Steps>
-  <Step title="Identify the narrowing field">
-    Which column, compared with something about the caller, cuts the table down to what they may see? `owner_id`, `org_id`, `tenant_id`, `family_id`, `school_id`, `class_id`.
-  </Step>
-  <Step title="Put it at the top level of an all">
-    `{"all": [ {"eq": ["$record.org_id", "$auth.org"]}, … ]}`. Anything else in the `all` can be a residual; the equality has already done the heavy lifting.
-  </Step>
-  <Step title="Use role branches for staff">
-    `{"any": [ {"role": "staff"}, {…the equality…} ]}` gives staff an unrestricted plan and everyone else a pushed-down one.
-  </Step>
-  <Step title="Index the column">
-    Pushdown makes the query use the column; an index makes it fast. Add indexes in your database (Pawabase's migrate creates tables, not secondary indexes).
-  </Step>
-</Steps>
-
-### Rewriting common slow policies
-
-| Slow on big tables | Why | Faster alternative |
+| Step | What happens | Result |
 | --- | --- | --- |
-| `contains($record.member_ids, $auth.user_id)` | `contains` is never pushed | A join resource (`memberships`) listed with `owner`, or an `eq` on a `team_id` that tokens carry |
-| `any(owner, contains(…))` | OR can't be pushed | Split into two endpoints (mine / shared with me), each with a pushable policy |
-| `in($record.status, [...])` for guests | `in` isn't pushed | A boolean (`visible`) maintained by a flow, compared with `eq` |
-| `gte($record.created_at, …)` in the policy | ordering isn't pushed | Let clients filter `filter[created_at]=gte.…` (that's SQL) and keep the policy simple |
-| A Python policy on a list | always a residual | A JSON policy with an equality for lists; Python only for single-record operations |
+| **1. Partial evaluation** | Everything in the condition that does **not** depend on the row is decided now, using what is known about the caller and the request | A condition that is entirely decided becomes `true` (allow, no filter) or `false` (refuse before any query) |
+| **2. Pushdown** | What remains is split into equalities between **one record column and a known value**, and everything else | The equalities become SQL `WHERE` filters |
+| **3. Residual** | Whatever is left after pushdown is kept as a condition to check **per row** | Rows failing it are removed after the query |
 
-### Example: families at scale
+A condition with nothing left over is decided entirely before the query. One with only equalities is pure SQL. One with anything else has a residual.
 
-The school tutorial uses:
+### What counts as "known"
+
+During planning the engine knows the caller (`$auth`, `$credential`), the request (`$request`), and the environment. It does **not** know the row (`$record`) or the submitted body (`$input`), which is not read until later. A comparison is **decidable now** when neither side mentions `$record` or `$input`, and it is **deferred** when either does.
+
+So these are decided at plan time, with no row in sight:
+
+| Condition | Plan |
+| --- | --- |
+| `{"role": "admin"}` for an admin | allow, no filter |
+| `{"role": "staff"}` for someone else | **refuse before any query** |
+| `{"authenticated": true}` for a signed-out caller | refuse |
+| `{"eq": ["$auth.org", "acme"]}` | decided from the caller |
+
+and these are deferred, because they need the row:
+
+| Condition | Deferred part |
+| --- | --- |
+| `{"eq": ["$record.owner_id", "$auth.user_id"]}` | The comparison, with the caller's id substituted in |
+| `{"gt": ["$record.n", 3]}` | The whole comparison |
+| `{"eq": ["$record.user_id", "$input.user_id"]}` | The comparison, with `$input` left for the full check |
+
+### What becomes SQL
+
+Only **equalities** between a **single record column** and a **known value** are pushed down, and only when they are combined with `all`. The engine splits a condition into its `all` parts and takes each part that is an `eq` between `$record.<column>` and something known:
 
 ```json
-{ "any": [ { "role": [...staff] }, { "owner": "user_id" }, { "contains": ["$record.guardian_user_ids", "$auth.user_id"] } ] }
-```
-
-It's correct and fine for a school. For a national system with millions of students, add a `family_id` column, put the family id into guardians' tokens (via `app_metadata`), and write:
-
-```json
-{ "any": [
-  { "role": ["admin", "principal", "teacher"] },
-  { "eq": ["$record.family_id", "$auth.claims.app.family_id"] }
+{ "all": [
+  { "eq": ["$record.user_id", "$auth.user_id"] },
+  { "eq": ["$record.status", "open"] },
+  { "gt": ["$record.n", 3] }
 ] }
 ```
 
-For guardians, that plans to `WHERE family_id = '…'`: an indexed lookup with exact totals.
+becomes the filters `user_id = '7'` and `status = 'open'` (the caller's id was substituted), with the residual `{"gt": ["$record.n", 3]}`. Plans, as the engine produced them, for a signed-in caller with id `7` and the role `admin`:
 
-## How your filters combine with the plan
+| Policy | Filters (SQL) | Residual (per row) |
+| --- | --- | --- |
+| `public` | none | none |
+| `authenticated` | none | none |
+| `owner:user_id` | `user_id = '7'` | none |
+| `{"eq": ["$record.org_id", "$auth.org"]}` | `org_id = 'acme'` | none |
+| `{"eq": ["$auth.org", "$record.org_id"]}` (sides swapped) | `org_id = 'acme'` | none |
+| `all` of owner `eq` and `{"eq": ["$record.status", "open"]}` | `user_id = '7'`, `status = 'open'` | none |
+| `all` of owner `eq` and `{"gt": ["$record.n", 3]}` | `user_id = '7'` | `{"gt": ["$record.n", 3]}` |
+| `["authenticated", "own_rows"]` | `user_id = '7'` | none |
+| `any` of owner `eq` and `{"role": "admin"}` (as an admin) | none | none (decided: allow all) |
+| `any` of owner `eq` and `{"role": "staff"}` (not staff) | `user_id = '7'` | none |
+| `any` of owner `eq` and `{"eq": ["$record.public", true]}` | none | the whole `any` |
+| `{"not": {"eq": ["$record.status", "draft"]}}` | none | the whole `not` |
+| `{"in": ["$record.status", ["a", "b"]]}` | none | the whole `in` |
+| `{"eq": ["$record.a", "$record.b"]}` | none | the whole comparison (two columns) |
+| `{"eq": ["$record.address.city", "Lagos"]}` | none | the whole comparison (a nested path) |
+| `{"role": "staff"}` (not staff) | | **refused before any query** |
 
-Client filters (`filter[…]`) and pushed-down policy equalities are AND-ed into the same `WHERE`:
+Three observations carry most of the weight:
 
-```bash
-GET /rest/v1/invoices?filter[status]=overdue      # as a guardian of family 12
-```
+- **A known caller branch of an `any` collapses.** `any` of "I am the owner" and "I am an admin" costs nothing for an admin (the second branch is true, so the whole thing is) and becomes the owner filter for everyone else (the second branch is false and drops out). `any` of **two record conditions** cannot be reduced and stays a residual.
+- **Only `eq` is pushed.** `in`, `ne`, `gt`, `contains`, `starts_with` and the rest are per-row. See [Operators](/policies/operators#operators-and-sql).
+- **A nested path is not pushed.** `$record.address.city` is a path into a JSON column, and only a plain column name becomes a filter.
 
-```sql
-SELECT … FROM invoices WHERE status = 'overdue' AND family_id = '12' ORDER BY … LIMIT 20
-```
+If the same column appears in two equalities, only the first is pushed. This was run: with `eq a $auth.user_id` and `eq a "other"`, the plan pushed `a = '7'` and kept `a = 'other'` as the residual, which can never be true, so such a policy returns nothing.
 
-Clients can only narrow what the policy allows; they can never widen it. If a client filters on the same column the policy pushes down with a different value, the result is simply empty.
+### Anonymous callers
 
-## Observability
+For a signed-out caller, `$auth.user_id` is empty, so `{"eq": ["$record.user_id", "$auth.user_id"]}` plans to the filter `user_id = NULL`. That matches **no row**, so a list is empty, not refused. The single-record operations behave differently, because they evaluate the comparison against one record. See [the overview](/policies/overview#a-plain-eq-on-an-owner-column-fails-open).
 
-Studio's **Observability** records, for every request, the policy that planned it (the `policy` note). When a list is slow, check:
+## What a residual does to pages
 
-1. whether `total` is `null` in the response (a residual remained);
-2. the request's duration and the policy name in the request log;
-3. the SQL your database logs for that request id.
+When a policy has a residual, the query runs **without** it. The database returns one page of rows (those matching the pushed filters, sorted and paged as the caller asked), and **then** each row is checked in Python and the failures are dropped. The page is whatever survives.
 
-## Compared with Supabase and Firebase
+This was run on a table of thirty rows, every third one `published`, with three policies and `per_page=5`:
 
-<Tabs>
-  <Tab title="Supabase RLS">
-    Postgres Row Level Security adds each policy's `USING` expression to every query, so filtering is always "pushed down", but the expression runs **inside** the database for every candidate row. Performance depends on writing policies the planner can use with indexes (Supabase recommends wrapping `auth.uid()` in a subquery and indexing policy columns). Complex policies with joins or function calls can make every query slow.
+| | Pushed: `status = 'published'` | Residual: published **or** mine | Residual: `status` is not `draft` |
+| --- | --- | --- | --- |
+| Page 1 | ids 3, 6, 9, 12, 15 (**5 rows**) | id 3 (**1 row**) | id 3 (**1 row**) |
+| Page 2 | 18, 21, 24, 27, 30 (5 rows) | 6, 9 (**2 rows**) | 6, 9 (2 rows) |
+| Page 3 | none | 12, 15 (2 rows) | 12, 15 (2 rows) |
+| Page 4 | none | 18 (1 row) | 18 (1 row) |
+| `total` | **10** | **`null`** | **`null`** |
 
-    Pawabase pushes down only the simple, index-friendly part (equalities), evaluates role checks once per request instead of per row, and makes the cost of the rest visible (`total: null`). Different trade-off: less expressive in SQL, more predictable.
-  </Tab>
-  <Tab title="Firebase">
-    Firestore rules **are not filters**. A query is rejected if it *could* return any document the rules would deny, so clients must add `where("ownerId", "==", uid)` themselves, mirroring the rule. Forgetting it is an error, not a leak, which is safe but duplicates logic in every client.
+Both effects are visible:
 
-    Pawabase applies the policy to the query for you. Clients don't mirror rules; they just list.
-  </Tab>
-</Tabs>
+- **Pages are short and uneven.** Page 1 of the residual list holds one row, because the first five raw rows contained one published row. A client that asks for five and receives one cannot tell whether that is the end of the list.
+- **`total` is `null`.** The database's count includes rows the caller may not see, so reporting it would be wrong, and it cannot be recomputed without reading everything. The exact policy reports an exact `total`, the residual one reports nothing.
 
-## FAQ
+The practical consequences for clients and screens:
+
+| Symptom | Cause |
+| --- | --- |
+| A page of 20 shows 3 items | A residual removed the rest after the page was read |
+| An empty page, then a full one | The raw rows of the first page were all disallowed |
+| "Page 1 of ?" | `total` is `null` |
+| `sort=-id&per_page=3` returns one row | The newest raw rows were drafts and were dropped |
+| Counting rows by paging to the end | Unreliable: the end is not marked |
+
+Pagination by `page` and `per_page` still **advances** through the table, and every allowed row appears exactly once across pages, but nothing tells the client when to stop. A client that stops at the first short page stops too early. See [Sorting and pagination](/data/sorting-pagination#paging-with-a-per-row-policy).
+
+<Note>
+The same residual check is why a Python policy always has a residual: nothing in a function can be pushed into SQL, so a list under a Python policy is checked row by row and reports `total: null`. See [Python policies](/policies/python-policies).
+</Note>
+
+## A `select` can walk around a residual
+
+A residual is evaluated on the rows the query returned. If the request used `?select=` to return only some columns, **the rows the residual sees contain only those columns**. A condition that reads a column the caller did not select reads nothing, and nothing compares in the way you did not intend.
+
+This was run, on the same table (every third row `published`, the rest `draft`) with an anonymous caller:
+
+| Request | Policy | Rows returned |
+| --- | --- | --- |
+| `GET /rest/v1/pushed?select=title&per_page=5` | Pushed: `status = 'published'` | ids 3, 6, 9, 12, 15, only published rows. `total` 10 |
+| `GET /rest/v1/residual_ne?select=title,status&per_page=5` | Residual: `status` is not `draft` | id 3 only. Correct |
+| **`GET /rest/v1/residual_ne?select=title&per_page=5`** | Residual: `status` is not `draft` | **ids 1, 2, 3, 4, 5, the drafts** |
+| **`GET /rest/v1/residual_any?select=title&per_page=5`** | Residual: published **or** mine | **ids 1, 2, 3, 4, 5, the drafts** |
+
+With the policy column in the selection, the residual worked. With `select=title` it did not: the row had no `status`, the comparison `status <> 'draft'` was true for a missing value, and the `any` branch that compared the owner to a signed-out caller compared two empty values. **Every draft was returned to an anonymous caller.**
+
+<Warning>
+**A residual list policy can be bypassed with `?select=`** by choosing columns that leave out the ones the policy reads. Pushed (SQL) policies are not affected, because their filter is part of the query. Do not rely on a policy that has a residual to protect a list. Keep access rules to **equalities that can be pushed down**, or enforce the rule where the caller cannot change the columns.
+</Warning>
+
+The fix is in how you write the policy, because the engine does not add the policy's columns to the selection for you:
+
+| Approach | How |
+| --- | --- |
+| **Make the rule pushable** | Express it as `all` of equalities on columns and known values, so it becomes a SQL filter. Safe regardless of `select` |
+| **Split the resource** | Put the protected data in a resource whose policy is a pushable equality, and expose the open part separately |
+| **Use a route** | A flow that runs the query itself decides what is returned. See [Custom routes](/data/custom-routes) |
+| **Do not expose the list** | Disable `list` and serve a route, or serve only `get` by id |
+
+For a single record (`get`) the policy runs on the whole row it loaded, so this particular bypass is a list problem. Test your own `get` with `select` as well, since the behavior of a residual on a partial row is the behavior to distrust.
+
+## Your filters narrow, never widen
+
+The caller's `filter[...]` parameters are added to the policy's, with `AND`:
+
+| Request | Result |
+| --- | --- |
+| `GET /rest/v1/pushed?filter[title]=eq.t3` | One row: the policy's `status = 'published'` and `title = 't3'` |
+| `GET /rest/v1/pushed?filter[status]=eq.draft` | **Zero rows, `total` 0**: `status = 'published'` and `status = 'draft'` cannot both hold |
+| `GET /rest/v1/pushed?sort=-id&per_page=3` | ids 30, 27, 24, `total` 10 |
+
+A filter can only remove rows from what the policy already allows. It cannot see past it, **except** by reading the values of hidden columns through the result, which is a different concern: see [Filters can read what responses hide](/data/filtering#filters-can-read-what-responses-hide).
+
+For a residual list the same holds, and `sort=-id&per_page=3` returned only id 30: the three newest raw rows were 30, 29 and 28, and only 30 was published.
+
+## Designing for pushdown
+
+The goal is a list whose policy is **all equalities between a column and a caller-known value**. Here is how to get there from the rules people actually have.
+
+| The rule | As written | Stays in SQL? | A pushable design |
+| --- | --- | --- | --- |
+| My rows | `owner:user_id` | **Yes** | Already pushable |
+| My organisation's rows | `{"eq": ["$record.org_id", "$auth.org"]}` | **Yes** | Already pushable |
+| Published rows | `{"eq": ["$record.status", "published"]}` | **Yes** | Already pushable |
+| My rows in my org | `all` of two equalities | **Yes** | Already pushable |
+| Published **or** mine | `any` of two record conditions | **No** | Two lists (below), or a flag column |
+| Anything but drafts | `{"ne": ["$record.status", "draft"]}` | No | A column that is `true` for the visible rows, compared with `eq` |
+| One of several statuses | `{"in": ["$record.status", [...]]}` | No | A flag, or one resource per audience |
+| Created after a date | `gt` on a date | No | A flag maintained by a schedule |
+| Rows of any of my teams | `contains` on a list | No | A route that queries |
+| Admin sees everything, others their own | `any` of a role and an owner `eq` | **Yes** | Already pushable: the role decides at plan time |
+
+### Replace a negative with a positive
+
+`ne` and `not` cannot be pushed. Most "everything except" rules can be turned into an "equals" by adding a column:
+
+| Instead of | Add | Policy |
+| --- | --- | --- |
+| `status != 'draft'` | `visible` (boolean), set when a record is published | `{"eq": ["$record.visible", true]}` |
+| `status in ('published', 'featured')` | `public` (boolean) | `{"eq": ["$record.public", true]}` |
+| `deleted_at is empty` | `deleted` (boolean, default false) | `{"eq": ["$record.deleted", false]}` |
+
+A flag costs a little to keep in step. A flow on the resource's events, or the API's own validation, can set it. In exchange the list is exact, indexed and bypass-proof.
+
+### Two lists for "published or mine"
+
+A single list cannot page "published **or** mine" correctly, because the `or` is across two record conditions. Serve it as **two** lists, each pushable, and let the client combine them:
+
+| List | Policy | Query |
+| --- | --- | --- |
+| Published | `{"eq": ["$record.status", "published"]}` | `GET /rest/v1/posts` |
+| Mine | `owner:author_id` | `GET /rest/v1/my_posts`, a second resource over the same table, or a route |
+
+or a **route** whose flow runs one SQL query with the `or` in it and returns a page. The route's own policy then decides who may call it, and the SQL decides the rows.
+
+### Index what you push
+
+Every pushed equality is a `WHERE` on a column. A table with a million rows and a policy on `org_id` is fast when `org_id` is indexed and a scan when it is not. Mark the policy's columns **indexed** (the field's JSON, `"indexed": true`) and migrate. See [Migrations](/data/migrations#indexes) and [Filtering](/data/filtering#filters-and-indexes).
+
+### Pin the value that makes it push
+
+The pushed value must be **known at plan time**. A value from `$auth` or a literal is. A value from `$input` or another record column is not. If you find yourself writing `{"eq": ["$record.org_id", "$input.org_id"]}` for a list, there is nothing to push: lists have no input. For `create` and `update` that condition is right and is evaluated on the full check.
+
+## Operations other than list
+
+The plan is for `list`. The other operations evaluate the policy **once, against one record**, with the full context, and nothing is pushed:
+
+| Operation | Evaluation |
+| --- | --- |
+| `list` | Planned. Filters in SQL, residual per row |
+| `get` | The plan runs first (a policy that refuses everyone, or only fixes filters, applies at once), then the loaded row is checked against any residual |
+| `create` | The full condition, with `$record` and `$input` both the new data |
+| `update` | The full condition, with `$record` the existing row and `$input` the patch |
+| `delete` | The full condition, with `$record` the existing row |
+| `?expand=` | Each related row is checked against the related resource's read policy, one row at a time |
+
+The planner's filters also apply to `get`: a single-record request for a row outside the pushed filters is a `404`, as it would be for a missing row. That is how `owner:user_id` hides someone else's record even though the check is "per record".
+
+A related note on `expand`: the related rows are fetched for the whole page, then **each** is checked in Python, so a policy on a related resource always behaves like a residual, and a row the caller may not see comes back as `null`. See [Relations](/data/relations).
+
+## Seeing what the plan did
+
+You can tell which kind of list you have from the response alone:
+
+| You see | Meaning |
+| --- | --- |
+| `"total": 10` (a number) | The whole policy ran in SQL |
+| `"total": null` | A residual or a Python policy ran per row |
+| A short page followed by a fuller one | A residual |
+| `403` or `401` for a list with no query | The plan refused (a caller-only condition was false) |
+
+In **Observability**, a request's trace records the policy that produced the plan in its notes, which tells you which definition to open. It does not show the filters. To see them, read the policy and apply the table in [how a request is planned](#how-a-request-is-planned).
+
+## Cost, in one table
+
+| Part of the policy | Cost per list request |
+| --- | --- |
+| Decided at plan time | None |
+| A pushed equality | A `WHERE` clause. Free with an index, a scan without |
+| A residual per row | Python on every row of the fetched page, **and** the rows are fetched even when most are dropped |
+| A Python policy | A function call per row, plus whatever the function does |
+| A residual on a related resource (`expand`) | A check per related row, per page |
+
+A residual does not make a request wrong, it makes it **wasteful and unpredictable**: a page of 20 fetches 20 raw rows whether 20 or 0 are allowed. For a table that is mostly allowed, a residual is cheap. For one that is mostly forbidden, it fetches a lot and returns little.
+
+## Questions that come up
 
 <AccordionGroup>
-  <Accordion title="Why only equality?">
-    Equalities on one column are unambiguous across SQLite, Postgres and MySQL, are what ownership and tenancy rules are made of, and are what pagination correctness depends on. Pushing down arbitrary expressions portably would mean a query compiler for every dialect, for little gain.
+  <Accordion title="Why is `total` null?">
+    Because part of the list policy was checked per row after the query. The database's count would include rows the caller may not see.
   </Accordion>
-  <Accordion title="Does pushdown change results?">
-    No. A plan with pushdown returns exactly the rows a per-row check would, just faster and with correct totals.
+  <Accordion title="Why does my page of 20 show 3 items?">
+    A residual removed the rest after the page was read. Make the policy pushable, or fetch more pages.
   </Accordion>
-  <Accordion title="What about nested record fields?">
-    `$record.address.city` isn't pushed down (JSON columns differ by database). It's checked as a residual.
+  <Accordion title="Can I get an exact total with a residual?">
+    Not from the list. Count with a route that runs the query, or restructure the rule as equalities.
   </Accordion>
-  <Accordion title="Are relations (expand) filtered with the plan too?">
-    Expanded rows are checked against the **related** resource's own read policy, row by row. See [relations](/data/relations#expansions-respect-the-related-resources-rules).
+  <Accordion title="Is an `any` ever pushed down?">
+    Yes, when all but one branch is decided at plan time. `any` of an owner check and a role check is the owner filter for non-admins and unrestricted for admins. `any` of two record conditions is a residual.
+  </Accordion>
+  <Accordion title="Does a Python policy push down?">
+    No. Every list under a Python policy is a residual, with `total` null.
+  </Accordion>
+  <Accordion title="Do stored policies and inline conditions plan the same?">
+    Yes. The plan sees only the condition, whatever it was called.
+  </Accordion>
+  <Accordion title="Can I add a database index for a policy?">
+    Yes, and you should. Index every column a pushed equality uses.
   </Accordion>
 </AccordionGroup>
+
+## What to remember
+
+- **A list is planned: caller-only parts are decided first, equalities become SQL, the rest is a per-row residual.**
+- **Only `eq` between one column and a known value is pushed, and only inside `all`.**
+- **A residual makes `total` null and pages short.** The end of the list is not marked.
+- **A residual can be bypassed with `?select=`.** Keep access rules pushable.
+- **A caller's filters only narrow.**
+- **Replace negatives and `any` with a flag column and an `eq`.**
+- **Index the columns you push.**
+- **Anything caller-only is free.** Put roles and plans where they decide before the query.
+
+<CardGroup cols={2}>
+  <Card title="Operators" icon="equal" href="/policies/operators" />
+  <Card title="Sorting and pagination" icon="arrow-down-up" href="/data/sorting-pagination" />
+  <Card title="Filtering" icon="filter" href="/data/filtering" />
+  <Card title="Policy recipes" icon="chef-hat" href="/policies/recipes" />
+</CardGroup>

@@ -1,246 +1,337 @@
 ---
 title: "Where policies are enforced"
-description: "Every place Pawabase makes an access decision, in the order it happens, with defaults, context, response codes and what is not governed by caller policies."
+description: "Every place Pawabase makes an access decision, with the context it sees, the default it uses, the status codes it returns, and everything that is not governed by caller policies."
 icon: "map-pin"
 ---
 
-Policies are only as strong as the coverage of the places that enforce them. This page lists every **enforcement point** in Pawabase, what it checks, when, with which default, and what it returns on refusal, plus the few paths that are deliberately *not* governed by caller policies and how they're protected instead.
+## One engine, many doors
 
-## Find the attachment in Studio
+Pawabase has one policy engine and several **entry points** that ask it for a decision. Each entry point builds a context from what it knows, asks the engine, and turns a refusal into its own kind of failure. Knowing the entry points is knowing where your rules apply, and, as important, where they do not.
 
-An enforcement point is where a definition's policy reference becomes an access decision. In Studio, a resource exposes that reference in **Build → Resources** → **Access**, where every enabled operation has its own switch and **Policy** picker. The picker label **Secret keys only** for an empty resource policy is consequential: it is not the same default used by routes or buckets.
+| Entry point | Asks about | Refusal looks like |
+| --- | --- | --- |
+| [Resource operations](#resource-operations) | `list`, `get`, `create`, `update`, `delete` on a table | `401`, `403`, or `404` |
+| [Custom routes](#custom-routes) | A flow or function behind `/rest/v1/<path>` | `401` or `403` |
+| [Functions](#functions-and-flows-called-directly) | `/functions/v1/<name>` | `401` or `403` |
+| [Flows](#functions-and-flows-called-directly) | `/flows/v1/<name>` | `401` or `403` |
+| [Storage](#storage-buckets) | An object, a listing, a signed URL | `404`, or `403` |
+| [Realtime](#realtime-channels) | A subscribe, a publish, presence | The operation is refused |
+| [Event subscriptions](#event-subscriptions) | Whether a subscription fires | It does not fire |
+| [Inside flows](#inside-flows) | The **Check policy** block | The `denied` edge |
 
-The distinction continues outside Resources. **Build → Policies** manages named conditions behind saved references; **Settings → Realtime** contains **Default policy**, **Subscribe**, and **Publish** controls for channel rules; bucket forms label their fields **Read policy** and **Write policy**. Read each control together with this page's enforcement point, because a selected name is universal but the context and default are not.
+In Studio you attach a policy on the resource's **Access** section, the route's **Access** section, a bucket's **Read policy** and **Write policy**, **Settings → Realtime**, a subscription's **Only when…**, and a flow's HTTP trigger configuration. See [Policies](/policies/overview#where-policies-apply).
 
 ## The layers of a request
 
-Before any policy runs, two other layers have already made decisions:
+A policy is one layer in a stack. For a request to `/rest/v1/...`, the checks run in this order, and a refusal at any layer ends the request:
 
-```mermaid
-flowchart LR
-  A[Request] --> G1[Gateway<br/>API key · origin · rate limit]
-  G1 --> V[API<br/>token · scopes · validation]
-  V --> P[Policy]
-  P --> H[Handler<br/>resource · flow · function · storage]
-```
-
-| Layer | Decides | Refusal |
+| Layer | Where | Refusal |
 | --- | --- | --- |
-| Gateway | Is the API key valid for this environment? Is the origin allowed (publishable keys)? Within rate limits? | `401`, CORS failure, `429` |
-| Authentication | Is the user token valid, unexpired and for this environment? | `401` |
-| Scopes | Does the key carry the operation's scope? | `403` |
-| Validation | Is the body well-formed? | `422` |
-| **Policy** | May this caller do this, to this data? | `403` / `404` |
+| **API key** | The gateway: is the key valid, in its allowed IP ranges, and allowed for this route? | `401` or `403` before the API sees it |
+| **Rate limit** | The resource or route, per caller | `429` |
+| **Body validation** | `create`, `update` and routes with an input model | `422` |
+| **Key scope** | `resource:read`, `resource:write`, `routes:invoke`, `functions:invoke` | `403`, `This API key lacks the '...' scope` |
+| **Policy: the plan** | The part that does not need a record | `401` or `403` |
+| **Policy: the full check** | With the record and the input | `403` or `404` |
+| **The data layer** | Constraints, uniqueness | `500` or `4xx` |
 
-Policies are the last line, not the only one. But they're the only line that understands your data.
+The two orderings that matter for security: **validation runs before the policy**, so the field names of a protected endpoint are visible to anyone who can reach it; and **`DELETE` skips the scope check**, so a key with no write scope can still delete what the policy allows. Both are covered below.
+
+The gateway layer is separate from policies and deserves a mention: a key's **Allowed IP ranges** (*Optional comma-separated IPs or CIDRs. The gateway rejects every other client.*) and **Allowed routes** (*Optional comma-separated gateway rules: GET /rest/v1/\* or POST /functions/v1/\**) restrict a key **before** any policy runs. A public read-only key set to `GET /rest/v1/*` cannot be used to `DELETE`.
 
 ## Resource operations
 
-The most important enforcement point, and the most nuanced.
+Every enabled operation of a resource has a policy, set in the resource's **Access** section: *Which endpoints exist, and who may call each.* Each row has a switch, the method (`GET`, `GET`, `POST`, `PATCH`, `DELETE`), the operation name, and a policy picker. A row switched off reads *Off: the endpoint is not served.*
 
-| Operation | Scope | When the policy runs | `$record` | Refusal |
-| --- | --- | --- | --- | --- |
-| `list` | `resource:read` | Planned before the query; residual per row | each row | `403` if decided false up front; otherwise rows are just excluded |
-| `get` | `resource:read` | After loading the row | the row | `404` |
-| `create` | `resource:write` | After validation and owner-field assignment, before insert | the new row | `403` (`401` if an owner field needs a user) |
-| `update` | `resource:write` | After loading the existing row, before the update | the existing row | `403` for signed-in callers, `404` for anonymous |
-| `delete` | `resource:write` | After loading the row, before the delete | the row | `403` for signed-in callers, `404` for anonymous |
+| Operation | Method and path | Context | Evaluated |
+| --- | --- | --- | --- |
+| `list` | `GET /rest/v1/<name>` | `auth`, `credential`, `request`; `record` per row | Planned, then per-row for a residual |
+| `get` | `GET /rest/v1/<name>/<id>` | the same, with the row | The plan, then the loaded row |
+| `create` | `POST /rest/v1/<name>` | `record` and `input` both the new data | Once, after validation |
+| `update` | `PATCH` or `PUT /rest/v1/<name>/<id>` | `record` the existing row, `input` the patch | Once, after loading the row |
+| `delete` | `DELETE /rest/v1/<name>/<id>` | `record` the existing row | Once, after loading the row |
 
-**Defaults:** an operation must be **enabled** to exist at all. An enabled operation with policy `null` admits **only secret keys and operators**.
+An operation that is **not enabled** has no endpoint. A request to it is answered by the router, not by a policy, so there is nothing to misconfigure: a disabled `DELETE` on a path that still serves `GET` answered **`405`, `Method Not Allowed`**, and a path that serves nothing answers `404`.
 
-**Expand:** related rows returned by `?expand=` are checked against the **related** resource's read policy (`get`, falling back to `list`) and shaped by its transformer. A relation to a resource with no read operation returns related rows only to service credentials.
+### What each refusal looks like
 
-**Side effects:** after a permitted write, events, realtime publication and cache invalidation happen regardless of who wrote. They're part of the data, not the request.
+These were run on a resource whose `list`, `get`, `update` and `delete` use `owner:owner_id` and whose `create` is `authenticated`:
+
+| Operation | Signed out | Signed in, not allowed | Record missing |
+| --- | --- | --- | --- |
+| `list` | `401`, `Authentication required` | `403`, `policy '<name>' refused` (when the plan refuses outright) | n/a |
+| `get` | `401` | **`404`**, `Not found` | `404`, `Not found` |
+| `create` | `401` | `403`, `policy '<name>' refused` | n/a |
+| `update` | `401` | `403`, `policy '<name>' refused` | `404`, `Not found` |
+| `delete` | **`404`**, `policy '<name>' refused` | `403`, `policy '<name>' refused` | `404`, `Not found` |
+
+Why each cell is what it is:
+
+- **`401` for a signed-out caller** comes from the plan: a policy that no signed-out caller can satisfy refuses at the gate, and a refusal of someone who is not signed in is always `401`.
+- **`get` is a `404` for a stranger** so that a refused record and a missing record look the same.
+- **`update` and `delete` are `403` for a signed-in stranger**, because the record was loaded before the check. That distinguishes "exists but not yours" from "missing". If existence is sensitive, a policy cannot hide it here.
+- **`delete` for a signed-out caller is a `404` with a refusal message.** The gate that turns signed-out callers away early is not applied to `DELETE`, so the request reaches the handler, which refuses it. The record is not deleted.
+
+### The `DELETE` gap
+
+The gate that applies to every other operation does two things before the handler: it checks the **key's scope**, and it turns a signed-out caller away when the plan refuses. `DELETE` does not go through it. The policy is still checked in the handler, but:
+
+| Key and request | `POST`, `PATCH` | `DELETE` |
+| --- | --- | --- |
+| A key with only `resource:read` | `403`, lacks `resource:write` | **`204`. The record was deleted** |
+| A key with no relevant scope | `403` | `404` if the record is already gone, otherwise it runs |
+| A signed-out caller where the policy refuses | `401` | `404` with the refusal message |
+
+A scope-limited public key, the kind meant for reading, **can delete anything the `delete` policy allows**. Close it with the policy (do not enable `delete` for a public resource, or require a user), and with the key's **Allowed routes** (`GET /rest/v1/*`). See [the overview](/policies/overview#delete-skips-the-key-scope-check-and-the-sign-in-gate).
+
+### Scopes on resources
+
+| Operation | Needs the scope |
+| --- | --- |
+| `list`, `get` | `resource:read` |
+| `create`, `update` | `resource:write` |
+| `delete` | none (the gap above) |
+
+A key with **no scopes** is unrestricted. A key with some scopes needs the right one: a key with only `resource:write` was refused on `list` and `get` with `This API key lacks the 'resource:read' scope`. A key with `storage:read` and nothing else was refused on all of them.
+
+### Related rows
+
+`?expand=` fetches related rows and checks **each one** against the related resource's read policy (its `get`, or its `list` when it has no `get`). A row the caller may not read comes back as `null`. A related resource with **no readable operation** is shown only to service credentials. See [Relations](/data/relations).
+
+### Records the caller never sees
+
+For `list`, a row the policy does not admit is removed by SQL or by the residual, and never reaches the response. For `get`, `update` and `delete`, the check is on the one row. Nothing is returned for a refused record other than the status.
 
 ## Custom routes
 
-```json
-{ "method": "POST", "path": "/finance/payments", "policy": "finance_staff", "…": "…" }
-```
+A route has one policy, set in the route's **Access** section, and a body that may be validated. The order is:
 
-- Scope: `routes:invoke`.
-- The policy runs **before** the handler, with `$input` (the validated body) and `$request.params`. No `$record`.
-- Default when `null`: `authenticated`.
-- Refusal: `403`.
-
-Record-level checks belong **inside** the handler: a flow loads the record and uses `control.if` / `policy.check` / `error.raise`.
-
-## Direct flow invocation
-
-`POST /flows/v1/<name>` runs a flow directly if it has a `trigger.http` node **without a path**. That node's `policy` config decides access (default `authenticated`). Flows with only path-bound HTTP triggers can't be invoked directly; they're served by custom routes.
-
-## Functions
-
-`POST /functions/v1/<name>` checks the function's `@function(policy=…)`, default `authenticated`. When a function is the handler of a custom route, the **route's** policy applies to the request, and the function runs as the handler.
-
-```python
-@function("next_admission_no", policy="school_admin")
-async def next_admission_no(ctx): ...
-```
-
-## Storage
-
-Every object operation checks the bucket's policies:
-
-| Operation | Endpoint | Action | Policy |
-| --- | --- | --- | --- |
-| Download | `GET /storage/v1/object/{bucket}/{key}` | `read` | read policy (or public) |
-| List | `GET /storage/v1/list/{bucket}` | `list` | read policy |
-| Upload | `PUT`/`POST /storage/v1/object/{bucket}/{key}` | `write` | write policy |
-| Delete | `DELETE /storage/v1/object/{bucket}/{key}` | `delete` | write policy |
-| Create a signed URL | `POST /storage/v1/sign/{bucket}/{key}` | the requested method | the policy for that action |
-
-- **Signed URLs** carry a grant. Whoever holds the URL may perform that one action until it expires, without an API key or token. The policy is checked when the URL is **created**, not when it's used. Keep expiry short.
-- Public buckets allow reads by anyone (no key needed); writes still need the write policy.
-- Defaults: `authenticated` for both (reads open for public buckets).
-- Bucket policies must be JSON conditions; they see `$auth`, `$credential` and `$object`.
-
-[Storage access →](/storage/access)
-
-## Realtime
-
-Each channel operation is checked against the first **channel rule** whose pattern matches:
-
-| Client action | Policy |
+| Order | Check |
 | --- | --- |
-| `subscribe` (and `history`) | the rule's `subscribe` |
-| `publish` | the rule's `publish` (and the environment must allow client publishing) |
-| `presence` | allowed if the rule enables presence and the client is subscribed |
+| 1 | Rate limit |
+| 2 | Body validation, if the route has an input model |
+| 3 | Key scope: **`routes:invoke`** |
+| 4 | The **plan**: the parts of the policy that do not need the body |
+| 5 | The route's **cache**, for a `GET` route with a `cache_ttl` |
+| 6 | The **full policy**, with the body as `$input` |
+| 7 | The handler |
 
-Channels matching no rule use the environment's realtime `default_policy` (`authenticated` by default). Templated patterns like `user:{{ auth.user_id }}` claim every `user:*` channel, so another user's private channel is refused by the template rather than falling through to the default. Servers publish over HTTP with a secret key. [Channel rules →](/realtime/channel-rules)
+A request that fails the plan answers `401` or `403` without reading further. A request that passes the plan but fails the full check, because a condition on `$input` is false, answers the same way. Two consequences:
+
+- **A cached answer is returned before the full check.** For a cached `GET` route the plan has run, but a condition that depends on the body or on state the plan could not see is not re-evaluated on a hit. Keep a cached route's policy to conditions on the caller. See [Custom routes](/data/custom-routes#caching-a-route).
+- **A condition on `$input` for a `GET` route fails closed.** A `GET` has no body, so `$input.n` is empty, and `{"lte": ["$input.n", 10]}` is false. A stored policy of that shape refused a signed-in caller on a `GET` route with `403`.
+
+A route's refusals read `policy '<name>' refused` for a signed-in caller and `Authentication required` for a signed-out one.
+
+## Functions and flows called directly
+
+Two more doors reach code without a route:
+
+| Door | Path | Policy | Notes |
+| --- | --- | --- | --- |
+| A **function** | `POST /functions/v1/<name>` | The **function's** `policy` (the `@function(policy=...)` argument, default `authenticated`) | Needs the key scope `functions:invoke`. The result is wrapped as `{"data": ...}` |
+| A **flow** | `POST /flows/v1/<name>` | The **HTTP trigger's** `policy` setting (default `authenticated`) | Only a flow whose HTTP trigger has **no path** is reachable here. A flow with a path answers `404`, `no directly invocable flow '<name>'` |
+
+These doors have their own policies, and they are **separate from any route**. This is the most useful fact on this page for review:
+
+- **A route that calls a function does not apply the function's policy.** Only the **route's** policy decides. A function with the policy `deny` returned its result through a route whose policy was `public`, while the same function called directly answered `403`, `policy 'deny' refused`.
+- **A flow behind a locked route can still be open at `/flows/v1`.** If its HTTP trigger has no path and no restrictive `policy`, the default `authenticated` applies there, whatever the route says.
+
+For every function and flow, ask: *what is its direct door's policy, and does it differ from the route that fronts it?*
+
+A flow's trigger `policy` is **not validated** when you save it. A name that does not exist saves, and non-service callers then get a plain `500`.
+
+## Storage buckets
+
+A bucket has a **Read policy** and a **Write policy** in its sheet, with the choice **Default** meaning `authenticated`. A bucket marked public reads with `public`. The policies run **per object**, with the context `auth`, `credential`, `project`, `env` and `object` (the key, its segments and the action), and they must be JSON conditions.
+
+| Request | Policy | Refusal |
+| --- | --- | --- |
+| Download (`GET /storage/v1/object/<bucket>/<key>`) | Read | `404`, `Not found` |
+| Upload (`PUT` or `POST`) | Write | `403`, `the bucket's policy refused this upload` |
+| Delete (`DELETE`) | Write | `404`, `Not found` |
+| List (`GET /storage/v1/list/<bucket>?prefix=...`) | Read, with the **prefix** as the key | `403`, `the bucket's policy refused this listing` |
+| Signed URL (`POST /storage/v1/sign/<bucket>/<key>`) | The read or write policy, for the **requester** | `403`, `you may not grant access you do not have` |
+
+Details worth knowing:
+
+- **Reads and deletes that are refused are `404`s**, the same as a missing object, so a stranger cannot probe for keys.
+- **A signed URL grants only what the signer already has.** A caller who may not read a key cannot mint a link to it.
+- **A listing is judged by its prefix**, so with the per-user layout `users/<id>/...` a caller must list inside their own folder, and listing the whole bucket is refused.
+- **Storage requests do not check key scopes.** The storage routes in the code ask only the bucket's policy, and the scopes the platform enforces (`resource:read`, `resource:write`, `routes:invoke`, `functions:invoke`) do not include a storage scope. The bucket's policy is therefore the only guard. A public bucket's write policy is `authenticated` by default, which is what refused a signed-out upload.
+- **`GET /storage/v1/buckets` has no policy.** It lists every bucket's name, whether it is public, its accepted types and size limit, to any caller with a key.
+- **A public bucket is readable and listable by anyone** with the key, signed out included.
+
+See [the context reference](/policies/context#storage-object) for the `object` paths.
+
+## Realtime channels
+
+Realtime is served by a separate service, and its policies are **channel rules** set under **Settings → Realtime**. Each rule has a **Pattern**, a **Subscribe** policy, a **Publish** policy, **Presence** and **History depth**, and the environment has a **Default policy** and **Clients may publish**.
+
+| Action | Checked by |
+| --- | --- |
+| Subscribe | The matching rule's Subscribe policy |
+| Publish | The matching rule's Publish policy, and **Clients may publish** |
+| Presence | The rule's **Presence** switch, and the Subscribe policy |
+
+The order of evaluation for an action on a channel:
+
+| Order | Check | Refusal |
+| --- | --- | --- |
+| 1 | The channel name is valid: not empty, at most 200 characters, no `/` | `invalid channel name` |
+| 2 | **Which rule governs it**: the first rule, top to bottom, whose pattern matches | (falls to the default policy if none) |
+| 3 | A **service credential** passes from here on | |
+| 4 | A **templated rule** must name this channel for this caller | `this channel belongs to someone else` |
+| 5 | **Clients may publish** is on, for a publish | `clients may not publish in this environment` |
+| 6 | **Presence** is on, for a presence action | `presence is off for this channel` |
+| 7 | The rule's policy, with the channel context | the policy's refusal |
+
+A pattern may contain `*` wildcards and `{{ ... }}` templates. A **templated** pattern such as `user:{{ auth.user_id }}` governs **every** channel that has the shape `user:*`, and then admits only the one it renders to for the caller. So a user may join `user:u-1` as `u-1`, and `user:u-2` is refused by that rule with `this channel belongs to someone else`, rather than falling through to the default. A caller for whom the template renders to nothing (a signed-out caller, `user:None`) is refused.
+
+The context a channel policy sees is `auth`, `credential`, `project`, `env`, and **`channel`** (`name`, `segments` split on `:` and `/`, and `action`), plus the payload as `input` for a publish. Realtime policies must be **stored** (or built-in) policies: Python policies are not available to the realtime service, and a rule whose policy cannot be loaded is skipped.
+
+The defaults are `authenticated` for subscribe, publish, and the **Default policy**. A channel that matches no rule is therefore open to **every signed-in user**, including channels you never meant to expose. Add a rule for each family of channels, and treat the default as the fallback you are accepting.
+
+A resource whose **Broadcast changes** switch is on publishes every change, with the **raw record**, to `resource:<name>`. That channel's Subscribe policy is a data-access policy: add a rule for `resource:*` that is at least as strict as the resource's own `list` policy. See [Resource events](/data/resource-events#the-two-switches-on-a-resource).
+
+## Event subscriptions
+
+A subscription's **Only when…** condition decides whether the subscription fires for an event. It is evaluated against the event alone (`{"event": {...}}`), with no `auth` and no `request`. It is a filter, not an access check:
+
+| What it does | What it does not |
+| --- | --- |
+| Decides whether a flow, function or channel is notified | Decide who may see the event. The event reaches every subscription whose pattern matches |
+| Reads `$event.name`, `$event.payload`, `$event.actor` | Read the caller. There is none |
+
+The default condition Studio fills in, `{"exists": "$event.data"}`, never matches, so a subscription with it never fires. See [the context reference](/policies/context#event-subscriptions-event).
 
 ## Inside flows
 
-The `policy.check` block evaluates any policy with an explicit `record` and `input` and the flow's caller context, following `allowed` or `denied`. Use it when a route's handler needs a record-level decision:
+The **Check policy** block (`policy.check`) asks the engine about a policy for a context you build, and follows `allowed` or `denied`:
 
-```text
-http → resource.get invoice → policy.check family_access (record = invoice)
-     → allowed: continue
-     → denied:  error.raise 404
-```
+| Config | |
+| --- | --- |
+| `policy` | A name, or an inline condition |
+| `record` | The `$record` for the check |
+| `input` | The `$input` for the check |
+
+The block uses the flow run's `auth` and `credential`. When a flow was started by a **service credential**, the engine's first step makes every check **allowed**, so the block cannot refuse in that case. For flows started by users, it enforces as a user. A flow started by an **event** or a **schedule** has the system's identity (not signed in), so a policy that needs a user refuses.
+
+**Resource blocks inside a flow are not governed by policies at all.** `resource.list`, `resource.get`, `resource.create`, `resource.update` and `resource.delete` act with the platform's authority, which is why a flow can write a record the caller could not. A flow is code that you wrote, running as the system. If a flow acts on behalf of a user, it must **check** (with `policy.check`, or with explicit conditions) what the user may do. The route or trigger that started it gets one decision, and everything after that is the flow's own responsibility.
+
+The **Require sign-in** block (`auth.require`) is a simpler check: it fails the flow with `401` for a signed-out caller, and with `403` when a required role or permission is missing.
 
 ## What is not governed by caller policies
 
-Some paths have no "caller" in the policy sense. They're protected differently:
+Policies decide what **callers of the public surface** may do. These act with the platform's own authority, and no caller policy applies:
 
-| Path | Protection |
+| Thing | Why it matters |
 | --- | --- |
-| **Secret keys and operators** | Bypass policies by design. Protect the keys; use scoped keys for integrations. |
-| **Flows and functions writing data** | Run with platform rights. Guard their **entry** (route, trigger, `@function` policy) and validate inside. |
-| **Event subscriptions, webhooks, schedules** | Triggered by the platform, not callers. Subscription `condition`s filter events; they don't authorise people. |
-| **Inbound hooks** (`/hooks/v1/…`) | Verified by signature (HMAC, Pawabase signature or token), not by policy. Treat payloads as untrusted input. |
-| **Auth endpoints** (`/auth/v1/…`) | Akountz's own rules: sign-up enabled, password policy, lockout, redirect allowlists, MFA. |
-| **The database console** | Operators only, audited; writes need an explicit opt-in. |
-| **Direct database access** | Outside Pawabase entirely. Use your database's own users and network controls. |
+| **Secret keys and operators** | They bypass every policy, by design |
+| **The Records tab** in Studio | Operators read and write any row. Its writes publish events (actor `studio`) and clear caches, and are not audited in the audit log |
+| **The Database console** | Any SQL. Its writes are audited as `database.write` and clear every resource's cache. It publishes no events |
+| **Migrations** | Structural changes with the platform's authority |
+| **Resource blocks and the runtime in flows and functions** | Trusted code. See above |
+| **Events, webhooks and realtime fan-out** | They carry the raw record to every consumer. A policy does not filter an event |
+| **A direct database connection** | Bypasses Pawabase entirely. A database role has its own grants |
+| **`GET /storage/v1/buckets`** | Lists buckets to any key |
+| **The OpenAPI document**, if you publish it | Shows every operation and field name |
+| **Validation errors** | Reveal field names before any policy runs |
 
-<Warning>
-Because flows write with platform rights, a flow triggered by a **public** route can write anything its blocks are configured to write. Always give public routes a tight policy and validate inputs inside the flow (types come from the route's schema; business rules from `control.if`).
-</Warning>
+Two of these deserve a decision rather than a note. **Events** carry hidden fields to consumers, so a resource with sensitive columns needs its events off or shaped. And **flows and functions** are a way for a policy-limited caller to cause writes the caller could not make directly: review each flow that a public route can start.
 
 ## Defaults at a glance
 
-| Enforcement point | Policy when unset |
+| Where | Default policy |
 | --- | --- |
-| Resource operation (enabled) | Secret keys and operators only |
+| Resource operation | `authenticated` (labelled **Secret keys only** in Studio, which is wrong) |
 | Custom route | `authenticated` |
-| Direct flow call | `authenticated` |
 | Function | `authenticated` |
-| Bucket read | `authenticated` (anyone if public) |
+| Flow HTTP trigger | `authenticated` |
+| Bucket read | `authenticated` (`public` if the bucket is public) |
 | Bucket write | `authenticated` |
-| Realtime channel (no rule) | `default_policy`, `authenticated` unless changed |
+| Realtime subscribe and publish | `authenticated` |
+| Realtime default policy | `authenticated` |
+| Event subscription | No condition: it always fires |
+| Operation not enabled | There is no endpoint (`405` or `404` from the router) |
 
-## Coverage review
+`authenticated` is the same everywhere, and it admits **every signed-in user**. If your project lets anyone sign up, `authenticated` is effectively public. Choose a real policy for each thing that holds anything private.
 
-Use this list when reviewing a project:
+## What each door returns, side by side
 
-<Check>Every enabled resource operation has a deliberate policy.</Check>
-<Check>Resources nobody should write directly (payments, audit tables) have `create`/`update`/`delete` disabled, and are written only by flows.</Check>
-<Check>Every custom route has a policy at least as strict as the data its flow writes.</Check>
-<Check>Buckets holding personal data aren't public, and their key layout supports per-user or per-org rules.</Check>
-<Check>Channel rules exist for every channel family your apps use, especially `resource:*` change feeds.</Check>
-<Check>Inbound hooks use signature verification (not `none`) in production.</Check>
-<Check>Secret keys live only on servers; integrations use scoped keys.</Check>
-
-## Every enforcement point, systematically
-
-The table below is the complete list of places a policy reference can be attached in Pawabase, cross-checked directly against the engine, gate and storage adapter source rather than against any single feature's docs. Each row names the exact field that carries the reference and the module responsible for evaluating it.
-
-| # | Enforcement point | Where the reference lives | Evaluated by |
+| Door | Signed out | Signed in, refused | Not found |
 | --- | --- | --- | --- |
-| 1 | Resource `list` | `operations.list.policy` | `PolicyEngine.plan` (planned, then `row_allowed` per residual row) |
-| 2 | Resource `get` | `operations.get.policy` | `PolicyEngine.check` |
-| 3 | Resource `create` | `operations.create.policy` | `PolicyEngine.check` |
-| 4 | Resource `update` | `operations.update.policy` | `PolicyEngine.check` |
-| 5 | Resource `delete` | `operations.delete.policy` | `PolicyEngine.check` |
-| 6 | Expanded/related reads (`?expand=`) | the related resource's own `get`/`list` policy | `PolicyEngine.check`/`plan`, recursively |
-| 7 | Custom route | `policy` on the route definition | `PolicyGate.authenticate` (a Sillo `useAuth` subclass) |
-| 8 | Direct flow invocation | `policy` on the flow's path-less `trigger.http` node | `PolicyGate`, same as a route |
-| 9 | Function (`/functions/v1/<name>`) | `@function(policy=...)` | `PolicyGate` |
-| 10 | Function as a route handler | the **route's** policy, not the function's own | `PolicyGate` on the route |
-| 11 | Storage read/list/stat | bucket `read_policy` | `PolicyStorage.allows` |
-| 12 | Storage write/delete | bucket `write_policy` | `PolicyStorage.allows` |
-| 13 | Signed URL creation | the policy for the requested action, checked once at creation | `PolicyStorage.allows`, via the signing endpoint |
-| 14 | Realtime `subscribe`/`history` | the matching channel rule's `subscribe` | the realtime service's policy check (same `PolicyEngine`) |
-| 15 | Realtime `publish` | the matching channel rule's `publish` | same, plus the environment's client-publish toggle |
-| 16 | Realtime `presence` | the channel rule's presence flag | same, gated on an active subscription |
-| 17 | Flow `policy.check` block | the block's `policy` config, with an explicit `record`/`input` | `PolicyEngine.check`, called directly by the block |
+| Resource `list` | `401` | `403` | n/a |
+| Resource `get` | `401` | `404` | `404` |
+| Resource `create` | `401` | `403` | n/a |
+| Resource `update` | `401` | `403` | `404` |
+| Resource `delete` | `404` (refusal message) | `403` | `404` |
+| Custom route | `401` | `403` | `404` (router) |
+| Function (direct) | `401` | `403` | `404` |
+| Flow (direct) | `401` | `403` | `404` |
+| Storage read | `404` | `404` | `404` |
+| Storage write | `403` | `403` | n/a |
+| Storage list | `403` | `403` | n/a |
+| Storage delete | `404` | `404` | `404` |
 
-This list was cross-checked against `apps/docs/policies/overview.mdx` (entry-point table and "where policies apply" section), `apps/docs/flows/platform-blocks.mdx` (the `policy.check` block's exact config fields and its interaction with `auth.require`), and the engine, gate and storage source directly. One realtime doc page (`apps/docs/realtime/channel-rules.mdx`) currently contains inaccuracies — it describes policy evaluation happening "at the gateway" before proxying to a component it calls "Angula," and lists operators (`neq`, `and`, `or`) that don't exist in the condition language (the real operators are `ne`, `all`, `any` — see [operators](/policies/operators)). Rows 14–16 above are stated from the engine and this page's own pre-existing, verified content rather than from that page; if you're cross-referencing realtime documentation elsewhere, prefer this page and [conditions](/policies/conditions)/[operators](/policies/operators) for the actual condition grammar.
+## A coverage review
 
-There is no enforcement point beyond this list. If you've added a route, a function, a bucket, a channel, or a flow trigger and it doesn't appear above, it either inherits its policy from something that does (a route-handled function, entry 10) or it is one of the explicitly ungoverned paths in [what is not governed by caller policies](#what-is-not-governed-by-caller-policies).
+When you inherit a project, or before a launch, walk this list once. Each line is a door, and the question is who can pass.
 
-### Resource operations: the five-row table, expanded
+| Door | Question | Where to look |
+| --- | --- | --- |
+| Each resource, each operation | Is it enabled, and what is its policy? | The resource's **Access** section |
+| Each resource's `delete` | Does a key with no write scope reach it? | The `delete` policy and the key's scopes |
+| Each custom route | What is its policy, and what does its handler do with the caller? | The route's **Access** |
+| Each function | Is it reachable directly, and with what policy? | `@function(policy=...)` |
+| Each flow | Is there an HTTP trigger with no path, and what policy? | The flow's trigger |
+| Each bucket | Read and write policies? Public? | The bucket sheet |
+| Each realtime family | Is there a rule, or does the default admit all signed-in users? | **Settings → Realtime** |
+| Each resource with **Broadcast changes** | Is `resource:<name>` as strict as `list`? | The channel rules |
+| Each resource with **Emit events** | Do consumers need the hidden fields? | The subscriptions and webhooks |
+| Each key | Which scopes, IPs and routes? | **API keys** |
+| Each secret key | Where is it, and is it on a server? | Your deployment |
 
-The core table earlier on this page gives the *when* and the *refusal* for each operation. Here's the *why* behind two rows that are easy to misread.
+## Questions that come up
 
-**Why `create` can return `401` instead of `403`.** Most policy refusals for signed-in callers are `403` — the caller is known, they're just not allowed to do this. `create` is the one operation where an **anonymous** caller can be refused with `401` instead: when the resource has an owner field, the server needs a `$auth.user_id` to stamp onto the new row, and an anonymous caller has none. This isn't strictly a policy decision (the policy might be `authenticated`, which would refuse an anonymous caller with `403` on its own) — it's specifically the owner-field assignment step failing before the policy even gets a fully-formed candidate row to evaluate, which the platform reports as "you need to be signed in" (`401`) rather than "you're signed in but not allowed" (`403`).
+<AccordionGroup>
+  <Accordion title="Where is the policy for a flow started by a route?">
+    The route's policy decides whether the flow starts. After that, the flow's blocks act with the platform's authority, and the flow is responsible for any further checks.
+  </Accordion>
+  <Accordion title="Why can a key with no write scope delete?">
+    `DELETE` is not behind the scope gate. The policy still applies. Restrict the key's allowed routes and do not enable `delete` for public resources.
+  </Accordion>
+  <Accordion title="Does the Records tab respect policies?">
+    No. It is for operators, and acts with the platform's authority.
+  </Accordion>
+  <Accordion title="Are events filtered by the resource's policy?">
+    No. Every matching consumer receives the raw record.
+  </Accordion>
+  <Accordion title="Do policies apply to the OpenAPI document?">
+    No. The document describes the surface, and a policy does not hide an operation or a field from it.
+  </Accordion>
+  <Accordion title="What does a refused realtime subscribe look like?">
+    The subscription is rejected with the policy's refusal, or `this channel belongs to someone else` for a templated rule.
+  </Accordion>
+  <Accordion title="Can I use the same policy on a bucket and a resource?">
+    If it reads only paths both have: `auth` and `credential`. `$record` does not exist for a bucket and `$object` does not exist for a resource.
+  </Accordion>
+</AccordionGroup>
 
-**Why `get` on a nonexistent row and `get` on a row you can't see look identical.** Both return `404` with the same generic body. This is deliberate (see [from decision to HTTP response](/policies/overview#from-decision-to-http-response) on the overview page), but it has a debugging consequence worth stating plainly here: you cannot distinguish "this id was never valid" from "this id is valid but refused" by inspecting the response alone. The only way to tell them apart is to repeat the request with a secret key (bypasses the policy) or check Studio's Observability, which records the policy's decision even when the client-facing response hides it.
+## What to remember
 
-### Custom routes: what the gate does before your handler runs
+- **One engine, eight kinds of door.** Each has a context, a default and its own refusal.
+- **`authenticated` is the default everywhere,** and admits every signed-in user.
+- **Validation runs before policies.** Field names are public.
+- **`DELETE` skips the scope gate.** The policy is the only guard.
+- **A route does not apply the policy of the function or flow it calls.** Those have direct doors of their own.
+- **Reads that are refused are `404`s for single records and objects.** Writes by signed-in strangers are `403`s.
+- **Realtime's default admits every signed-in user.** Add rules per channel family.
+- **Flows, resource blocks, the Records tab, the console, events and secret keys are not governed by caller policies.**
 
-`PolicyGate` (a `sillo.auth.useAuth` subclass) runs in two steps, both before your route's own code executes:
-
-1. **Authenticate.** It calls the parent `useAuth.authenticate`, which resolves whatever credential the request carries (token, key, or neither) into the `auth`/`credential` parts of the context, without yet deciding anything about the route's specific policy.
-2. **Scope, then policy.** If the gate was configured with a `scope` argument (as it is for every resource-operation route Pawabase generates internally, and as you can configure on your own routes), it checks `platform.allows_scope(scope)` first and raises `PermissionDenied` with a scope-specific message if it's missing — **before** the policy runs at all. Only once the scope check passes does it build the full policy context (`build_policy_context`) and call `engine.check(self.policy, context)`.
-
-The order matters for what error a caller sees: a request with the right token but a key that lacks `resource:write` gets the scope error, never the policy's own refusal reason, even if the policy would also have refused it. If you're debugging "why does this request fail" and the error mentions a scope rather than a policy name, the policy never ran.
-
-### Storage: the read/write split, and what "action" means to a condition
-
-`PolicyStorage.allows` maps five possible actions down to just two policies: `read`, `list`, and `stat` all check `read_policy`; everything else (`write`, `delete`) checks `write_policy`. There's no separate policy for "delete" versus "upload" — if a bucket's use case needs uploads allowed but deletes forbidden for the same role, that distinction has to be expressed **inside** the write condition itself, using `$object.action`:
-
-```json
-// write_policy: uploads by members, deletes by admins only
-{ "any": [
-  { "all": [ { "eq": ["$object.action", "write"] }, { "role": "member" } ] },
-  { "all": [ { "eq": ["$object.action", "delete"] }, { "role": "admin" } ] }
-] }
-```
-
-Without checking `$object.action` explicitly, a single `write_policy` of `{"role": "member"}` grants members both upload **and** delete on every object the policy admits — a common surprise for a first storage setup, since "write" reads like "upload" but covers deletion too.
-
-### Realtime: the "first matching rule wins" behavior, precisely
-
-Channel rules are matched by pattern, and the **first** rule whose pattern matches the channel name is the one whose `subscribe`/`publish` policy applies — later rules that would also match are never consulted, even if they're more specific. A templated pattern like `user:{{ auth.user_id }}` matches only the *literal* channel name for the current caller (Pawabase substitutes the template before comparing), so it doesn't accidentally intercept a differently-shaped channel; but two **static** rules that both match the same literal name, or a broad rule ordered before a narrow one, resolve by whichever comes first in the rule list. When authoring channel rules, order the most specific patterns first, exactly as you would with routing rules in any pattern-matching system — this page is the canonical source for that behavior even where other realtime documentation is inconsistent (see the note under [Every enforcement point, systematically](#every-enforcement-point-systematically) above).
-
-### Flows: `policy.check` versus `auth.require`
-
-Two blocks look similar but answer different questions, and they compose:
-
-- **`auth.require`** is the flow equivalent of a route's `policy: "authenticated"` gate — it asks only "is there a valid signed-in caller at this point in the flow," with no record or input involved. Use it right after a trigger that has no policy of its own (an event trigger, a schedule), to guard a manual re-run of the same flow, since schedule and event triggers don't have a caller-facing policy the way `trigger.http` does.
-- **`policy.check`** asks the full question — any policy reference, against an explicit `record` and `input` you supply — and branches on `allowed`/`denied` rather than raising by itself. It's the block you reach for once "is anyone signed in" isn't precise enough and the decision genuinely depends on *which* record or *what* was submitted.
-
-A flow can use both: `auth.require` immediately after a schedule trigger to stop a manual "run now" from an unauthenticated context, then a `policy.check` deeper in the flow once a specific record has been loaded and there's something record-shaped to evaluate against.
-
-## Compared with Supabase and Firebase
-
-| Entry point | Pawabase | Supabase | Firebase |
-| --- | --- | --- | --- |
-| Table/collection rows | Policies per operation, planned into SQL | RLS per table and command | Rules per document path |
-| Custom endpoints | Route policies | Edge Functions check auth themselves | Cloud Functions check auth themselves |
-| Files | Bucket read/write policies | RLS on `storage.objects` | Storage rules |
-| Realtime | Channel rules with policies | Realtime authorization via RLS on `realtime.messages` | Rules apply to listeners |
-| Server bypass | Secret key | `service_role` key | Admin SDK |
-
-The shape is similar across all three: a server credential that bypasses rules, and rules at each entry point. Pawabase's difference is one condition language and one policy library across all of them.
+<CardGroup cols={2}>
+  <Card title="Policies" icon="shield-check" href="/policies/overview" />
+  <Card title="Context reference" icon="list-tree" href="/policies/context" />
+  <Card title="Custom routes" icon="route" href="/data/custom-routes" />
+  <Card title="Resource events" icon="bell" href="/data/resource-events" />
+</CardGroup>
