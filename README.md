@@ -7,7 +7,6 @@ The Pawabase documentation site, built with [Mintlify](https://mintlify.com).
 Requires Node.js 20 or newer.
 
 ```bash
-cd apps/docs
 npm install          # installs the Mintlify CLI (mint) locally
 npm run dev          # http://localhost:3333, reloads as pages change
 ```
@@ -50,5 +49,4 @@ server. Regenerate them after API changes.
 
 ## Deploying
 
-Connect the repository in the Mintlify dashboard and set the docs directory to
-`apps/docs`. Every push to the default branch publishes.
+Connect the repository in the Mintlify dashboard and leave the docs directory at the repository root. Every push to the default branch publishes.
