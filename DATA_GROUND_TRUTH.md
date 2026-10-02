@@ -136,7 +136,7 @@ The **More options** panel labels, by type:
 - always: **Description** (optional, placeholder "Shown in the API docs"), **Default**
   (placeholder "No default"; boolean is a segmented None/Yes/No; for `json`/`array`/`object`/`ref`
 
-## 3. Field types and validation (pawabase_kit/schemas.py)
+## 3. Field types and validation (pawabase_core/schemas.py)
 
 `FIELD_TYPES` is a 14-tuple exactly as above (the machine values are the lowercase keys).
 
@@ -249,7 +249,7 @@ list/get and `resource:write` for create/update/delete. A key lacking the scope 
 | op | meaning | notes |
 |---|---|---|
 
-## 9. Policy pushdown and `total: null` (pawabase_kit/policies/engine.py)
+## 9. Policy pushdown and `total: null` (pawabase_core/policies/engine.py)
 
 `PolicyEngine.plan(ref, context)` returns a `ListPlan(allowed, filters, residual, policy)`.
 `pushdown()` splits a residual condition into `{column: value}` equalities that become SQL `WHERE`
@@ -284,7 +284,7 @@ Expansion (`_expand`):
 - Unknown relation name in `expand` → **400** "posts has no relation 'comments'".
 - Expansion is a second/third query per relation, not a join.
 
-## 11. Transformers (pawabase_kit/transformers.py)
+## 11. Transformers (pawabase_core/transformers.py)
 
 `STEPS = ("omit", "pick", "set", "rename", "case")` — and they always run in **that fixed order**,
 regardless of the order they appear in the JSON.
@@ -457,7 +457,7 @@ Resolution order for a transformer *reference* (`apply_transformer`):
 4. Otherwise `TransformerError`: "unknown transformer 'name'".
 
 A transformer's `definition` may also be given **inline** as a dict on the resource or route.
-Templating for `set` uses `pawabase_kit.templating.render` with `{{ }}` and the state includes
+Templating for `set` uses `pawabase_core.templating.render` with `{{ }}` and the state includes
 `record` plus the policy context (`auth`, `credential`, `request`, `project`).
 
 | `eq` | equals | the implicit default |

@@ -1,0 +1,171 @@
+---
+title: "The pawabase CLI"
+description: "Deploy functions with an API key, emulate them locally against a real deployment, trigger events, flows and schedules, and read logs."
+icon: "terminal"
+---
+
+`pawabase` is installed with the kit (`pip install pawabase`). It talks to a deployment only through its public API, using a **secret project key**.
+
+```text
+pawabase login | logout | link | init | whoami
+pawabase deploy [--branch NAME | --git-branch] [--dry-run] [--force] [-y]
+pawabase emulate [--watch] [--port 8787]
+pawabase invoke NAME [-d JSON] [--local] [--as-user ID]
+pawabase trigger event|schedule|flow NAME [-d JSON] [--remote]
+pawabase functions | deployments | rollback [ID] | branches [--remove B] | logs [-f] | test
+```
+
+Exit status: `0` success, `1` the operation failed, `2` something is missing or misspelled. `--json` makes output machine-readable, `-q` keeps only errors and results. The global
+options (`--url`, `--api-key`, `--project`, `-e`, `-b`) work before or after the command.
+
+## Settings
+
+Four things say which Pawabase to talk to: the gateway **URL**, an **API key**, the **project**, and the **environment** (plus a **branch**). In order of priority:
+
+| Source | Example |
+| --- | --- |
+| Flags | `--url`, `--api-key`, `--project`, `-e/--environment`, `-b/--branch` |
+| Environment variables | `PAWABASE_URL`, `PAWABASE_API_KEY`, `PAWABASE_PROJECT`, `PAWABASE_ENVIRONMENT`, `PAWABASE_BRANCH` |
+| `.env` next to the project file | `PAWABASE_API_KEY=pb_sk_…`, so the key lives with the project and out of version control |
+| `pawabase.toml` (found by walking up from the current folder) | `url`, `project`, `environment`, `branch`, `functions`, `include`, `exclude`, `paths`, `timeout`, `memory_mb` |
+| `pawabase login` (`~/.config/pawabase/config.json`, mode 0600) | `url`, `api_key` |
+
+```toml
+# pawabase.toml: committed
+project = "shop"
+environment = "development"
+functions = "functions"
+include = ["shared"]
+```
+
+```bash
+# .env: git-ignored
+PAWABASE_URL=https://api.example.com
+PAWABASE_API_KEY=pb_sk_...
+```
+
+The **key is never written to `pawabase.toml`**, and a key found in it is refused with an explanation. `pawabase whoami` shows the resolved settings, where each came from, and checks the
+deployment accepts them.
+
+The key must be a **secret** key (`pb_sk_…`) of the environment you target. A project key manages its own project and environment only; a key for another project or environment is refused with `403`.
+Scopes: `functions:manage` to deploy and read runs, `runtime:use` to emulate (reach the runtime over HTTP; reading a secret's value also needs `secrets:read`), `functions:invoke` to call functions.
+A key with no scope restriction has all of them.
+
+## `deploy`
+
+```bash
+pawabase deploy                       # main
+pawabase deploy --branch my-feature   # beside main
+pawabase deploy --git-branch          # a branch named after the checked-out git branch (feature/Login → feature-login)
+pawabase deploy --dry-run             # build and check, upload nothing
+```
+
+What it does, in order, stopping at the first problem and uploading nothing until the end:
+
+1. **Imports your functions locally.** Broken code is reported with the file and error before anything leaves your machine (`--no-check` skips this).
+2. **Builds a reproducible bundle**: `functions/` plus each `include` entry, sorted and with normalised timestamps, so the same source gives the same checksum.
+3. **Refuses to ship credentials.** A `.env`, a private key, or a source line containing a live key stops the deploy with the file and line named (`--allow-secrets` overrides, for a test fixture). Caches, dotfiles, `tests/` and symlinks are left out.
+4. **Says "No changes"** if the active deployment has the same checksum (`--force` deploys anyway).
+5. **Uploads.** The deployment unpacks it beside the live code, compiles and imports it, and only then switches. If it does not load, the previous code keeps serving and you get the problems listed. Production-named environments ask for confirmation (`-y` skips it).
+
+Each deployment records its manifest (git commit, whether the tree was dirty, the functions found, the kit version). Artifacts are kept, so you can go back:
+
+```bash
+pawabase deployments                 # id, branch, status, functions, checksum
+pawabase rollback                    # re-activate the one before the active
+pawabase rollback 27294078           # or a specific one (a prefix is enough)
+```
+
+**Where it is stored.** Uploaded artifacts live in `PAWABASE_DEPLOYMENTS_PATH` (default `<code_path>/.deployments`). It must be writable and shared by every API, worker and scheduler process; in Docker it is `/data/deployments`, because `/code` is a read-only mount. **The libraries your functions import must be installed where the platform runs**: a missing one refuses the deployment with `No module named …` (add it to `docker/function-requirements.txt` and rebuild the image).
+
+`routes.py`, `policies.py` and `transformers.py` cannot be deployed: they change what a whole project enforces and routes, and are loaded from the project's mounted code.
+
+## `emulate`
+
+```bash
+pawabase emulate --watch
+# Emulating shop / development on http://127.0.0.1:8787
+#   local functions (12): orders.pay, orders.list, …
+#   served locally: 9 routes, plus /functions/v1 for the above; everything else is forwarded to https://api.example.com
+```
+
+Point your app at `http://127.0.0.1:8787` instead of the gateway and keep sending your **publishable** key and the user's token as usual. The emulator is a small local gateway:
+
+* `POST /functions/v1/<name>` runs **your local copy** when you have one, otherwise it is forwarded.
+* `/rest/v1/<path>` that a route of the deployment binds to a function you have locally runs it here, with the platform's payload, after the deployment evaluates the route's policy.
+* **Everything else is forwarded unchanged**: the data API, sign-in, storage, flows, realtime. Your app signs in against the real identity service and reads real data.
+* The caller's token is **verified by the deployment**; a forged or expired token is anonymous. A secret key bypasses policies, as on the platform.
+* **WebSockets are not proxied** (realtime): connect those to the deployment directly; they do not involve your functions.
+* `--watch` reloads when a source file changes (including helper packages).
+* It listens on `127.0.0.1` by default. It holds your secret key, so a warning is printed if you bind elsewhere.
+
+Control endpoints: `/_emulator/health`, `/functions`, `/routes`, `/runs` (recent invocations with their logs), `/refresh`, and `POST /_emulator/trigger/event|schedule|flow/<name>`.
+
+**What it does not do:** the deployment does not call back into your machine. A real `order.paid` happening on the deployment runs the *deployed* subscribers; use a trigger to run yours.
+
+**It is chatty.** Every database statement a local function runs is a request to the deployment. The kit waits and retries when the gateway answers `429` (the default limit is 600 requests a minute per key), but for
+heavy local work raise `PAWABASE_RATE_LIMIT` on your development gateway.
+
+## `trigger`
+
+```bash
+pawabase trigger event order.paid -d '{"id": 7}'
+pawabase trigger schedule nightly-report
+pawabase trigger flow send-receipt -d '{"order": 7}'
+```
+
+Each subscriber runs **where its code lives**:
+
+* a subscription (or a schedule) whose target is a function **you have locally** runs on your machine;
+* a flow, or a function you only have deployed, runs on the deployment;
+* the event itself is *not* emitted on the deployment, because that would run the deployed copy of a function that just ran locally. `--remote` emits it there and runs only deployed code.
+
+A flow is always run on the deployment. The output names, for every subscription, where it ran and what it returned.
+
+## `invoke`, `functions`, `logs`
+
+```bash
+pawabase invoke orders.pay -d '{"order_id": 7}'                       # the deployed function, as an operator
+pawabase invoke orders.pay -d @input.json --as-user 42 --role staff     # as a user
+pawabase invoke orders.pay --local                                      # your copy, against the deployment's runtime
+pawabase invoke orders.pay --branch my-feature
+
+pawabase functions            # deployed and local, with where each came from and what is not deployed yet
+pawabase logs -f              # follow runs as they happen
+pawabase logs --function orders.pay --status failed -n 50
+pawabase logs --run <id>      # one run in full: input, output or error, log lines
+```
+
+## In CI
+
+```yaml
+- run: pip install pawabase
+- run: pawabase test                      # your pytest suite, with pawabase.testing
+- run: pawabase deploy --git-branch -y
+  env:
+    PAWABASE_URL: ${{ secrets.PAWABASE_URL }}
+    PAWABASE_API_KEY: ${{ secrets.PAWABASE_API_KEY }}
+    PAWABASE_PROJECT: shop
+    PAWABASE_ENVIRONMENT: staging
+```
+
+## HTTP API
+
+The CLI uses these; so can you. All under `/platform/v1/projects/{ref}/envs/{env}` with a secret key.
+
+| Method | Path | |
+| --- | --- | --- |
+| `POST` | `/function-deployments` | `{archive (base64 tar.gz), branch, manifest, limits}` → deploy and activate |
+| `GET` | `/function-deployments?branch=` | Deployments and their status (`active`, `superseded`, `failed`, `removed`) |
+| `POST` | `/function-deployments/{id}/activate` | Re-activate a stored artifact (rollback) |
+| `DELETE` | `/function-deployments/{id}` | Remove an inactive deployment and its stored artifact |
+| `GET` / `DELETE` | `/function-branches[/{branch}]` | Branches with functions; delete one |
+| `GET` | `/functions?branch=` | Functions visible there, with `source` (`branch`, `deployment`, `project`) |
+| `POST` | `/functions/{name}/invoke` | `{input, branch, as_user}` run now as an operator |
+| `GET` | `/function-runs[/{id}]` | `?function=&branch=&status=&after=` |
+| `POST` | `/events`, `/flows/{name}/run`, `/schedules/{name}/run` | Trigger |
+| `POST` | `/runtime/call` | One `ctx.runtime` method: `{method, args, kwargs, as_user, branch}` (needs `runtime:use`) |
+| `POST` | `/runtime/db` | SQL: `{op, tx, sql, params}` with `op` one of `fetch one scalar execute insert update delete begin commit rollback` |
+| `POST` | `/runtime/identify` | `{token}` → the `auth` context the deployment vouches for |
+
+Values in runtime calls travel in a typed JSON form (`{"$dt": …}`, `{"$b64": …}`, `{"$dec": …}`, `{"$set": […]}`) so datetimes, bytes and decimals survive the trip (`pawabase.codec`).

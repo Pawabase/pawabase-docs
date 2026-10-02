@@ -1,159 +1,202 @@
 ---
 title: "Functions"
-description: "Writing, registering, and calling Python functions in Pawabase -- from inline function.call to background queue.function dispatches."
+description: "Write Python functions with the pawabase kit, test them without a server, deploy them with an API key, and run them locally against a real deployment."
 icon: "function"
 ---
 
-A **function** is a Python callable registered in a project's `code/<project>/functions/` directory. Functions are the escape hatch when a flow's block vocabulary isn't expressive enough.
+A **function** is an `async def` that Pawabase calls: from a route, a flow, an event subscription, a schedule, or directly at `POST /functions/v1/<name>`. Functions are for the work flows
+are bad at (a transactional stock reservation, a PDF, a call to a payment provider) and they live in **your repository**, not in Studio.
 
-<CardGroup cols={2}>
-  <Card title="Inline" icon="link">Call a function synchronously with `function.call` from inside a flow or another function.</Card>
-  <Card title="Background" icon="clock">Dispatch a function as a background job with `queue.function`.</Card>
-</CardGroup>
+You write them with the `pawabase` package (the public kit, which only needs `httpx`), and the same file runs in three places without changes:
+
+| Where | How | `ctx.runtime` is |
+| --- | --- | --- |
+| On a deployment | `pawabase deploy` uploaded it | The platform's own runtime |
+| On your machine | `pawabase emulate` | A [`RemoteRuntime`](#the-runtime-on-your-machine): the deployment's database, events, flows and secrets, over HTTP |
+| In a unit test | `pawabase.testing.call(...)` | A [`FakeRuntime`](#testing): real SQL on SQLite, everything else recorded |
+
+```bash
+pip install pawabase
+pawabase init                 # functions/hello.py, a test, .env.example
+pawabase emulate --watch      # run it locally, against your deployment
+pawabase deploy               # put it on the deployment
+```
 
 ## Writing a function
 
-A function is a Python module containing one or more callables decorated with `@function(...)`.
-
 ```python
-# code/myproject/functions/pricing.py
-from pawabase import function, FunctionContext
-from decimal import Decimal
+# functions/orders.py
+from pawabase.functions import FunctionError, function
 
-@function("calculate_price", description="Compute the final price for an order", input_schema={
-    "items": {"type": "json", "required": True},
-    "discount_code": {"type": "string", "required": False},
-})
-async def calculate_price(ctx: FunctionContext, items: list[dict], discount_code: str | None = None) -> dict:
-    subtotal = sum(Decimal(str(item["price"])) for item in items)
-    discount = await _lookup_discount(ctx, discount_code) if discount_code else Decimal("0")
-    total = subtotal - discount
-    return {"subtotal": float(subtotal), "discount": float(discount), "total": float(total)}
-
-async def _lookup_discount(ctx, code):
-    result = await ctx.runtime.db_query("SELECT amount FROM discounts WHERE code = ? AND active = 1", [code])
-    return Decimal(str(result[0]["amount"])) if result else Decimal("0")
+@function(
+    "orders.pay",
+    description="Mark an order paid and tell the rest of the system",
+    policy="authenticated",
+    input_fields=[
+        {"name": "order_id", "type": "integer", "required": True},
+        {"name": "reference", "type": "string", "max_length": 100},
+    ],
+    timeout=30,
+)
+async def pay(ctx):
+    async with ctx.runtime.transaction() as db:
+        moved = await db.execute(
+            "UPDATE orders SET status = 'paid' WHERE id = ? AND status = 'pending'", [ctx.input["order_id"]]
+        )
+        if not moved:
+            raise FunctionError("That order is not waiting for payment.", status=409, code="not_pending")
+    await ctx.runtime.emit("order.paid", {"id": ctx.input["order_id"], "by": ctx.auth.get("user_id")})
+    ctx.log("paid", order=ctx.input["order_id"])
+    return {"paid": True}
 ```
 
-The `@function` decorator records the function's metadata -- its name, description, and input schema.
+### The decorator
 
-## Input and output
+| Argument | Meaning |
+| --- | --- |
+| `name` | The function's address. Letters, digits and `_ . : -`, starting with a letter. `orders.pay` and `charge-order` are both fine |
+| `description` | Shown in Studio and `pawabase functions` (the first docstring line when omitted) |
+| `policy` | Who may call it over HTTP (`/functions/v1/<name>`): `public`, `authenticated`, a policy name, or an inline condition. Not applied when a route, flow or job calls it: those have their own gates |
+| `input_fields` | Field definitions that validate the input and fill defaults. See below |
+| `timeout` | Seconds before the call is cancelled (default 30) |
+| `tags` | Free labels |
 
-Functions receive their arguments as keyword arguments matching the `input_schema` declared in the decorator. The platform's `FunctionContext` provides access to the same `Runtime` capabilities a flow block uses:
+A function must be `async`; the decorator refuses anything else.
 
-- **`ctx.runtime`** -- `resource_list`, `resource_get`, `db_query`, `cache_get`, `emit`, `call_function`, `secret`, `http_request`, and the full `Runtime` protocol
-- **`ctx.state`** -- the run's current state (`input`, `auth`, `vars`, `steps`)
-- **`ctx.render()`** -- render templates against the current state
+### The context
 
-The return value of the function is whatever the function returns, and it's available to the caller as the function's output.
+| Attribute | Meaning |
+| --- | --- |
+| `ctx.input` | The payload, validated against `input_fields`. For a route it is `{**path_params, **body}` |
+| `ctx.auth` | The caller: `authenticated`, `user_id`, `email`, `roles`, `permissions`, `kind` |
+| `ctx.project`, `ctx.env`, `ctx.branch` | Where it runs. `branch` is `main` unless a branch deployment is being served |
+| `ctx.trigger` | `http`, `flow`, `job`, `schedule`, `event`, `webhook` (`emulator` and `test` under local tooling) |
+| `ctx.request` | For a route: `{"params", "query", "body", "headers", "client_ip"}`; otherwise `None` |
+| `ctx.runtime` | The capabilities below |
+| `ctx.log(message, **data)` | A line in the invocation's log, visible in `pawabase logs --run <id>` |
 
-## Registering functions
+`ctx.request["headers"]` has every header except the platform's own credentials (`apikey`, `cookie`, …). `client_ip` is the address the **gateway** saw: what a caller wrote in
+`X-Forwarded-For` is ignored (set `PAWABASE_TRUSTED_PROXY_HOPS` if a load balancer sits in front of the gateway).
 
-Functions are discovered through the `pawabase.functions` entry point group in `pyproject.toml`:
+### Input fields
+
+```python
+input_fields=[
+    {"name": "sku", "type": "string", "required": True, "max_length": 40},
+    {"name": "quantity", "type": "integer", "minimum": 1, "default": 1},
+    {"name": "kind", "type": "string", "enum": ["pickup", "delivery"]},
+]
+```
+
+Types: `string`, `text`, `integer`, `number`, `boolean`, `array`, `object`, `json` (and `url`, `email`, `uuid`, `date`, `datetime` as strings). Rules: `required`, `default`, `enum`,
+`minimum`/`maximum`, `min_length`/`max_length`. A boolean is never accepted as an integer. Fields you do not list pass through. Invalid input is a `422` naming **every** bad field, before your code runs.
+
+### Failing on purpose
+
+```python
+raise FunctionError("Not enough stock.", status=409, code="insufficient_stock", details={"available": 2})
+```
+
+reaches the caller as `{"error": "insufficient_stock", "message": "Not enough stock.", "details": {...}}` with status 409. Any other exception is a `500` that names the exception (and the
+traceback is in the run record). An HTTP-style exception (anything with `status_code` and `detail`, such as Sillo's `HTTPException`) is the response it describes.
+
+## `ctx.runtime`
+
+The same methods wherever the function runs.
+
+| Group | Methods |
+| --- | --- |
+| Data | `resource_list`, `resource_get`, `resource_create`, `resource_update`, `resource_delete` (the resources and their policies' bypass: a function acts as the application) |
+| SQL | `db()` and `transaction()` (below), `db_query` (read-only), `db_transaction` (resource writes, atomic) |
+| Cache | `cache_get`, `cache_set(key, value, ttl, tags)`, `cache_delete`, `cache_invalidate(tags)` |
+| Events and work | `emit(name, payload)`, `dispatch_flow`, `call_flow`, `dispatch_function`, `call_function`, `publish(channel, event, payload)` |
+| Storage and mail | `storage_put`, `storage_read`, `storage_signed_url`, `storage_delete`, `send_mail` |
+| Outbound | `http_request(method, url, headers=, json=, params=, timeout=, retries=)` |
+| Platform | `secret(name)`, `identity_user(id)`, `check_policy(policy, context)`, `log`, `metric`, `webhook_send` |
+
+### SQL
+
+```python
+db = await ctx.runtime.db()
+rows = await db.fetch("SELECT id, total FROM orders WHERE status = ?", ["paid"])
+one = await db.one("SELECT * FROM orders WHERE id = ?", [7])
+total = await db.scalar("SELECT SUM(total) FROM orders")
+changed = await db.execute("UPDATE stock SET on_hand = on_hand - ? WHERE sku = ? AND on_hand >= ?", [2, "A", 2])
+row = await db.insert("orders", {"total": 10})          # declared defaults and timestamps applied, key returned
+await db.update("orders", 7, {"status": "paid"})
+await db.delete("orders", 7)
+
+async with ctx.runtime.transaction() as db:             # commit on success, roll back on any exception
+    ...
+```
+
+`?` placeholders on every database (converted to `$1` / `%s`). Pass values as parameters; never format them into the statement. Values are encoded and decoded by the resources'
+field definitions: JSON columns come back as dicts, booleans as `True`/`False`, datetimes as `datetime`. A conditional `UPDATE … WHERE on_hand >= ?` that returns `0` is the whole
+concurrency story for "reserve stock without overselling".
+
+SQL runs as the application, so no resource policy applies: check what the caller may do first.
+
+## Helper packages
+
+Functions can import code that lives next to them. List it in `pawabase.toml`:
 
 ```toml
-[project.entry-points."pawabase.functions"]
-pricing = "code.myproject.functions.pricing:calculate_price"
-analytics = "code.myproject.functions.analytics:track_event"
+functions = "functions"
+include = ["shared"]        # shipped in the bundle as shared/…, imported as `import shared`
+paths = ["."]               # (emulate) where to import it from on your machine
 ```
 
-The platform's `FunctionRegistry` loads all registered functions at startup. New functions added to a package are picked up without restarting the API.
+**Import everything at the top of the file.** Each deployment is loaded in isolation (two environments may ship different versions of `shared`), so a function that imports a
+sibling module lazily, inside its body, may not find it later.
 
-## Calling conventions
+## Environments and branches
 
-Functions can be called in two ways: synchronously via `function.call` within a flow, or asynchronously via `queue.function` as a background job.
+Code is deployed **per environment**: what you deploy to `development` is not what runs in `production`. A function is looked for, in order, in the branch's deployment, the
+environment's deployment, then code mounted on the project (the older `code/<project>/` way).
 
-### Synchronous calls via function.call
+A **branch** deployment (`pawabase deploy --branch my-feature`) exists beside `main`:
 
-When a flow calls a function via `function.call`, the worker executes the function inline and returns the result immediately.
-
-```json
-{"id": "price", "data": {"block": "function.call", "config": {"function": "calculate_price", "input": {"items": "{{ steps.cart.output }}", "discount": "{{ vars.discount }}"}}}}
-```
-
-### Asynchronous calls via queue.function
-
-When a flow or code dispatches a function via `queue.function`, the worker creates a job and adds it to the job queue.
-
-```python
-from pawabase import queue
-
-await queue.function('calculate_price', {'items': [...], 'discount': 'SAVE10'})
-```
-
-### Manual calls
-
-Functions can be called manually from the command line using the `pawabase call` CLI.
-
-```bash
-pawabase call calculate_price --input '{"items": [...]}'
-```
-
-## FunctionContext
-
-Every function receives a `FunctionContext` as its first argument. The context provides access to input, auth, project, env, runtime, trigger, request, and logs.
-
-```python
-async def my_function(ctx, param1, param2):
-    input_data = ctx.input
-    auth = ctx.auth
-    project = ctx.project
-    env = ctx.env
-    runtime = ctx.runtime
-    trigger = ctx.trigger
-    request = ctx.request
-    logs = ctx.logs
-    ...
-```
-
-## Depth limit
-
-`call_function` is depth-limited to 8 levels. This prevents infinite recursion from crashing the worker.
-
-## Timeout
-
-Each function has a `timeout` parameter (default 30 seconds). The worker's `WorkerOptions.timeout` (default 300 seconds) controls the maximum job duration.
-
-```python
-@function("long_running", timeout=60)
-async def long_running(ctx):
-    ...
-```
-
-## Policy
-
-Functions can have a `policy` parameter that controls access.
-
-```python
-@function("admin_only", policy="admin")
-async def admin_only(ctx):
-    ...
-```
-
-## Error handling
-
-Functions raise exceptions that propagate to the caller. In a synchronous call via `function.call`, the exception is caught by the flow engine.
+* it does not change what `main` serves;
+* call it by naming the branch: `POST /functions/v1/<name>?branch=my-feature`, or `pawabase invoke <name> --branch my-feature`;
+* a function the branch does not define falls back to the environment's, so a branch only carries what it changed;
+* `pawabase branches --remove my-feature` deletes it.
 
 ## Testing
 
-Functions are tested by calling the handler with a fake `FunctionContext`.
+`pawabase.testing` runs a function the way the platform does (validated input, timeout, errors as answers) against a runtime that does everything in memory:
 
 ```python
-async def test_my_function():
-    ctx = FunctionContext(...)
-    result = await my_function(ctx, param1, param2)
-    assert result == expected
+from pawabase.testing import FakeRuntime, authenticated, call
+
+async def test_pay_is_refused_twice():
+    runtime = FakeRuntime(sql="CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT); INSERT INTO orders (status) VALUES ('pending');")
+    first = await call("orders.pay", {"order_id": 1}, runtime=runtime, project_dir="functions", auth=authenticated("u1"))
+    assert first.ok and runtime.emitted == [("order.paid", {"id": 1, "by": "u1"})]
+    second = await call("orders.pay", {"order_id": 1}, runtime=runtime)
+    assert second.status == 409 and second.body["error"] == "not_pending"
 ```
 
-## Performance
+`FakeRuntime` runs **real SQL** on in-memory SQLite, keeps resources in a dict, and records what leaves the function: `emitted`, `flows`, `functions`, `published`, `mails`,
+`http_calls` (answers set with `http=`), `stored`, `logs`, `metrics`. Nothing it does touches a network. The result of `call` is an `Invocation` with `ok`, `status`, `result`,
+`error`, `body`, `logs` and `traceback`.
 
-Functions run directly without graph execution overhead. Inline function calls are fast. Background calls have serialization overhead.
+## The runtime on your machine
 
-## Security
+Under `pawabase emulate` (and `pawabase invoke --local`), `ctx.runtime` is a `RemoteRuntime`: each call is one authenticated request to the deployment (`POST …/runtime/call`),
+executed there as the caller. Reads and writes hit the deployment's real database; `emit` publishes a real event; `secret` reads a real secret (and is audited). Two things stay local:
+`http_request` leaves from your machine, and `call_function` prefers **your** copy of a function over the deployed one.
 
-Functions are subject to the policy engine. The `policy` parameter on the `@function` decorator controls access.
+Remote SQL transactions are held open by the deployment for you and rolled back after a minute of silence. They live in one server process: a development convenience, not something to put
+load through.
 
-## Observability
+## Calling functions
 
-Function invocations produce logs and metrics. Both are visible in Studio Observability.
+| From | How |
+| --- | --- |
+| A client | `POST /functions/v1/<name>` with the function's `policy` and the key's `functions:invoke` scope. Answers `{"data": result}` |
+| A route | A route whose handler is the function. Answers the result itself |
+| A flow | The `function.call` / `queue.function` blocks |
+| An event, a schedule | A subscription or schedule whose target is the function |
+| Studio, the CLI | `POST …/functions/<name>/invoke` (`pawabase invoke`), as an operator, bypassing the policy |
 
+Every call is recorded (`pawabase logs`): the function, branch, deployment, trigger, input, output or error, log lines and duration.

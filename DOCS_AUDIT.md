@@ -1,7 +1,7 @@
 # Pawabase Documentation Audit
 
 Audit-only pass over all 146 pages (~38,500 lines) across 24 sections, cross-checked against
-actual source in `{akountz,angula,api,gateway,studio}/` and `pawabase_kit`. No files were
+actual source in `{akountz,angula,api,gateway,studio}/` and `pawabase_core`. No files were
 rewritten. This report is the input to a subsequent rewrite pass — see per-directory sections for
 file-by-file verdicts, and the cross-cutting patterns below for what to fix first.
 
@@ -99,7 +99,7 @@ the product.
 ## A. auth/ + policies/
 
 **policies/** (11 files): generally strong, most verified line-for-line against
-`pawabase_kit/policies/engine.py` and Studio's `ConditionBuilder.jsx`/`PolicyPicker.jsx`. Studio
+`pawabase_core/policies/engine.py` and Studio's `ConditionBuilder.jsx`/`PolicyPicker.jsx`. Studio
 example fields confirmed to match real UI, not internal payloads.
 - `policies/debugging.mdx` (51 lines): **truncated mid-section**, cross-linked elsewhere as a key
   reference — needs real content, not just length.
@@ -233,7 +233,7 @@ duplication and no contradicted claims.
 - `code/overview.mdx` self-contradicts on whether adding a function requires a restart (says both
   "no restart required" and "picked up on next API restart" in the same file).
 - Wrong imports throughout (`from pawabase import function, FunctionContext` — no top-level
-  `pawabase` package exists, only `pawabase_kit`).
+  `pawabase` package exists, only `pawabase_core`).
 - `code/python-extensions.mdx`/`code/extension-routes.mdx` have duplicated back-halves (see
   cross-cutting pattern 3).
 - `code/runtime.mdx` is the best-verified file in code/ — accurate `Runtime` protocol description,
