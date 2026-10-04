@@ -154,7 +154,7 @@ Every key below is part of the stored definition. Defaults are the API defaults;
 | `description` | text | `""` | The route summary shown in OpenAPI |
 | `table` | varchar(128) | `name` | The table in the environment database; stored as `body.table or body.name` |
 | `primary_key` | varchar(64) | `id` | The column that identifies a record |
-| `id_type` | varchar(16) | `integer` | `integer` or `uuid`; affects id coercion and column DDL |
+| `id_type` | varchar(16) | `ulid` | `ulid` or `uuid` for new resources (`integer` only on resources created before ULIDs); affects id coercion and column DDL |
 | `fields` | JSON | `[]` | The field definitions, stored in the database column `fields_` |
 | `operations` | JSON | `{}` | Per operation, `{"enabled": bool, "policy": ref}` |
 | `relations` | JSON | `[]` | `[{"name", "resource", "field", "type"}]` |
@@ -198,7 +198,7 @@ Section headings have been renamed between releases. What has not changed is the
 | **Name** | `name` | Monospace input, autofocused while new, hint "Served at /rest/v1/`<name>`". Disabled once created |
 | **Table** | `table` | Optional; "Defaults to the name" |
 | **Primary key** | `primary_key` | Defaults to `id` |
-| **ID type** | `id_type` | A two-way choice: **Auto-increment** (`integer`) or **UUID** (`uuid`) |
+| **ID type** | `id_type` | **ULID** (`ulid`, the default) or **UUID** (`uuid`) for a new resource; shown read-only afterwards |
 | **Description** | `description` | Optional; placeholder "What rows live here?" |
 
 The **Description** is not decoration. It becomes the route summary in OpenAPI, and it is the first thing a colleague integrating against your API reads.
@@ -328,25 +328,29 @@ A key without the required scope gets `403` before the policy is ever evaluated.
 The two checks compose. A key with `resource:read` calling `list` still has to pass the `list` policy. A publishable key in the browser is not a bypass of anything; it is a credential with fewer scopes.
 </Note>
 
-## `id_type`: integer or uuid
+## `id_type`: ulid, uuid or integer
 
-`id_type` is a two-way choice in Studio — **Auto-increment** or **UUID** — and it has consequences at three different layers.
+`id_type` is **ULID** or **UUID** for a new resource (an older resource may still be **Auto-increment**), and it has consequences at three different layers. `ulid` is the default, in Studio and in the API: a definition sent without `id_type` gets ULID keys. **`integer` can no longer be chosen for a new resource**: creating one with `"id_type": "integer"` is a 422. Resources that already use `integer` keep working and can be edited; a replacement that does not name `id_type` keeps the resource's, and naming a different one is a 409.
 
-| Layer | `integer` | `uuid` |
-| --- | --- | --- |
-| Value at create | Assigned by the database | Generated with `uuid.uuid4()` in Python |
-| sqlite column | `INTEGER PRIMARY KEY AUTOINCREMENT` | `TEXT` |
-| postgres column | `BIGSERIAL PRIMARY KEY` | `UUID` |
-| mysql column | `BIGINT AUTO_INCREMENT PRIMARY KEY` | `CHAR(36)` |
-| Value in JSON | a number | a string |
+| Layer | `ulid` | `uuid` | `integer` |
+| --- | --- | --- | --- |
+| Value at create | Generated in Python: 26 characters, time-ordered | Generated with `uuid.uuid4()` in Python | Assigned by the database |
+| sqlite column | `TEXT` | `TEXT` | `INTEGER PRIMARY KEY AUTOINCREMENT` |
+| postgres column | `CHAR(26)` | `UUID` | `BIGSERIAL PRIMARY KEY` |
+| mysql column | `CHAR(26)` | `CHAR(36)` | `BIGINT AUTO_INCREMENT PRIMARY KEY` |
+| Value in JSON | a string, e.g. `01J9Z3K8V0X5Q7R2M4N6P8T1WY` | a string | a number |
 
 The last row matters more than it looks. A uuid primary key serializes as a string in every response, on every database. Clients that assume numeric ids — arithmetic on ids, zero-padded formatting, integer-keyed local caches — will misbehave against a uuid resource with no error raised anywhere.
 
-Choose `uuid` when records are created in more than one place, when ids appear in URLs that will be shared or indexed, or when merging data from another system makes collisions conceivable. Choose `integer` when the ids are internal, when you want the cheapest possible primary key, and when sequential ids are acceptable to you.
+A ULID is 48 bits of millisecond timestamp followed by 80 random bits, written in Crockford base32 (no `I`, `L`, `O` or `U`). Ids made later sort later, so the primary-key index stays append-mostly and `ORDER BY id` is creation order, which a UUIDv4 cannot give you. They do not reveal how many records exist or let a caller guess the next one. Ids made in the same millisecond still increase. They are accepted in either case and always returned upper-case.
 
-### The 404-on-non-digit rule
+Choose `ulid` for almost every new resource. Choose `uuid` when you must interoperate with something that insists on the UUID format, or want Postgres's native `UUID` type. Auto-increment keys are not offered for new resources: the cheapest possible key is also the most guessable, and it tells a competitor how many records you have.
 
-When `id_type` is `integer`, the id from the URL is coerced before anything else happens:
+Both `ulid` and `uuid` suit records created in more than one place, ids that appear in shared URLs, and merging data from another system.
+
+### The 404-on-malformed-id rule
+
+When `id_type` is `integer` or `ulid`, the id from the URL is checked before anything else happens:
 
 ```python
 def _coerce_id(spec, raw):
@@ -354,15 +358,19 @@ def _coerce_id(spec, raw):
         if not raw.isdigit():
             raise HTTPException(status_code=404, detail="Not found")
         return int(raw)
+    if spec.id_type == "ulid":
+        if not is_ulid(raw):
+            raise HTTPException(status_code=404, detail="Not found")
+        return raw.upper()
     return raw
 ```
 
-So `GET /rest/v1/invoices/abc` on an integer-id resource is a **404**, not a 422. That is deliberate: reporting "your id was malformed" to a caller probing for existing records tells them more about your system than "no such record" does. Do not build a client that treats a 404 here as evidence of a type bug.
+So `GET /rest/v1/invoices/abc` on an integer-id or ULID resource is a **404**, not a 422. That is deliberate: reporting "your id was malformed" to a caller probing for existing records tells them more about your system than "no such record" does. Do not build a client that treats a 404 here as evidence of a type bug.
 
 For `uuid`, the raw string is passed through untouched and the database does the matching.
 
 <Warning>
-`id_type` is chosen before the first migration, and changing it afterwards is a manual operation. Migrate is additive only: it never drops and never retypes a column. Converting an existing table from `integer` to `uuid` means writing the DDL yourself in the Database console. See [Migrations](/data/migrations).
+`id_type` is chosen before the first migration, and changing it afterwards is a manual operation. Migrate is additive only: it never drops and never retypes a column. Converting an existing table between `integer`, `uuid` and `ulid` means writing the DDL yourself in the Database console. See [Migrations](/data/migrations).
 </Warning>
 
 ### Primary key
