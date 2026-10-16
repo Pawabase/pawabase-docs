@@ -1,0 +1,792 @@
+---
+title: "Server runtimes and testing with TypeScript"
+description: "Design browser, SSR, edge, Node, React Native, worker, and test clients with explicit session ownership, runtime adapters, cleanup, and deterministic transport tests."
+icon: "server"
+---
+
+The TypeScript package runs in several JavaScript environments, but the correct client lifetime and credential model differ between them.
+The central design question is not “does this runtime support `fetch`?”
+It is “who owns identity and how long can this client retain it?”
+
+| Runtime pattern | Client lifetime | Identity owner | Main risk |
+| --- | --- | --- | --- |
+| Browser single-page application | Application lifetime | Managed SDK session | Duplicate clients, exposed secret key, stale UI state |
+| Server-rendered request | One request or stateless shared base plus `asUser()` | Framework cookie/session layer | Cross-user token leakage |
+| Trusted worker | Process or job lifetime | Service configuration | Accidental policy bypass and unbounded retries |
+| Edge function | One invocation or runtime-reused stateless base | Request token | Assuming process memory is durable |
+| React Native application | Application lifetime | Custom persistent storage | Missing storage adapter and deep-link handling |
+| Command-line tool | Command lifetime | Explicit key or adopted session | Timer/socket preventing exit |
+| Unit test | One test or suite fixture | Test-controlled adapter | Hidden network calls and leaked timers |
+
+## Package formats
+
+`@pawabase/client` publishes ESM, CommonJS, and TypeScript declarations.
+The package export map selects the correct runtime build.
+The package is marked side-effect free so bundlers can omit unused exports when their tree-shaking rules permit it.
+
+### ESM
+
+```typescript
+import {
+  createClient,
+  PermissionError,
+  VERSION,
+} from "@pawabase/client";
+```
+
+### CommonJS
+
+```typescript
+const {
+  createClient,
+  PermissionError,
+  VERSION,
+} = require("@pawabase/client");
+```
+
+The package requires Node.js 20 or newer for its supported Node environment and type-generation command.
+Node version support does not imply that every Node release has a global WebSocket.
+
+## The exported version
+
+`VERSION` identifies the installed SDK release.
+The HTTP transport also sends it in the client-information header.
+
+```typescript
+import { VERSION } from "@pawabase/client";
+
+logger.info("Pawabase SDK initialized", {
+  sdkVersion: VERSION,
+});
+```
+
+Record it with deployment metadata when diagnosing behavior that differs between application releases.
+Do not branch business behavior on a version string when capability detection or a server contract is available.
+
+## Browser application ownership
+
+A browser application normally owns one client for the lifetime of the application shell.
+
+```typescript
+import { createClient } from "@pawabase/client";
+import type { Database } from "./pawabase.types";
+
+export const pawabase = createClient<Database>({
+  url: import.meta.env.PUBLIC_PAWABASE_URL,
+  apiKey: import.meta.env.PUBLIC_PAWABASE_PUBLISHABLE_KEY,
+});
+```
+
+The key must be publishable.
+The client can retain the user session in browser storage, coordinate refresh, and keep one realtime socket.
+
+Creating a client inside a render function can create multiple auth listeners, refresh timers, channel objects, and sockets.
+Put it in a stable module or framework provider.
+
+## Browser environment variables
+
+Build tools often expose variables with a public prefix.
+That prefix is an explicit declaration that the value will be bundled for users.
+
+| Value | May be public? |
+| --- | --- |
+| Gateway URL | Yes |
+| Publishable key | Yes |
+| Project reference | Yes |
+| Environment name | Yes |
+| Secret key | No |
+| User access token | Not as a build variable |
+| Refresh token | Not as a build variable |
+
+Do not rely on an unguessable variable name to protect a bundled secret.
+Anyone who can load the application can inspect its code and requests.
+
+## Server-rendered requests
+
+A server renderer typically receives a user token through a cookie or framework session.
+Create a stateless acting client for that request.
+
+```typescript
+export async function loadPage(request: Request) {
+  const accessToken = await readAccessToken(request);
+
+  const actingClient = createClient<Database>({
+    url: process.env.PAWABASE_URL!,
+    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+    accessToken,
+  });
+
+  try {
+    const tasks = await actingClient
+      .from("tasks")
+      .order("created_at", "desc")
+      .all({ maxRecords: 200 });
+
+    return renderTasks(tasks);
+  } finally {
+    actingClient.dispose();
+  }
+}
+```
+
+The `accessToken` client does not persist or refresh a session.
+The framework remains responsible for updating cookies or obtaining a replacement token.
+
+## Shared stateless base client
+
+A server can keep one base client for stable transport configuration and derive user clients.
+
+```typescript
+const baseClient = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  hooks: serverHooks,
+});
+
+export async function readAccount(accessToken: string, accountId: string) {
+  const actingClient = baseClient.asUser(accessToken);
+
+  try {
+    return await actingClient.from("accounts").get(accountId);
+  } finally {
+    actingClient.dispose();
+  }
+}
+```
+
+`asUser()` copies the configuration but uses externally owned identity.
+It does not mutate the base client.
+
+<Warning>
+  Do not sign users into one process-wide managed client.
+  Its mutable session is shared state, so concurrent requests can send the wrong user's token.
+</Warning>
+
+## Cookie-backed storage
+
+A framework can supply a `SessionStorage` adapter, but doing so makes the client a managed-session owner.
+Use this only when the request lifecycle can write updated cookies and serialize refresh safely.
+
+```typescript
+const cookieStorage = {
+  async getItem(key: string) {
+    return cookies.get(key) ?? null;
+  },
+  async setItem(key: string, value: string) {
+    cookies.set(key, value, cookieOptions);
+  },
+  async removeItem(key: string) {
+    cookies.delete(key);
+  },
+};
+
+const client = createClient({
+  url,
+  apiKey,
+  auth: {
+    storage: cookieStorage,
+    storageKey: "pawabase-session",
+  },
+});
+```
+
+Cookie design must account for encryption or signing, size, `Secure`, `HttpOnly`, `SameSite`, path, domain, and expiry.
+A JavaScript SDK running in the browser cannot read an `HttpOnly` cookie; a server adapter can.
+
+When a framework already has a tested session-refresh layer, `accessToken` mode is usually clearer than giving two layers ownership.
+
+## Trusted service clients
+
+A worker or backend can use a secret key when the operation is intentionally administrative.
+
+```typescript
+const admin = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
+});
+```
+
+The secret key bypasses policies.
+The worker must establish its own authorization boundary and input validation.
+Use a publishable key with an end-user token when the worker should preserve user policy behavior.
+
+## Background jobs
+
+Jobs often have a larger retry policy around the SDK.
+Decide which layer owns retry counts.
+
+```typescript
+const workerClient = createClient({
+  url,
+  apiKey: secretKey,
+  retry: false,
+  timeoutMs: 20_000,
+});
+```
+
+Disabling SDK retry lets the queue treat one job attempt as one network attempt.
+Keeping SDK retry can absorb brief gateway failures without consuming a job attempt.
+Calculate the product of both budgets before choosing.
+
+For side-effecting functions, flows, and routes, a queue retry still needs an idempotency design even when SDK retry is disabled.
+
+## Edge runtimes
+
+Edge runtimes usually provide `fetch`, but support for WebSocket constructors, streams, Node globals, and process environment access varies.
+
+Use web-standard APIs in adapters.
+Keep the client stateless per request.
+Do not assume that an in-memory auth session survives the next invocation or stays isolated to one user.
+
+```typescript
+export default async function handle(request: Request) {
+  const accessToken = request.headers
+    .get("authorization")
+    ?.replace(/^Bearer\s+/i, "") ?? null;
+
+  const client = createClient({
+    url: runtimeEnv.PAWABASE_URL,
+    apiKey: runtimeEnv.PAWABASE_PUBLISHABLE_KEY,
+    accessToken,
+    fetch,
+  });
+
+  try {
+    const user = await client.auth.getUser();
+    return Response.json({ user });
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+Use realtime only when the edge platform supports the required outbound WebSocket lifecycle and invocation duration.
+An HTTP publish is often a better fit for a short-lived edge function.
+
+## Node.js WebSocket support
+
+Node.js 22 and newer provides a compatible global WebSocket in supported releases.
+Node.js 20 requires an implementation.
+
+```bash
+npm install ws
+```
+
+```typescript
+import WebSocket from "ws";
+
+const client = createClient({
+  url,
+  apiKey,
+  realtime: {
+    webSocket: WebSocket,
+  },
+});
+```
+
+If the application never opens realtime, no WebSocket adapter is required for ordinary HTTP capability clients.
+
+## React Native
+
+React Native integration needs deliberate persistent storage and URL callback handling.
+Supply a storage object implementing the SDK's three-method interface.
+
+```typescript
+const sessionStorage = {
+  getItem(key: string) {
+    return AsyncStorage.getItem(key);
+  },
+  setItem(key: string, value: string) {
+    return AsyncStorage.setItem(key, value);
+  },
+  removeItem(key: string) {
+    return AsyncStorage.removeItem(key);
+  },
+};
+
+const client = createClient({
+  url,
+  apiKey,
+  auth: {
+    storage: sessionStorage,
+    detectSessionInUrl: false,
+  },
+});
+```
+
+Handle the application deep link explicitly.
+
+```typescript
+async function handleAuthUrl(url: string) {
+  const result = await client.auth.getSessionFromUrl(url);
+
+  if (result.status === "mfa_required") {
+    navigateToMfa(result);
+  }
+}
+```
+
+Verify that the runtime's `fetch`, `Blob`, `FormData`, streams, and WebSocket behavior match the features the application uses.
+
+## In-memory sessions
+
+`MemoryStorage` is exported for explicit non-persistent session ownership.
+
+```typescript
+import {
+  createClient,
+  MemoryStorage,
+} from "@pawabase/client";
+
+const client = createClient({
+  url,
+  apiKey,
+  auth: {
+    storage: new MemoryStorage(),
+    persistSession: true,
+  },
+});
+```
+
+Persistence here lasts only as long as the storage object and process.
+It does not survive a reload or restart.
+This is appropriate for tests and some command-line tools.
+
+## Command-line tools
+
+A short-lived command should create one client, run bounded work, and dispose it.
+
+```typescript
+async function main() {
+  const client = createClient({
+    url: process.env.PAWABASE_URL!,
+    apiKey: process.env.PAWABASE_SECRET_KEY!,
+    retry: { retries: 2 },
+  });
+
+  try {
+    for await (const row of client.from("products")) {
+      await writeRow(row);
+    }
+  } finally {
+    client.dispose();
+  }
+}
+
+await main();
+```
+
+Set `maxRecords` for commands triggered by untrusted or accidental input.
+Call `dispose()` so auth timers and sockets do not keep the process active.
+
+## Testing strategy
+
+Test application behavior at three different boundaries.
+
+| Test level | Transport | Purpose |
+| --- | --- | --- |
+| Unit | Fake `fetch`, fake storage, optional fake socket | Deterministic request and error handling |
+| Integration | Local Pawabase installation | Policies, validation, schema, auth, and feature interaction |
+| Contract | Controlled deployed environment | Runtime/proxy behavior and public deployment configuration |
+
+Unit tests should not attempt to prove that a Pawabase policy is correct.
+Integration tests should not replace fast deterministic checks for application branching.
+
+## A minimal fetch fake
+
+The custom `fetch` option is the narrowest HTTP test seam.
+
+```typescript
+function jsonResponse(body: unknown, init: ResponseInit = {}) {
+  return new Response(JSON.stringify(body), {
+    status: init.status ?? 200,
+    headers: {
+      "content-type": "application/json",
+      ...init.headers,
+    },
+  });
+}
+
+const requests: Array<{
+  url: string;
+  init?: RequestInit;
+}> = [];
+
+const fakeFetch = async (url: string, init?: RequestInit) => {
+  requests.push({ url, init });
+  return jsonResponse({
+    data: [],
+    page: 1,
+    per_page: 20,
+    total: 0,
+  });
+};
+
+const client = createClient({
+  url: "https://api.test",
+  apiKey: "pb_pk_test",
+  fetch: fakeFetch,
+  retry: false,
+});
+```
+
+After the call, assert the public request contract rather than private SDK state.
+
+```typescript
+await client.from("posts").eq("status", "live");
+
+expect(requests).toHaveLength(1);
+expect(requests[0].url).toContain("filter%5Bstatus%5D=eq.live");
+expect(new Headers(requests[0].init?.headers).get("apikey"))
+  .toBe("pb_pk_test");
+```
+
+## Test typed errors
+
+Return the same public error shapes an application can receive.
+
+```typescript
+const fakeFetch = async () => {
+  return jsonResponse(
+    [
+      {
+        loc: ["body", "email"],
+        msg: "must be a valid email",
+        type: "value_error.email",
+      },
+    ],
+    {
+      status: 422,
+      headers: {
+        "x-request-id": "req_test_01",
+      },
+    },
+  );
+};
+```
+
+```typescript
+await expect(client.from("profiles").create(input))
+  .rejects
+  .toMatchObject({
+    name: "ValidationError",
+    requestId: "req_test_01",
+  });
+```
+
+Use `instanceof ValidationError` when the test runner preserves one module instance.
+Use public fields when a runner isolates realms or transforms modules in a way that makes constructor identity unreliable.
+
+## Test retries deterministically
+
+Configure short delays and count calls.
+
+```typescript
+let attempts = 0;
+
+const fakeFetch = async () => {
+  attempts += 1;
+
+  if (attempts === 1) {
+    return jsonResponse("busy", { status: 503 });
+  }
+
+  return jsonResponse({
+    data: [],
+    page: 1,
+    per_page: 20,
+    total: 0,
+  });
+};
+
+const client = createClient({
+  url: "https://api.test",
+  apiKey: "pb_pk_test",
+  fetch: fakeFetch,
+  retry: {
+    retries: 1,
+    baseDelayMs: 1,
+    maxDelayMs: 1,
+  },
+});
+```
+
+Assert that a safe read retries and an unsafe `POST` does not retry unless the application explicitly marked its call idempotent.
+
+## Test cancellation
+
+The fake must observe `init.signal` rather than returning immediately.
+
+```typescript
+const fakeFetch = async (_url: string, init?: RequestInit) => {
+  await new Promise((_resolve, reject) => {
+    init?.signal?.addEventListener(
+      "abort",
+      () => reject(init.signal?.reason),
+      { once: true },
+    );
+  });
+
+  return new Response();
+};
+```
+
+```typescript
+const controller = new AbortController();
+const pending = client.from("posts")
+  .withOptions({ signal: controller.signal })
+  .execute();
+
+controller.abort();
+
+await expect(pending).rejects.toMatchObject({
+  name: "AbortError",
+});
+```
+
+## Test session persistence
+
+Use one `MemoryStorage` instance across two clients to simulate an application restart without involving browser state.
+
+```typescript
+const storage = new MemoryStorage();
+
+const first = createClient({
+  url,
+  apiKey,
+  fetch: fakeFetch,
+  auth: { storage },
+});
+
+await first.auth.signInWithPassword({ email, password });
+first.dispose();
+
+const second = createClient({
+  url,
+  apiKey,
+  fetch: fakeFetch,
+  auth: { storage },
+});
+
+await second.auth.initialized();
+expect(await second.auth.getCachedUser()).not.toBeNull();
+second.dispose();
+```
+
+Use a unique `storageKey` when several clients share the storage instance in one test process.
+
+## Corrupt-session behavior
+
+The auth client discards an unreadable stored session instead of keeping invalid serialized state.
+Test the application response to a signed-out initial session rather than depending on a parser exception.
+
+```typescript
+const brokenStorage = {
+  getItem() {
+    return "not-json";
+  },
+  setItem() {},
+  removeItem() {},
+};
+```
+
+After initialization, `getSession()` should be `null` and the application should render its signed-out path.
+
+## Realtime tests
+
+Realtime unit tests need a fake implementing the public `WebSocketLike` surface:
+
+```typescript
+interface WebSocketLike {
+  readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  onopen: ((event: unknown) => void) | null;
+  onmessage: ((event: { data: unknown }) => void) | null;
+  onclose: ((event: { code: number; reason?: string }) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+}
+```
+
+Test application behavior around public events: subscribed, message, presence, closed, and error.
+Do not assert private reconnect timer fields.
+
+For rule authorization and history retention, use a real local Pawabase environment.
+
+## Cleanup in tests
+
+Every created client should be disposed, even when an assertion fails.
+
+```typescript
+const client = createClient(options);
+
+try {
+  await exercise(client);
+} finally {
+  client.dispose();
+}
+```
+
+Cleanup prevents an auto-refresh timer, storage listener, heartbeat, or reconnect timer from leaking into the next test or keeping the process open.
+
+## Avoid shared mutable fixtures
+
+A suite-wide browser-style client can retain a user, cached channel, or listener across tests.
+Prefer a factory that returns a new client with a unique storage namespace and deterministic adapters.
+
+```typescript
+function testClient(overrides = {}) {
+  return createClient({
+    url: "https://api.test",
+    apiKey: "pb_pk_test",
+    fetch: fakeFetch,
+    retry: false,
+    auth: {
+      storage: new MemoryStorage(),
+      storageKey: crypto.randomUUID(),
+    },
+    ...overrides,
+  });
+}
+```
+
+If a test intentionally verifies persistence, share only the storage object needed for that scenario.
+
+## Local integration tests
+
+A local installation lets tests cover behavior a transport fake cannot establish:
+
+- resource validation compiled from Studio definitions;
+- policy visibility and hidden `404` results;
+- user sign-up and refresh-token rotation;
+- storage bucket limits and policies;
+- function and flow deployment behavior;
+- realtime channel rules, history, and presence;
+- generated type drift against the active environment.
+
+Use a dedicated test environment and data namespace.
+Do not point destructive test cleanup at development or production by relying on a default URL.
+
+## Secrets in test systems
+
+CI can use a scoped secret key for setup and cleanup while test subjects use publishable keys and user sessions.
+
+| Credential | Use in tests |
+| --- | --- |
+| Publishable key | Exercise real application policy behavior |
+| User session | Exercise ownership and role rules |
+| Secret key | Provision and clean fixtures under controlled CI access |
+
+Keep the secret out of snapshots, request dumps, and test failure output.
+Use separate clients so an administrative key cannot accidentally become the subject of a policy test.
+
+## Observability in runtime tests
+
+Hooks can collect request count, retry count, status, duration, and request IDs.
+
+```typescript
+const observations = [];
+
+const client = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onResponse(info) {
+      observations.push(info);
+    },
+  },
+});
+```
+
+Assert outcomes rather than exact durations.
+For an integration failure, include `requestId` in the test output so the corresponding request can be found in **Observability**.
+
+## Direct `HttpClient` use
+
+`HttpClient` is exported for advanced transport composition.
+Most applications should use `PawabaseClient.request()` because it already has a correctly configured key, token provider, retry policy, and hooks.
+
+Constructing `HttpClient` directly requires a complete `HttpConfig`, including a fetch function, headers, timeout, retry configuration, hooks, and optional token provider.
+That surface is appropriate for infrastructure libraries that deliberately own those pieces.
+
+```typescript
+import { HttpClient } from "@pawabase/client";
+
+const http = new HttpClient({
+  baseUrl: url,
+  apiKey,
+  fetch,
+  headers: {},
+  timeoutMs: 30_000,
+  retry: false,
+  hooks: {},
+  tokens: null,
+});
+```
+
+Do not build a second session-refresh system merely because the transport class is exported.
+For normal raw public endpoints, use the root client's `request()` method.
+
+## Low-level request parsing
+
+`HttpClient.request()` supports parse modes for JSON, text, blobs, array buffers, streams, and raw responses.
+The capability clients choose the correct mode for their public methods.
+
+| Parse mode | Result |
+| --- | --- |
+| `json` | Parsed JSON, or `undefined` for `204` |
+| `text` | Response text |
+| `blob` | `Blob` |
+| `arrayBuffer` | `ArrayBuffer` |
+| `stream` | Response body stream |
+| `response` | Raw successful `Response` |
+
+An absolute URL request sends neither API key nor user token.
+The storage client uses this behavior for signed upload URLs.
+Do not use it as a general way to send Pawabase credentials to another origin.
+
+## Runtime readiness checklist
+
+| Concern | Browser | Node/worker | Edge | React Native |
+| --- | --- | --- | --- | --- |
+| `fetch` | Usually global | Global on supported Node | Usually global | Verify runtime |
+| `WebSocket` | Usually global | Node-version dependent | Platform dependent | Verify runtime |
+| Persistent storage | `localStorage` | Custom | Usually external | Supply adapter |
+| Secret key | Never | Controlled deployment only | Controlled secret binding only | Never |
+| User session | Managed client | Request-scoped preferred | Request-scoped | Managed with custom storage |
+| OAuth callback | Browser URL fragment | Framework callback | Framework callback | Deep link |
+| Disposal | App shutdown/hot reload | Request/job/process cleanup | Invocation cleanup | App teardown/tests |
+
+## Common runtime failures
+
+| Symptom | Cause | Correction |
+| --- | --- | --- |
+| User A receives user B's data on SSR | Shared mutable managed session | Use `accessToken` or `asUser()` per request |
+| Node 20 realtime throws configuration error | No WebSocket constructor | Supply a compatible implementation |
+| React Native signs out after restart | No persistent auth storage | Supply async `SessionStorage` |
+| OAuth works in browser but not mobile | Redirect fragment never reaches SDK | Call `getSessionFromUrl()` from deep-link handler |
+| Test process does not exit | Undisposed timer or socket | Dispose every client fixture |
+| Unit test waits through real backoff | Default retry enabled | Disable retry or use a tiny test policy |
+| Edge invocation loses session | Relied on process memory | Supply identity from every request |
+| Policy test unexpectedly succeeds | Fixture used secret key | Exercise with publishable key and intended user |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Client configuration" icon="sliders" href="/clients/typescript/client-configuration">
+    Constructor options, session storage, token providers, hooks, and disposal.
+  </Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/clients/typescript/errors-retries">
+    Deterministic failure handling, retry ownership, deadlines, and cancellation.
+  </Card>
+  <Card title="Generated types" icon="brackets-curly" href="/clients/typescript/generated-types">
+    Keep test and deployment resource contracts aligned.
+  </Card>
+  <Card title="Mobile clients" icon="mobile" href="/clients/mobile">
+    Mobile storage, deep links, network behavior, and application integration.
+  </Card>
+</CardGroup>

@@ -1,423 +1,1715 @@
 ---
 title: "Auth in policies"
-description: "Using `$auth` in policy expressions — the claims, org, operator, user_id, session_id, meta vs app claims, policy examples, and admin override patterns."
+description: "What authentication puts into a policy condition — the real $auth and $credential context, the exact JSON operators, and how roles, permissions, org, aal and meta/app claims behave when a policy is evaluated."
 icon: "code"
 ---
 
-Pawabase uses a policy engine to enforce access control on protected routes and operations. Policies are written in a simple expression language that evaluates the `$auth` object — which contains all the information about the authenticated user. Policies determine whether a request is allowed or denied based on the user's identity, roles, organization, and authentication level.
+Authentication and authorization are two separate stages of every Pawabase request. Authentication decides **who is calling**; a policy decides **what they may do**. This page is about the seam between them: what the first stage hands to the second, and how to write conditions against it.
 
-The `$auth` object is available in every policy expression. It is constructed from the access token claims and provides a structured way to access the user's identity, roles, organization, and metadata within policy expressions.
+<Note>
+Policies are **JSON**, not TOML and not an expression language. A condition is a JSON object with exactly one key. There is no `&&`, no `==`, no `expression = "..."` key, and no permission-checking function inside a condition. If a page tells you otherwise, that page is describing a system that does not exist.
+</Note>
 
 <CardGroup cols={3}>
-  <Card title="`$auth.claims`" icon="key">All token claims including roles, org, aal, user, and app metadata.</Card>
-  <Card title="`$auth.org`" icon="building">Organization context — `id`, `slug`, and `name` for org-scoped policies.</Card>
-  <Card title="`$auth.operator`" icon="server">`true` for service key requests, `false` for user-initiated requests.</Card>
+  <Card title="Conditions are JSON" icon="file-code">`{"all": [{"authenticated": true}, {"eq": [...]}]}`. One operator per object, operands are arrays.</Card>
+  <Card title="$auth is a snapshot" icon="camera">It is built from verified token claims. Nothing is fetched at policy time, so a claim change waits for a refresh.</Card>
+  <Card title="No hidden helpers" icon="ban">No functions, no variables, no `lower()`. When a rule needs code, it is a Python policy.</Card>
 </CardGroup>
 
-## The `$auth` object structure
+## The two stages
 
-The `$auth` object is constructed from the access token claims. Every authenticated request has a `Principal` object that provides access to all claims:
+A request reaches a policy having already passed through a backend. `ProjectUserBackend` verifies the bearer token, and Sillo resolves it into a `Principal` on the request context:
 
 ```python
-class Principal:
-    def __init__(self, token: dict, secret: str):
-        self.claims = token
-        self.org = token.get("org")
-        self.user_id = token.get("sub")
-        self.session_id = token.get("session_id")
-        self.roles = token.get("roles", [])
-        self.claims["roles"] = self.roles
-        self.claims["org"] = self.org
-        self.claims["aal"] = token.get("aal", "aal1")
+async def authenticate(self, ctx) -> AuthResult:
+    token = _bearer(ctx.headers)
+    if not token:
+        return _FAIL
+    try:
+        claims = verify_user_token(
+            token, self.master_secret, project=PLATFORM_PROJECT, env=PLATFORM_ENV
+        )
+    except TokenInvalid:
+        return _FAIL
+    return AuthResult(
+        success=True, identity=encode_identity("user", claims), scope="user"
+    )
 ```
 
-The `$auth` object exposes the following fields:
+`verify_user_token` is strict about the environment:
 
-| Expression | Type | Description |
+```python
+def verify_user_token(token: str, master: str, *, project: str, env: str) -> dict[str, Any]:
+    """Verify a user access token for *project*/*env*. Raises :class:`TokenInvalid`."""
+    claims = _decode(token, derive_env_secret(master, project, env), audience=USER_AUDIENCE)
+    if claims.get("typ") != "access":
+        raise TokenInvalid("not an access token")
+    if claims.get("prj") != project or claims.get("env") != env:
+        raise TokenInvalid("token belongs to another environment")
+    return claims
+```
+
+The claims that come back are packed into a string the framework carries around, and `Principal.load_user` turns them back into an object:
+
+```python
+PRINCIPAL_PREFIX = "pawabase:"
+
+
+def encode_identity(kind: str, claims: dict[str, Any]) -> str:
+    """Pack verified claims into the identity string a backend returns."""
+    return PRINCIPAL_PREFIX + json.dumps({"kind": kind, "claims": claims}, default=str)
+```
+
+```python
+@classmethod
+async def load_user(cls, identity: str) -> Principal | None:
+    if not identity.startswith(PRINCIPAL_PREFIX):
+        return None
+    data = json.loads(identity[len(PRINCIPAL_PREFIX) :])
+    return cls(data["kind"], data["claims"])
+```
+
+The key property, stated in the module's own docstring:
+
+> The claims are already verified, so nothing is fetched.
+
+That single sentence explains every staleness question you will ever have about `$auth`. A policy does not call Akountz, does not read `akz_memberships`, and does not know what happened to a user's role thirty seconds ago. It knows what the token said when the token was minted.
+
+### The three kinds of principal
+
+`kind` is set by whichever backend authenticated the request:
+
+| `kind` | Set by | What it means |
 | --- | --- | --- |
-| `$auth.claims` | object | All token claims. Contains `roles`, `org`, `aal`, `user`, `app`, `sub`, `session_id`, etc. |
-| `$auth.org` | object or null | The organization context. `null` if the session is not organization-scoped. |
-| `$auth.org_role` | string or null | The user's role within the organization. `null` if not scoped to an org. |
-| `$auth.user_id` | string | The user's unique ID (`sub` claim). |
-| `$auth.session_id` | string | The session UUID. |
-| `$auth.operator` | boolean | `true` if the request came from a service key, `false` otherwise. |
-| `$auth.claims.roles` | array of strings | The role names assigned to the user. |
-| `$auth.claims.aal` | string | The Authenticator Assurance Level. |
-| `$auth.claims.user` | object | The `user_metadata` object. **Not safe for policies.** |
-| `$auth.claims.app` | object | The `app_metadata` object. **Safe for policies.** |
+| `user` | `ProjectUserBackend` | One of your application's end users, in this environment |
+| `operator` | `OperatorBackend`, or `ServiceBackend` with a `sub` | A Studio operator acting through the console |
+| `service` | `ServiceBackend` without a `sub` | Another Pawabase service, or your server holding the secret key |
 
-### `$auth.org` structure
+`ServiceBackend` decides between the last two on one field:
 
-When the session is organization-scoped, `$auth.org` is an object:
+```python
+claims = verify_service_token(token, self.secret, audience=self.audience)
+kind = "operator" if claims.get("sub") else "service"
+if kind == "service":
+    claims.setdefault("roles", ["admin"])
+return AuthResult(success=True, identity=encode_identity(kind, claims), scope=kind)
+```
 
-```json
-{
-    "id": "uuid-here",
-    "slug": "acme-hq",
-    "name": "Acme Corporation"
+Note the `setdefault`. A service principal is given `roles: ["admin"]` automatically, and the principal's Python-side permission check has a matching special case: for a `service` or `operator` principal that holds the `admin` role, it returns `True` for any permission without consulting the `perms` list at all. For every other principal it falls through to `permission in perms or "*" in perms`.
+
+<Warning>
+`has_permission` is a **Python convenience on the principal object**. It is not a policy operator. There is no `{"has_permission": "..."}` condition and no `permission()` function in the JSON language. The JSON equivalent is the `permission` shorthand, documented below.
+</Warning>
+
+## The evaluation context
+
+`build_policy_context` assembles everything a condition can read. Seven keys, no more:
+
+```python
+def build_policy_context(
+    ctx: Any,
+    *,
+    record: Mapping[str, Any] | None = None,
+    input: Any = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the full evaluation context for a request."""
+    platform = current_context(ctx)
+    context: dict[str, Any] = {
+        "auth": policy_auth(_safe_user(ctx)),
+        "credential": credential_context(ctx),
+        "request": request_context(ctx),
+        "project": platform.project if platform else None,
+        "env": platform.env if platform else None,
+        "record": dict(record) if record is not None else None,
+        "input": input,
+    }
+    if extra:
+        context.update(extra)
+    return context
+```
+
+| Path | Contents |
+| --- | --- |
+| `$auth` | Who is calling — see below |
+| `$credential` | The API key's role, scopes, and whether it is a service |
+| `$request` | `method`, `path`, `ip`, `params`, `query` |
+| `$project` | The project slug |
+| `$env` | The environment name |
+| `$record` | The row being read or written, on a single-record operation |
+| `$input` | The submitted body or arguments |
+
+### `$auth`
+
+From `Principal.as_policy_context`:
+
+```python
+def as_policy_context(self) -> dict[str, Any]:
+    """What policies see under ``auth``."""
+    return {
+        "authenticated": True,
+        "kind": self.kind,
+        "user_id": self.identity,
+        "email": self.email,
+        "roles": self.roles,
+        "permissions": self.permissions,
+        "org": self.org,
+        "org_role": self.claims.get("org_role"),
+        "aal": self.claims.get("aal"),
+        "session_id": self.claims.get("sid"),
+        "claims": self.claims,
+    }
+```
+
+| Path | Type | Source |
+| --- | --- | --- |
+| `$auth.authenticated` | boolean | Always `true` for a `Principal` |
+| `$auth.kind` | string | `user`, `operator` or `service` |
+| `$auth.user_id` | string | The `sub` claim — a ULID |
+| `$auth.email` | string or null | The `email` claim |
+| `$auth.roles` | array of strings | The `roles` claim, environment-scoped, prefix-stripped |
+| `$auth.permissions` | array of strings | The `perms` claim, direct plus via groups |
+| `$auth.org` | string or null | The organization **slug** — not an object |
+| `$auth.org_role` | string or null | `owner`, `admin`, `member`, `viewer`, or null |
+| `$auth.aal` | string | `aal1`, or `aal2` after MFA |
+| `$auth.session_id` | string | The `sid` claim — the token family |
+| `$auth.claims` | object | The entire verified claim set |
+
+<Warning>
+`$auth.org` is a **slug string**. There is no `$auth.org.slug`, no `$auth.org.name`, no `$auth.org.id`. A condition written as `{"eq": ["$auth.org.slug", "acme-hq"]}` resolves the left operand to `None` and refuses. Compare the slug directly: `{"eq": ["$auth.org", "acme-hq"]}`.
+</Warning>
+
+### The anonymous context
+
+When nothing authenticated the request, `policy_auth` substitutes a fixed dictionary rather than `None`:
+
+```python
+ANONYMOUS_POLICY_CONTEXT: dict[str, Any] = {
+    "authenticated": False,
+    "kind": "anonymous",
+    "user_id": None,
+    "email": None,
+    "roles": [],
+    "permissions": [],
+    "org": None,
+    "org_role": None,
+    "aal": None,
+    "session_id": None,
+    "claims": {},
+}
+
+
+def policy_auth(user: Any) -> dict[str, Any]:
+    """The ``auth`` policy context for whatever is on ``ctx.user``."""
+    if isinstance(user, Principal):
+        return user.as_policy_context()
+    return dict(ANONYMOUS_POLICY_CONTEXT)
+```
+
+This is why `{"authenticated": true}` is a meaningful, necessary condition: every field exists on every request, so a policy never crashes on a missing key. `dict(...)` is a shallow copy, so a caller mutating the result cannot corrupt the module-level default.
+
+### `$credential`
+
+```python
+def credential_context(ctx: Any) -> dict[str, Any]:
+    """What policies see under ``credential``: the API key's role and scopes."""
+    platform = current_context(ctx)
+    user = _safe_user(ctx)
+    kind = getattr(user, "kind", None)
+    if platform is None:
+        return {
+            "role": kind or "none",
+            "is_service": kind in ("service", "operator"),
+            "scopes": [],
+            "key_id": None,
+        }
+    return {
+        "role": platform.role,
+        "is_service": platform.is_service or kind in ("service", "operator"),
+        "scopes": list(platform.scopes),
+        "key_id": platform.key_id,
+    }
+```
+
+| Path | Type | Meaning |
+| --- | --- | --- |
+| `$credential.role` | string | `anon`, `service` or `operator` |
+| `$credential.is_service` | boolean | Whether this credential bypasses policies |
+| `$credential.scopes` | array of strings | Scopes the API key grants |
+| `$credential.key_id` | string or null | Which key was presented |
+
+Note that `is_service` is true for **operators** as well as services, and that the `PlatformContext` role and the principal `kind` are OR'd together. A request is "service" if either layer says so.
+
+When the gateway resolved the key, its role comes from `PlatformContext`:
+
+```python
+@property
+def is_service(self) -> bool:
+    """Whether this credential bypasses policies."""
+    return self.role in ("service", "operator")
+```
+
+### `$request`
+
+```python
+def request_context(ctx: Any) -> dict[str, Any]:
+    """What policies see under ``request``."""
+    client = getattr(ctx, "client", None)
+    return {
+        "method": ctx.scope.get("method"),
+        "path": ctx.scope.get("path"),
+        "ip": getattr(client, "host", None) if client else None,
+        "params": dict(ctx.path_params) if hasattr(ctx, "path_params") else {},
+        "query": dict(ctx.query_params) if hasattr(ctx, "query_params") else {},
+    }
+```
+
+| Path | Meaning |
+| --- | --- |
+| `$request.method` | `GET`, `POST`, … |
+| `$request.path` | The request path |
+| `$request.ip` | The client address, if known |
+| `$request.params` | Path parameters, as a mapping |
+| `$request.query` | Query parameters, as a mapping |
+
+`$request.ip` is the transport-level address. It is not the `x-forwarded-for` value Akountz records in `akz_login_events`, which prefers the forwarded header:
+
+```python
+def client_info(ctx: Any) -> tuple[str | None, str | None]:
+    forwarded = ctx.headers.get("x-forwarded-for")
+    ip = forwarded.split(",")[0].strip() if forwarded else (ctx.client.host if ctx.client else None)
+    return ip, (ctx.headers.get("user-agent") or "")[:500]
+```
+
+If you are restricting by IP in a policy, remember that behind the gateway this is the gateway's address unless the client connects directly. Prefer an explicit claim or a rate limit over an IP condition.
+
+## The condition language
+
+A condition is one of three things:
+
+- a boolean — `true` or `false`, taken literally;
+- a **mapping with exactly one key** — the operator and its argument;
+- anything else — rejected at validation time.
+
+```python
+Condition = Any  # bool | dict
+```
+
+That "exactly one key" rule is enforced up front, before a condition is ever stored:
+
+```python
+def validate_condition(condition: Condition, *, path: str = "condition") -> None:
+    """Refuse a malformed condition before it is stored.
+
+    Raises:
+        PolicyError: Naming where the condition is wrong.
+    """
+    if isinstance(condition, bool):
+        return
+    if not isinstance(condition, Mapping) or len(condition) != 1:
+        raise PolicyError(f"{path}: a condition is true, false, or an object with one key")
+    ((op, arg),) = condition.items()
+    if op in ("all", "any"):
+        if not isinstance(arg, list):
+            raise PolicyError(f"{path}.{op}: expected a list of conditions")
+        for index, child in enumerate(arg):
+            validate_condition(child, path=f"{path}.{op}[{index}]")
+    elif op == "not":
+        validate_condition(arg, path=f"{path}.not")
+    elif op in BINARY_OPS:
+        if not isinstance(arg, list) or len(arg) != 2:
+            raise PolicyError(f"{path}.{op}: expected [left, right]")
+        if op == "matches" and isinstance(arg[1], str) and not arg[1].startswith("$"):
+            try:
+                re.compile(arg[1])
+            except re.error as exc:
+                raise PolicyError(f"{path}.matches: invalid pattern: {exc}") from exc
+    elif op in UNARY or op in SHORTHANDS:
+        return
+    else:
+        raise PolicyError(f"{path}: unknown operator {op!r}")
+```
+
+Note that a *literal* `true` or `false` is a whole condition. `true` is how you write an unconditional allow; `false` is how you write an unconditional deny.
+
+### Operands: paths and literals
+
+```python
+def resolve(operand: Any, context: Mapping[str, Any]) -> Any:
+    """The value of an operand: a ``$path`` lookup, or the literal itself."""
+    if isinstance(operand, str) and operand.startswith("$"):
+        if operand.startswith("$$"):
+            return operand[1:]
+        return lookup(context, operand[1:])
+    return operand
+```
+
+- A string starting with a single `$` is a **path** into the context.
+- Anything else — numbers, booleans, lists, objects — is a **literal**.
+- `$$` escapes a literal dollar, so `"$$secret"` is the string `$secret`, not a lookup.
+
+Path lookup walks nested mappings, lists and objects:
+
+```python
+def lookup(context: Mapping[str, Any], path: str, default: Any = None) -> Any:
+    """Read ``a.b.0.c`` out of nested mappings, lists and objects."""
+    if path == "now":
+        return datetime.now(UTC)
+    current: Any = context
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, Mapping):
+            current = current.get(part, _MISSING)
+        elif isinstance(current, (list, tuple)) and part.isdigit():
+            index = int(part)
+            current = current[index] if index < len(current) else _MISSING
+        else:
+            current = getattr(current, part, _MISSING)
+        if current is _MISSING:
+            return default
+    return current
+```
+
+Three properties worth memorising:
+
+1. **A missing path is `None`, never an error.** Any policy referencing a field that does not exist evaluates that field as `null`. Nothing throws.
+2. **Numeric segments index into lists.** `$auth.claims.some_list.0` works; `.5` on a two-element list returns `None`.
+3. **`now` is a magic path** returning the current UTC `datetime`, useful with `gt`/`lt` for time-window rules.
+
+### The binary operators
+
+These are the exact names. There are no others:
+
+```python
+BINARY_OPS = {
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "in",
+    "not_in",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "matches",
 }
 ```
 
-When the session is not organization-scoped, `$auth.org` is `null`. Policies that reference `$auth.org` must handle the `null` case:
-
-```toml
-# Policy example: only allow if the user is in an organization
-expression = "$auth.org != null && $auth.org.slug == 'acme-hq'"
-```
-
-### `$auth.operator` flag
-
-The `operator` flag indicates whether the request was authenticated using a service key:
-
-- **`$auth.operator == false`**: The request was authenticated by a user (password, magic link, social login, or refresh). The user's identity, roles, and organization are available.
-- **`$auth.operator == true`**: The request was authenticated by a service key. The service key's claims are available, but user-specific fields like `roles`, `org`, and `org_role` may be empty or set by the service key configuration.
-
-The `operator` flag is critical for distinguishing between user-initiated requests and service-initiated requests. Backend services, cron jobs, and server-to-server communication use service keys, while frontend applications use user authentication.
-
-<Warning>
-Never trust `$auth.operator` alone for access control. A service key may have broad permissions, but the policy should still verify that the specific operation is allowed. Always combine `$auth.operator` checks with other policy conditions.
-</Warning>
-
-## Meta vs app claims
-
-The distinction between `meta` (user_metadata) and `app` (app_metadata) is critical for policy design:
-
-### `user` (meta) claims
-
-The `user` claim contains `user_metadata` — data that the user themselves can modify:
-
-- **Profile information**: Name, avatar, preferences.
-- **Custom fields**: Any user-editable data.
-- **Public information**: Data that should not gate access.
-
-Because users can modify `user_metadata` themselves, **it must never be used for access decisions**. A malicious user could simply change their own metadata to gain access to protected resources.
-
-### `app` claims
-
-The `app` claim contains `app_metadata` — data that only administrators or service keys can modify:
-
-- **Role assignments**: Tiers, plans, access levels.
-- **Permissions**: Feature flags, access controls.
-- **Administrative data**: Internal metadata that should not be user-editable.
-
-Because only administrators can modify `app_metadata`, **it is safe to use for access decisions**. Users cannot change their own `app_metadata` to gain unauthorized access.
-
-### Policy examples using meta vs app
-
-```toml
-# ❌ BAD — user can modify this themselves
-expression = "$auth.claims.user.tier == 'premium'"
-
-# ✅ GOOD — only admins can modify this
-expression = "$auth.claims.app.tier == 'premium'"
-```
-
-```toml
-# ❌ BAD — user could change their own role
-expression = "$auth.claims.user.role == 'admin'"
-
-# ✅ GOOD — only admins can assign roles
-expression = "$auth.claims.app.role == 'admin'"
-```
-
-```toml
-# ✅ Correctly checking both meta and app
-expression = "$auth.claims.app.verified == true && $auth.claims.user.status == 'active'"
-```
-
-## Policy expression language
-
-Policy expressions are written in a simple expression language that evaluates to a boolean. The expression can reference any field of the `$auth` object using dot notation.
-
-### Basic operators
-
-| Operator | Description | Example |
+| Operator | Argument | Behaviour |
 | --- | --- | --- |
-| `==` | Equal to | `$auth.claims.app.tier == 'premium'` |
-| `!=` | Not equal to | `$auth.claims.aal == 'aal2'` |
-| `&&` | Logical AND | `$auth.claims.app.tier == 'premium' && $auth.claims.aal == 'aal2'` |
-| `||` | Logical OR | `$auth.claims.roles contains 'admin' || $auth.claims.app.bypass == true` |
-| `!` | Logical NOT | `$auth.claims.app.disabled != true` |
-| `contains` | Array membership | `$auth.claims.roles contains 'editor'` |
-| `in` | List membership | `$auth.claims.app.tier in ['free', 'premium']` |
+| `eq` | `[left, right]` | Equal after normalisation |
+| `ne` | `[left, right]` | Not equal |
+| `gt` | `[left, right]` | `left > right`; false if either side is `None` |
+| `gte` | `[left, right]` | `left >= right`; false if either side is `None` |
+| `lt` | `[left, right]` | `left < right`; false if either side is `None` |
+| `lte` | `[left, right]` | `left <= right`; false if either side is `None` |
+| `in` | `[left, right]` | `left` is a member of the list `right` |
+| `not_in` | `[left, right]` | Not a member; true when `right` is `None` |
+| `contains` | `[left, right]` | Member if `left` is a collection; substring if `left` is a string |
+| `starts_with` | `[left, right]` | String prefix |
+| `ends_with` | `[left, right]` | String suffix |
+| `matches` | `[left, right]` | `re.search(pattern, text)` |
 
-### String comparison
+The comparison itself:
 
-String comparisons are case-sensitive. If you need case-insensitive comparison, use the `lower()` function:
-
-```toml
-expression = "lower($auth.claims.user.department) == 'engineering'"
+```python
+def _compare(op: str, left: Any, right: Any) -> bool:
+    try:
+        if op == "eq":
+            return _norm(left) == _norm(right)
+        if op == "ne":
+            return _norm(left) != _norm(right)
+        if op == "gt":
+            return left is not None and right is not None and left > right
+        ...
+        if op == "in":
+            return right is not None and _norm(left) in [_norm(v) for v in right]
+        if op == "not_in":
+            return right is None or _norm(left) not in [_norm(v) for v in right]
+        if op == "contains":
+            return (
+                left is not None and _norm(right) in [_norm(v) for v in left]
+                if isinstance(left, (list, tuple, set))
+                else (left is not None and str(right) in str(left))
+            )
+        ...
+    except TypeError:
+        return False
+    raise PolicyError(f"unknown operator {op!r}")
 ```
 
-### Array operations
-
-Array operations allow checking whether a value exists in an array:
-
-```toml
-# Check if the user has a specific role
-expression = "$auth.claims.roles contains 'admin'"
-
-# Check if the user's tier is in a list of allowed tiers
-expression = "$auth.claims.app.tier in ['free', 'premium', 'enterprise']"
-```
-
-### Complex expressions
-
-Complex expressions combine multiple conditions:
-
-```toml
-# Premium user in the acme-hq organization with at least aal2
-expression = "$auth.claims.app.tier == 'premium' && $auth.org.slug == 'acme-hq' && $auth.claims.aal == 'aal2'"
-
-# Admin or user with verified email and active status
-expression = "$auth.claims.roles contains 'admin' || ($auth.claims.app.email_verified == true && $auth.claims.app.active == true)"
-```
-
-## Role-based policy examples
-
-### Simple role check
-
-```toml
-# Only users with the 'admin' role can access this route
-[policy]
-expression = "$auth.claims.roles contains 'admin'"
-```
-
-### Multiple roles
-
-```toml
-# Users with 'admin' or 'editor' role can access
-[policy]
-expression = "$auth.claims.roles contains 'admin' || $auth.claims.roles contains 'editor'"
-```
-
-### Role check with organization
-
-```toml
-# Admin in the acme-hq organization
-[policy]
-expression = "$auth.org.slug == 'acme-hq' && $auth.org_role == 'admin'"
-```
-
-### Role hierarchy (none — flat)
-
-Pawabase does not have a built-in role hierarchy. Roles are flat — there is no inheritance between roles. If you need a role hierarchy, implement it in the policy expression:
-
-```toml
-# Manual role hierarchy: admin > editor > member
-expression = "$auth.claims.roles contains 'admin' || ($auth.claims.roles contains 'editor' && $auth.claims.app.access_level >= 2)"
-```
-
-<Warning>
-Pawabase roles are flat. There is no implicit inheritance between roles. If you need a hierarchy (e.g., admin > editor > member), you must implement it yourself in the policy expression or through `app_metadata`.
-</Warning>
-
-## Organization-based policy examples
-
-### Organization scope
-
-```toml
-# Only users in the acme-hq organization
-[policy]
-expression = "$auth.org != null && $auth.org.slug == 'acme-hq'"
-```
-
-### Organization and role
-
-```toml
-# Users who are admins in their organization
-[policy]
-expression = "$auth.org_role == 'admin'"
-```
-
-### Multiple organizations
-
-```toml
-# Users in either acme-hq or globex-inc
-[policy]
-expression = "$auth.org.slug == 'acme-hq' || $auth.org.slug == 'globex-inc'"
-```
-
-### Organization-level `min_aal`
-
-```toml
-# Only aal2 sessions in the acme-hq organization
-[policy]
-expression = "$auth.org.slug == 'acme-hq' && $auth.claims.aal == 'aal2'"
-```
-
-## Combined role and organization policies
-
-The most common use case is combining role-based and organization-based policies:
-
-```toml
-# Admins can access everything, editors can access the acme-hq org
-[policy]
-expression = "$auth.claims.roles contains 'admin' || ($auth.org.slug == 'acme-hq' && $auth.claims.roles contains 'editor')"
-```
-
-```toml
-# Users in acme-hq with at least aal2 can access premium features
-[policy]
-expression = "$auth.org.slug == 'acme-hq' && $auth.claims.aal == 'aal2' && $auth.claims.app.premium == true"
-```
-
-```toml
-# Only org admins can manage members, and only in their own org
-[policy]
-expression = "$auth.org_role == 'admin' && $auth.claims.app.action == 'manage_members'"
-```
-
-## The `require_aal` directive
-
-The `require_aal` directive is a special policy configuration that enforces a minimum Authenticator Assurance Level:
-
-```toml
-[auth]
-require_aal = "aal2"
-```
-
-When `require_aal` is set, every request is checked against the minimum AAL. If the session's AAL is below the minimum, the request is denied with `403 aal2 authentication required`.
-
-### Environment-level `require_aal`
-
-Set at the environment level:
-
-```toml
-[auth]
-require_aal = "aal2"
-```
-
-This applies to all requests in this environment. All sessions must have at least `aal2` to access any protected resource.
-
-### Organization-level `require_aal`
-
-Set at the organization level:
-
-```toml
-[org.acme-hq.auth]
-require_aal = "aal2"
-```
-
-This applies only to members of the `acme-hq` organization. Members of other organizations are not affected.
-
-### `require_aal` vs policy expressions
-
-`require_aal` is a hard requirement — it is enforced before the policy expression is evaluated. The policy expression is evaluated only if the `require_aal` check passes. This means:
-
-1. If `require_aal = "aal2"`, all sessions must have `aal2` or higher.
-2. The policy expression can still further restrict access (e.g., only admins can access a specific route).
-3. `require_aal` is not a substitute for policy expressions — it is an additional enforcement layer.
-
-## The `has_permission` function
-
-The `has_permission` function checks whether the user has a specific permission:
-
-```toml
-expression = "has_permission($auth, 'user:delete')"
-```
-
-The `has_permission` function checks the user's roles and permissions against a permission string. It returns `true` if the user has the permission, `false` otherwise.
-
-The function uses the `Role.permissions` array and the `RoleAssignment` records to determine whether the user has the specified permission. See [Roles and permissions →](/auth/roles-and-permissions) for the complete reference.
-
-### Performance considerations
-
-The `has_permission` function performs database lookups to resolve the user's permissions. For performance-critical endpoints, consider caching the permission result or using role-based checks instead of permission-based checks:
-
-```toml
-# ✅ Fast — simple role check
-expression = "$auth.claims.roles contains 'admin'"
-
-# ⚠️ Slower — permission check with database lookups
-expression = "has_permission($auth, 'user:delete')"
-```
-
-For high-traffic endpoints, prefer role-based checks (`$auth.claims.roles contains ...`) over permission-based checks (`has_permission(...)`).
-
-## Admin override of policy decisions
-
-Administrators can override policy decisions through the `force` flag:
-
-### The `force` flag
-
-The `force` flag bypasses policy evaluation for a specific request. When `force = true`, the request is allowed regardless of the policy expression:
-
-```toml
-[auth]
-force = true  # All requests bypass policy evaluation
-```
-
-The `force` flag is intended for administrative operations and should be used sparingly:
-
-1. **Emergency access**: When a policy is incorrectly denying access to a legitimate user.
-2. **Administrative operations**: When an administrator needs to perform an operation that would normally be denied by policy.
-3. **Testing**: During policy testing, to verify that the request would be allowed without policy enforcement.
-
-<Warning>
-The `force` flag bypasses ALL policy evaluation. Never use `force = true` in production for regular user requests. It should only be used by administrators for specific operations. All `force` overrides are logged in the audit trail.
-</Warning>
-
-### Audit logging for overrides
-
-Every policy override is logged:
-
-```json
-{
-    "event": "policy.override",
-    "user_id": "uuid-here",
-    "session_id": "uuid-here",
-    "resource": "/projects/my-project/envs/prod/users/{user_id}",
-    "policy_expression": "$auth.claims.roles contains 'admin'",
-    "force": true,
-    "operator": true,
-    "timestamp": "2025-09-28T10:00:00Z",
-    "reason": "emergency_access"
-}
-```
-
-Audit logs include the policy expression, whether `force` was used, the operator status, the timestamp, and the reason for the override. This provides a complete audit trail of all policy decisions and overrides.
-
-## Policy evaluation order
-
-Policies are evaluated in a specific order:
-
-1. **`require_aal` check**: If `require_aal` is configured, the AAL is checked first. If the AAL is below the minimum, the request is denied immediately.
-2. **`force` check**: If `force` is `true`, the policy expression is bypassed and the request is allowed.
-3. **Policy expression evaluation**: The policy expression is evaluated against the `$auth` object.
-4. **`has_permission` check**: If the policy expression passes, the `has_permission` function is evaluated (if referenced).
-5. **Decision**: The final decision is `allow` if all checks pass, or `deny` if any check fails.
-
-The evaluation order ensures that hard requirements (`require_aal`) are checked before soft requirements (policy expressions), and that `force` overrides are the last resort.
-
-## Common mistakes
+Five behaviours in that implementation are worth calling out, because each one has a policy implication.
 
 <AccordionGroup>
-  <Accordion title="Using `user` claims for access decisions">
-    Never gate access on `$auth.claims.user` fields — users can modify their own `user_metadata`. Use `$auth.claims.app` instead, which only administrators can modify.
+  <Accordion title="Ids are normalised before comparison">
+    `eq` and `ne` run both sides through `_norm`, which stringifies integers:
+
+    ```python
+    def _norm(value: Any) -> Any:
+        # Ids arrive as ints from the database and as strings from tokens; a policy
+        # comparing them must not depend on which side happened to be which.
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int):
+            return str(value)
+        return value
+    ```
+
+    So `{"eq": ["$record.id", "$auth.user_id"]}` works whether the record's id came back as an integer or a string. Booleans and `None` are passed through untouched, so `True` never equals `1`.
   </Accordion>
-  <Accordion title="Not handling `$auth.org == null`">
-    Policies that reference `$auth.org` must handle the `null` case. A missing `org` will throw an error when accessing `$auth.org.slug`. Always check `$auth.org != null` first.
+  <Accordion title="Ordering operators refuse on `None`">
+    `gt`, `gte`, `lt` and `lte` are all `left is not None and right is not None and …`. A missing field makes them **false**, not an error. This is what makes `{"lt": ["$auth.claims.exp", "now"]}` safe to write even though the engine has no guarantee `exp` exists.
   </Accordion>
-  <Accordion title="Confusing `$auth.operator` with `force`">
-    `$auth.operator` indicates whether a service key was used. `force` bypasses policy evaluation. They are unrelated — a service key request still goes through policy evaluation unless `force` is set.
+  <Accordion title="`not_in` is true when the list is `None`">
+    `return right is None or _norm(left) not in […]`. An absent list permits everything. If you are writing a *restriction*, prefer `in` or `eq`; if you are writing a *denylist*, `not_in` failing open on a missing list may not be what you want.
   </Accordion>
-  <Accordion title="Using `force` for regular requests">
-    The `force` flag is for emergency administrative overrides only. Using it for regular requests bypasses all policy enforcement and creates a security vulnerability.
+  <Accordion title="`contains` is polymorphic">
+    On a list it tests membership; on anything else it is a substring test, because the expression falls through to `str(right) in str(left)`. So `{"contains": ["$auth.roles", "admin"]}` tests list membership, while `{"contains": ["$auth.email", "@partner.com"]}` tests a suffix. Convenient, and easy to apply to the wrong operand by accident.
   </Accordion>
-  <Accordion title="Ignoring `require_aal` in policy design">
-    `require_aal` is checked before policy expressions. If `require_aal = "aal2"` and a user has `aal1`, the policy expression is never evaluated. Always design policies with `require_aal` in mind.
+  <Accordion title="`TypeError` becomes `False`, not a 500">
+    The whole comparison is wrapped in `try: … except TypeError: return False`. Comparing a string to a number with `gt` refuses quietly instead of raising. A policy that is accidentally un-comparable fails closed.
   </Accordion>
-  <Accordion title="Not logging policy overrides">
-    All `force` overrides should be logged for audit purposes. If you're not logging overrides, you can't track when and why policies were bypassed.
+</AccordionGroup>
+
+```json
+{ "contains": ["$auth.roles", "admin"] }
+{ "eq": ["$auth.org", "acme-hq"] }
+{ "in": ["$auth.org_role", ["owner", "admin"]] }
+{ "not_in": ["$auth.org", [null, ""]] }
+{ "starts_with": ["$auth.email", "ops@"] }
+{ "ends_with": ["$auth.email", "@acme.example"] }
+{ "matches": ["$auth.email", "^[a-z]+@.*\\.example$"] }
+{ "gt": ["$record.updated_at", "$input.since"] }
+```
+
+<Warning>
+`matches` compiles the pattern **at validation time** when the right operand is a literal string, so a malformed regex is rejected when you save the policy rather than at request time. If the right operand starts with `$`, it is resolved at evaluation time and no such check happens — which means a regex coming from `$auth.claims.…` is unvalidated.
+</Warning>
+
+### The unary operators
+
+```python
+UNARY = {"exists", "truthy", "empty"}
+```
+
+| Operator | Argument | True when |
+| --- | --- | --- |
+| `exists` | one operand | The resolved value is not `None` |
+| `truthy` | one operand | The resolved value is truthy in Python terms |
+| `empty` | one operand | The resolved value is falsy |
+
+```python
+if op == "exists":
+    return resolve(arg, context) is not None
+if op == "truthy":
+    return bool(resolve(arg, context))
+if op == "empty":
+    return not resolve(arg, context)
+```
+
+The distinction between `exists` and `truthy` matters for values that exist but are falsy. `{"exists": "$record.published_at"}` is true for a timestamp of `0` or an empty string; `{"truthy": "$record.published_at"}` would be false for the empty string. For "is this field set at all", use `exists`.
+
+### The combinators
+
+```python
+COMBINATORS = {"all", "any", "not"}
+```
+
+| Operator | Argument | Meaning |
+| --- | --- | --- |
+| `all` | list of conditions | Every one must hold |
+| `any` | list of conditions | At least one must hold |
+| `not` | one condition | Inverts it |
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    {
+      "any": [
+        { "role": "editor" },
+        { "role": "admin" },
+        { "owner": "owner_id" }
+      ]
+    }
+  ]
+}
+```
+
+There is no `all` of zero semantics to worry about: `all([])` is `True` and `any([])` is `False`, following Python. The validator accepts an empty list, so be deliberate about it.
+
+## The shorthands
+
+These are the eight names you will use most, because they are the readable spelling of the `$auth` and `$credential` paths:
+
+```python
+SHORTHANDS = {"authenticated", "role", "permission", "owner", "service", "kind", "scope", "aal"}
+```
+
+A shorthand is not a primitive. Each one **expands** into a condition and is then evaluated as that condition:
+
+```python
+def _shorthand(op: str, arg: Any, context: Mapping[str, Any]) -> Condition:
+    """Expand a shorthand into the condition it stands for."""
+    if op == "authenticated":
+        return {"eq": ["$auth.authenticated", bool(arg)]}
+    if op == "role":
+        roles = arg if isinstance(arg, list) else [arg]
+        return {"any": [{"contains": ["$auth.roles", role]} for role in roles]}
+    if op == "permission":
+        perms = arg if isinstance(arg, list) else [arg]
+        return {
+            "all": [
+                {
+                    "any": [
+                        {"contains": ["$auth.permissions", p]},
+                        {"contains": ["$auth.permissions", "*"]},
+                    ]
+                }
+                for p in perms
+            ]
+        }
+    if op == "owner":
+        column = arg if isinstance(arg, str) else "owner_id"
+        return {"all": [{"authenticated": True}, {"eq": [f"$record.{column}", "$auth.user_id"]}]}
+    if op == "service":
+        return {"eq": ["$credential.is_service", bool(arg)]}
+    if op == "kind":
+        return {"eq": ["$auth.kind", arg]}
+    if op == "scope":
+        return {"contains": ["$credential.scopes", arg]}
+    if op == "aal":
+        return {"eq": ["$auth.aal", arg]}
+    raise PolicyError(f"unknown shorthand {op!r}")
+```
+
+The expansions are worth reading carefully, because each one bakes in a decision.
+
+### `authenticated`
+
+```json
+{ "authenticated": true }
+```
+
+Expands to `{"eq": ["$auth.authenticated", true]}`. The argument is coerced with `bool(arg)`, so `{"authenticated": 1}` behaves as `true` — but write `true` or `false`, not a truthy value.
+
+### `role`
+
+```json
+{ "role": "admin" }
+{ "role": ["editor", "admin"] }
+```
+
+Expands to an `any` of `contains` over `$auth.roles`. The list form is exactly equivalent to writing the `any` yourself, which is the preferred idiom when combining with other conditions:
+
+```json
+{ "all": [
+  { "authenticated": true },
+  { "any": [
+    { "contains": ["$auth.roles", "editor"] },
+    { "contains": ["$auth.roles", "admin"] }
+  ]}
+]}
+```
+
+<Warning>
+`$auth.roles` is the **environment-wide RBAC** roles list — the names you defined in Studio's Roles tab — *not* the organization role. Organization roles live in `$auth.org_role` and have exactly four values. Mixing the two is the most common conceptual error on this page.
+</Warning>
+
+### `permission`
+
+```json
+{ "permission": "posts.write" }
+{ "permission": ["posts.write", "posts.publish"] }
+```
+
+Expands to an `all` of `any`s, and **each** permission independently accepts either the literal permission or the wildcard `"*"`:
+
+```json
+{ "permission": "posts.write" }
+// becomes
+{ "all": [{ "any": [
+  { "contains": ["$auth.permissions", "posts.write"] },
+  { "contains": ["$auth.permissions", "*"] }
+]}]}
+```
+
+So `{"permission": "anything"}` is satisfied by a principal whose `perms` list contains `"*"`. That is the same rule the principal's Python-side permission check applies, including the `"*"` wildcard.
+
+<Info>
+A service or operator principal is given `roles: ["admin"]` by `ServiceBackend`, so `has_permission` short-circuits to `True` for them. The JSON `permission` shorthand has no equivalent short-circuit — but it does not need one, because service credentials never reach the engine at all. `PolicyEngine.check` returns allowed before resolving the policy.
+</Info>
+
+### `owner`
+
+```json
+{ "owner": true }
+{ "owner": "author_id" }
+```
+
+With no argument, or any non-string, the column defaults to `owner_id`:
+
+```json
+{ "owner": true }
+// becomes
+{ "all": [{ "authenticated": true }, { "eq": ["$record.owner_id", "$auth.user_id"] }]}
+```
+
+The string form names a different column, which is how you express "the user who wrote this" on a resource that calls it `author_id`:
+
+```json
+{ "owner": "author_id" }
+// becomes
+{ "all": [{ "authenticated": true }, { "eq": ["$record.author_id", "$auth.user_id"] }]}
+```
+
+<Note>
+`owner` expands into a combinator containing a binary operator, so it participates in SQL pushdown. `{"eq": ["$record.owner_id", "$auth.user_id"]}` resolves `$auth.user_id` at plan time and becomes a `WHERE owner_id = ?` filter. This is why the built-in `owner` policy keeps list pagination correct.
+</Note>
+
+### `service`
+
+```json
+{ "service": true }
+```
+
+Expands to `{"eq": ["$credential.is_service", true]}`. Useful for *excluding* service traffic from a rule — for example, refusing to let a background job take an action that should require a human:
+
+```json
+{ "all": [
+  { "service": false },
+  { "aal": "aal2" }
+]}
+```
+
+### `kind`
+
+```json
+{ "kind": "user" }
+```
+
+Expands to `{"eq": ["$auth.kind", "user"]}`. This is how you distinguish your application's end users from Studio operators reaching the same data.
+
+### `scope`
+
+```json
+{ "scope": "posts:write" }
+```
+
+Expands to `{"contains": ["$credential.scopes", arg]}` — an exact membership test on the key's scope list. Note this is *stricter* than `PlatformContext.allows_scope`, which is what the gate actually enforces:
+
+```python
+def allows_scope(self, scope: str) -> bool:
+    """Whether the key's scopes permit *scope* (``resource:read`` etc.)."""
+    if not self.scopes:
+        return True
+    family = scope.split(":", 1)[0]
+    return scope in self.scopes or f"{family}:*" in self.scopes or "*" in self.scopes
+```
+
+<Warning>
+A key with no scopes at all is unrestricted (`if not self.scopes: return True`), but the `scope` shorthand would refuse it, because an empty list contains nothing. A key with `posts:*` passes `allows_scope` but fails `{"scope": "posts:write"}`. If you rely on scopes, enforce them through the gate's `scope=` argument rather than in the condition, so the two cannot disagree.
+</Warning>
+
+### `aal`
+
+```json
+{ "aal": "aal2" }
+```
+
+Expands to `{"eq": ["$auth.aal", "aal2"]}`. The assurance level is per **session**, not per user and not per organization: `aal1` at start, `aal2` once MFA has been completed on that session.
+
+<Warning>
+There is no `min_aal` directive, no environment-level AAL setting, and no per-organization AAL. All three are invented. `aal2` is available as a shorthand and as the built-in `mfa` policy:
+
+```python
+"mfa": Policy(
+    "mfa",
+    {"all": [{"authenticated": True}, {"aal": "aal2"}]},
+    "Signed in with a second factor.",
+),
+```
+
+`{ "mfa": true }` is **not** a shorthand — `mfa` is a *policy name*, referenced as the string `"mfa"`. Confusing the two is another common mistake.
+</Warning>
+
+## Policy references
+
+Wherever a policy is expected — a route's `policy=`, a resource operation, a bucket — you may write any of four things.
+
+```python
+def resolve_ref(self, ref: Any) -> Policy:
+    """The :class:`Policy` a reference names."""
+    if ref is None:
+        return self.policies["authenticated"]
+    if isinstance(ref, (bool, Mapping)):
+        validate_condition(ref)
+        return Policy("inline", ref)
+    if isinstance(ref, list):
+        resolved = [self.resolve_ref(item) for item in ref]
+        if any(p.handler for p in resolved):
+            raise PolicyError(
+                "Python policies cannot be combined in a list; call them from Python"
+            )
+        return Policy(
+            "+".join(p.name for p in resolved), {"all": [p.condition for p in resolved]}
+        )
+    if isinstance(ref, str):
+        if ref in self.policies:
+            return self.policies[ref]
+        kind, _, argument = ref.partition(":")
+        if argument and kind in ("role", "permission", "owner", "scope", "kind"):
+            return Policy(ref, {kind: argument})
+    raise PolicyError(f"unknown policy {ref!r}")
+```
+
+| You write | It means |
+| --- | --- |
+| `"owner"` | The named policy — a stored one, a registered Python one, or a built-in |
+| `"role:admin"`, `"permission:posts.write"`, `"owner:author_id"`, `"scope:posts:write"`, `"kind:user"` | The shorthand, parameterised, with the argument after the colon |
+| `{"all": [...]}` — a JSON object | An inline condition, validated before use |
+| `["authenticated", "owner"]` — a list | A conjunction: every reference must pass |
+
+<Warning>
+The parameterised form only works for five shorthands: `role`, `permission`, `owner`, `scope`, `kind`. `"aal:aal2"` is **not** valid — `aal` is not in that tuple, so `resolve_ref` falls through and raises `unknown policy 'aal:aal2'`. Write the object form `{"aal": "aal2"}` instead.
+</Warning>
+
+### The built-in policies
+
+```python
+BUILTIN_POLICIES: dict[str, Policy] = {
+    "public": Policy("public", True, "Anyone, including anonymous callers."),
+    "deny": Policy("deny", False, "Nobody except service credentials."),
+    "authenticated": Policy("authenticated", {"authenticated": True}, "Any signed-in user."),
+    "service": Policy("service", {"service": True}, "Secret keys and operators only."),
+    "owner": Policy(
+        "owner", {"owner": "owner_id"}, "The user whose id is in the record's owner_id."
+    ),
+    "mfa": Policy(
+        "mfa",
+        {"all": [{"authenticated": True}, {"aal": "aal2"}]},
+        "Signed in with a second factor.",
+    ),
+}
+```
+
+A stored policy of the same name overrides the built-in, because of the merge order in the constructor:
+
+```python
+self.policies: dict[str, Policy] = {
+    **BUILTIN_POLICIES,
+    **(python or {}),
+    **(policies or {}),
+}
+```
+
+So defining a stored policy called `owner` replaces the built-in entirely for that project.
+
+<Info>
+`public` and `deny` are literal booleans, not conditions. `{"public": true}` is **not** valid — `"public"` is a policy *name* and must be written as the string `"public"`.
+</Info>
+
+## The gate
+
+A route opts into policy enforcement through `PolicyGate`, which subclasses Sillo's `useAuth` so it plugs into the framework's own route-level `auth=` argument:
+
+```python
+class PolicyGate(useAuth):
+    """A route gate that authenticates like ``useAuth`` and then applies a policy.
+
+    Args:
+        policy: A policy reference (see :class:`PolicyEngine`).
+        engine: Where references are resolved. A callable receiving the context
+            is accepted so a gate can pick the engine of the request's project.
+        schemes: Accepted credentials, as for ``useAuth``.
+        scope: An API-key scope required as well (``resource:write``).
+    """
+
+    def __init__(
+        self,
+        policy: Any = "authenticated",
+        *,
+        engine: PolicyEngine | Callable[[Any], PolicyEngine] | None = None,
+        scope: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.setdefault("required", False)
+        super().__init__(**kwargs)
+        self.policy = policy
+        self.engine = engine
+        self.scope_required = scope
+```
+
+`required` defaults to `False`, so authentication is not mandatory at the gate level — which is exactly what you want, because a policy may legitimately allow anonymous callers.
+
+The decision sequence:
+
+```python
+async def authenticate(self, ctx: Any) -> bool:
+    await super().authenticate(ctx)
+    platform = current_context(ctx)
+    if (
+        self.scope_required
+        and platform is not None
+        and not platform.allows_scope(self.scope_required)
+    ):
+        raise PermissionDenied(f"This API key lacks the {self.scope_required!r} scope")
+    decision = await self._engine(ctx).check(self.policy, build_policy_context(ctx))
+    ctx.scope[DECISION_SCOPE_KEY] = decision
+    if not decision:
+        user = _safe_user(ctx)
+        if user is None or not getattr(user, "is_authenticated", False):
+            raise AuthenticationFailed("Authentication required")
+        raise PermissionDenied(decision.reason)
+    return True
+```
+
+<Steps>
+  <Step title="Credential first">
+    `super().authenticate(ctx)` lets each registered backend try. Success or failure, execution continues — the gate is not yet deciding.
+  </Step>
+  <Step title="API key scope">
+    If the route declared `scope=`, the platform context must allow it. A missing scope is `PermissionDenied` *before* the policy is consulted.
+  </Step>
+  <Step title="Service bypass">
+    Inside `check`, a service credential short-circuits to allowed. This is where secret keys and operators stop being subject to your conditions.
+  </Step>
+  <Step title="Evaluate the policy">
+    `build_policy_context(ctx)` assembles the seven keys, and the policy decides.
+  </Step>
+  <Step title="401 or 403, chosen by authentication state">
+    Refused **and** unauthenticated → `AuthenticationFailed` (`401`). Refused **and** authenticated → `PermissionDenied` (`403`). This is why an anonymous caller gets `401` for a policy they fail, not `403`.
+  </Step>
+</Steps>
+
+The decision is stashed on the request scope for inspection:
+
+```python
+DECISION_SCOPE_KEY = "pawabase.policy"
+
+
+def last_decision(ctx: Any) -> Decision | None:
+    """The decision the gate made for this request, for request inspection."""
+    return ctx.scope.get(DECISION_SCOPE_KEY)
+```
+
+and it carries the policy name and a one-sentence reason:
+
+```python
+@dataclass(slots=True)
+class Decision:
+    """The outcome of a policy check.
+
+    Attributes:
+        allowed: Whether the operation may proceed.
+        policy: The policy that decided.
+        reason: Why, in a sentence, for request inspection in Studio.
+    """
+
+    allowed: bool
+    policy: str = ""
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.allowed
+```
+
+The reason is a fixed format — `f"policy {policy.name!r} {'allowed' if allowed else 'refused'}"` — and it is what appears in Studio's request inspector and in the `403` body. There is no custom-reason field in a JSON condition; if you want a human-readable explanation, it has to come from your own code, not from the condition.
+
+## Two evaluation modes
+
+This is the part that makes policies behave correctly on list endpoints, and it is worth understanding before you write one.
+
+`check` decides a single operation against a single record. `plan` decides a **list** request before any rows are read.
+
+### `check` — one request, one record
+
+```python
+async def check(self, ref: Any, context: Mapping[str, Any]) -> Decision:
+    """Decide one operation.
+
+    Service credentials (secret keys, operators, services) always pass: they
+    are how a developer's own servers and Studio operate on the data.
+    """
+    if lookup(context, "credential.is_service"):
+        return Decision(True, "service", "service credential bypasses policies")
+    policy = self.resolve_ref(ref)
+    if policy.handler is not None:
+        result = policy.handler(dict(context))
+        if inspect.isawaitable(result):
+            result = await result
+        allowed = bool(result)
+    else:
+        allowed = evaluate(policy.condition, context)
+    return Decision(
+        allowed, policy.name, f"policy {policy.name!r} {'allowed' if allowed else 'refused'}"
+    )
+```
+
+Two things to note: a **Python** policy is awaited if it returns an awaitable, and the handler receives `dict(context)` — a shallow copy, so mutating it does not corrupt the caller's context.
+
+### `plan` — a list request, decided early
+
+```python
+def plan(self, ref: Any, context: Mapping[str, Any]) -> ListPlan:
+    """Decide a list operation before reading rows. See the module docstring."""
+    if lookup(context, "credential.is_service"):
+        return ListPlan(True, policy="service")
+    policy = self.resolve_ref(ref)
+    if policy.handler is not None:
+        # Python policies see each row; nothing can be pushed down.
+        return ListPlan(True, residual=policy, policy=policy.name)
+    outcome = partial(policy.condition, context)
+    if outcome is True:
+        return ListPlan(True, policy=policy.name)
+    if outcome is False:
+        return ListPlan(False, policy=policy.name)
+    filters, residual = pushdown(outcome)
+    return ListPlan(True, filters=filters, residual=residual, policy=policy.name)
+```
+
+```python
+@dataclass(slots=True)
+class ListPlan:
+    """How to run a list request under a policy.
+
+    Attributes:
+        allowed: False when no row could ever be visible. The request is refused
+            before any query runs.
+        filters: ``{field: value}`` equalities to add to the SQL ``WHERE``.
+        residual: A condition to check per row after the query, or ``None``.
+        policy: The policy that produced this plan.
+    """
+
+    allowed: bool
+    filters: dict[str, Any] = field(default_factory=dict)
+    residual: Condition | None = None
+    policy: str = ""
+```
+
+There are four outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| `allowed=False` | The policy is false regardless of the row. The request is refused **before any query runs** |
+| `filters` set, `residual=None` | Everything decidable became SQL. The database does the work and pagination is exact |
+| `residual` set | Whatever could not be pushed down is checked per row after the query |
+| Both set | The conjunction of the two |
+
+`partial` is what decides what can be known without a record:
+
+```python
+def _deferred(operand: Any) -> bool:
+    """Operands unknown when a request is first planned: the record, and the
+    submitted body (a gate runs before the body is read). Conditions on them
+    are left for the full check with the record and input in hand."""
+    return _mentions_record(operand) or (
+        isinstance(operand, str) and (operand == "$input" or operand.startswith("$input."))
+    )
+```
+
+<Warning>
+`$input` is deferred on a **route gate** because the gate runs before the body has been read. If your condition depends on the submitted body, it becomes a residual and is evaluated per row. For a write operation that is fine; for a list, remember the body is not what you thought it was.
+</Warning>
+
+When a binary operator has one deferred side, `partial` pins the *known* side immediately so the residual carries a literal:
+
+```python
+if op in BINARY_OPS:
+    if _deferred(arg[0]) or _deferred(arg[1]):
+        # Pin the known side now, so the residual carries a literal.
+        left = arg[0] if _deferred(arg[0]) else resolve(arg[0], context)
+        right = arg[1] if _deferred(arg[1]) else resolve(arg[1], context)
+        return {op: [_literal(left), _literal(right)]}
+    return evaluate(condition, context)
+```
+
+so `{"eq": ["$record.owner_id", "$auth.user_id"]}` becomes the residual `{"eq": ["$record.owner_id", "01JX…"]}` — with the user's id already baked in as a literal.
+
+`_literal` exists to re-escape a resolved value that happens to start with `$`:
+
+```python
+def _literal(value: Any) -> Any:
+    if isinstance(value, str) and value.startswith("$") and not _deferred(value):
+        return "$" + value  # escape a resolved value that happens to start with $
+    return value
+```
+
+### Pushdown
+
+```python
+def pushdown(residual: Condition) -> tuple[dict[str, Any], Condition | None]:
+    """Split a residual into SQL equality filters and what is left.
+
+    Only conjunctions of ``eq`` between one ``$record.<column>`` and a literal
+    are pushed down. That is exactly the ownership and tenancy shape, and it is
+    the part pagination depends on.
+    """
+    parts = residual["all"] if isinstance(residual, Mapping) and "all" in residual else [residual]
+    filters: dict[str, Any] = {}
+    remaining = []
+    for part in parts:
+        if isinstance(part, Mapping) and "eq" in part:
+            left, right = part["eq"]
+            if _mentions_record(left) and not _deferred(right) and left.count(".") == 1:
+                column = left.split(".", 1)[1]
+                value = resolve(right, {})
+                if column not in filters:
+                    filters[column] = value
+                    continue
+            if _mentions_record(right) and not _deferred(left) and right.count(".") == 1:
+                column = right.split(".", 1)[1]
+                value = resolve(left, {})
+                if column not in filters:
+                    filters[column] = value
+                    continue
+        remaining.append(part)
+    if not remaining:
+        return filters, None
+    return filters, remaining[0] if len(remaining) == 1 else {"all": remaining}
+```
+
+The constraints are narrow and deliberate: a top-level conjunction, an `eq`, a **single-segment** record column, and a literal on the other side.
+
+```json
+{ "eq": ["$record.owner_id", "$auth.user_id"] }        // pushes down → WHERE owner_id = ?
+{ "eq": ["$record.meta.tenant", "$auth.org"] }          // stays residual — two dots
+{ "contains": ["$record.tags", "urgent"] }              // stays residual — not an eq
+{ "all": [{ "eq": ["$record.a", "1"] }, { "eq": ["$record.b", "2"] }] }  // both push down
+```
+
+<Note>
+Because `pushdown` only handles conjunctions, wrapping your equalities in a stray `any` loses the optimisation entirely. `{"any": [{"eq": ["$record.owner_id", "$auth.user_id"]}, {"role": "admin"}]}` is correct but pushes nothing down, so the list is filtered row by row after a full table read — and pagination becomes approximate.
+</Note>
+
+Also worth noticing: the first filter for a given column wins, and a second equality on the same column falls through into the residual rather than conflicting. `{"all": [{"eq": ["$record.id", "1"]}, {"eq": ["$record.id", "2"]}]}` pushes `id = 1` and leaves `id = 2` as a residual, which no row satisfies. The result is empty, which is correct.
+
+### The residual check
+
+```python
+async def row_allowed(self, plan: ListPlan, context: Mapping[str, Any]) -> bool:
+    """Check a residual against one row (``context`` includes ``record``)."""
+    if plan.residual is None:
+        return True
+    if isinstance(plan.residual, Policy):
+        result = plan.residual.handler(dict(context))  # type: ignore[misc]
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+    return evaluate(plan.residual, context)
+```
+
+A **Python** policy on a list becomes the residual, because it needs to see each row and nothing about it can be known in advance. That is the trade: correctness at the cost of the pushdown.
+
+### Writing list-safe policies
+
+A checklist that follows directly from the implementation:
+
+<Steps>
+  <Step title="Put equality against `$auth` at the top level of an `all`">
+    That is the shape `pushdown` recognises. Nested inside an `any`, it is still correct but loses the SQL filter.
+  </Step>
+  <Step title="Name the column as one path segment">
+    `$record.owner_id`, not `$record.owner.id` or `$record.meta.owner_id`. One dot after `$record`.
+  </Step>
+  <Step title="Keep the auth-only conditions out of the residual">
+    Anything referencing only `$auth`, `$credential` or `$project` is decided during `partial` and disappears entirely.
+  </Step>
+  <Step title="Avoid Python policies on hot list endpoints">
+    They force a residual and a per-row handler call, possibly an `await` per row.
+  </Step>
+</Steps>
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$record.org_slug", "$auth.org"] },
+    { "eq": ["$record.owner_id", "$auth.user_id"] },
+    {
+      "any": [
+        { "eq": ["$record.visibility", "public"] },
+        { "role": "editor" }
+      ]
+    }
+  ]
+}
+```
+
+Here the two `eq`s push down into SQL, the `any` becomes a residual, and the `$auth.roles` lookup inside it is resolved per row. The row-level check is cheap string membership.
+
+## `meta` versus `app`
+
+The token carries two optional metadata objects, and the difference between them is the single most important security property in the whole system.
+
+From `issue_user_token`'s own documentation:
+
+```python
+extra: Additional public claims (``user_metadata``), as ``meta``. Users can
+    edit these, so policies must not trust them.
+app: Administrator-controlled claims (``app_metadata``), as ``app``. Only
+    admins can change them, so policies may rely on them.
+```
+
+The minting reflects it:
+
+```python
+if extra:
+    payload["meta"] = extra
+if app:
+    payload["app"] = app
+```
+
+and in `_access_token`:
+
+```python
+extra=user.user_metadata or None,
+app=user.app_metadata or None,
+```
+
+| | `meta` claim | `app` claim |
+| --- | --- | --- |
+| Source | `AuthUser.user_metadata` | `AuthUser.app_metadata` |
+| Who may write it | The user themselves | An administrator or service key |
+| Reachable at | `$auth.claims.meta.*` | `$auth.claims.app.*` |
+| Trustworthy for access decisions | **No** | **Yes** |
+
+<Warning>
+The claim names are **`meta`** and **`app`**. There are no `user_metadata` or `app_metadata` claims, and no `$auth.claims.user` — `user` is a *subject* prefix in token verification, not a claim name here. `{"eq": ["$auth.claims.user.tier", "premium"]}` resolves to `None` and refuses, which fails closed but for the wrong reason.
+</Warning>
+
+A user edits their own metadata through `PATCH /auth/v1/user`:
+
+```python
+if body.data is not None:
+    user.user_metadata = {**(user.user_metadata or {}), **body.data}
+    changed.append("user_metadata")
+```
+
+That is a shallow merge, so a user can add, overwrite or remove any top-level key in their own `user_metadata` — including one your UI uses to decide what to show. Nothing stops them calling the endpoint directly.
+
+The safe pattern is therefore: write the value an administrator controls, and read it from `app`.
+
+```json
+{ "eq": ["$auth.claims.app.tier", "premium"] }
+```
+
+If you *must* use `meta` — say, a display preference — treat it as untrusted input, not as an authorisation input. A user who can set `{"department": "finance"}` on themselves can set it to anything.
+
+<Info>
+`create_account` accepts `app_metadata` as a parameter, but the public `SignUp` body does not expose it — `SignUp` only takes `data`, which becomes `user_metadata`. `app_metadata` is settable through admin routes and flows, not through sign-up.
+</Info>
+
+## Python policies
+
+When JSON cannot express the rule — a database lookup, a clock-and-hash comparison, an ownership chain — you register a Python function:
+
+```python
+from pawabase_core.policies import policy
+
+@policy("same-team", description="Callers on the record's team")
+async def same_team(context):
+    team = await lookup_team(context["record"]["team_id"])
+    return context["auth"]["user_id"] in team.members
+```
+
+The registry:
+
+```python
+def policy(
+    name: str, *, description: str = ""
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Register a Python policy under *name*."""
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        _registry[name] = Policy(
+            name=name, handler=func, description=description or (func.__doc__ or "").strip()
+        )
+        return func
+
+    return decorator
+```
+
+Rules that follow from the engine:
+
+<AccordionGroup>
+  <Accordion title="The handler receives the full context, not just $auth">
+    `context` is the whole evaluation context — `auth`, `credential`, `request`, `project`, `env`, `record`, `input`. The registry's example reads `context["record"]` and `context["auth"]`.
+  </Accordion>
+  <Accordion title="Sync or async both work">
+    `check` awaits the result if `inspect.isawaitable(result)`, so a plain `def` returning a bool is fine.
+  </Accordion>
+  <Accordion title="You get a shallow copy">
+    The engine calls `policy.handler(dict(context))`. Mutating the top level is safe; mutating a nested dict is not.
+  </Accordion>
+  <Accordion title="A Python policy cannot be combined in a list reference">
+    `resolve_ref` raises `PolicyError("Python policies cannot be combined in a list; call them from Python")`. Call it from another Python policy, or combine at the resource level with `all`.
+  </Accordion>
+  <Accordion title="On a list, it becomes the residual">
+    `plan` returns `ListPlan(True, residual=policy, …)` with no filters, so the whole table is read and the handler is called per row.
+  </Accordion>
+  <Accordion title="Returning a non-bool is coerced">
+    `allowed = bool(result)`. Return something truthy and it allows; return `None` and it refuses.
+  </Accordion>
+</AccordionGroup>
+
+```python
+from pawabase_core.policies import policy, lookup
+
+
+@policy("billing-admin")
+async def billing_admin(context):
+    """Account owners may change billing; support staff may too."""
+    if context["auth"]["kind"] != "user":
+        return False
+    return context["auth"]["user_id"] == context["record"].get("billing_contact_id")
+
+
+@policy("published-or-owner")
+async def published_or_owner(context):
+    record = context["record"]
+    if record.get("status") == "published":
+        return True
+    return record.get("owner_id") == context["auth"]["user_id"]
+```
+
+## Storage policies
+
+The storage layer asks its policy two questions, and Pawabase answers the first with the same JSON conditions:
+
+```python
+class PolicyStorage:
+    """A Sillo storage policy backed by Pawabase policies.
+
+    Args:
+        engine: Resolves references.
+        read: Policy reference for reading and listing.
+        write: Policy reference for uploads and deletes.
+        credential: The request's credential context (service keys bypass).
+        signed_reads: Whether signed URLs may grant reads.
+        signed_writes: Whether signed URLs may grant uploads.
+    """
+
+    def __init__(
+        self,
+        engine: PolicyEngine,
+        *,
+        read: Any = "authenticated",
+        write: Any = "authenticated",
+        credential: dict[str, Any] | None = None,
+        project: str | None = None,
+        env: str | None = None,
+        signed_reads: bool = True,
+        signed_writes: bool = True,
+    ) -> None:
+        self.engine = engine
+        self.read_policy = engine.resolve_ref(read)
+        self.write_policy = engine.resolve_ref(write)
+        for resolved in (self.read_policy, self.write_policy):
+            if resolved.handler is not None:
+                raise ValueError("storage policies must be JSON conditions")
+        self.credential = credential or {"is_service": False, "role": "anon", "scopes": []}
+        self.project = project
+        self.env = env
+        self.signed_reads = signed_reads
+        self.signed_writes = signed_writes
+
+    def allows(self, action: Any, key: str, user: Any = None) -> bool:
+        if self.credential.get("is_service"):
+            return True
+        name = getattr(action, "value", str(action))
+        policy = self.read_policy if name in ("read", "list", "stat") else self.write_policy
+        context = {
+            "auth": policy_auth(user),
+            "credential": self.credential,
+            "project": self.project,
+            "env": self.env,
+            "object": {"key": key, "segments": key.split("/"), "action": name},
+        }
+        return evaluate(policy.condition, context)
+
+    def signable(self, action: Any) -> bool:
+        name = getattr(action, "value", str(action))
+        return self.signed_reads if name in ("read", "list", "stat") else self.signed_writes
+```
+
+Three things to know:
+
+<AccordionGroup>
+  <Accordion title="There is an `$object` path, not `$record`">
+    The object key and its path segments are exposed as `$object.key`, `$object.segments` (a list) and `$object.action`. This is the storage equivalent of `$record`.
+  </Accordion>
+  <Accordion title="Numeric segments index the list">
+    Because `segments` is a real list, `$object.segments.0` is the first path component. A `users/<id>/…` layout is written `{"eq": ["$object.segments.0", "users"]}` and `{"eq": ["$object.segments.1", "$auth.user_id"]}`.
+  </Accordion>
+  <Accordion title="Python policies are rejected at construction">
+    `raise ValueError("storage policies must be JSON conditions")`. The storage API is synchronous at the policy boundary. A Python policy is enforced in the storage routes instead, before the bucket is called.
+  </Accordion>
+</AccordionGroup>
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$object.segments.0", "users"] },
+    { "eq": ["$object.segments.1", "$auth.user_id"] }
+  ]
+}
+```
+
+Note that `read`, `list` and `stat` share the read policy, and everything else — upload, delete, and any action added later — falls to the write policy. New action names are write-by-default.
+
+## Recipes
+
+### Public reads, authenticated writes
+
+For the read policy, write the literal:
+
+```json
+true
+```
+
+For the write policy:
+
+```json
+{ "authenticated": true }
+```
+
+There is no need to wrap `true` in an `any`, and doing so adds nothing.
+
+### The owner, or anyone with a permission
+
+```json
+{ "any": [
+  { "owner": true },
+  { "permission": "posts.manage_any" }
+] }
+```
+
+`{ "owner": true }` already expands to `{"all": [{"authenticated": true}, {"eq": ["$record.owner_id", "$auth.user_id"]}]}`, so this grants nothing to anonymous callers.
+
+### Organization administrators, scoped to their organization
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "not_in": ["$auth.org", [null, ""]] },
+    { "in": ["$auth.org_role", ["owner", "admin"]] },
+    { "eq": ["$record.org_slug", "$auth.org"] }
+  ]
+}
+```
+
+The `not_in` is not decoration: without it a de-scoped session produces `$record.org_slug = null`, which matches nothing in SQL. Being explicit documents the intent, and `not_in` is the right operator because `exists` reads more clearly as "set" while `not_in` also excludes the empty string.
+
+### Second-factor-only operations
+
+```json
+"mfa"
+```
+
+or, with an org check as well:
+
+```json
+{
+  "all": [
+    { "aal": "aal2" },
+    { "in": ["$auth.org_role", ["owner", "admin"]] }
+  ]
+}
+```
+
+### Admin-controlled feature flags
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$auth.claims.app.beta", true] }
+  ]
+}
+```
+
+`beta` must be written to `app_metadata` by an administrator. If it lives in `user_metadata`, the user can set it themselves through `PATCH /auth/v1/user`.
+
+### Support staff, distinguished from end users
+
+```json
+{
+  "all": [
+    { "eq": ["$auth.kind", "operator"] },
+    { "starts_with": ["$auth.email", "support@"] }
+  ]
+}
+```
+
+The `kind` check is the load-bearing one: it says the caller arrived as an operator or service credential, not that their email happens to look right. Prefer it wherever you can.
+
+### Time-bounded access
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "gt": ["now", "$auth.claims.meta.access_until"] }
+  ]
+}
+```
+
+This one deliberately uses `meta` — the expiry is the *user's own* deadline, so letting them move it later is at worst self-serving and never grants a role they lack. Do not put the entitlement itself in `meta`.
+
+### Drafts visible only to their author
+
+```json
+{
+  "any": [
+    { "owner": true },
+    {
+      "all": [
+        { "eq": ["$record.status", "published"] },
+        { "authenticated": true }
+      ]
+    }
+  ]
+}
+```
+
+### Refusing a method
+
+There is no method-negation shorthand, but `ne` does it:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "ne": ["$request.method", "DELETE"] }
+  ]
+}
+```
+
+### A stored policy
+
+Policies are data, so they can be stored per project and referenced by name. `policy_from_definition` validates on the way in:
+
+```python
+def policy_from_definition(name: str, definition: Mapping[str, Any]) -> Policy:
+    """Build a :class:`Policy` from its stored form, validating it."""
+    condition = definition.get("condition", definition.get("rules", True))
+    validate_condition(condition)
+    return Policy(name=name, condition=condition, description=definition.get("description", ""))
+```
+
+A stored policy looks like this, and `rules` is accepted as an alias for `condition`:
+
+```json
+{
+  "name": "org-editor",
+  "description": "Editors and above inside the selected organization.",
+  "condition": {
+    "all": [
+      { "authenticated": true },
+      { "in": ["$auth.org_role", ["owner", "admin", "member"]] },
+      { "eq": ["$record.org_slug", "$auth.org"] }
+    ]
+  }
+}
+```
+
+Referenced from a resource as the string `"org-editor"`.
+
+<Warning>
+`definition.get("condition", definition.get("rules", True))` defaults to **`True`** when neither key is present. A malformed stored definition with no condition is an unconditional allow, not an error. Always write `condition` explicitly.
+</Warning>
+
+## The staleness rule
+
+Everything in `$auth` is a snapshot of the token. Nothing is re-read at policy time. The token is minted with:
+
+```python
+roles=await rbac.roles_of(user),
+permissions=await rbac.permissions_of(user),
+org=org,
+org_role=org_role,
+```
+
+and those four calls happen exactly once, when the access token is minted.
+
+The consequences, stated plainly:
+
+| You change | Reaches policies when |
+| --- | --- |
+| A user's RBAC role or permissions | Next token mint — a refresh, or a new sign-in |
+| An organization membership role | Next token mint, same reason |
+| An organization's `name` or `metadata` | Immediately — it is read from the database, not the token |
+| A row's fields | Immediately — `$record` is the live row |
+| `$auth.claims.app` / `$auth.claims.meta` | Next token mint |
+| The environment's `auth` config | Akountz's cache TTL, not the token |
+
+The window is `access_ttl` seconds — 900 by default. There is no token version counter, no claim-invalidation list, and no way to force re-issue except a refresh.
+
+<Warning>
+This is why a role revocation is not instant. If you demote someone from `admin` to `member`, `{"eq": ["$auth.org_role", "admin"]}` keeps allowing them until their access token expires. If the revocation must be immediate, revoke the session — `POST /auth/v1/logout` with `{"scope": "global"}` — which makes the refresh fail with `401 invalid refresh token`.
+</Warning>
+
+## What does not exist
+
+A list of things this page has been asked about that are not in the engine.
+
+<AccordionGroup>
+  <Accordion title="There is no TOML policy syntax">
+    Configuration is JSON throughout — the environment's `auth` block, stored policy definitions, and conditions. There is no `[policy]` table, no `expression = "..."` key, and no parser for one.
+  </Accordion>
+  <Accordion title="There is no expression string at all">
+    A condition is JSON data. There is no `&&`, `||`, `!`, `==`, `!=`, `contains` operator-as-word, or parentheses to balance. `{"all": [...]}` is the conjunction.
+  </Accordion>
+  <Accordion title="There are no functions">
+    No `lower()`, `upper()`, `len()`, `now()` call, `concat()`, or date arithmetic. String comparison is exact and case-sensitive; `matches` with a regex is the only text manipulation available. The magic `now` *path* exists, but it is not a function you call with arguments.
+  </Accordion>
+  <Accordion title="There are no variables">
+    No `let`, no bindings, no parameter substitution. A condition is one literal tree. The `"role:admin"` reference syntax is the closest thing, and it only builds a single shorthand.
+  </Accordion>
+  <Accordion title="There is no permission function inside a condition">
+    The principal object has a Python method for checking a permission, but it is not callable from JSON. In a condition, use the `permission` shorthand, which additionally accepts the `"*"` wildcard.
+  </Accordion>
+  <Accordion title="There is no `$auth.operator`">
+    The nearest real fields are `$auth.kind` (`user`, `operator`, `service`, `anonymous`) and `$credential.is_service`. There is no boolean `operator` flag in the auth context.
+  </Accordion>
+  <Accordion title="There is no `$auth.org` object">
+    `$auth.org` is the slug string or `null`. `$auth.org.slug` does not exist and resolves to `None`.
+  </Accordion>
+  <Accordion title="There is no `$auth.claims.user`">
+    The metadata claim is `meta`. `$auth.claims.app` is the admin-controlled one.
+  </Accordion>
+  <Accordion title="There is no minimum-AAL configuration directive">
+    AAL is checked with the `aal` shorthand or the `"mfa"` policy name. No configuration key sets a minimum assurance level for an environment or an organization — `mfa_enabled` controls whether users *may* enrol a second factor, not what a policy demands.
+  </Accordion>
+  <Accordion title="There is no `force` flag, and no override event">
+    No `force: true`, no `policy.override` event, no override audit log. Service credentials bypass policies structurally, in `check`, not through a flag you can set on a request.
+  </Accordion>
+  <Accordion title="There is no role hierarchy">
+    `$auth.roles` is a flat list. There is no inheritance between roles. Write the alternation yourself with `any`, or use permissions, which are flat strings too.
+  </Accordion>
+  <Accordion title="There is no shorthand cache">
+    `_shorthand` and `resolve_ref` are called on every evaluation. Expansion is cheap and happens fresh each time — there is no memoisation layer to reason about or invalidate.
+  </Accordion>
+</AccordionGroup>
+
+## Testing a condition
+
+`evaluate` is a pure function of a condition and a context, so you can exercise policies without a request. Build a context that looks like a real one:
+
+```python
+from pawabase_core.policies import evaluate
+from pawabase_core.principal import ANONYMOUS_POLICY_CONTEXT
+
+def user_context(*, user_id="01JXUSER", roles=(), perms=(), org=None, org_role=None, aal="aal1"):
+    """A minimal $auth context matching Principal.as_policy_context."""
+    return {
+        "auth": {
+            "authenticated": True,
+            "kind": "user",
+            "user_id": user_id,
+            "email": "dana@example.com",
+            "roles": list(roles),
+            "permissions": list(perms),
+            "org": org,
+            "org_role": org_role,
+            "aal": aal,
+            "session_id": "family",
+            "claims": {},
+        },
+        "credential": {"role": "anon", "is_service": False, "scopes": [], "key_id": None},
+        "project": "acme",
+        "env": "production",
+        "record": None,
+        "input": None,
+    }
+
+
+editor_only = {
+    "all": [
+        {"authenticated": True},
+        {"in": ["$auth.org_role", ["owner", "admin"]]},
+    ]
+}
+
+assert evaluate(editor_only, user_context(org="acme-hq", org_role="admin")) is True
+assert evaluate(editor_only, user_context(org="acme-hq", org_role="viewer")) is False
+assert evaluate(editor_only, user_context()) is False            # unscoped session
+assert evaluate(editor_only, {"auth": ANONYMOUS_POLICY_CONTEXT}) is False
+```
+
+The last line is worth being deliberate about: an anonymous caller is not "a user with no roles", it is a distinct context with `authenticated: False`. Test both.
+
+And test the pushdown, since it is where list behaviour is decided:
+
+```python
+from pawabase_core.policies import PolicyEngine
+
+engine = PolicyEngine()
+ctx = user_context(org="acme-hq", org_role="member")
+
+plan = engine.plan(
+    {"all": [
+        {"authenticated": True},
+        {"eq": ["$record.org_slug", "$auth.org"]},
+        {"eq": ["$record.owner_id", "$auth.user_id"]},
+    ]},
+    ctx,
+)
+assert plan.filters == {"org_slug": "acme-hq", "owner_id": "01JXUSER"}
+assert plan.residual is None
+```
+
+If `plan.filters` comes back empty, your equality is nested somewhere `pushdown` does not look.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| A condition refuses everyone, including the owner | Compared a claim that does not exist — `$auth.org.slug`, `$auth.claims.user.*` | `$auth.org` is the slug string; the metadata claim is `meta` |
+| A condition allows everyone | It resolved to `true` — a stored definition with no `condition` key | Write `condition` explicitly; `rules` is an accepted alias |
+| `unknown policy 'role:admin'` | Typo, or the shorthand is not one of the five | Valid: `role`, `permission`, `owner`, `scope`, `kind` |
+| `unknown policy 'aal:aal2'` | `aal` is not in the parameterised tuple | Write `{"aal": "aal2"}`, or reference `"mfa"` |
+| A user with the role is refused | Their token predates the role grant | Wait for a refresh; claims are read at issue time |
+| A revoked role still works | Same, up to `access_ttl` | Revoke the session for immediate effect |
+| `401` where you expected `403` | The caller is unauthenticated, so the gate raised `AuthenticationFailed` | Check whether the token was actually sent |
+| A list shows rows you did not expect | The condition did not push down; filtering happened per row after pagination | Put the equality at the top level of an `all` |
+| Pagination counts are wrong | Same cause | Same fix; verify `plan.filters` in a test |
+| A Python policy is slow on a list | It became the residual for every row | Move the decidable part into JSON conditions |
+| `PolicyError: Python policies cannot be combined in a list` | A list reference containing a Python policy | Call it from another Python policy, or use `all` at the resource level |
+| `{"contains": [...]}` matched the wrong things | `contains` is a substring test on strings | Use `eq` for exact matching |
+| `{"gt": [...]}` always false | An operand is `None` | Ordering operators refuse on `None`; check the field exists |
+| A scope-restricted key passes `allows_scope` but fails the condition | The `scope` shorthand is an exact test; `allows_scope` also accepts `posts:*` and `*` | Enforce scopes via the gate's `scope=` argument |
+| Storage policy raises `ValueError` at startup | A Python policy was passed | Storage takes JSON conditions only |
+
+<AccordionGroup>
+  <Accordion title="How do I find out which policy decided a request?">
+    Read `last_decision(ctx)`, which returns the `Decision` the gate stored under `ctx.scope["pawabase.policy"]`. In Studio, the request inspector shows the same decision with its policy name and the `policy '…' allowed|refused` reason. Note that the reason is generated from a fixed format string — it names the policy, it does not explain which clause failed.
+  </Accordion>
+  <Accordion title="Why did a policy allow a request I expected to be refused?">
+    Work through three checks in order. First, was the credential a service or operator? `check` returns `Decision(True, "service", "service credential bypasses policies")` before the policy is even resolved. Second, was the token stale — does the claim hold the value you think? Third, does the condition have a branch you forgot, such as an `any`?
+  </Accordion>
+  <Accordion title="Why is a condition I wrote not pushing down?">
+    `pushdown` requires a top-level `all`, an `eq` operator, a `$record.<single-segment>` on one side, and a literal on the other. `$record.meta.tenant` has two dots. `contains` is not `eq`. Wrapping in `any` breaks the conjunction. Test `engine.plan(...)` and assert on `plan.filters`.
+  </Accordion>
+  <Accordion title="Can a policy call the database?">
+    Not from JSON — there are no functions and no I/O. A Python policy can, and the registry's own example does a lookup. Remember that on a list endpoint it runs once per row.
+  </Accordion>
+  <Accordion title="Is `email` a reliable identifier in a policy?">
+    It is stable for the token's lifetime, but a user can change their address through `PATCH /auth/v1/user` (pending confirmation), and the new value appears only on the next mint. Use `$auth.user_id` for identity checks.
   </Accordion>
 </AccordionGroup>
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Roles and permissions" icon="shield" href="/auth/roles-and-permissions">Role-based access control.</Card>
-  <Card title="Organizations" icon="building" href="/auth/organizations">Multi-tenant organization management.</Card>
-  <Card title="Client integration" icon="code" href="/auth/client-integration">SDK and backend integration patterns.</Card>
-  <Card title="Security model" icon="shield-check" href="/auth/security-model">Threat model and security best practices.</Card>
+  <Card title="Policies overview" icon="shield-check" href="/policies/overview">How policies attach to routes, resources, buckets and channels, and how a decision becomes an HTTP response.</Card>
+  <Card title="Shorthands" icon="book" href="/policies/shorthands">A deeper reference on the eight shorthands and how they expand.</Card>
+  <Card title="Organizations" icon="building" href="/auth/organizations">The membership model behind `$auth.org` and `$auth.org_role`, and how they are issued.</Card>
+  <Card title="Roles and permissions" icon="shield" href="/auth/roles-and-permissions">How `$auth.roles` and `$auth.permissions` get their values, and how to change them.</Card>
 </CardGroup>

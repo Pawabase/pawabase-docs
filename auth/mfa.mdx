@@ -1,352 +1,1510 @@
 ---
-title: "MFA"
-description: "TOTP enrollment and verification, recovery codes, assurance levels (aal1/aal2), and the enroll/confirm/verify/disable lifecycle, straight from app/mfa.py."
-icon: "shield-check"
+title: "Multi-factor authentication"
+description: "How Pawabase stores TOTP factors and recovery codes, how a session moves from aal1 to aal2, and why recovery codes are hashed and shown exactly once."
+icon: "shield-halved"
 ---
 
-Pawabase's second factor is TOTP (RFC 6238) — the six-digit, time-based codes produced by an authenticator app like Google Authenticator, Authy, or a password manager's built-in generator. Sillo has no one-time-password primitive of its own, so this comes from `pyotp`. This page documents the whole lifecycle: enrollment, confirmation, verification during sign-in, recovery codes, and how MFA interacts with sessions through the assurance level.
+Multi-factor authentication in Pawabase is TOTP and nothing else: an authenticator app, and a set of recovery codes for when the phone is gone. There is no SMS factor, no push approval, and no email second factor. If you are designing an enrolment flow, the entire surface you need to build is a secret, a QR code, one verification code, and ten recovery codes.
+
+The mechanism is small. The parts that surprise people are the storage decisions — the TOTP secret is encrypted at rest rather than hashed, because you must be able to recompute a code from it, while recovery codes are hashed and therefore unrecoverable — and the fact that recovery codes are shown once and never again.
 
 <CardGroup cols={3}>
-  <Card title="One factor at a time" icon="smartphone">An account has at most one confirmed `MfaFactor`. Re-enrolling replaces it.</Card>
-  <Card title="Secrets are encrypted, never plain" icon="lock">The TOTP secret is stored as `secret_ciphertext`, sealed with the platform's secret box — never as plain base32.</Card>
-  <Card title="Recovery codes are hashed" icon="key">Ten single-use codes are issued on confirmation. Only their SHA-256 hash is ever stored.</Card>
+  <Card title="Two real models" icon="database">`MfaFactor` holds the TOTP factor. `RecoveryCode` holds the single-use fallback codes. There is no `MFARecoveryCode` model.</Card>
+  <Card title="Stored hashed, not encrypted" icon="lock">Recovery codes are SHA-256 hashed at rest. The raw code is returned once at generation and cannot be recovered afterwards — not by you, not by an administrator.</Card>
+  <Card title="aal1 to aal2" icon="arrow-up">The default assurance level is `aal1`. A completed MFA challenge issues tokens at `aal2`, and the claim rides along with every request.</Card>
 </CardGroup>
 
-## The two real models
+## Where MFA sits in the layered model
 
-MFA state lives in two tables, both in `database/models/users.py`. Neither resembles a `mfa_secret` column on the user row, and neither is named `MFARecoveryCode`.
+MFA is entirely inside the identity layer, with one exception: the resulting assurance level is carried in the token so other services can read it without asking anyone.
 
-### `MfaFactor`
-
-```python
-class MfaFactor(Model):
-    """A second factor. TOTP secrets are encrypted at rest."""
-    id = fields.IntField(primary_key=True)
-    user = fields.ForeignKeyField("models.AuthUser", related_name="factors", on_delete=fields.CASCADE)
-    kind = fields.CharField(max_length=16, default="totp")
-    secret_ciphertext = fields.TextField()
-    confirmed_at = fields.DatetimeField(null=True)
-    last_used_step = fields.BigIntField(default=0)
-    friendly_name = fields.CharField(max_length=100, default="Authenticator app")
-```
-
-| Field | Meaning |
+| Layer | What MFA asks of it |
 | --- | --- |
-| `kind` | Always `"totp"` today — the only factor kind Akountz implements. |
-| `secret_ciphertext` | The TOTP secret, **encrypted**, not the raw base32 string. Sealed with `akountz.box.seal(secret)` on write, opened with `akountz.box.open(...)` only at verification time. |
-| `confirmed_at` | `null` until the user proves possession with a first valid code. An unconfirmed factor is not usable for sign-in and is cleaned up the next time enrollment starts. |
-| `last_used_step` | The last 30-second TOTP time step that was accepted. This is the replay guard — see [Replay protection](#replay-protection) below. |
-| `friendly_name` | A label; not currently surfaced by any endpoint, but present for future multi-factor UI. |
+| **Akountz** (identity) | Stores factors and recovery codes. Verifies codes. Issues `aal2` tokens. Owns `akz_mfa_factors` and `akz_recovery_codes`. |
+| **The API** (project config) | Owns one switch: `mfa_enabled`, which decides whether enrolment is permitted. |
+| **Gateway / `pawabase_core`** | Verifies the token, including the `aal` claim. Enforces nothing about MFA itself. |
+
+The consequence worth knowing before you design anything: **the `aal` claim is the entire interface between MFA and the rest of the system.** A service that wants to require a second factor reads one claim and needs no call back to Akountz. See [Auth in policies](/auth/auth-in-policies).
+
+MFA state belongs to an account in one `project` + `env` pair, exactly like everything else. A user who enrolled an authenticator in staging has to enrol again in production. There is no cross-environment sharing of factors.
+
+<Info>
+If you have not read [Authentication](/auth/overview), read it first. This page assumes the layered model and the per-environment tenancy rule.
+## The two models, and what is not there
+
+MFA has exactly two pieces of storage. Both are real models with real tables, and naming them correctly matters because everything else on this page refers to them.
+
+| Model | Table | What one row is |
+| --- | --- | --- |
+| `MfaFactor` | `akz_mfa_factors` | One second factor for one user. Currently only TOTP. |
+| `RecoveryCode` | `akz_recovery_codes` | One single-use fallback code for one user. |
+
+**There is no `MFARecoveryCode` model.** If you are following documentation or a schema dump that names one, it is describing something that does not exist. The recovery codes live in `RecoveryCode`, alongside nothing else — the table holds one kind of thing.
+
+### The factor
+
+| Field | Type | What it holds |
+| --- | --- | --- |
+| `id` | ULID | The factor's identifier. |
+| `user` | FK | The owning account. Deleting the user deletes the factor. |
+| `kind` | str | `"totp"`. |
+| `secret_ciphertext` | text | The shared secret, **encrypted** with the platform secret box. |
+| `confirmed_at` | datetime or null | Set once a code has been verified. Null means unconfirmed. |
+| `last_used_step` | int | The last accepted time step, for replay protection. |
+| `friendly_name` | str | Defaults to `"Authenticator app"`. |
 
 <Warning>
-The TOTP secret is never stored or transmitted as plain base32 after enrollment. It exists in plaintext only for the brief moment between generation and the response to `POST /auth/v1/mfa/totp/enroll` (so it can be shown to the user or embedded in a QR code), and again in memory during verification, after being decrypted from `secret_ciphertext`. If you were told the secret lives on `AuthUser.mfa_secret`, that is not how the current implementation works.
+The TOTP secret is encrypted, not hashed. That is not an inconsistency with the recovery codes — it is a requirement of the algorithm. Verifying a TOTP code means recomputing it from the secret, so the secret must be recoverable. A hashed secret could confirm nothing.
 </Warning>
 
-### `RecoveryCode`
+The `confirmed_at` column is what makes enrolment two-phase, and it is the field to understand first. A factor created by the enrolment endpoint is **unconfirmed**: it exists, it has a secret, but it does not count. It stops the account from having MFA until the user proves they can produce a code, which means a user who abandons enrolment halfway does not end up locked out of their own account.
 
-```python
-class RecoveryCode(Model):
-    """A single-use MFA recovery code, stored as a SHA-256 hash."""
-    id = fields.IntField(primary_key=True)
-    user = fields.ForeignKeyField("models.AuthUser", related_name="recovery_codes", on_delete=fields.CASCADE)
-    code_hash = fields.CharField(max_length=128, db_index=True)
-    used_at = fields.DatetimeField(null=True)
+### The recovery code
+
+| Field | Type | What it holds |
+| --- | --- | --- |
+| `id` | ULID | The row's identifier. |
+| `user` | FK | The owning account. |
+| `code_hash` | str | SHA-256 of the normalised code. Indexed for lookup. |
+| `used_at` | datetime or null | Set when the code is spent. Null means unused. |
+
+**Recovery codes are stored hashed, and only hashed.** The raw code exists exactly once, in the response to the call that generated it, and is never written anywhere in a form that could be read back. This is the standard argument for one-way hashing on a low-entropy secret: anyone who can read the table learns nothing, because the codes have far too little randomness to brute-force backwards from a hash — each one is five bytes of it.
+
+There is a deliberate asymmetry with the TOTP secret, and it is worth being able to explain it in one sentence: **a recovery code is verified by comparing a hash, so it never needs to be recoverable; a TOTP secret is used to compute a code, so it must be.**
+### The boolean flag
+
+The user's `mfa_enabled` field is the switch everything reads. It is set when enrolment is confirmed and cleared when MFA is turned off, and it is what the sign-in flow checks to decide whether to challenge.
+
+| Source of truth | Used for |
+| --- | --- |
+| `AuthUser.mfa_enabled` | Whether to challenge at sign-in, and what `/mfa` reports. |
+| A confirmed `MfaFactor` row | The actual secret used to verify codes. |
+| Unused `RecoveryCode` rows | How many fallbacks remain. |
+
+These are kept in step by the code rather than by a database constraint, so it is worth knowing which one to trust when they disagree. `mfa_enabled` is what the sign-in path branches on. If a confirmed factor exists but the flag is false, the user is not challenged — which is the state an administrator's MFA reset leaves behind.
+
+## How codes are generated and verified
+
+### The recovery code format
+
+Recovery codes are generated in a specific format that determines how they are hashed, and therefore what your user interface must accept.
+
+Each code is produced by taking five bytes of randomness, rendering them as ten hexadecimal characters, and splitting that in half with a hyphen:
+
+```text
+a3f9c2e1d4  ->  a3f9c-2e1d4
 ```
 
-That's the entire row: a hash and a used-at timestamp. There is no `code` column holding the raw value — once the ten codes are generated and returned to the client at confirmation time, Akountz has no way to display them again. If a user loses them, the only path forward is `POST /auth/v1/mfa/recovery-codes`, which invalidates every existing code and issues ten new ones.
+Ten of these are created each time. The count is fixed, and regenerating replaces the whole set rather than adding to it.
 
-## The enrollment lifecycle
+### The hash, and why the format matters
 
-MFA enrollment is a three-step flow: start it, confirm it with a real code, then it's live.
+Before hashing, the code is normalised: the hyphen is removed, whitespace is stripped from each end, and the result is lowercased. Only then is it hashed with SHA-256.
 
-<Steps>
-  <Step title="POST /auth/v1/mfa/totp/enroll">
-    Requires a signed-in user and `mfa_enabled: true` on the environment (`403 MFA is disabled for this project` otherwise). This calls `mfa.enroll(akountz, user, issuer)`:
+That normalisation is the reason the format is forgiving. Because the hyphen is stripped before hashing, `A3F9C-2E1D4`, `a3f9c2e1d4` and `a3f9c-2E1D4` all hash to the same value. A user who types their recovery code from an email, from a password manager, or from a handwritten note, in whatever case and with whatever spacing, gets a match.
 
-    ```python
-    async def enroll(akountz: Akountz, user: AuthUser, issuer: str) -> dict[str, str]:
-        await MfaFactor.filter(user=user, confirmed_at=None).delete()
-        secret = pyotp.random_base32()
-        factor = await MfaFactor.create(
-            user=user, kind="totp", secret_ciphertext=akountz.box.seal(secret)
-        )
-        uri = pyotp.TOTP(secret).provisioning_uri(name=user.email, issuer_name=issuer)
-        return {"factor_id": str(factor.id), "secret": secret, "otpauth_uri": uri}
-    ```
+<Warning>
+Only the hyphen and case are normalised. Anything else the user types — a missing character, a space in the middle, a wrong code — produces a different hash and fails. There is no fuzzy matching and no partial credit.
+</Warning>
 
-    Any *unconfirmed* factor from a previous, abandoned enrollment attempt is deleted first — calling enroll again always starts clean. A fresh random base32 secret is generated, sealed, and stored. The response carries the **plaintext** secret (for manual entry) and an `otpauth://` provisioning URI (to render as a QR code), issued with `issuer` set to the project's display name.
+### Verifying a TOTP code
 
-    <Note>
-    Calling enroll again while a factor is *already confirmed* does not touch the confirmed factor — it only clears unconfirmed ones. The old confirmed factor keeps working for sign-in until a new one is confirmed, at which point `confirm()` deletes every other factor the user has.
-    </Note>
-  </Step>
-  <Step title="Scan or enter the secret">
-    The client renders `otpauth_uri` as a QR code (most authenticator apps scan it directly) or shows `secret` for manual entry. This step happens entirely on the client; Akountz is not involved.
-  </Step>
-  <Step title="POST /auth/v1/mfa/totp/verify with the first code">
-    Confirms the enrollment:
+The check is stricter than the usual comparison, and the reason is a specific attack.
 
-    ```python
-    async def confirm(akountz: Akountz, user: AuthUser, code: str) -> list[str] | None:
-        factor = await MfaFactor.filter(user=user, confirmed_at=None).order_by("-id").first()
-        if factor is None or not await _check(akountz, factor, code):
-            return None
-        await MfaFactor.filter(user=user).exclude(id=factor.id).delete()
-        factor.confirmed_at = datetime.now(UTC)
-        await factor.save(update_fields=["confirmed_at"])
-        user.mfa_enabled = True
-        await user.save(update_fields=["mfa_enabled"])
-        return await regenerate_recovery_codes(user)
-    ```
+TOTP codes are time-based: the current 30-second window produces one code, and it stays valid for the whole window. Anyone who sees a code — over a shoulder, in a screenshot, in a log — could replay it until the window rolls over. To prevent that, the last accepted time step is recorded on the factor, and any step at or below it is refused.
 
-    If the code checks out, every *other* factor the user has is deleted (enforcing "at most one factor"), the new one is marked confirmed, `AuthUser.mfa_enabled` flips to `true`, and ten fresh recovery codes are generated and returned — **this is the only response that ever contains raw recovery codes**. A wrong code returns `400 the code is not valid` and leaves the factor unconfirmed. If the current session came from a token, the route also calls `elevate()` to mark it `aal2` immediately, so the user doesn't have to sign in again right after turning MFA on.
-  </Step>
-</Steps>
+The verification accepts a small amount of clock drift, checking the previous, current and next windows, and comparing against the secret using a constant-time comparison. When a code matches, the accepted step is written immediately.
+
+| Aspect | Behaviour |
+| --- | --- |
+| Code length | Six digits. Non-digits fail immediately. |
+| Windows accepted | Previous, current, next — about 30 seconds of drift either way. |
+| Replay | The same code cannot be accepted twice, even within its window. |
+| Comparison | Constant-time. |
+| On success | The accepted step is saved before the request returns. |
+
+<Info>
+The replay protection is why a user who taps "verify" twice on a slow connection can be told their code is wrong on the second attempt. The first attempt consumed it. Waiting for the next code is the correct response, and it is not a bug.
+</Info>
+
+### Which factor is used
+
+Only one confirmed factor counts. When verifying, the newest confirmed factor for the user is taken — the first one found among the confirmed rows.
+
+There is room for more than one factor per user in the model, but nothing in the current flow creates a second one, so in practice an account has either one confirmed TOTP factor or none.
+
+<Info>
+Calling enrolment again deletes any unconfirmed factor first, so a user who starts enrolment twice does not accumulate junk rows. Only one pending factor can exist at a time.
+</Info>
+## The assurance level, and how a session is elevated
+
+This is the part that matters most for anything downstream of sign-in.
+
+Every session carries an **assurance level**, written as a claim in its tokens. `aal1` is the default: something was verified, but only one thing. `aal2` means a second factor was presented. There is no `aal3`.
+
+| Level | How it is reached |
+| --- | --- |
+| `aal1` | Password, magic link, social sign-in, email verification — any single-factor sign-in. |
+| `aal2` | A sign-in that completed an MFA challenge, or enrolment on a live session. |
+
+Two different paths lead to `aal2`, and the difference matters when you are reasoning about a session you are already holding.
+
+### Elevation at sign-in
+
+This is the ordinary path. The user submits credentials, the system recognises that MFA is required, and instead of issuing tokens it issues a **challenge**. The user then supplies a code, and only then is the session created — at `aal2`, because the second factor has now been presented.
+
+At no point does a session exist at `aal1` and then get upgraded. The `aal1` attempt produces no session at all. This is the safer shape: there is no window in which a partially-authenticated session is usable.
+
+### Elevation of a live session
+
+The second path happens when a signed-in user enrols an authenticator app. Confirming enrolment marks the account as having MFA, and the **current session is elevated to `aal2`** in place.
+
+This is the one case where a session changes level after it exists. It happens because the user has just proven they hold a second factor — they produced a valid code to confirm enrolment — so the session's assurance is updated to reflect that proof.
+
+<Warning>
+Elevating a session does not change access tokens that already exist. It updates the stored session, so newly issued tokens carry `aal2`. A client still holding a pre-elevation token continues to present `aal1` until it refreshes. If a policy requires `aal2`, plan for the client to refresh.
+</Warning>
+
+### The claim, and who reads it
+
+The assurance level rides in the token as `aal`, so every service that verifies a token can act on it without calling Akountz.
+
+```json
+{
+  "claims": {
+    "sub": "01HQ8X4M2K9P7R3T6V0YB5ZCNDA",
+    "prj": "acme",
+    "env": "production",
+    "typ": "access",
+    "aal": "aal2",
+    "sid": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6"
+  }
+}
+```
+
+| Consumer | How it uses `aal` |
+| --- | --- |
+| `GET /auth/v1/user` | Reports the current session's level. |
+| `GET /auth/v1/mfa` | Reports it alongside the enabled flag. |
+| A policy | Can require `aal2` for an operation. See [Auth in policies](/auth/auth-in-policies). |
+| Studio | The session's recorded level, alongside its method. |
+
+<Info>
+Because `aal` is a claim rather than a lookup, requiring a second factor is a policy decision rather than a code change. See [Auth in policies](/auth/auth-in-policies) for how to require it.
+</Info>
+## The sign-in challenge
+
+When a user with MFA signs in, the credential check succeeds and no session is issued. Instead, a challenge comes back.
 
 ```bash
-curl -X POST "$GW/auth/v1/mfa/totp/enroll" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $PAWABASE_PUBLISHABLE_KEY"
+curl -X POST "https://api.example.com/auth/v1/token" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"grant_type": "password", "email": "ada@example.com", "password": "..."}'
 ```
 
 ```json
 {
-  "factor_id": "14",
-  "secret": "JBSWY3DPEHPK3PXP",
-  "otpauth_uri": "otpauth://totp/Acme:chioma@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme"
+  "mfa_required": true,
+  "mfa_token": "...",
+  "factors": ["totp", "recovery_code"]
 }
 ```
 
+| Field | Meaning |
+| --- | --- |
+| `mfa_required` | Always `true` here. The signal to prompt for a code. |
+| `mfa_token` | A one-time token naming the user and the original sign-in method. |
+| `factors` | The methods that may satisfy it. Both a TOTP code and a recovery code. |
+
+<Warning>
+The response is not an error. It is a `200`, and the credentials were correct. A client that treats anything other than a token response as a failure will show a login error at the moment the user was most likely to succeed.
+</Warning>
+
+The `factors` list is the contract for what your prompt should accept. Because both methods are listed, one input field is enough: the user types either their six-digit authenticator code or one of their recovery codes, and the same endpoint handles both.
+
+### What the challenge token carries
+
+The `mfa_token` is a one-time token holding more than the user's identity:
+
+| Stored | Used for |
+| --- | --- |
+| The user | Whose codes to check. |
+| `method` | The sign-in method that started the flow, so the session records `password`, `magic_link` or `oauth:<provider>`. |
+| `org` | The organization named at sign-in, carried through to the issued session. |
+
+That `method` field is why an MFA-completed session still shows up correctly as a social or password session — the fact that a second factor was required does not overwrite how the person authenticated.
+
+The token is valid for **five minutes**. That is a deliberately tight window compared with the other one-time tokens, because it is not a link in an email that a person might find later — it is a challenge being answered right now.
+
+### Completing the challenge
+
 ```bash
-curl -X POST "$GW/auth/v1/mfa/totp/verify" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" -d '{"code": "482913"}'
+curl -X POST "https://api.example.com/auth/v1/token" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"grant_type": "mfa", "mfa_token": "...", "code": "123456"}'
+```
+
+The response is the standard token response, at `aal2`, with one extra field recording which method worked:
+
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1750000000,
+  "session_id": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6",
+  "org": null,
+  "org_role": null,
+  "user": { },
+  "mfa_method": "totp"
+}
+```
+
+| Field | Values |
+| --- | --- |
+| `mfa_method` | `"totp"` or `"recovery_code"` — which one satisfied the challenge. |
+| `session_id` | The token family. Used to revoke this session later. |
+
+<Info>
+`mfa_method` is the only difference in shape from an ordinary token response, and it is worth surfacing in an audit log: knowing whether someone used their authenticator or burned a recovery code tells you something about their account's health that the session row alone does not.
+</Info>
+
+<Warning>
+A failed challenge counts toward the account's lockout, exactly as a wrong password does. There is no separate MFA attempt budget. A user fumbling their authenticator repeatedly can lock themselves out of the account exactly as they could by mistyping their password.
+</Warning>
+## Recovery codes
+
+Ten single-use codes that stand in for the authenticator when the phone is not to hand. They are generated, shown once, stored hashed, and spent one at a time.
+
+### What they are not
+
+They are not a backup of the TOTP secret. They do not reconstruct it, and having all ten of them does not let you generate future codes. Each one is an independent, single-use credential that will satisfy exactly one future challenge and then be worthless.
+
+That distinction matters when a user asks to "recover" their authenticator. Regenerating the set does not restore access to the old one — it produces an entirely new set of ten credentials and invalidates the old ones.
+
+### Generation
+
+Regenerating deletes every existing recovery code for the user and creates a fresh set of ten. It is a replacement, never an addition.
+
+| Aspect | Value |
+| --- | --- |
+| Count per generation | 10 |
+| Source of randomness | Five bytes per code, from the system CSPRNG. |
+| Rendered form | Ten hexadecimal characters, hyphenated in the middle. |
+| Stored as | SHA-256 of the normalised code. |
+| Returned as | A list of plain-text codes, once. |
+
+**The plain-text codes exist only in the response that generated them.** Once that response is discarded, they cannot be retrieved — not by an administrator, not from the database, not by any support procedure. The stored hashes are one-way.
+
+<Warning>
+This is the single most important thing to get right in a product built on this. If your user does not copy their recovery codes, the codes are gone and the only remaining path is the one you provide for a lost authenticator — which in most deployments is an administrator using the MFA reset action in Studio.
+</Warning>
+
+### Spending one
+
+A recovery code is checked by hashing the submitted value and looking for an unused row with that hash.
+
+```json
+{
+  "code_hash": "b1946ac92492d2347c6235b4d2611184...",
+  "used_at": null
+}
+```
+
+When one matches, the row is marked used **with a conditional update** — an update that only applies while `used_at` is still null. This is what makes it single-use even under a race: if two requests arrive with the same code simultaneously, only one update matches, and only that one succeeds. The other is treated as a failure.
+
+<Info>
+The conditional update is the same technique used for one-time email links, for the same reason: it closes the window where two concurrent requests both believe they consumed a single-use credential.
+</Info>
+
+### Counting what is left
+
+The remaining count is the number of rows for that user with no `used_at`. It is reported by the status endpoint and is worth showing to users, because a user on their last recovery code is a support ticket waiting to happen.
+
+```bash
+curl "https://api.example.com/auth/v1/mfa" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+```json
+{
+  "enabled": true,
+  "aal": "aal2",
+  "recovery_codes_remaining": 8
+}
+```
+
+### Regenerating, and why it needs a TOTP code
+
+Regenerating recovery codes requires a **current authenticator code specifically** — a recovery code will not do it.
+
+| Field | Requirement |
+| --- | --- |
+| Signed in | Yes. |
+| MFA already enabled | Yes. |
+| Code supplied | Must satisfy the challenge **as `totp`**. |
+
+The reasoning is sound: if someone has stolen a session, they cannot mint themselves a fresh set of durable fallback credentials. Requiring the authenticator means recovery codes can only be replaced by the person who actually holds the second factor.
+
+<Warning>
+A user who has lost their authenticator **and** their recovery codes cannot regenerate codes. That is not a gap to work around in the application — it is the situation the administrator MFA reset exists for.
+</Warning>
+## Enrolling
+
+Three requests: start, confirm, and optionally disable. The first returns the secret and a provisioning URI; the second proves the user can use them and issues the recovery codes.
+
+### Starting
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/totp/enroll" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+```json
+{
+  "factor_id": "01HQ8X4M2K9P7R3T6V0YB5ZCNDA",
+  "secret": "JBSWY3DPEHPK3PXP",
+  "otpauth_uri": "otpauth://totp/Acme:ada@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme"
+}
+```
+
+| Field | What to do with it |
+| --- | --- |
+| `secret` | The shared secret, if you render the code by hand. |
+| `otpauth_uri` | Render as a QR code, which is what most authenticator apps scan. |
+| `factor_id` | The new factor's identifier. Retained for your own tracking. |
+
+The issuer in the URI is the environment's project name, or the project slug when no display name is set — so the label a user sees in their authenticator app matches your product.
+
+<Warning>
+The secret is returned exactly once, by this call, and is the only time it exists outside the encrypted column. If you render it as text as well as a QR code, treat the page as sensitive: it is a credential that defeats the second factor, and anything that logs the page or the response leaks it permanently.
+</Warning>
+
+Calling this twice is safe. Unconfirmed factors are deleted first, so the user always ends up with exactly one pending secret and the one they just requested.
+
+### Confirming
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/totp/verify" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"code": "123456"}'
 ```
 
 ```json
 {
   "enabled": true,
   "recovery_codes": [
-    "9f31c-a02de",
-    "7b4e1-c9a03",
-    "..."
+    "a3f9c-2e1d4", "7b02e-9c8a1", "44d1f-6e0b3"
   ]
 }
 ```
 
+Confirmation does several things at once, which is why it is one request:
+
+| Effect | Consequence |
+| --- | --- |
+| Marks the factor confirmed. | It starts being used to verify codes. |
+| Deletes any other factors for the user. | An account ends up with exactly one. |
+| Sets `mfa_enabled` on the account. | Sign-ins are challenged from now on. |
+| Elevates the current session to `aal2`. | Your existing tokens refresh to the higher level. |
+| Generates ten recovery codes. | **Returned once, in this response, and never again.** |
+
 <Warning>
-Recovery codes appear exactly once, in this response. Instruct users to store them immediately — a password manager, a printed sheet, anywhere durable. There is no "show my recovery codes" endpoint, because Akountz never has the raw codes to show; only `code_hash` is on disk.
+The last row is the one to design your interface around. These codes are the only copy the user will ever have. Present them in a way that survives being dismissed — a modal they must acknowledge, or a page they must confirm they have saved, rather than a toast that disappears in four seconds.
+</Warning>
+### Disabling
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/disable" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"code": "123456"}'
+```
+
+Disabling requires a current code — either an authenticator code or a recovery code will do, since the point is to prove possession of a second factor rather than of the specific one.
+
+Turning MFA off deletes **both** the factor and every recovery code, then clears the flag. Nothing is left behind.
+
+| Response | Meaning |
+| --- | --- |
+| `{"enabled": false}` | MFA is now off. |
+| `{"enabled": false}` (returned early) | MFA was already off; no code was checked. |
+
+<Warning>
+This is irreversible with respect to the codes. There is no way to recover a deleted recovery code set, and the user will need to enrol again from scratch — producing a new secret, new codes, and a re-scan of the QR code.
 </Warning>
 
-## Recovery code format
+<Info>
+Disabling does not revoke existing sessions or lower their assurance level. A session issued at `aal2` stays at `aal2` for its remaining life. If you need a user's access gone, revoke their sessions — see [Tokens and sessions](/auth/tokens-and-sessions).
+</Info>
 
-```python
-RECOVERY_CODE_COUNT = 10
+## Endpoint reference
 
-async def regenerate_recovery_codes(user: AuthUser) -> list[str]:
-    await RecoveryCode.filter(user=user).delete()
-    codes = []
-    for _ in range(RECOVERY_CODE_COUNT):
-        raw = secrets.token_hex(5)
-        code = f"{raw[:5]}-{raw[5:]}"
-        codes.append(code)
-        await RecoveryCode.create(user=user, code_hash=_hash(code))
-    return codes
+Every MFA route, with what it needs and what it returns.
+
+| Method | Path | Needs a code | Rate limit | Returns |
+| --- | --- | --- | --- | --- |
+| POST | `/auth/v1/mfa/totp/enroll` | no | none | `factor_id`, `secret`, `otpauth_uri` |
+| POST | `/auth/v1/mfa/totp/verify` | yes | `akz:mfa` | `enabled`, `recovery_codes` |
+| POST | `/auth/v1/mfa/disable` | yes | `akz:mfa` | `enabled` |
+| POST | `/auth/v1/mfa/recovery-codes` | yes, TOTP only | `akz:mfa` | `recovery_codes` |
+| GET | `/auth/v1/mfa` | no | none | `enabled`, `aal`, `recovery_codes_remaining` |
+| POST | `/auth/v1/token` | yes | `akz:auth` | The token response at `aal2` |
+
+### Request bodies
+
+Two of the routes take a body, and both validate the code's shape before looking at it.
+
+```json
+{
+  "code": "123456"
+}
 ```
 
-Each code is `secrets.token_hex(5)` — **10 hex characters** drawn from 5 cryptographically random bytes — split evenly and joined with a hyphen, e.g. `9f31c-a02de`. Ten such codes are generated per batch, and generating a new batch always deletes every code from the previous batch first — codes are never additive.
+| Constraint | Applies to |
+| --- | --- |
+| Minimum length 6 | Every code body. |
+| Maximum length 32 | Every code body. |
 
-The hash function normalizes before hashing so formatting doesn't matter at verification time:
+<Info>
+The minimum length of six is why a recovery code fits the same body as a TOTP code — the hyphenated form is exactly ten characters. One field, either method, no client-side discrimination needed.
+</Info>
 
-```python
-def _hash(code: str) -> str:
-    return hashlib.sha256(code.replace("-", "").strip().lower().encode()).hexdigest()
-```
+### Errors
 
-A user can type `A1B2C3D4E5`, `a1b2c-3d4e5`, or `a1b2c 3d4e5` and all three hash identically — hyphens are stripped, whitespace trimmed, case lowered, before hashing. This makes recovery codes forgiving of how a user transcribes them from a printed sheet.
-
-<Note>
-Recovery codes are 10 lowercase hex characters (40 bits of entropy), not the shorter 8-character `token_hex(4)` format described in older material. Do not build a client-side regex validator narrower than "10 hex characters, optionally hyphenated" or it will reject valid codes.
-</Note>
-
-## Verifying a code
-
-`mfa.verify(akountz, user, code)` is the single entry point used both by the sign-in MFA challenge and by the "confirm with a current code" gate on disabling MFA or regenerating recovery codes. It tries TOTP first, then falls back to recovery codes:
-
-```python
-async def verify(akountz: Akountz, user: AuthUser, code: str) -> str | None:
-    factor = await MfaFactor.filter(user=user).exclude(confirmed_at=None).first()
-    if factor is not None and await _check(akountz, factor, code):
-        return "totp"
-    recovery = await RecoveryCode.filter(user=user, code_hash=_hash(code), used_at=None).first()
-    if recovery is not None:
-        updated = await RecoveryCode.filter(id=recovery.id, used_at=None).update(used_at=datetime.now(UTC))
-        if updated:
-            return "recovery_code"
-    return None
-```
-
-It returns `"totp"`, `"recovery_code"`, or `None` — never raises. The recovery-code consumption is a conditional `UPDATE ... WHERE used_at IS NULL`, so two concurrent requests racing to use the same recovery code can't both succeed; only one `UPDATE` affects a row.
-
-### Replay protection
-
-A TOTP code is checked against a ±1 step window (90 seconds total, accounting for clock drift), but each accepted step is remembered:
-
-```python
-async def _check(akountz: Akountz, factor: MfaFactor, code: str) -> bool:
-    totp = pyotp.TOTP(akountz.box.open(factor.secret_ciphertext))
-    ...
-    for drift in (-1, 0, 1):
-        step = int(now // 30) + drift
-        if step <= factor.last_used_step:
-            continue
-        if secrets.compare_digest(totp.at(step * 30), code):
-            factor.last_used_step = step
-            await factor.save(update_fields=["last_used_step"])
-            return True
-    return False
-```
-
-`last_used_step` only ever moves forward. Once step `N` has been accepted, steps `≤ N` are rejected outright, even if the six digits are correct — this is what stops someone who observed a code over a shoulder (or intercepted it) from replaying it within its 30-second validity window. The comparison itself uses `secrets.compare_digest`, a constant-time comparison, so verification timing doesn't leak which digit differed.
-
-## Disabling MFA and resetting recovery codes
-
-| Endpoint | What it needs | What it does |
+| Status | Detail | Cause |
 | --- | --- | --- |
-| `POST /auth/v1/mfa/disable` | A current, valid code (TOTP or recovery). | Deletes every `MfaFactor` and every `RecoveryCode` for the user, sets `mfa_enabled = false`. |
-| `POST /auth/v1/mfa/recovery-codes` | A current **TOTP** code specifically — a recovery code will not satisfy this check. | Deletes and reissues all ten recovery codes. |
-| `GET /auth/v1/mfa` | A signed-in session. | Returns the `enabled`, `aal`, and `recovery_codes_remaining` fields. |
-
-```python
-async def disable(user: AuthUser) -> None:
-    await MfaFactor.filter(user=user).delete()
-    await RecoveryCode.filter(user=user).delete()
-    user.mfa_enabled = False
-    await user.save(update_fields=["mfa_enabled"])
-```
-
-`recovery-codes` deliberately requires a TOTP code (`await mfa.verify(...) != "totp"` is the rejection condition) rather than accepting a recovery code — otherwise a recovery code could be used to mint itself a fresh batch, defeating the "single use" property.
-
-An administrator can also force-clear a user's MFA through the admin API: `POST /projects/{project}/envs/{env}/users/{user_id}/mfa/reset` calls the same `mfa.disable(user)` and emits `user.mfa_reset`. This is the recovery path for a user who has lost both their authenticator and every recovery code — support must verify identity out-of-band before calling it, since it removes the second factor entirely.
-
-## MFA during sign-in
-
-MFA does not gate the credential check itself — a wrong password still fails before MFA is ever considered. Once the password (or magic link, or social login) succeeds, Akountz checks whether the account has MFA enabled *and* the environment allows it:
-
-```python
-if user.mfa_enabled and config.mfa_enabled:
-    challenge = await links.issue(akountz, config, "mfa", user=user, data={"method": "password", "org": body.org})
-    return {"mfa_required": True, "mfa_token": challenge, "factors": ["totp", "recovery_code"]}
-```
-
-Instead of a session, the client gets an `mfa_token` — a short-lived (5-minute) [one-time token](/auth/tokens-and-sessions#one-time-tokens) that remembers which sign-in method was in progress and which organization (if any) was requested. The client then completes the grant:
-
-```bash
-curl -X POST "$GW/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "content-type: application/json" \
-  -d '{"grant_type": "mfa", "mfa_token": "eyJ...", "code": "482913"}'
-```
-
-On success, a session is started with `aal="aal2"` directly — the resulting access token's `aal` claim is `aal2` from the very first token, not upgraded on a later refresh. The response also includes `"mfa_method": "totp"` or `"mfa_method": "recovery_code"` so the client can prompt "you're running low on recovery codes" when appropriate (combine with `GET /auth/v1/mfa`'s `recovery_codes_remaining`).
-
-A wrong code during this step calls the same `record_failure` lockout mechanism as a wrong password — repeated bad MFA attempts count toward the account's lockout threshold, they are not a separate, unlimited-attempts surface. `POST /auth/v1/mfa/totp/verify`, `/mfa/disable` and `/mfa/recovery-codes` are additionally rate-limited to 10 requests per 60 seconds per caller.
-
-## Assurance levels: `aal1` and `aal2`
-
-Every session (`SessionInfo` row) carries an `aal` field, either `"aal1"` (password/magic-link/social login alone) or `"aal2"` (MFA completed). This value is re-read and re-minted onto the access token on every refresh, so a session that reached `aal2` stays `aal2` across its whole lifetime unless something explicitly resets it:
-
-```python
-async def elevate(akountz: Akountz, config: AuthConfig, user: AuthUser, family: str) -> None:
-    """Mark a session as having passed MFA (aal2)."""
-    await SessionInfo.filter(family=family, user=user).update(aal="aal2")
-```
-
-`elevate()` is called from exactly one place today: right after a user confirms TOTP enrollment on an already-open session, so they don't have to sign out and back in to get an `aal2` token. A brand-new sign-in through the MFA challenge flow reaches `aal2` directly via `start_session(..., aal="aal2", ...)`.
-
-### Using `aal` in a policy
-
-The assurance level is on the token as `$auth.claims.aal`, and the condition language ships a dedicated shorthand for it:
-
-```json
-{ "aal": "aal2" }
-```
-
-which expands to `{"eq": ["$auth.claims.aal", "aal2"]}`. A typical use is gating a sensitive action behind MFA regardless of role:
-
-```json
-{ "all": [
-  { "role": "bursar" },
-  { "aal": "aal2" }
-] }
-```
-
-See [the condition language](/policies/conditions#shorthands) for the full shorthand reference.
+| 400 | `the code is not valid` | Wrong code, expired challenge, or a replayed TOTP step. |
+| 400 | `a current authenticator code is required` | Regenerating codes with a recovery code instead of a TOTP code. |
+| 400 | `mfa_token and code are required` | The MFA grant sent without both fields. |
+| 400 | `the challenge is no longer valid` | The user was deleted or disabled after the challenge was issued. |
+| 403 | `MFA is disabled for this project` | Enrolment attempted where `mfa_enabled` is off. |
+| 429 | `too many failed attempts; try again later` | The account is locked out. |
 
 <Warning>
-There is no per-organization or per-route "minimum AAL" configuration field anywhere in Akountz — `aal` is only ever an attribute of a session, read and compared inside policy conditions like the one above. If you need "this route always requires `aal2`," write that as part of the route's policy, not as a separate configuration block. Akountz's `AuthConfig` has a single environment-wide `mfa_enabled` toggle (whether MFA is available/enforced at all when a user has enrolled one) — it has no config field named `require_aal`, and no per-organization auth settings of any kind. See [Organizations → one auth configuration per environment](/auth/organizations#one-auth-configuration-per-environment).
+`the code is not valid` covers several distinct causes — a wrong code, an expired challenge, a replayed TOTP code, an already-spent recovery code — and they are indistinguishable from outside. That is deliberate. Giving a user a precise reason would let someone probe which recovery codes are already used.
 </Warning>
+## Configuring MFA
 
-## Real scenarios
-
-### Enforcing MFA for a specific role
-
-Akountz has no "require MFA for role X" configuration switch — `mfa_enabled` is an environment-wide flag, not scoped to a role or organization. To require MFA specifically for, say, every `bursar`, enforce it at the policy layer on the operations that matter:
+There is exactly one setting, and it decides two different things.
 
 ```json
-{ "any": [
-  { "not": { "role": "bursar" } },
-  { "all": [ { "role": "bursar" }, { "aal": "aal2" } ] }
-] }
+{
+  "auth": {
+    "mfa_enabled": true
+  }
+}
 ```
 
-This reads as "anyone who isn't a bursar is unaffected by this rule; a bursar must additionally have completed MFA." Combine it with the rest of the resource's access policy in an `all`.
+| What `mfa_enabled` controls | Effect when false |
+| --- | --- |
+| Enrolment | `POST /mfa/totp/enroll` returns `403 MFA is disabled for this project`. |
+| Sign-in challenge | Existing enrolments stop being challenged at sign-in. |
 
-### Customer onboarding with optional MFA
+That second row is the surprising one, and it is a genuinely useful behaviour: **turning MFA off stops requiring it without destroying it.** A user who enrolled an authenticator keeps their factor and their recovery codes, they simply stop being challenged. Turning it back on restores the challenge immediately.
 
-A common SaaS pattern: MFA is available but not mandatory, and users are nudged to enroll after their first sign-in. Since `user_metadata` is client-editable, a safe way to track "has been nudged" without letting the user fake it is to store the flag in `app_metadata` from a server-side flow, and read `mfa_enabled` directly from `GET /auth/v1/user` to decide whether to show the enrollment prompt.
+<Warning>
+`mfa_enabled` is a per-environment setting and defaults to **on**. An environment that has never been configured has MFA available and enabled, and anyone can enrol. The platform's own reserved environment is the exception — it has `signup_enabled` off and a stricter policy set, and magic links disabled.
+</Warning>
 
-### Recovering a locked-out user (support flow)
+### There is no directive to require MFA
 
-A user who has lost their phone and their recovery codes cannot self-service — there is no "email me a new secret" flow, by design, since that would defeat the purpose of a second factor. The only path is an administrator calling the admin reset endpoint after verifying identity out-of-band:
+This is worth stating directly, because it is a common assumption carried over from other systems.
 
-```bash
-curl -X POST "$STUDIO/internal/v1/projects/acme/envs/production/users/482/mfa/reset" \
-  -H "Authorization: Bearer $SERVICE_TOKEN"
+**There is no `require_aal` setting, and there is no `require_mfa` setting.** Neither exists. There is also **no TOML anywhere in authentication configuration** — the environment's auth block is JSON, as it is everywhere else in Pawabase.
+
+If you are looking for a way to force every user in an environment to have MFA, that is not a configuration setting. The two available approaches are:
+
+| Approach | How |
+| --- | --- |
+| Require `aal2` in a policy. | Branch on the token's `aal` claim at the operation that needs it. See [Auth in policies](/auth/auth-in-policies). |
+| Enrol users administratively. | There is no admin route to enrol on a user's behalf; an administrator resets MFA rather than setting it up. |
+
+<Warning>
+Pawabase has no directive that forces enrolment. If your product needs "every account must have MFA before it can do X", express that as a policy on `aal`, and treat an un-enrolled user's `aal1` as the case you are rejecting. This is the intended design: assurance is a property of the session, not a flag on the account.
+</Warning>
+
+<Info>
+Remember the ten-second configuration cache. Turning MFA off in Studio does not take effect on sign-in attempts made in the next few seconds. See [Authentication configuration](/auth/configuration).
+</Info>
+
+### Policies are JSON too
+
+If you are expressing the assurance requirement in a policy, the shape is JSON like everything else.
+
+```json
+{
+  "require": {
+    "aal": "aal2"
+  }
+}
 ```
 
-This clears `mfa_enabled` and deletes all factors and recovery codes. The user can then sign in with just their password and re-enroll MFA from scratch.
+The `aal` claim is available to conditions, exactly like the other identity claims. See [Conditions](/policies/conditions) for the full condition vocabulary and [Auth in policies](/auth/auth-in-policies) for how this is applied.
 
-## Common mistakes
+## What Studio shows
+
+MFA appears in three places in Studio's **Users & auth** page, and they answer three different questions.
+
+### The environment switch
+
+Under the **Configuration** tab, the **Sign-in methods** section holds **MFA (TOTP)**, whose hint reads *"Let users add an authenticator app for aal2."* That is the `mfa_enabled` setting, described in the interface in exactly the assurance-level terms this page uses.
+
+It sits beside **Magic links**, described as *"Passwordless sign-in by emailed one-time link"*, in a section with no description of its own. Two switches, two sign-in methods, one tab.
+
+<Info>
+The hint text names `aal2` explicitly, which is a good confirmation that the assurance level is the concept the product is built around rather than an implementation detail.
+</Info>
+
+### Per user
+
+Under the **Users** tab, a user's modal shows whether MFA is on. For a user who has it enabled, the modal offers a **Reset MFA** action.
+
+That reset is the administrative escape hatch for a user who has lost both their authenticator and their recovery codes. It deletes the factor and the recovery codes and clears the flag, returning the account to a state where they can sign in with one factor and enrol again.
+
+<Warning>
+MFA reset removes the user's ability to verify themselves. Before offering it as a support action, treat it as an account-recovery event: confirm the person's identity by whatever means your support process requires, and record that you did.
+</Warning>
+
+### The audit trail
+
+Under the **Sign-in activity** tab, MFA produces its own event rows alongside ordinary sign-ins.
+
+| Event | When |
+| --- | --- |
+| `mfa_challenge` | A challenge is issued instead of a session. |
+| `mfa_verify` | A challenge is answered. Recorded with success or failure and a reason. |
+| `mfa_enrolled` | A factor is confirmed. |
+
+A failed `mfa_verify` carries the reason `wrong code`, and renders in the Result column like any other failure. Watching for repeated failures on one account is the practical way to spot someone who cannot get into their account.
+
+<Info>
+The **failures only** checkbox on that tab is the fastest way to review MFA problems across an environment.
+</Info>
+## Building the user interface
+
+The three screens an MFA feature needs, and the decisions that are easy to get wrong in each.
+
+### Enrolment
+
+The screen has one job: get the secret into an authenticator app and prove it works before the account is committed.
+
+| Element | Notes |
+| --- | --- |
+| QR code | Rendered from `otpauth_uri`. The path most users take. |
+| The secret as text | For users who cannot scan. Show it; do not hide it. |
+| A code input | Confirms the enrolment. |
+| A warning about losing the device | Before they commit, not after. |
+
+<Warning>
+The most common enrolment failure is a user who scans the QR code, does not complete the confirmation step, and navigates away. Because unconfirmed factors are deleted on the next enrolment attempt but not by abandoning, an abandoned attempt leaves a pending factor that does not affect the account. The user simply tries again and gets a new secret.
+</Warning>
+
+### The recovery codes screen
+
+This is the screen most products get wrong, because the easy implementation is a toast.
+
+| Decision | Why it matters |
+| --- | --- |
+| Make it blocking | The codes exist once. A dismissible toast loses them. |
+| Show all ten at once | There is no way to fetch them later, so a partial view is a partial loss. |
+| Offer a download | Users lose phones. A `.txt` file in their password manager is the realistic path. |
+| Offer a print | Some users will print them. |
+| Do not auto-advance | Let them leave only when they have said they have them. |
+| Show the count later | `recovery_codes_remaining` is the warning that arrives too late otherwise. |
+
+<Warning>
+If you offer a "remind me later" option, it must not pretend the codes can be retrieved. There is no endpoint that returns them. The honest options are: they saved them, or they need to enrol again.
+</Warning>
+
+### The challenge prompt
+
+One field, because both methods are accepted by the same endpoint.
+
+| Element | Notes |
+| --- | --- |
+| A single code input | Accepts a six-digit TOTP code or a hyphenated recovery code. |
+| Label | Should not say "enter your authenticator code" — that excludes recovery-code users. |
+| A recovery-code affordance | A link explaining that they can use a saved code instead. |
+| No `autocomplete` guessing | Do not let a browser offer to fill this in. |
+
+<Warning>
+The replay protection means a user who submits a valid code twice sees the second one rejected. If your form allows resubmission, make the error message distinguish this case — "that code was already used, wait for the next one" saves a support ticket that "invalid code" reliably generates.
+</Warning>
+
+### Clock skew, from the user's side
+
+TOTP depends on the device clock agreeing with the server. Roughly thirty seconds of drift in either direction is tolerated, so ordinary clock drift is not a problem — but a device whose clock is badly wrong is.
+
+| Symptom | Likely cause |
+| --- | --- |
+| Codes rejected while the server's own codes work | The phone's clock is wrong. |
+| Codes rejected intermittently | Timezone confusion, or a device that has been offline. |
+| Codes accepted, then immediately rejected | Replay protection, after a double submit. |
+
+<Info>
+If a whole class of users reports invalid codes, check the clock before suspecting the secret. The tolerance window exists precisely so that normal clock differences do not matter, which means a failure means the difference is not normal.
+</Info>
+## Worked examples
+
+### A first sign-in with MFA
+
+The user posts their email and password. The credentials are correct, and the account has MFA on.
+
+No session is issued. A challenge comes back carrying a token valid for five minutes, recording that this was a password sign-in. The user types the six-digit code from their app. The grant `mfa` is sent with that code.
+
+The code matches a window the factor has not consumed, so the step is recorded and the token spent. A session is created with the original method — `password` — and `aal2`, because a second factor was presented. The response carries `mfa_method: "totp"`.
+
+The sign-in history records the challenge, the verification, and the session.
+
+### Signing in with a recovery code
+
+Identical, except the user types `a3f9c-2e1d4` instead.
+
+The TOTP check fails — it is not six digits — so the recovery check runs. The code normalises, hashes, and matches an unused row. The conditional update marks it used and succeeds, so the challenge is satisfied.
+
+The session is the same, at `aal2`, with `mfa_method: "recovery_code"`. `recovery_codes_remaining` is now one lower, and a recovery-code user who has just used their last code should be prompted to enrol a new authenticator.
+
+### A user who enrolled on their phone and then lost it
+
+They have their recovery codes. The sign-in challenge accepts one, and they are in.
+
+They can then enrol a new factor, which deletes the old one and produces a fresh set of recovery codes.
+
+### A user who lost the phone and the codes
+
+Neither path works. No code can be produced, and the codes cannot be regenerated — that requires a TOTP code, precisely to stop a stolen session doing it.
+
+**This is the one situation MFA cannot resolve, and it is why the administrative reset exists.** An administrator uses **Reset MFA** on the user in Studio, which deletes the factor and the codes and clears the flag. The user signs in with one factor and enrols again.
+
+<Warning>
+Design your support process around this case explicitly, because it will happen and it is indistinguishable from an attacker with a stolen session. That ambiguity is inherent to any second factor, and resolving it is an identity-verification decision, not a technical one.
+</Warning>
+
+### Enrolling while already signed in
+
+The user is signed in at `aal1` and enrols an authenticator app. Confirmation marks the account as having MFA and elevates the current session to `aal2`.
+
+Their existing access token still says `aal1`, because it was minted before the elevation. Their next refresh produces tokens carrying `aal2`, and a policy requiring `aal2` starts passing.
+
+<Info>
+If your application checks its own session's `aal` from a cached token rather than from the API, it will keep reporting the old level until it refreshes. `GET /auth/v1/mfa` is the authoritative answer at any moment.
+</Info>
+## Troubleshooting
+
+MFA problems are few and each has one real cause, so the table is short and worth reading in full.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `the code is not valid`, code is right | Already consumed by an earlier attempt. | Wait for the next 30-second window. |
+| `the code is not valid`, always | The device clock is wrong. | Correct the device's time. |
+| `the code is not valid`, on one device only | That device has not been given the current secret. | Re-enrol; the old factor is deleted. |
+| `the code is not valid`, code copied from the confirmation screen | Those were recovery codes, not an authenticator code. | Use the authenticator app for TOTP. |
+| `a current authenticator code is required` | A recovery code was used to regenerate. | Supply a TOTP code. |
+| `MFA is disabled for this project` | `mfa_enabled` is off in that environment. | Turn **MFA (TOTP)** on in the Configuration tab. |
+| User is never challenged | Their `mfa_enabled` flag is false, or the environment's is off. | Check `GET /auth/v1/mfa`. |
+| Challenge expires | Five minutes elapsed. | Start the sign-in again. |
+| `429 too many failed attempts` | The account's lockout threshold was hit. | Wait out the lockout, or an administrator clears it. |
+| Codes rejected for a whole team | Device clocks, or a misconfigured environment. | Check `mfa_enabled` and the users' clocks. |
+| Nothing happens after confirming enrolment | A code was submitted twice and the second was a replay. | Use the next code. |
+
+<Warning>
+If a user cannot recover with either factor, the support path is **Reset MFA** in Studio. Nothing else in the product will produce a working code for them, and no amount of retrying with the same secret will change that.
+</Warning>
 
 <AccordionGroup>
-  <Accordion title="Expecting the secret to be retrievable after enrollment">
-    `secret_ciphertext` is opaque outside Akountz's own decryption. If a user closes the enrollment screen before scanning the QR code, the only fix is to call `enroll` again — it clears the unconfirmed factor and issues a fresh secret. There's no "show me my in-progress secret again" endpoint.
+  <Accordion title="Can I see a user's recovery codes?">
+    No. Only the hashes are stored, and they cannot be reversed. This is the intended design — an administrator with database access gains nothing from the recovery codes. The only ways forward are the user spending one, or an administrator resetting MFA.
   </Accordion>
-  <Accordion title="Treating recovery codes as reusable">
-    Each code works exactly once — `used_at` is set on first successful use and the code is rejected on every subsequent attempt, even if it's typed correctly. This is enforced with a conditional update, not a delete, so used codes remain visible for audit (though no endpoint currently exposes them).
+  <Accordion title="Can a user have two authenticator apps?">
+    Not through the normal flow. Confirming an enrolment deletes any other factor for that account, so an account has exactly one. A user who wants the same secret on two devices should enrol once and enter the secret manually on the second device — the secret is shown at enrolment for exactly this.
   </Accordion>
-  <Accordion title="Assuming MFA is configured per-organization or per-role">
-    It's a single environment-wide toggle (`mfa_enabled`) plus a per-account flag (`AuthUser.mfa_enabled`). There is no config surface for "require MFA only for admins" — build that as a policy condition on the operations that need it, as shown above.
+  <Accordion title="Does an MFA challenge work across environments?">
+    No. The challenge token is bound to one project and environment, and it names a user in that environment. A challenge issued in staging cannot be completed against production.
   </Accordion>
-  <Accordion title="Confusing `mfa_enabled` on the environment with `mfa_enabled` on the user">
-    Both must be true for a challenge to be issued at sign-in (`if user.mfa_enabled and config.mfa_enabled`). Turning off the environment's `mfa_enabled` doesn't delete anyone's factors — it just stops the challenge from being issued, effectively letting MFA-enrolled users sign in with just a password until it's turned back on.
+  <Accordion title="Why is my aal still aal1 after enrolling?">
+    Because the token you are holding was issued before the elevation, and tokens are immutable. Refresh and it will be `aal2`. `GET /auth/v1/mfa` reports the session's actual level at any moment.
+  </Accordion>
+  <Accordion title="Does turning mfa_enabled off delete anything?">
+    No. It stops enrolment and stops the sign-in challenge. Factors and recovery codes remain, and turning it back on restores them. The way to actually delete them is for the user to disable MFA, or for an administrator to reset it.
+  </Accordion>
+</AccordionGroup>
+## How MFA interacts with the other sign-in methods
+
+MFA is not tied to passwords. Whichever way a person authenticates, the same challenge comes back and the same code satisfies it.
+
+| Sign-in method | Challenged? | Session method | Reaches `aal2` |
+| --- | --- | --- | --- |
+| Password | yes | `password` | via the challenge |
+| Magic link | yes | `magic_link` | via the challenge |
+| Social | yes | `oauth:<provider>` | via the challenge |
+| Email verification | no | `email_verification` | no — it is not a sign-in method users return from |
+| Password recovery | no | `recovery` | no, but the flow has already proven email control |
+
+The last two rows are worth reading twice. Confirming an email address issues a session, and resetting a password issues a session, but neither challenges for a second factor. A user who resets their password from an email link is signed in without one.
+
+<Warning>
+That is worth understanding before you rely on `aal` as a guarantee. A user who used a recovery link has a session at `aal1`, because proving control of an email inbox is the only factor checked. If an operation must require `aal2`, a policy on the claim is the enforcement point — not the assumption that reaching the account implies a second factor.
+</Warning>
+
+Social sign-in deserves particular mention: a social sign-in that returns `mfa_required` does so **through the URL fragment**, like any other social result, so a browser-based client has to handle the MFA branch in its callback page. See [Social login](/auth/social-login).
+
+### Where MFA sits relative to email verification
+
+The two are independent, and the order they are checked in at sign-in is fixed.
+
+| Check | When | Failure |
+| --- | --- | --- |
+| Credentials | First. | `invalid email or password` |
+| Disabled account | Second. | `403 this account is disabled` |
+| Email verification | Third. | `403 confirm your email address first` |
+| MFA challenge | Last. | Returns `mfa_required`. |
+
+Verification is checked before MFA, so an unverified user in an environment that requires it is told to confirm their address and never sees a code prompt. That ordering is deliberate: there is no point asking for a second factor from someone whose first factor is not yet trusted.
+
+### What the assurance level does not mean
+
+`aal2` means one thing: a second factor was presented during this session's authentication, or during enrolment on it. It is worth being precise about what that does not imply, because the name suggests more assurance than it delivers.
+
+| `aal2` implies | `aal2` does not imply |
+| --- | --- |
+| A TOTP code or a recovery code was accepted. | The account's email address is verified. |
+| The session is more than single-factor. | The person is the account's owner in any stronger sense. |
+| Recovery codes cannot be regenerated without the authenticator. | The device holding the authenticator is trustworthy. |
+| Elevated sessions will keep the level until they end. | The session will be revoked if the factor is later removed. |
+
+The first row is the one that catches people. A user can reach `aal2` with an unverified email address, because the MFA challenge does not check verification. If an operation needs both, the policy has to require both.
+
+| Second factor removed | Effect on a live `aal2` session |
+| --- | --- |
+| The user disables MFA | The session keeps `aal2` until it expires or is revoked. |
+| An administrator resets MFA | Same. The account's flag is cleared; existing sessions are untouched. |
+
+<Warning>
+MFA reset removes the account's ability to verify itself, but it does not end sessions that already exist at `aal2`. If you need those gone, revoke the user's sessions as a separate action. See [Tokens and sessions](/auth/tokens-and-sessions).
+</Warning>
+
+### Requiring a second factor in a policy
+
+Because there is no configuration directive for it, this is where the requirement actually lives. The condition reads the `aal` claim, which is present on every user token.
+
+```json
+{
+  "conditions": [
+    { "fact": "aal", "operator": "equals", "value": "aal2" }
+  ]
+}
+```
+
+| Deployment shape | How to express it |
+| --- | --- |
+| Some operations need a second factor. | Require `aal2` on those routes only. |
+| Everything needs it. | Require `aal2` globally — a user who has not enrolled cannot do anything. |
+| High-risk records only. | Require `aal2` on those tables' routes. |
+
+<Warning>
+Requiring `aal2` globally in an environment where enrolment is optional locks out every user who has not enrolled, with no error explaining why. If you go that way, make sure your application offers enrolment and explains the requirement, or you will generate support tickets with no diagnostic in the logs.
+</Warning>
+
+See [Auth in policies](/auth/auth-in-policies) and [Conditions](/policies/conditions) for the full vocabulary.
+
+### Storage and its consequences
+
+Two fields, two storage strategies, and the reasoning behind each. This is the part of MFA that matters if you ever need to reason about a breach.
+
+| | TOTP secret | Recovery code |
+| --- | --- | --- |
+| Storage | Encrypted at rest with the platform secret box. | SHA-256 hash. |
+| Recoverable? | Yes, by decrypting. | No. |
+| Randomness per value | 160 bits. | 40 bits. |
+| Why | Must be able to recompute a code from it. | Only ever compared, never recomputed. |
+| Blast radius of a leak | An attacker who can decrypt can generate valid codes. | An attacker learns nothing useful. |
+
+The entropy difference is the important part. A recovery code has five bytes of randomness, which is far too little to brute-force *forwards* through SHA-256 in any practical sense against a rate-limited interface — but note the qualifier: forwards. The reason one-way hashing is safe here is that the check is a lookup of the submitted code's hash against stored hashes, not an attempt to invert the stored ones.
+
+<Info>
+This is the ordinary argument for hashing high-entropy secrets, and it is the reason the recovery code table is not a liability in the way the TOTP table is. If you are ever tempted to "decrypt" a recovery code for support purposes, that is the wrong instinct — it is not encrypted and never was.
+</Info>
+
+### Sessions at each level
+
+A table of what a session looks like at each level, since the difference is mostly in claims and the session row.
+
+| Aspect | `aal1` | `aal2` |
+| --- | --- | --- |
+| Claim | `"aal": "aal1"` | `"aal": "aal2"` |
+| Session row `aal` | `aal1` | `aal2` |
+| How it was reached | Any single-factor sign-in | A completed challenge, or enrolment |
+| Extra token field | — | `mfa_method`, on the response that created it |
+| Refresh keeps it | yes | yes |
+| Revocable | yes | yes |
+
+<Warning>
+Refresh preserves the assurance level by reading it from the stored session, which means an `aal2` session stays `aal2` for its whole life — up to `refresh_ttl`, thirty days by default. Revocation is the only way to end it early.
+</Warning>
+
+## The whole enrolment and sign-in cycle
+
+The sequences in one place, because the individual endpoints are clearer once you have seen them end to end.
+
+### Enrolling, from the user's point of view
+
+```text
+  signed in at aal1
+        |
+        |  POST /mfa/totp/enroll
+        v
+  factor_id, secret, otpauth_uri          <- shown once; never returned again
+        |
+        |  the user scans the QR code into their app
+        v
+  they read a 6-digit code from the app
+        |
+        |  POST /mfa/totp/verify   {code}
+        v
+  {enabled: true, recovery_codes: [...]}   <- shown once; never returned again
+        |
+        |  the user saves the codes somewhere durable
+        v
+  session elevated to aal2, mfa_enabled set
+```
+
+Two responses in that sequence contain credentials the user will never be able to obtain again: the secret and the recovery codes. Everything else is retrievable or derivable.
+
+<Warning>
+If your application logs responses, both of those responses must be excluded. A structured logger that captures bodies at debug level will persist the secret and the codes, and neither can be rotated retroactively without invalidating every enrolled user.
+</Warning>
+
+### Signing in, when MFA is on
+
+```text
+  POST /token  {grant_type: password, email, password}
+        |
+        |  credentials check out; account has MFA; no session is issued
+        v
+  {mfa_required: true, mfa_token: "...", factors: [totp, recovery_code]}
+        |
+        |  the user types either a 6-digit code or one recovery code
+        v
+  POST /token  {grant_type: mfa, mfa_token, code}
+        |
+        |  code verified; challenge consumed; session created
+        v
+  the token response at aal2, plus mfa_method
+```
+
+### Signing in, when MFA is off
+
+```text
+  POST /token  {grant_type: password, email, password}
+        |
+        v
+  the token response at aal1
+```
+
+No challenge, no second round trip. The difference between these two diagrams is the entire observable effect of a user's MFA enrolment on the sign-in flow.
+
+### Locking yourself out with MFA
+
+The lockout mechanism is shared with passwords, which surprises people who assume a second factor deserves its own budget.
+
+```text
+  wrong password x N   ──┐
+  wrong MFA code x N  ──┼──>  failed_logins increments
+                        │    at the threshold the account locks
+                        │    for lockout_minutes
+                        v
+  429 too many failed attempts; try again later
+```
+
+The counters are per account and the thresholds are installation settings, not per-environment ones. A user who mistypes their authenticator repeatedly can lock themselves out exactly as they could by mistyping their password, and an administrator's MFA reset does not clear the lockout — only the expiry or a successful sign-in does.
+
+<Warning>
+Recovery from a lockout caused by MFA confusion is not achieved with **Reset MFA**. That removes the factor and the codes but leaves the account locked. Wait for the lockout to expire, or clear it administratively.
+</Warning>
+
+<Info>
+The rate limit on the MFA endpoints is a second, independent brake: ten requests per minute. It bounds how fast codes can be guessed per caller without the account being locked at all, which is what makes the forty-bit recovery codes safe against online guessing.
+</Info>
+
+### What an administrator can and cannot do
+
+The admin surface is deliberately narrow.
+
+| Action | Available | Effect |
+| --- | --- | --- |
+| See whether MFA is on | yes | In the user modal. |
+| Reset MFA | yes | Deletes the factor and codes, clears the flag. |
+| See a user's recovery codes | no | Hashed, one-way. |
+| Enrol on a user's behalf | no | There is no route for it. |
+| Set a user's assurance level | no | It follows from the factor. |
+| Revoke a user's sessions | yes | Separate action, and the real fix after a reset. |
+
+<Warning>
+An administrator resetting MFA does not revoke that user's sessions, and does not clear a lockout. If you are responding to a suspected compromise, reset the factor **and** revoke their sessions **and** wait out or clear the lockout. See [Managing users](/auth/managing-users).
+</Warning>
+
+### Answering the questions people ask
+
+**Can I move my authenticator to a new phone?**
+Yes, by enrolling again. The new enrolment deletes the old factor and issues a fresh secret and codes. There is no transfer endpoint.
+
+**Does enrolment need a password?**
+No. It needs a signed-in session. Because confirming enrolment requires producing a code from the new secret, the proof of the second factor is the enrolment itself.
+
+**Can I have MFA without a password?**
+Yes. An account created socially or by an administrator can enrol. That is the normal shape for a social-only account.
+
+**Why is my session still aal1 after a refresh?**
+It should not be. If it is, the session row's level was never elevated — which happens when the enrolment confirmation ran without a live session, or the account's flag and factor disagree. Check `GET /auth/v1/mfa`.
+
+**Can I disable MFA for someone else?**
+You can reset it, which is not the same as disabling: reset clears the flag and deletes the factor, so the account is left without MFA and able to enrol again. There is no separate administrative disable.
+
+**Why does my recovery code work when I mistyped it?**
+It does not. Recovery codes are hashed, so a mistyped code produces a different hash and fails. What is forgiving is the hyphen and the case, because both are normalised away before hashing.
+
+### Data you can inspect
+
+When diagnosing an MFA problem, these are the columns that answer the question, in the order worth checking.
+
+| Question | Column | Where |
+| --- | --- | --- |
+| Is the account flagged? | `AuthUser.mfa_enabled` | `akz_users` |
+| Does a factor exist? | `MfaFactor` rows for the user | `akz_mfa_factors` |
+| Is it confirmed? | `confirmed_at` | `akz_mfa_factors` |
+| Has a code been replayed? | `last_used_step` | `akz_mfa_factors` |
+| How many codes are left? | Unused `RecoveryCode` rows | `akz_recovery_codes` |
+| Has a code been spent? | `used_at` | `akz_recovery_codes` |
+| What level is the session at? | `SessionInfo.aal` | `akz_sessions` |
+
+```sql
+-- Everything about one account's MFA state in one result.
+SELECT
+  u.email,
+  u.mfa_enabled,
+  f.confirmed_at,
+  f.last_used_step,
+  (SELECT count(*) FROM akz_recovery_codes c
+    WHERE c.user_id = u.id AND c.used_at IS NULL) AS codes_left
+FROM akz_users u
+LEFT JOIN akz_mfa_factors f ON f.user_id = u.id
+WHERE u.project = 'acme' AND u.env = 'production'
+  AND u.email = 'ada@example.com';
+```
+
+<Warning>
+`secret_ciphertext` is encrypted. Selecting it into a log, a terminal, or a support ticket leaks a live credential — anyone with the secret can generate valid codes until the factor is replaced. Select only the boolean and timestamp columns above.
+</Warning>
+
+### Consistency, and the states you can find
+
+The flag, the factor and the codes are maintained by code rather than by a constraint, so it is worth knowing which inconsistent states are reachable and what each means.
+
+| State | What it means | What to do |
+| --- | --- | --- |
+| Flag false, no factor, no codes | Normal. Never enrolled. | Nothing. |
+| Flag true, confirmed factor, ten unused codes | Normal, healthy. | Nothing. |
+| Flag true, factor unconfirmed | Should not persist. An abandoned enrolment. | Re-enrol; the pending factor is replaced. |
+| Flag true, no factor | Reachable transiently; sign-in would challenge with nothing to verify. | Disable and re-enrol, or reset. |
+| Flag false, factor present | Reachable after a partial failure. Not challenged at sign-in. | Re-enrol to restore, or leave it if MFA is intentionally off. |
+| Flag true, no unused codes | Possible after ten failed or burnt recoveries. | Warn the user; they can still regenerate with a TOTP code. |
+
+<Info>
+In practice the interesting state is the second-to-last: an account with MFA flagged on and no codes left. It still signs in with a working authenticator, but a single lost phone ends it. Surfacing a warning at that threshold is the reason `recovery_codes_remaining` exists.
+</Info>
+
+### Rate limits in detail
+
+MFA endpoints sit under a tighter bucket than the general auth endpoints, for the obvious reason that a code is guessable.
+
+| Bucket | Limit | Window | Endpoints |
+| --- | --- | --- | --- |
+| `akz:mfa` | 10 | 60 seconds | `/mfa/totp/verify`, `/mfa/disable`, `/mfa/recovery-codes` |
+| `akz:auth` | 30 | 60 seconds | `/token`, including the `mfa` grant |
+| `akz:links` | 10 | 60 seconds | Endpoints that send email |
+
+<Warning>
+Because the `mfa` grant goes through `/token`, an attempt to brute-force a code is subject to both buckets — ten per minute on the MFA limit and thirty on the auth limit. With forty bits of entropy in a recovery code and six digits in a TOTP code, neither budget is a meaningful attack surface over the short term.
+</Warning>
+
+### Why six-digit codes are still safe here
+
+A TOTP code is six digits, which is about twenty bits of entropy, and that number deserves a moment of scepticism.
+
+The safety does not come from the entropy. It comes from three properties of the design:
+
+| Property | Effect |
+| --- | --- |
+| The code changes every 30 seconds. | An attacker has one shot per window, and must know the time. |
+| The last accepted step is recorded. | A guess that succeeds cannot be retried, and a correct guess is consumed. |
+| Repeated failures lock the account. | A sustained attack costs the attacker the account. |
+
+An attacker who guesses correctly gets one `aal2` session and then triggers the lockout. In practice the lockout is what stops the attack, not the entropy.
+
+<Info>
+This is also why disabling replay protection would be a serious regression: it would let an observer who saw a single code replay it inside its window, and it would quietly weaken the lockout's value by making each attempt a coin flip rather than a single-shot.
+</Info>
+
+### Client integration, end to end
+
+The sequence in code, because the two-response enrolment is the part that gets built wrong.
+
+```text
+// Enrolling. The session must already exist.
+const start = await fetch("/auth/v1/mfa/totp/enroll", {
+  method: "POST",
+  headers: authHeaders(),
+});
+
+// The secret exists only in this response. Render it, then let it go.
+renderQrCode(start.otpauth_uri);
+showSecretForManualEntry(start.secret);
+
+const confirmed = await fetch("/auth/v1/mfa/totp/verify", {
+  method: "POST",
+  headers: { ...authHeaders(), "content-type": "application/json" },
+  body: JSON.stringify({ code: enteredCode }),
+});
+
+// These ten codes exist only in this response. Block until acknowledged.
+await showRecoveryCodes(confirmed.recovery_codes, { downloadable: true });
+```
+
+```text
+// Signing in. The MFA branch is a 200, not an error.
+const res = await fetch("/auth/v1/token", {
+  method: "POST",
+  headers: { ...contextHeaders(), "content-type": "application/json" },
+  body: JSON.stringify({ grant_type: "password", email, password }),
+});
+const body = await res.json();
+
+if (body.mfa_required) {
+  // Both a TOTP code and a recovery code are accepted by the same call.
+  const code = await promptForAnyFactor(body.factors);
+  const done = await fetch("/auth/v1/token", {
+    method: "POST",
+    headers: { ...contextHeaders(), "content-type": "application/json" },
+    body: JSON.stringify({ grant_type: "mfa", mfa_token: body.mfa_token, code }),
+  });
+  storeSession(await done.json());
+} else {
+  storeSession(body);
+}
+```
+
+| Decision | Why |
+| --- | --- |
+| Treat `mfa_required` as a branch, not a failure. | It is a `200` with correct credentials. |
+| One input for both factor types. | `factors` lists both; the endpoint accepts both. |
+| Block on the recovery codes. | They are not retrievable. |
+| Never log either enrolment response. | Both contain one-time credentials. |
+| Read the level from the API when it matters. | A cached token may predate an elevation. |
+
+<Warning>
+The `storeSession` above is yours to write. There is no first-party SDK, so refresh handling, storage and replay are yours too. See [Client integration](/auth/client-integration) for how to do that properly.
+</Warning>
+
+### Enrolment without JavaScript
+
+Not every application has a browser. The same three requests work from anything that can make HTTP calls, with the secret rendered as text rather than a QR code.
+
+```bash
+# Enrol. Read the secret from the response.
+curl -sX POST "$BASE/auth/v1/mfa/totp/enroll" -H "Authorization: Bearer $TOKEN"
+
+# Confirm with a code the authenticator app produces.
+curl -sX POST "$BASE/auth/v1/mfa/totp/verify" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"code":"123456"}'
+```
+
+The second response is where the recovery codes come from, and in a non-browser context there is no one to show them to. Store them in the caller's secret store immediately, because that is the only copy.
+
+<Info>
+An account that has a factor but no saved recovery codes is materially weaker than one that has both, and there is no reminder mechanism that will reach a user who never saw them. If your enrolment flow can be automated, store the codes as part of the flow rather than leaving them to a person.
+</Info>
+
+### Migrating an existing deployment to MFA
+
+The order that avoids locking anyone out, given that enrolment is entirely voluntary.
+
+| Consideration | Guidance |
+| --- | --- |
+| MFA is off by default per environment | Nothing breaks by enabling the switch. |
+| Enrolment is voluntary | Enabling `mfa_enabled` does not challenge anyone who has not enrolled. |
+| Existing sessions are unaffected | Their level stays `aal1`; nothing is invalidated. |
+| Policies are the enforcement point | Add `aal2` requirements only after users have had a chance to enrol. |
+
+<Warning>
+The order matters: turning on a policy that requires `aal2` before your users can enrol will lock out everyone who has not. The switch, the enrolment surface, and then the policy — in that order, with time in between.
+</Warning>
+
+### Verifying the setup
+
+Two checks confirm MFA is wired correctly, and both are quick.
+
+```bash
+# 1. Enrol, confirm, and check the status. Codes should read 10, then 9 after one is spent.
+curl -s "$BASE/auth/v1/mfa" -H "Authorization: Bearer $TOKEN"
+
+# 2. Sign out, sign in, and confirm a challenge comes back rather than a session.
+curl -sX POST "$BASE/auth/v1/token" \
+  -H 'content-type: application/json' \
+  -d '{"grant_type":"password","email":"ada@example.com","password":"..."}'
+```
+
+| What the checks tell you | Good result |
+| --- | --- |
+| Enrolment completed | `enabled: true`, `aal: "aal2"`, ten codes left. |
+| The challenge fires | `mfa_required: true` on a fresh sign-in. |
+| A code is accepted | A token response at `aal2`, with `mfa_method`. |
+| A recovery code is accepted | The same, with `recovery_codes_remaining` decremented. |
+| Replay is refused | The same code fails on a second attempt. |
+
+<Info>
+Testing the replay refusal is worth doing once, deliberately. It is the property most likely to surprise a user later, and knowing it works means the error message you wrote for it will not be the first time you see it.
+</Info>
+
+### Sign-in events, in detail
+
+The login history is the only place the MFA story of a sign-in is recorded end to end, and the three events it writes are worth distinguishing.
+
+| Event | Written when | Success value | Reason on failure |
+| --- | --- | --- | --- |
+| `mfa_challenge` | A challenge is issued instead of a session. | — | — |
+| `mfa_verify` | A challenge is answered. | true or false | `wrong code` |
+| `sign_in` | The session is created. | true | as usual |
+
+A single MFA sign-in therefore produces three rows: a challenge, a verification, and a sign-in. Reading them in order tells you the whole story, including whether the code was accepted first time.
+
+<Info>
+The `mfa_verify` failure reason is always `wrong code`, regardless of whether the code was wrong, replayed, or already spent. That is deliberate — see [Endpoint reference](#errors).
+</Info>
+
+### Recovery codes as an operational signal
+
+The count of unused codes is a better health metric for an account than the binary "has MFA", and it is cheap to expose.
+
+| Count | What it suggests |
+| --- | --- |
+| 10 | Enrolled, no codes used. |
+| 6–9 | Normal attrition. |
+| 2–5 | Worth prompting the user to regenerate. |
+| 1 | The account is one lost phone from an outage. |
+| 0 | Still signable with the authenticator, but no fallback exists. |
+
+```bash
+curl -s "$BASE/auth/v1/mfa" -H "Authorization: Bearer $TOKEN" | python3 -c "import json,sys; print(json.load(sys.stdin)['recovery_codes_remaining'])"
+```
+
+<Warning>
+Prompting a user to regenerate requires a TOTP code, so the prompt cannot be sent from a background job with no user present. It has to be a nudge inside the application, triggered by the count the status endpoint reports.
+</Warning>
+
+### Comparing the two storage strategies once more
+
+Because the asymmetry is the most frequently questioned design decision on this page, it is worth stating the reasoning in its simplest form.
+
+A recovery code's only job is to answer one question: *does this submitted string match a code this user holds?* That is a comparison, and a comparison can be performed against a hash. Nothing ever needs the original back.
+
+A TOTP secret's job is different: it must *produce* the code that the user's device is showing. That is generation, not comparison, so the original must be recoverable, and hashing makes it impossible.
+
+| Need | Storage | Consequence of the choice |
+| --- | --- | --- |
+| Compare submitted codes | Hash | Codes are unrecoverable by design. |
+| Generate codes | Encrypt | The secret must be decryptable. |
+
+<Info>
+If you are ever asked to "add a way to see the recovery codes", the answer is that no such way can exist without storing them reversibly, which would make the table a liability equal to the password table. The product answer is the administrative reset, not a lookup.
+</Info>
+
+### The three questions to have answered before shipping
+
+A short checklist, because MFA is the feature most often shipped with one of these wrong.
+
+| Question | If you cannot answer it |
+| --- | --- |
+| Where does the user see their recovery codes, and can they dismiss without saving them? | They will lose them. Make the screen blocking. |
+| What does your app show when a code is rejected? | "Invalid code" generates tickets for replayed codes. Distinguish them. |
+| What is the path when a user loses both factors? | Without one, they contact you and someone improvises. Decide it deliberately. |
+
+The third is the one most teams defer, and it is the one that determines whether a lost phone is a two-minute support interaction or an outage.
+
+### What happens when the environment turns MFA off
+
+A scenario worth walking through, because the behaviour is non-destructive and people expect it to be destructive.
+
+```text
+  environment has mfa_enabled = true
+  Ada is enrolled, has a factor and ten codes, signs in at aal2
+        |
+        |  an administrator turns MFA (TOTP) off
+        v
+  Ada's next sign-in returns a session directly, at aal1
+  her factor is untouched
+  her recovery codes are untouched
+  her existing aal2 sessions continue at aal2 until they end
+        |
+        |  the administrator turns MFA back on
+        v
+  Ada is challenged again, at her next sign-in
+  her factor is still the one she enrolled
+  nothing had to be re-enrolled
+```
+
+| Thing | Affected by turning MFA off |
+| --- | --- |
+| Enrolment | Refused, with `403 MFA is disabled for this project`. |
+| Sign-in challenge | Not issued, even for enrolled users. |
+| Existing factors | Untouched. |
+| Existing recovery codes | Untouched. |
+| Existing sessions | Untouched, including their assurance level. |
+| Turning it back on | Everything resumes as it was. |
+
+<Info>
+This is what makes the switch safe to use as a temporary measure during an incident — you can stop requiring a second factor without destroying anyone's ability to use one.
+</Info>
+
+### What happens when the environment turns MFA on
+
+The mirror image, and equally unintrusive.
+
+| Situation | Result after enabling |
+| --- | --- |
+| User never enrolled | Not challenged. Signs in at `aal1` exactly as before. |
+| User is enrolled | Challenged at the next sign-in. |
+| User is mid-sign-in | Depends on the config cache; the current attempt may complete without a challenge. |
+| User has a live session | Unaffected until it ends or refreshes. |
+
+<Warning>
+Because each environment's configuration is cached for a short window, turning MFA on does not take effect instantly. A sign-in in the seconds immediately after saving may complete without a challenge, which makes this look unreliable when testing. See [Authentication configuration](/auth/configuration).
+</Warning>
+
+### Enrolling in one environment does not enrol in another
+
+The tenancy rule applied to MFA, and worth stating because it surprises people who have enrolled once and then deploy.
+
+| Environment | Ada's MFA state |
+| --- | --- |
+| `acme/production` | Enrolled, factor and codes present. |
+| `acme/staging` | Nothing. She is not enrolled. |
+| `acme/development` | Nothing. |
+
+Factors and codes belong to an account in one `project` + `env` pair, because the account itself does. Promoting an environment between staging and production promotes **configuration** — including whether MFA is enabled — but never users, and therefore never their factors.
+
+<Info>
+The practical consequence for a launch checklist: if you require `aal2` by policy in production, every user must enrol there too. There is no way to carry a factor across from staging, and no reason to expect one to.
+</Info>
+
+<AccordionGroup>
+  <Accordion title="Why does my code get rejected immediately after a successful one?">
+    Replay protection. The time step the code belonged to has been recorded on the factor, and any step at or below it is refused. Wait for the next 30-second window and use the new code. If your form allows resubmission, say this in the error message rather than reporting an invalid code.
+  </Accordion>
+  <Accordion title="Can I use the same secret on two phones?">
+    Yes — enrol once, then enter the secret manually on the second device. But do not run a second enrolment: confirming one deletes the other factor and issues a new secret, so the first phone stops working.
+  </Accordion>
+  <Accordion title="Why does enrolment return codes instead of asking me to set a password?">
+    Enrolment is an account-level setting, not a sign-in method. The account may already have a password, or may be social-only, or may have been created by an administrator. Adding a second factor does not change any of that.
+  </Accordion>
+  <Accordion title="Does the MFA reset in Studio revoke sessions?">
+    No. It deletes the factor and the recovery codes and clears the account's flag. Sessions that already exist keep working, including at `aal2`. If you are responding to a compromise, revoke their sessions separately.
   </Accordion>
 </AccordionGroup>
 
-## Troubleshooting
+### Every error, and what it means
 
-| Symptom | Likely cause | Fix |
+The complete set, grouped by which layer produced it.
+
+**From the challenge lifecycle.**
+
+| Status | Detail | Meaning | Response |
+| --- | --- | --- | --- |
+| 400 | `mfa_token and code are required` | The `mfa` grant arrived incomplete. | A client bug. |
+| 400 | `the challenge is no longer valid` | The account was deleted or disabled after the challenge was issued. | Restart the sign-in. |
+| 400 | `the code is not valid` | Wrong, replayed, expired challenge, or spent code. | Let them try the next code. |
+
+**From enrolment.**
+
+| Status | Detail | Meaning | Response |
+| --- | --- | --- | --- |
+| 403 | `MFA is disabled for this project` | `mfa_enabled` is off. | Hide the enrolment surface. |
+| 400 | `the code is not valid` | The confirmation code did not match. | The secret or the clock is wrong. |
+
+**From the code-management routes.**
+
+| Status | Detail | Meaning | Response |
+| --- | --- | --- | --- |
+| 400 | `a current authenticator code is required` | A recovery code was used where a TOTP code is required. | Ask for the authenticator code. |
+| 400 | `the code is not valid` | The supplied code failed. | Ask for a fresh one. |
+
+**From the session layer, affecting MFA like everything else.**
+
+| Status | Detail | Meaning |
 | --- | --- | --- |
-| `403 MFA is disabled for this project` on enroll | The environment's `mfa_enabled` is `false`. | Enable it in the environment's auth configuration. |
-| `400 the code is not valid` on confirm | Clock drift beyond ±30s, or the wrong secret was scanned. | Confirm the device clock is correct; retry `enroll` for a fresh secret if in doubt. |
-| A previously accepted code is rejected on retry | Expected — `last_used_step` blocks replay of an already-used step. | Wait for the next 30-second window and enter the new code. |
-| `400 a current authenticator code is required` on `/mfa/recovery-codes` | A recovery code (not a TOTP code) was submitted. | Regenerating codes requires the authenticator app specifically. |
-| User locked out with no recovery codes and no phone | Both factors of MFA lost. | An administrator must call the admin MFA-reset endpoint after verifying identity. |
+| 401 | `sign in first` | No usable session on a route that needs one. |
+| 401 | `the account is not available` | The account is disabled or gone. |
+| 429 | `too many failed attempts; try again later` | The account is locked out. |
 
-## Next
+<Info>
+Every one of these is a `detail` string rather than a machine-readable code, so branch on the status and treat the detail as diagnostic rather than as a branch condition. That is the opposite of the OAuth flow, where stable codes travel in the fragment precisely so a client can branch on them.
+</Info>
 
-<CardGroup cols={2}>
-  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">How `aal` ends up on the access token, and how sessions are tracked.</Card>
-  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Gating specific operations on `aal2`.</Card>
-  <Card title="Passwords" icon="lock" href="/auth/passwords">The sign-in flow MFA hooks into.</Card>
-  <Card title="Social login" icon="git-branch" href="/auth/social-login">MFA also gates OAuth sign-ins when the account has a factor enrolled.</Card>
-</CardGroup>
+### Response shapes, complete
+
+Every MFA response in one place, so nothing has to be guessed.
+
+```json
+{ "factor_id": "01HQ...", "secret": "JBSWY3DPEHPK3PXP", "otpauth_uri": "otpauth://totp/..." }
+```
+
+```json
+{ "enabled": true, "recovery_codes": ["a3f9c-2e1d4", "..."] }
+```
+
+```json
+{ "enabled": false }
+```
+
+```json
+{ "recovery_codes": ["a3f9c-2e1d4", "..."] }
+```
+
+```json
+{ "enabled": true, "aal": "aal2", "recovery_codes_remaining": 10 }
+```
+
+```json
+{ "mfa_required": true, "mfa_token": "...", "factors": ["totp", "recovery_code"] }
+```
+
+| Response | From | Contains a one-time secret |
+| --- | --- | --- |
+| Enrolment | `/mfa/totp/enroll` | **yes** — the TOTP secret |
+| Confirmation | `/mfa/totp/verify` | **yes** — the recovery codes |
+| Disable | `/mfa/disable` | no |
+| Regenerate | `/mfa/recovery-codes` | **yes** — a new set of codes |
+| Status | `/mfa` | no |
+| Challenge | `/token` (password grant) | **yes** — the challenge token |
+
+<Warning>
+Three of the six responses carry a credential that exists exactly once. Any logging, error reporting or session-replay tool that captures response bodies will retain them permanently, and neither the secret nor the codes can be rotated for one user without affecting them.
+</Warning>
+
+### The fields that matter, in one table
+
+A final consolidation, for readers who want the whole surface without the prose.
+
+| Field | Where | Type | Notes |
+| --- | --- | --- | --- |
+| `enabled` | Most responses | bool | The account's MFA flag. |
+| `aal` | Status, token response | str | `aal1` or `aal2`. |
+| `recovery_codes` | Confirmation, regeneration | list[str] | Ten codes, plain text, once. |
+| `recovery_codes_remaining` | Status | int | Unused rows. |
+| `factor_id` | Enrolment | str | The factor's ULID. |
+| `secret` | Enrolment | str | The TOTP secret, once. |
+| `otpauth_uri` | Enrolment | str | Render as a QR code. |
+| `mfa_required` | Challenge | bool | Always true in that response. |
+| `mfa_token` | Challenge | str | Valid five minutes. |
+| `factors` | Challenge | list[str] | Both methods are always listed. |
+| `mfa_method` | Token response | str | Which method satisfied the challenge. |
+| `code` | Request bodies | str | Six to thirty-two characters. |
+
+<Info>
+Every field above is real and every one is documented here. There is no enrolment token, no factor list endpoint, no backup-code regeneration key — the surface is these routes and these fields.
+</Info>
+
+### A short decision guide
+
+| If you are trying to | Go to |
+| --- | --- |
+| Understand what is stored | [The two models](#the-two-models-and-what-is-not-there) |
+| Build the enrolment screen | [Enrolling](#enrolling) |
+| Build the recovery-code screen | [Recovery codes](#recovery-codes) |
+| Build the challenge prompt | [The sign-in challenge](#the-sign-in-challenge) |
+| Require a second factor somewhere | [Requiring a second factor in a policy](#requiring-a-second-factor-in-a-policy) |
+| Work out why a code is rejected | [Troubleshooting](#troubleshooting) |
+| Handle a user who lost everything | [The whole enrolment and sign-in cycle](#the-whole-enrolment-and-sign-in-cycle) |
+| Decide whether to keep MFA on | [What happens when the environment turns MFA off](#what-happens-when-the-environment-turns-mfa-off) |
+| Find a field or an error | [Endpoint reference](#endpoint-reference) |
+
+## Reference
+
+### Models
+
+| Model | Table | Fields worth knowing |
+| --- | --- | --- |
+| `MfaFactor` | `akz_mfa_factors` | `kind`, `secret_ciphertext`, `confirmed_at`, `last_used_step`, `friendly_name`. |
+| `RecoveryCode` | `akz_recovery_codes` | `code_hash`, `used_at`. |
+| `OneTimeToken` | `akz_one_time_tokens` | The five-minute `mfa` challenge. |
+| `SessionInfo` | `akz_sessions` | `aal`, defaulting to `aal1`. |
+| `AuthUser` | `akz_users` | `mfa_enabled`, the flag the sign-in path branches on. |
+
+### Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| POST | `/auth/v1/mfa/totp/enroll` | Start enrolment; returns the secret and URI. |
+| POST | `/auth/v1/mfa/totp/verify` | Confirm enrolment; returns the recovery codes. |
+| POST | `/auth/v1/mfa/disable` | Turn MFA off; deletes factors and codes. |
+| POST | `/auth/v1/mfa/recovery-codes` | Replace the codes; needs a TOTP code. |
+| GET | `/auth/v1/mfa` | Status, assurance level, codes remaining. |
+| POST | `/auth/v1/token` | `grant_type=mfa` completes a challenge. |
+| GET | `/auth/v1/settings` | Reports `mfa_enabled` for the environment. |
+
+### Values and constants
+
+| Name | Value |
+| --- | --- |
+| Recovery codes per generation | 10 |
+| Recovery code format | `{first5}-{last5}`, from 5 bytes of randomness. |
+| Recovery code storage | SHA-256 of the normalised code. |
+| TOTP scheme | RFC 6238, 30-second steps. |
+| TOTP windows accepted | Previous, current, next. |
+| TOTP secret storage | Encrypted at rest. |
+| Factor kind | `totp` |
+| Default assurance level | `aal1` |
+| Elevated assurance level | `aal2` |
+| Challenge lifetime | 300 seconds |
+| Rate limit | 10 requests per 60 seconds, under `akz:mfa` |
+
+### One-time token lifetimes, for comparison
+
+The challenge is the shortest-lived of the one-time tokens, which reflects how it is used.
+
+| Purpose | Lifetime |
+| --- | --- |
+| `mfa` | 300 seconds |
+| `link` | 600 seconds |
+| `magic` | 900 seconds |
+| `recovery` | 3600 seconds |
+| `verify`, `email_change` | 24 hours |
+| `invite` | 7 days |
+
+<Info>
+The MFA challenge is short because it is answered immediately. A magic link at fifteen minutes and a recovery link at an hour exist because people find those in an inbox minutes or hours later; nobody leaves a code prompt open for five minutes and comes back to it.
+</Info>
+
+### Events
+
+| Event | When |
+| --- | --- |
+| `user.mfa_enabled` | Enrolment confirmed. |
+| `user.mfa_disabled` | MFA turned off. |
+| `mfa_challenge` | A challenge is issued at sign-in. |
+| `mfa_verify` | A challenge is answered, successfully or not. |
+| `mfa_enrolled` | Recorded in the sign-in history as a login event. |
+
+### Related pages
+
+[Authentication](/auth/overview) for the layered model, [Authentication configuration](/auth/configuration) for `mfa_enabled` and the config cache, [Passwords](/auth/passwords) for the credential half of a sign-in, [Tokens and sessions](/auth/tokens-and-sessions) for what `aal` rides on and how sessions are revoked, [Auth in policies](/auth/auth-in-policies) for requiring `aal2`, [Social login](/auth/social-login) for the challenge arriving in a fragment, [Magic links](/auth/magic-links) for the other challenge path, [Managing users](/auth/managing-users) for the administrative MFA reset, [Organizations](/auth/organizations) for how org scoping survives a challenge, [Events](/events/overview) for delivery, [Rate limits](/reference/limits) for the limits, and [Security model](/auth/security-model) for how the second factor fits the wider picture.
+</Info>

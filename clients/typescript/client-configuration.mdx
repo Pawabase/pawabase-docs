@@ -1,0 +1,584 @@
+---
+title: "Configure the TypeScript client"
+description: "Configure gateway scope, keys, transport, sessions, runtime adapters, server-side identity, observability hooks, and client lifecycle."
+icon: "sliders"
+---
+
+Client configuration defines a trust boundary as well as a network address.
+The same `createClient()` call decides which environment receives traffic, which credential accompanies it, who owns the user session, which failures may be retried, and which runtime primitives carry the request.
+
+The safest design starts by deciding whether the client runs in an untrusted application, a trusted server, or a server request acting for one user.
+
+| Execution context | Key | User identity | Recommended session model |
+| --- | --- | --- | --- |
+| Browser or installed application | Publishable | Managed by `auth` | Persisted browser or app storage |
+| Trusted background service | Secret when policy bypass is required; otherwise publishable | Usually none | No shared end-user session |
+| Server-rendered request | Publishable | Access token supplied by the framework | Stateless `accessToken` client or `asUser()` |
+| Test | Publishable fixture key | Controlled fixture | `MemoryStorage` or a deterministic fake |
+
+## Constructor options
+
+`createClient(options)` and `new PawabaseClient(options)` accept the same `ClientOptions` object.
+Most applications should use `createClient()`.
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `url` | `string` | Required | Gateway origin, including `http` or `https` |
+| `apiKey` | `string` | Required | Publishable or secret environment key |
+| `project` | `string` | None | Project reference used as a scope hint and required for social sign-in URL construction |
+| `environment` | `string` | None | Environment name used as a scope hint and required for social sign-in URL construction |
+| `timeoutMs` | `number` | `30000` | Per-attempt request timeout; `0` disables it |
+| `retry` | `RetryOptions \| false` | Built-in policy | Retry budget and backoff limits, or `false` |
+| `fetch` | `FetchLike` | Global `fetch` | Runtime adapter, test double, or instrumented transport |
+| `headers` | `Record<string, string>` | Empty | Stable headers added to every SDK HTTP request |
+| `hooks` | `Hooks` | Empty | Request, response, retry, and error observations |
+| `auth` | `AuthOptions` | Browser-aware defaults | Session storage, persistence, refresh, and redirect detection |
+| `realtime` | `RealtimeOptions` | Built-in defaults | WebSocket constructor, heartbeat, acknowledgements, connection timeout, and reconnect behavior |
+| `accessToken` | Token or provider | None | Externally owned request identity; disables managed sessions |
+| `dangerouslyAllowBrowser` | `boolean` | `false` | Overrides browser secret-key refusal without making the key safe |
+
+## URL and environment scope
+
+`url` is the gateway origin, not a resource path.
+Do not append `/rest/v1`, `/auth/v1`, or another service prefix.
+The capability client adds the correct public path.
+
+```typescript
+const client = createClient({
+  url: "https://api.example.com",
+  apiKey: "pb_pk_…",
+});
+```
+
+Trailing slashes are normalized.
+The URL must use HTTP or HTTPS.
+An invalid or missing URL is a `ConfigError` before a useful application request can run.
+
+A base Pawabase installation contains one project and can contain multiple environments.
+The API key resolves the environment for normal calls.
+The optional `project` and `environment` strings are needed when the SDK must construct a URL whose path explicitly names them, notably social sign-in.
+
+```typescript
+const client = createClient({
+  url: "https://api.example.com",
+  apiKey: "pb_pk_…",
+  project: "acme",
+  environment: "production",
+});
+```
+
+<Warning>
+  `project` and `environment` do not retarget an API key.
+  A key issued for development does not become a production key because the constructor says `environment: "production"`.
+  Keep the URL, key, generated types, and optional scope hints from the same deployment configuration.
+</Warning>
+
+## Publishable and secret clients
+
+Use **Build → Settings → API keys** in Studio to manage keys for the active environment.
+The full value is visible only when a new key is created.
+
+| Property | Publishable key | Secret key |
+| --- | --- | --- |
+| Prefix | `pb_pk_…` | `pb_sk_…` |
+| Browser use | Intended | Refused by default |
+| Mobile bundle | Intended | Never |
+| Policy behavior | Policies apply | Policies are bypassed |
+| Typical owner | Frontend or public client | Trusted backend or controlled automation |
+| Main security boundary | Policies plus key scopes | Deployment secret handling plus key scopes |
+
+The browser guard detects an obvious secret-key leak.
+`dangerouslyAllowBrowser: true` only disables that guard.
+It does not hide the key from source maps, browser tools, extensions, proxies, or users.
+
+## Common headers
+
+`headers` adds stable application headers to every SDK HTTP request.
+Use it for values such as a client build identifier or a trace-correlation header that is safe to send to every Pawabase endpoint.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  headers: {
+    "x-client-build": releaseId,
+    "x-app-surface": "customer-portal",
+  },
+});
+```
+
+Do not use common headers for a per-user access token.
+Managed auth or `accessToken` owns the `Authorization` header.
+Do not attempt to forge `x-pawabase-*` context headers; the gateway owns platform context.
+
+## Custom fetch
+
+The `fetch` option accepts a function with the standard `fetch(input, init)` shape.
+It supports runtimes without a suitable global, deterministic tests, and transport-level instrumentation.
+
+```typescript
+const tracedFetch = async (input, init) => {
+  const startedAt = performance.now();
+  try {
+    return await fetch(input, init);
+  } finally {
+    metrics.observe("pawabase.fetch_ms", performance.now() - startedAt);
+  }
+};
+
+const client = createClient({
+  url,
+  apiKey,
+  fetch: tracedFetch,
+});
+```
+
+A wrapper must preserve the request body and signal.
+It must return a standards-compatible `Response`.
+If it consumes the response body before returning, the SDK cannot parse it again.
+
+## Timeouts
+
+`timeoutMs` limits each attempt, not the entire retry sequence.
+With the default 30-second timeout and two retries, total wall time can exceed 30 seconds because backoff and multiple attempts are involved.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  timeoutMs: 12_000,
+});
+```
+
+Set `timeoutMs: 0` only when the surrounding runtime provides another reliable deadline.
+An unlimited request in a long-lived process can consume resources indefinitely.
+
+Individual calls can override the client timeout where their option type exposes `timeoutMs`.
+Record queries use `withOptions({ timeoutMs })`.
+Storage transfers, function calls, flow calls, and route calls accept it in their operation options.
+
+## Retry configuration
+
+The retry object changes the budget and wait ceilings; it does not make unsafe methods retryable automatically.
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `retries` | `2` | Additional attempts after the original request |
+| `baseDelayMs` | `300` | Initial full-jitter backoff ceiling |
+| `maxDelayMs` | `8000` | Maximum backoff ceiling |
+| `maxRetryAfterMs` | `30000` | Longest server-requested wait the SDK will accept |
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  retry: {
+    retries: 4,
+    baseDelayMs: 200,
+    maxDelayMs: 5_000,
+    maxRetryAfterMs: 15_000,
+  },
+});
+```
+
+Use `retry: false` for callers whose surrounding job system owns all retry decisions.
+Be careful not to create nested retry storms when both the SDK and a queue retry the same operation.
+
+## Hooks
+
+Hooks observe transport activity without changing request results.
+An exception thrown by a hook does not fail the request.
+
+| Hook | Receives | Useful for |
+| --- | --- | --- |
+| `onRequest` | Method, URL, attempt, masked headers | Counters and request tracing |
+| `onResponse` | Method, URL, attempt, status, duration, request ID | Latency and status metrics |
+| `onRetry` | Method, URL, attempt, reason, delay | Retry-volume alerts |
+| `onError` | Error plus method, URL, attempt | Structured failure reporting |
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onResponse(info) {
+      metrics.timing("pawabase.request", info.durationMs, {
+        status: String(info.status),
+      });
+    },
+    onRetry(info) {
+      logger.warn("Pawabase request retry", info);
+    },
+  },
+});
+```
+
+The SDK masks key and token values in hook headers.
+Your own wrapper and logger must still avoid recording request bodies that contain passwords, tokens, or private application data.
+
+## Managed auth options
+
+The default browser client persists a session, refreshes it before expiry, and reads a social sign-in result from the URL fragment.
+Non-browser runtimes default to memory storage.
+
+| Auth option | Default | Meaning |
+| --- | --- | --- |
+| `storage` | Browser `localStorage` when usable; memory otherwise | Implements `getItem`, `setItem`, and `removeItem` |
+| `storageKey` | Derived from URL and API key | Namespace for the serialized session |
+| `persistSession` | `true` | Preserve the session between application starts when storage allows |
+| `autoRefreshToken` | `true` | Schedule refresh shortly before access-token expiry |
+| `refreshMarginSeconds` | `60` | Treat a token as expiring this many seconds early |
+| `detectSessionInUrl` | `true` in browsers | Process OAuth and link results in the URL fragment |
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+    refreshMarginSeconds: 90,
+    detectSessionInUrl: true,
+  },
+});
+```
+
+Use a distinct `storageKey` only when the same origin intentionally hosts multiple independent clients whose URL-and-key-derived names are insufficient.
+Sharing one storage key between unrelated environments can cause one client to read tokens issued by another.
+
+## Custom session storage
+
+A storage adapter may be synchronous or asynchronous.
+It only needs three methods.
+
+```typescript
+const storage = {
+  async getItem(key) {
+    return await secureStore.get(key);
+  },
+  async setItem(key, value) {
+    await secureStore.set(key, value);
+  },
+  async removeItem(key) {
+    await secureStore.remove(key);
+  },
+};
+
+const client = createClient({
+  url,
+  apiKey,
+  auth: { storage },
+});
+```
+
+The adapter stores a session containing refresh and access tokens.
+Choose storage appropriate to the runtime's threat model.
+In a browser, JavaScript-readable storage is exposed to successful cross-site scripting.
+Strong content security policy, dependency hygiene, output escaping, and short token lifetimes remain relevant.
+
+## Externally owned access tokens
+
+`accessToken` switches the client into stateless identity mode.
+It accepts a string or a function that returns a string, `null`, or a promise of either.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  accessToken: async () => {
+    return requestContext.currentAccessToken();
+  },
+});
+```
+
+In this mode the client does not persist a session, refresh tokens, or inspect a redirect URL.
+That is appropriate when a web framework, cookie layer, gateway, or server request already owns session renewal.
+If the supplied token expires, the provider must return a new one or the call fails.
+
+## `asUser()`
+
+`asUser(tokenOrProvider)` derives a client with the same base configuration but a request-owned user identity.
+
+```typescript
+async function loadDashboard(baseClient, accessToken) {
+  const userClient = baseClient.asUser(accessToken);
+
+  const [tasks, profile] = await Promise.all([
+    userClient.from("tasks").all({ maxRecords: 200 }),
+    userClient.auth.getUser(),
+  ]);
+
+  return { tasks, profile };
+}
+```
+
+Use it to avoid repeating URL, key, retry, and hook configuration.
+Do not use a secret-key base client when the purpose is to reproduce the user's policy boundary; the secret key still bypasses policies.
+
+## Realtime options
+
+Realtime configuration is separate because socket lifecycles differ from individual HTTP calls.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `webSocket` | Global constructor | Runtime WebSocket implementation |
+| `heartbeatSeconds` | `25` | Interval between pings |
+| `ackTimeoutMs` | `10000` | Wait for subscribe, publish, track, and history acknowledgements |
+| `connectTimeoutMs` | `10000` | Wait for the socket welcome |
+| `reconnect` | Enabled | Backoff configuration, or `false` |
+| `onProtocolError` | None | Receives malformed or unexpected protocol detail |
+
+Node.js 20 needs a supplied WebSocket constructor.
+
+```typescript
+import WebSocket from "ws";
+
+const client = createClient({
+  url,
+  apiKey,
+  realtime: {
+    webSocket: WebSocket,
+    heartbeatSeconds: 25,
+    ackTimeoutMs: 10_000,
+  },
+});
+```
+
+The `ws` package is an application dependency in this example.
+It is not installed by `@pawabase/client`.
+
+## Initialization and auth readiness
+
+Auth methods await session initialization internally.
+Call `auth.initialized()` only when application startup must explicitly wait for storage to be read before rendering identity-sensitive UI.
+
+```typescript
+await client.auth.initialized();
+const user = await client.auth.getCachedUser();
+renderApplication({ user });
+```
+
+`getCachedUser()` does not make a network request.
+Use `getUser()` when current server state and current assurance/session metadata matter.
+
+## Status checks
+
+`client.status()` requests the public gateway status without sending a user token.
+
+```typescript
+const status = await client.status();
+
+if (!status.ok) {
+  reportUnavailableServices(status.services);
+}
+```
+
+Status is a platform-health observation, not proof that the current key, user, policy, resource, or route is configured correctly.
+Use the failing request's `requestId` and **Observability** for an operation-specific investigation.
+
+## Disposal
+
+`dispose()` stops auth timers and listeners and closes realtime.
+It is synchronous and safe to call as part of cleanup.
+
+| Event | Dispose? | Sign out? |
+| --- | --- | --- |
+| User clicks sign out | Usually keep the application client | Yes |
+| Test ends | Yes | Only if the test owns a real session that must be revoked |
+| Hot-reload replaces a singleton | Yes | No |
+| Server request finishes with a request-scoped client | Recommended when it opened resources | No |
+| Process shuts down | Yes | No |
+
+<Tip>
+  Keep one browser client for the application shell unless isolation requires more.
+  Recreating clients during every render creates duplicate listeners and refresh timers and makes channel ownership difficult to reason about.
+</Tip>
+
+## Header precedence
+
+The transport combines SDK defaults, client-wide headers, and per-call headers.
+Per-call headers are the narrowest layer and can replace a same-named common value.
+
+```text
+SDK headers
+  accept
+  apikey
+  x-client-info
+        │
+        ▼
+client headers
+        │
+        ▼
+operation headers
+        │
+        ▼
+Authorization from the selected token source
+```
+
+Do not override `apikey` or `Authorization` through general header configuration.
+Use `apiKey`, managed auth, `accessToken`, or `asUser()` so refresh and masking behavior remains coherent.
+
+For object request bodies, the transport sets `content-type: application/json` when no case-insensitive content-type header exists.
+Raw strings, blobs, form data, URL parameters, byte buffers, and streams are sent without JSON serialization.
+
+## Query serialization on raw requests
+
+Raw and route query objects accept strings, numbers, booleans, dates, null, undefined, and arrays of those scalar query values.
+
+```typescript
+const result = await client.request(
+  "GET",
+  "/reports/v1/activity",
+  {
+    query: {
+      account: accountId,
+      after: new Date("2026-10-01T00:00:00Z"),
+      status: ["open", "closed"],
+      include_archived: false,
+      omitted: undefined,
+    },
+  },
+);
+```
+
+Arrays repeat the query key.
+Dates become ISO strings.
+`null` and `undefined` query values are omitted.
+These rules apply to URL construction, not to JSON bodies.
+
+## Per-call identity
+
+The low-level transport can accept an explicit access token for one call, but the root `PawabaseClient.request()` surface intentionally exposes the safer application-level subset.
+Use `asUser()` when several capability calls belong to one externally owned identity.
+
+```typescript
+const acting = baseClient.asUser(() => requestSession.accessToken);
+
+const [user, tasks] = await Promise.all([
+  acting.auth.getUser(),
+  acting.from("tasks").all({ maxRecords: 100 }),
+]);
+```
+
+A token provider can be asynchronous.
+It is evaluated when a request needs identity, allowing a framework to supply its current token without storing it inside the SDK.
+
+## Secret-key server boundaries
+
+Server-only does not automatically mean a secret key is necessary.
+
+| Server action | Recommended key model |
+| --- | --- |
+| Render data as the signed-in user | Publishable key plus user token |
+| Validate that a user policy permits an action | Publishable key plus user token |
+| Administrative maintenance that must bypass policies | Secret key |
+| Provision test fixtures | Scoped secret key in controlled test infrastructure |
+| Forward an untrusted browser request | Publishable/user model, or explicit server authorization before secret action |
+
+Use separate client instances when one process performs both user-scoped and administrative work.
+That makes accidental policy bypass visible in code review.
+
+## Client factories
+
+Centralize stable environment configuration without centralizing mutable user sessions.
+
+```typescript
+const baseOptions = {
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  timeoutMs: 15_000,
+  hooks: createServerHooks(),
+};
+
+export function clientForToken(accessToken: string | null) {
+  return createClient({
+    ...baseOptions,
+    accessToken,
+  });
+}
+```
+
+Factories also make tests supply a fake URL, fetch, retry policy, and storage without editing global module state.
+
+## Browser-storage fallback
+
+Browser storage can be unavailable because of privacy controls, sandboxed documents, quota errors, or runtime restrictions.
+The SDK falls back to memory when the default browser store cannot be used.
+
+The result is a valid session for the current page lifetime but no persistence across reload.
+If persistence is a product requirement, detect the signed-out initial state after reload and give the user clear guidance rather than assuming the SDK lost valid server state.
+
+Custom adapters should make `getItem`, `setItem`, and `removeItem` failures observable to the application monitoring layer while avoiding token values in logs.
+
+## Corrupt stored values
+
+An invalid serialized session is discarded during initialization.
+The client does not pass malformed tokens to later calls.
+
+This can happen after an interrupted manual storage migration or when unrelated code reuses the same key.
+Choose a dedicated `storageKey` and treat its value as SDK-owned serialization.
+
+## `dispose()` ownership rules
+
+Disposal belongs to whoever created the client.
+
+```typescript
+export async function withPawabase<T>(
+  options: ClientOptions,
+  run: (client: PawabaseClient) => Promise<T>,
+) {
+  const client = createClient(options);
+
+  try {
+    return await run(client);
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+A helper must not dispose a shared application singleton it did not create.
+For shared clients, remove the helper's listener or unsubscribe its channel rather than destroying all client activity.
+
+## Configuration failures to recognize
+
+| Symptom | Likely cause | Check |
+| --- | --- | --- |
+| Immediate `ConfigError` | Missing or invalid URL/key, or secret key in a browser | Constructor values and key type |
+| Every API returns `401` | Wrong, expired, revoked, or cross-environment key | **Build → Settings → API keys** |
+| OAuth URL construction fails | Missing `project` or `environment` | Constructor scope hints |
+| Session disappears on reload | Persistence disabled or storage unavailable | `auth.persistSession` and adapter behavior |
+| User calls leak across server requests | Shared managed session in a process singleton | Use `accessToken` or `asUser()` per request |
+| HTTP works but realtime does not | Missing WebSocket implementation or channel refusal | Runtime adapter and **Settings → Realtime** |
+| Process does not exit in a test | Client timer or socket remains active | Call `dispose()` |
+
+## Advanced runtime guidance
+
+The same configuration fields have different consequences by runtime.
+
+| Concern | Browser | Request server | Worker | Mobile |
+| --- | --- | --- | --- | --- |
+| Session persistence | Default local storage | Prefer external token | Usually none | Custom async store |
+| Auto refresh | Useful for long-lived tab | Framework-owned | Only for a deliberately signed-in service account | Useful for long-lived app |
+| Redirect detection | Browser fragment | Framework callback | Disabled | Manual deep-link parse |
+| Realtime | Global socket | Usually request-inappropriate | Suitable for long-lived consumer | Runtime socket |
+| Disposal | Hot reload/app teardown | End of request | Shutdown/job cleanup | App teardown/tests |
+
+See [server runtimes and testing](/clients/typescript/server-runtimes-testing) for complete SSR, edge, Node, React Native, and deterministic-test patterns.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Authentication" icon="lock" href="/clients/typescript/authentication">
+    Session storage, refresh, redirects, MFA, and sign-out behavior.
+  </Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/clients/typescript/errors-retries">
+    Timeout scope, retry safety, hooks, and normalized failures.
+  </Card>
+  <Card title="API keys" icon="key" href="/operate/api-keys">
+    Key roles, scopes, expiry, rotation, and Studio management.
+  </Card>
+  <Card title="React integration" icon="react" href="/clients/react">
+    Stable client ownership and framework lifecycle patterns.
+  </Card>
+</CardGroup>
