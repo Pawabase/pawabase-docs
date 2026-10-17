@@ -1,0 +1,763 @@
+---
+title: "Errors, retries, and cancellation in TypeScript"
+description: "Handle the SDK error hierarchy, validation details, policy refusals, request IDs, safe retry rules, deadlines, aborts, and transport hooks."
+icon: "triangle-alert"
+---
+
+The SDK turns different server error bodies and no-response failures into one class hierarchy.
+Application code should make decisions from the class, status, stable code, and structured fields rather than parsing message text.
+
+```text
+PawabaseError
+├── ApiError
+│   ├── AuthenticationError
+│   ├── PermissionError
+│   ├── NotFoundError
+│   ├── ConflictError
+│   ├── ValidationError
+│   ├── PayloadTooLargeError
+│   ├── RateLimitError
+│   └── ServerError
+├── NetworkError
+├── TimeoutError
+├── AbortError
+├── ConfigError
+├── RealtimeError
+└── InvalidQueryError
+```
+
+The distinction between response and no-response errors is operationally important.
+An `ApiError` means Pawabase answered.
+A `NetworkError` or `TimeoutError` means the client did not obtain a usable answer and a write outcome may be ambiguous.
+
+## Base errors
+
+Every error created by the package extends `PawabaseError`, which extends JavaScript `Error`.
+
+```typescript
+import {
+  isPawabaseError,
+  PawabaseError,
+} from "@pawabase/client";
+
+try {
+  await runOperation();
+} catch (error) {
+  if (isPawabaseError(error)) {
+    reportKnownClientFailure(error);
+  } else {
+    throw error;
+  }
+}
+```
+
+Use `instanceof PawabaseError` in one JavaScript realm.
+The exported guard is useful at generic error boundaries.
+
+## API error fields
+
+Every `ApiError` exposes normalized context.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | `number` | HTTP status |
+| `code` | `string` | Server code or status-derived stable code |
+| `message` | `string` | Human-readable summary |
+| `details` | `unknown` | Structured server detail when present |
+| `body` | `unknown` | Parsed response body as received |
+| `requestId` | `string \| null` | `x-request-id` for Observability correlation |
+| `method` | `string \| undefined` | Request method |
+| `url` | `string \| undefined` | Request URL |
+| `retryAfter` | `number \| null` | Server-requested wait in seconds |
+| `policy` | `string \| null` | Refusing policy name when the response states it |
+
+```typescript
+import { ApiError } from "@pawabase/client";
+
+try {
+  await client.from("posts").get(id);
+} catch (error) {
+  if (error instanceof ApiError) {
+    logger.warn("Pawabase API refusal", {
+      status: error.status,
+      code: error.code,
+      requestId: error.requestId,
+      policy: error.policy,
+    });
+  }
+  throw error;
+}
+```
+
+Do not log `body` indiscriminately.
+It can contain rejected user input or server detail unsuitable for general logs.
+
+## Status mapping
+
+| Status | Class | Default derived code | Application interpretation |
+| --- | --- | --- | --- |
+| `400` | `ValidationError` | `validation_failed` | Request shape or value was invalid |
+| `401` | `AuthenticationError` | `unauthenticated` | Key/token absent, invalid, or expired |
+| `403` | `PermissionError` | `forbidden` | Credential recognized but not allowed |
+| `404` | `NotFoundError` | `not_found` | Missing or policy-hidden target |
+| `409` | `ConflictError` | `conflict` | Uniqueness or current-state conflict |
+| `413` | `PayloadTooLargeError` | Status-derived | Request or object too large |
+| `422` | `ValidationError` | `validation_failed` | Structured field validation failed |
+| `429` | `RateLimitError` | `rate_limited` | Rate limit refused the request |
+| `5xx` | `ServerError` | `server_error` | Platform or invoked behavior failed |
+
+When the server supplies its own stable code, the SDK preserves it.
+For example, a bad key can be `invalid_api_key` rather than only `unauthenticated`.
+
+## Narrow by status or code
+
+`isApiError(value, status?)` narrows an unknown value.
+`ApiError.is(code)` compares stable code.
+
+```typescript
+import { isApiError } from "@pawabase/client";
+
+if (isApiError(error, 404)) {
+  renderMissing();
+}
+```
+
+```typescript
+if (error instanceof ApiError && error.is("invalid_api_key")) {
+  reportDeploymentCredentialProblem();
+}
+```
+
+Prefer class checks for broad UX behavior and stable code checks for a documented specific condition.
+Do not branch on full message text.
+
+## Authentication versus permission
+
+`401` and `403` require different remedies.
+
+| Error | Question to answer | Typical response |
+| --- | --- | --- |
+| `AuthenticationError` | Is the API key valid, and is a required user session present/current? | Refresh/sign in when appropriate, or fix deployment credentials |
+| `PermissionError` | Which key scope or policy refused a known caller? | Show access denied; inspect `policy`, key scopes, and Studio policy |
+
+Do not automatically sign the user out for every `401`.
+A bad deployment API key affects all users and cannot be fixed by user sign-in.
+The auth client already attempts one eligible refresh and replay when a managed access token caused the failure.
+
+## Not found is intentionally ambiguous
+
+`NotFoundError` can mean the object does not exist or a read policy hides it.
+This prevents an unauthorized caller from probing identifiers.
+
+`maybeGet()` converts record `404` to `null` for normal optional reads.
+It does not remove the ambiguity.
+
+```typescript
+const post = await client.from("posts").maybeGet(id);
+
+if (!post) {
+  renderUnavailable();
+}
+```
+
+Use neutral UI copy unless the caller has a separate administrative source of truth.
+
+## Validation errors
+
+`ValidationError` adds parsed `issues` plus helpers for forms.
+
+```typescript
+import { ValidationError } from "@pawabase/client";
+
+try {
+  await client.from("profiles").update(userId, input);
+} catch (error) {
+  if (error instanceof ValidationError) {
+    setFormErrors(error.byField());
+    return;
+  }
+  throw error;
+}
+```
+
+Each issue can include:
+
+| Field | Meaning |
+| --- | --- |
+| `loc` | Full body/query path, such as `['body', 'email']` |
+| `field` | Normalized field name without body/query prefix |
+| `message` | Validation message |
+| `type` | Validator category when supplied |
+| `input` | Rejected input when supplied |
+
+`fieldError(name)` returns the first message for one field.
+`byField()` returns all messages grouped by field.
+
+```typescript
+const emailMessage = error.fieldError("email");
+const allMessages = error.byField();
+```
+
+Nested locations can need application-specific mapping to nested form controls.
+Keep the original `issues` when the flattened field name is not enough.
+
+## Conflicts
+
+`ConflictError` represents an operation incompatible with current state.
+Common examples include a unique value already in use or a state transition that lost a race.
+
+Do not retry conflicts without changing input or re-reading state.
+For optimistic UI, restore the server representation and explain the conflict rather than replaying the same request automatically.
+
+## Rate limits
+
+`RateLimitError.retryAfter` is the parsed server wait in seconds when available.
+The client automatically retries `429` within its configured retry budget when the requested wait does not exceed `maxRetryAfterMs`.
+
+If the server requests a longer wait, the SDK surfaces the error rather than holding the caller longer than configured.
+
+```typescript
+if (error instanceof RateLimitError) {
+  showRateLimitCountdown(error.retryAfter);
+}
+```
+
+The exported `parseRetryAfter()` understands delta seconds and HTTP dates.
+Most applications can rely on the parsed error field.
+
+## Server errors
+
+`ServerError` covers `5xx` responses.
+Only `502`, `503`, and `504` participate in default transient retry rules.
+A `500` is surfaced immediately because repeating application behavior is not assumed safe or useful.
+
+Preserve `requestId` and inspect **Observability**.
+For functions and flows, also inspect their run history and application logs.
+
+## Network errors
+
+`NetworkError` means no response was available because of conditions such as offline state, DNS failure, connection refusal, or reset.
+It carries method and URL when known.
+
+For a read, retry can be straightforward.
+For a write, the server may have completed the operation before the connection failed.
+Reconcile state before encouraging repeated submission.
+
+## Timeout errors
+
+`TimeoutError` means an SDK deadline elapsed.
+Its `timeoutMs` field records the configured attempt limit.
+
+```typescript
+if (error instanceof TimeoutError) {
+  metrics.increment("pawabase.timeout", {
+    timeout_ms: String(error.timeoutMs),
+  });
+}
+```
+
+Timeout is per attempt.
+Total call time can include backoff and later attempts.
+An elapsed client deadline does not prove server-side work was cancelled.
+
+## Abort errors
+
+`AbortError` means the caller's `AbortSignal` fired.
+It usually represents navigation, superseded search, shutdown, or a parent deadline rather than a platform incident.
+
+```typescript
+try {
+  await query.withOptions({ signal }).execute();
+} catch (error) {
+  if (error instanceof AbortError) {
+    return;
+  }
+  throw error;
+}
+```
+
+Do not show “Pawabase is down” for an intentional abort.
+
+## Configuration errors
+
+`ConfigError` is raised when the client cannot safely or coherently use its configuration.
+Examples include an invalid base URL or a secret key detected in a browser.
+
+Configuration failures should fail deployment checks or application startup.
+They are not transient user errors and should not be placed in an automatic retry loop.
+
+## Invalid queries
+
+`InvalidQueryError` prevents a record request the public filter grammar would interpret incorrectly.
+
+It is used for:
+
+- a second filter on the same field, because the server would retain only the last;
+- an `in` member containing a comma, because the server splits the list on commas.
+
+Fix the query design.
+Retrying the same builder cannot help.
+
+## Realtime errors
+
+`RealtimeError` adds a protocol-oriented `code` such as `forbidden`.
+Socket acknowledgements, connection state, and rule refusal use this class.
+HTTP helpers under `client.realtime` use ordinary API error classes.
+
+```typescript
+room.on("error", (error) => {
+  if (error.code === "forbidden") {
+    renderChannelDenied();
+  }
+});
+```
+
+## Default retry policy
+
+The transport uses two additional attempts by default.
+Backoff uses full jitter from a 300 ms initial ceiling up to 8 seconds.
+The default maximum accepted `Retry-After` is 30 seconds.
+
+| Failure | `GET` | `PUT` | `DELETE` | `POST` | `PATCH` |
+| --- | --- | --- | --- | --- | --- |
+| `429` | Retry | Retry | Retry | Retry | Retry |
+| `502`, `503`, `504` | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
+| Network failure | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
+| Timeout | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
+| `500` | No | No | No | No | No |
+| Other `4xx` | No | No | No | No | No |
+
+The method table is a transport rule, not a proof about business semantics.
+Pawabase treats `PUT` and `DELETE` as naturally repeatable for retry policy.
+Design corresponding routes with stable target identity.
+
+## Why `429` can retry writes
+
+Rate limiting is decided before the handler runs, so a `429` means the operation did not execute.
+That makes waiting and retrying safe across methods within the configured budget.
+
+The SDK follows `Retry-After` when it is short enough.
+An excessive wait is surfaced so the application does not hang unexpectedly.
+
+## Declaring a call idempotent
+
+Function, flow, and route call options expose `idempotent`.
+Set it only when repeating the exact request cannot create a duplicate effect.
+
+```typescript
+await client.flows.run(
+  "rebuild-search-index",
+  { index: "products" },
+  { idempotent: true },
+);
+```
+
+An idempotency key understood by server behavior is stronger than a client boolean alone.
+The boolean only permits transport replay; it does not deduplicate on the server.
+
+## Configure retries
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  retry: {
+    retries: 3,
+    baseDelayMs: 250,
+    maxDelayMs: 4_000,
+    maxRetryAfterMs: 10_000,
+  },
+});
+```
+
+Set `retry: false` when a queue, workflow engine, or caller owns a larger retry policy.
+Coordinate retry layers to avoid multiplicative attempts.
+
+For example, three SDK attempts inside five job attempts can execute up to fifteen HTTP attempts.
+
+## Timeouts and retries together
+
+`timeoutMs` is evaluated for every attempt.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  timeoutMs: 10_000,
+  retry: { retries: 2 },
+});
+```
+
+This does not imply a 10-second total deadline.
+The worst case includes three 10-second attempts plus backoff.
+Use an outer `AbortSignal` when the whole operation needs a fixed end-to-end deadline.
+
+## End-to-end deadline
+
+```typescript
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 15_000);
+
+try {
+  return await client
+    .from("posts")
+    .withOptions({ signal: controller.signal })
+    .all({ maxRecords: 500 });
+} finally {
+  clearTimeout(timer);
+}
+```
+
+This aborts the complete caller wait even when an SDK attempt timeout and retry budget would allow longer.
+
+## Hooks for observability
+
+Transport hooks observe each attempt.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onRequest(info) {
+      metrics.increment("pawabase.request", {
+        method: info.method,
+        attempt: String(info.attempt),
+      });
+    },
+    onResponse(info) {
+      metrics.timing("pawabase.response_ms", info.durationMs, {
+        status: String(info.status),
+      });
+    },
+    onRetry(info) {
+      metrics.increment("pawabase.retry", {
+        reason: info.reason,
+      });
+    },
+    onError(error, info) {
+      captureTransportError(error, info);
+    },
+  },
+});
+```
+
+Hook failures are swallowed so monitoring cannot fail the application request.
+Headers passed to request hooks have credentials masked.
+Keep your own error capture and body logging policies equally careful.
+
+## Request IDs and Studio
+
+When `requestId` exists, include it in support output and structured logs.
+Open Studio's **Observability** area and search the corresponding request.
+
+```typescript
+if (error instanceof ApiError && error.requestId) {
+  showSupportReference(error.requestId);
+}
+```
+
+A request ID is diagnostic metadata, not a secret and not proof of authorization.
+It is more reliable than comparing approximate timestamps and URLs.
+
+## Form handling pattern
+
+```typescript
+async function saveProfile(input) {
+  try {
+    const profile = await client.from("profiles").update(input.id, input);
+    return { ok: true, profile };
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return {
+        ok: false,
+        kind: "validation",
+        fields: error.byField(),
+      };
+    }
+
+    if (error instanceof ConflictError) {
+      return {
+        ok: false,
+        kind: "conflict",
+      };
+    }
+
+    if (error instanceof PermissionError) {
+      return {
+        ok: false,
+        kind: "forbidden",
+        requestId: error.requestId,
+      };
+    }
+
+    throw error;
+  }
+}
+```
+
+Known expected outcomes become application results.
+Unknown failures continue to the error boundary and monitoring layer.
+
+## Server action pattern
+
+```typescript
+async function confirmOrder(accessToken, orderId) {
+  const actingClient = baseClient.asUser(accessToken);
+
+  try {
+    return await actingClient.routes.post(
+      "orders/confirm",
+      { order_id: orderId },
+    );
+  } catch (error) {
+    if (error instanceof ApiError) {
+      logger.warn("Order confirmation refused", {
+        status: error.status,
+        code: error.code,
+        requestId: error.requestId,
+      });
+    }
+    throw error;
+  }
+}
+```
+
+Do not set `idempotent: true` unless the order route has a stable deduplication or deterministic state contract.
+
+## Common incorrect handling
+
+| Pattern | Problem | Better decision |
+| --- | --- | --- |
+| Catch every error and return `null` | Hides permission, auth, validation, and outage distinctions | Convert only an expected class such as not-found |
+| Retry every `POST` | Duplicates side effects after ambiguous failures | Retry only a proven idempotent operation |
+| Match `error.message` | Copy can change and body shapes vary | Match class, status, or stable code |
+| Sign out on every `401` | Deployment key failures look like user expiry | Let managed refresh run; inspect code and scope |
+| Show raw validation body | Poor UX and possible data exposure | Map `issues` to controlled field messages |
+| Ignore `requestId` | Makes operations hard to correlate | Record and display a support reference |
+| Treat timeout as cancellation of server work | Can cause duplicate resubmission | Reconcile state or use a status endpoint |
+| Nest queue and SDK retries blindly | Produces retry storms | Assign ownership and calculate total attempts |
+
+## Response-body normalization
+
+Pawabase public surfaces can express errors in several body shapes.
+The SDK reads them into the same hierarchy.
+
+| Response shape | Example source | Normalized behavior |
+| --- | --- | --- |
+| Plain string | Simple API refusal | String becomes `message`; status supplies default code |
+| Bare validation issue array | Schema validation | Becomes `ValidationError.issues` |
+| `{ detail: [...] }` | Validation layer | Detail issues become `ValidationError.issues` |
+| `{ detail: "..." }` | Auth or API refusal | Detail becomes message |
+| `{ error, message, details }` | Gateway, function, or flow | Stable error code, message, and details preserved |
+| Unknown JSON body | Other public error | Preserved in `body` with status-derived class/code |
+
+Application code therefore does not need a different parser for records, auth, routes, functions, and flows.
+
+## Validation locations
+
+A validation issue's `loc` can start with `body`, `query`, or another request area and can contain nested indexes.
+
+```json
+{
+  "loc": ["body", "addresses", 0, "postal_code"],
+  "msg": "invalid postal code",
+  "type": "value_error"
+}
+```
+
+`field` is a convenient flattened field name for ordinary forms.
+For arrays and nested forms, use `loc` to map the message to the exact control.
+
+```typescript
+function formPath(issue: ValidationIssue) {
+  return issue.loc
+    .filter((part) => part !== "body" && part !== "query")
+    .join(".");
+}
+```
+
+Never reflect `input` into HTML without the application's normal escaping and data-handling rules.
+
+## Per-call retry overrides
+
+The lower-level capability option types can override timeout and, where exposed by the transport surface, retry behavior for one request.
+Use a client with `retry: false` when a whole operation must have single-attempt semantics.
+
+```typescript
+const singleAttempt = createClient({
+  url,
+  apiKey,
+  retry: false,
+});
+```
+
+For a query, `withOptions({ timeoutMs, signal })` changes its attempt deadline and cancellation but does not expose an independent query retry object.
+Keep retry ownership at the client or direct transport layer rather than assuming every high-level method has the same option surface.
+
+## Backoff distribution
+
+Full jitter chooses a random delay from zero through the exponential ceiling.
+
+```text
+attempt 0: 0 .. baseDelayMs
+attempt 1: 0 .. baseDelayMs × 2
+attempt 2: 0 .. baseDelayMs × 4
+...
+capped by maxDelayMs
+```
+
+Jitter spreads a fleet of clients after a shared outage.
+Do not write tests that expect one exact delay.
+Assert attempt count and an acceptable time bound, or configure very small ceilings.
+
+## `Retry-After` forms
+
+The parser accepts delta seconds and HTTP dates.
+
+```text
+Retry-After: 5
+```
+
+```text
+Retry-After: Fri, 09 Oct 2026 12:00:00 GMT
+```
+
+The normalized `retryAfter` field is seconds.
+A past HTTP date becomes an immediate or zero-length wait under parsing behavior.
+The SDK refuses to sleep beyond `maxRetryAfterMs` and surfaces `RateLimitError` or the relevant API error.
+
+## Attempt numbering in hooks
+
+Hook attempt numbers are zero-based.
+The original request is attempt `0`; the first retry is attempt `1`.
+
+```typescript
+onRetry(info) {
+  logger.warn("Retrying Pawabase request", {
+    nextAttempt: info.attempt + 1,
+    reason: info.reason,
+    delayMs: info.delayMs,
+  });
+}
+```
+
+`onRequest` runs for every actual attempt.
+`onResponse` runs for every obtained response, including a response that will be retried.
+`onError` runs for the final surfaced failure rather than every intermediate retry decision.
+
+## Token refresh is separate from transport retries
+
+A `401` replay after successful token refresh does not consume the normal retry budget in the same way as a `503` retry.
+It is limited to one refresh decision for the request.
+
+The body must be replayable.
+A stream body cannot be replayed after `401`, network failure, or transient status because it may already be consumed.
+
+This matters for direct streaming uploads from a long-lived signed-in client.
+Refresh the session before creating the stream when expiry is near, or use a signed upload URL whose authority is in the URL and does not require user-token refresh.
+
+## Ambiguous outcomes
+
+Classify failures by whether server execution is known.
+
+| Failure | Did the server answer? | Write outcome |
+| --- | --- | --- |
+| Validation `4xx` | Yes | Operation refused before successful completion |
+| Permission `403` | Yes | Operation refused |
+| Rate limit `429` | Yes | Handler did not run |
+| Conflict `409` | Yes | Requested state not applied as successful operation |
+| `502`/`503`/`504` | Gateway/service answered | Can be ambiguous depending on architecture and method |
+| Network reset | No usable response | Ambiguous |
+| Client timeout | No timely response | Ambiguous |
+| Caller abort | Caller stopped waiting | Server may continue |
+
+For payments, email, external webhooks, and workflow starts, return and persist stable operation IDs so the client can ask what happened.
+
+## UI error taxonomy
+
+Map transport detail into a small application vocabulary while retaining the original error for diagnostics.
+
+```typescript
+type SaveFailure =
+  | { kind: "signed_out" }
+  | { kind: "forbidden"; requestId: string | null }
+  | { kind: "validation"; fields: Record<string, string[]> }
+  | { kind: "conflict" }
+  | { kind: "retry_later"; after: number | null }
+  | { kind: "unknown"; requestId: string | null };
+```
+
+This keeps UI copy stable even when low-level messages vary, while operations teams still receive code and request ID.
+
+## Error boundaries and expected results
+
+Expected domain outcomes should be handled near the operation.
+Unexpected transport and programming failures should reach a shared error boundary.
+
+Do not catch at the client singleton and erase context for every caller.
+A record form, background synchronization job, and realtime status banner need different decisions from the same base classes.
+
+## Testing the retry matrix
+
+Tests should lock down method safety, not only eventual success.
+
+| Test input | Expected attempts |
+| --- | --- |
+| `GET` then `503` then success | Two |
+| `POST` then `503` | One |
+| Idempotent `POST` then `503` then success | Two |
+| Any method then `500` | One |
+| Any method then `429` with short wait then success | Two |
+| `429` with wait above configured cap | One surfaced error |
+| Safe method network failure within budget | Retry |
+| Caller abort | One and no retry |
+| Stream body transient failure | One and no replay |
+| Refresh endpoint network failure | No automatic refresh replay |
+
+Use a fake fetch for attempt counts and a real environment for gateway request IDs and policy fields.
+See [server runtimes and testing](/clients/typescript/server-runtimes-testing).
+
+## Error-response security
+
+Do not expose `body`, internal details, policy names, or complete URLs to end users without review.
+Policy names and request structure can reveal application design.
+Logs should omit access tokens, refresh tokens, API keys, passwords, signed URLs, and sensitive rejected input.
+
+UI copy should describe what the user can do.
+Operational logs should preserve class, status, code, request ID, method, safe route label, and attempt count.
+
+## Troubleshooting matrix
+
+| Observation | Likely layer | First evidence |
+| --- | --- | --- |
+| `ConfigError` before traffic | Application configuration | Constructor input and runtime |
+| `InvalidQueryError` | Application query construction | Repeated field or comma-containing list member |
+| `401 invalid_api_key` across operations | Deployment credential | **Build → Settings → API keys** |
+| `401` after token expiry | User session | Auth event stream and refresh failure |
+| `403` with `policy` | Authorization | Named policy and current auth/key context |
+| `404` for one record | Existence or read visibility | Neutral result plus policy review |
+| `422` | Request validation | `issues` and **API Explorer** schema |
+| `429` after SDK waits | Sustained rate pressure or excessive requested wait | `retryAfter` and hook retry events |
+| Repeated `503` | Service availability | Request ID and Studio Observability |
+| `NetworkError` only in one runtime | DNS, proxy, TLS, or runtime fetch | URL and transport adapter |
+| `TimeoutError` on long behavior | Deadline or synchronous design | Duration and run history |
+| `AbortError` | Caller lifecycle | Signal owner |
+| `RealtimeError forbidden` | Channel authorization | **Settings → Realtime** rule |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="General client errors" icon="circle-exclamation" href="/clients/errors">
+    REST status conventions and public error-body context.
+  </Card>
+  <Card title="Client configuration" icon="sliders" href="/clients/typescript/client-configuration">
+    Set retry budgets, attempt timeouts, hooks, and request-scoped identity.
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/operate/observability">
+    Correlate an SDK request ID with platform evidence.
+  </Card>
+  <Card title="API Explorer" icon="compass" href="/operate/api-explorer">
+    Reproduce validation and route behavior against the active environment.
+  </Card>
+</CardGroup>

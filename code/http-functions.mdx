@@ -1,0 +1,268 @@
+---
+title: "HTTP functions"
+description: "Functions that answer any HTTP request with a standard Response, the way Supabase Edge Functions do: one folder per function, streaming, secrets as environment variables, npm and jsr imports, background work, and per-function auth."
+icon: "globe"
+---
+
+An **HTTP function** is a TypeScript module in its own folder, `functions/<name>/index.ts`. It answers every request to
+`/functions/v1/<name>` and every path below it, with any method, by returning a standard `Response`. If you have written a Supabase
+Edge Function, a Cloudflare Worker or a `Deno.serve` handler, you already know how to write one.
+
+```ts functions/orders/index.ts
+import { serve, FunctionError } from "@pawabase/functions";
+
+export const config = { auth: "user", timeout: 30 };
+
+serve(async (req, ctx) => {
+  if (req.method === "GET") {
+    const { data } = await ctx.runtime.resourceList("orders", { filters: { user_id: ctx.auth.user_id } });
+    return Response.json(data);
+  }
+  if (req.method === "POST") {
+    const order = await ctx.runtime.resourceCreate("orders", { ...(await req.json()), user_id: ctx.auth.user_id });
+    ctx.waitUntil(ctx.runtime.emit("order.created", { id: order.id }));
+    return Response.json(order, { status: 201 });
+  }
+  throw new FunctionError(`${req.method} is not supported`, { status: 405, code: "method_not_allowed" });
+});
+```
+
+```bash
+curl -X POST https://api.example.com/functions/v1/orders \
+  -H "apikey: pb_pk_…" -H "Authorization: Bearer <user access token>" \
+  -d '{"sku": "A1", "qty": 2}'
+```
+
+HTTP functions live beside the other kind, [`fn()` functions](/code/typescript-functions) (`functions/*.ts`, JSON in and JSON out at
+`POST /functions/v1/<name>`), in the same deployment. A project's functions are one language, and HTTP functions are TypeScript.
+
+## Layout
+
+```
+functions/
+  orders/index.ts        → /functions/v1/orders/…
+  stripe-webhook/index.ts→ /functions/v1/stripe-webhook/… (or /functions/v1/public/<env>/stripe-webhook/… with auth: "public")
+  _shared/db.ts          shared code: a folder starting with _ is never a function
+  deno.json              an import map for every function ({ "imports": { … } })
+  orders/deno.json       an import map for one function (it wins over the shared one)
+  quote.ts               an fn() function, if you have any
+```
+
+A folder name is lowercase letters, digits, `-` and `_` (it is a URL segment). `public`, `v1`, `health` and `status` are reserved. The
+entry is `index.ts`, `index.mts`, `index.js` or `index.mjs`.
+
+## Writing the handler
+
+Two styles work, and you can mix them in one project:
+
+<CodeGroup>
+```ts serve() from the kit
+import { serve } from "@pawabase/functions";
+
+serve(async (req, ctx) => {
+  return Response.json({ hello: ctx.auth.user_id ?? "anonymous" });
+});
+```
+
+```ts Deno.serve, unchanged
+import { getContext } from "@pawabase/functions";
+
+Deno.serve(async (req) => {
+  const ctx = getContext(req);   // the same ctx, for code moved from Supabase or Deno Deploy
+  return new Response(`hello ${ctx.env}`);
+});
+```
+</CodeGroup>
+
+Inside the platform a function never listens on a port: `Deno.serve` records the handler and the runtime hands it each request. The
+handler gets a standard `Request` (method, URL as the caller used it, headers, a streaming body) and must return a `Response`.
+
+### `ctx`
+
+| Field | What it is |
+| --- | --- |
+| `auth` | The caller as policies see it: `authenticated`, `user_id`, `email`, `roles`, `permissions`, `org`. Anonymous callers have `authenticated: false`. |
+| `runtime` | The platform, acting as the caller: `resourceList/Get/Create/Update/Delete`, `dbQuery`, `dbTransaction`, `cacheGet/Set/Delete/Invalidate`, `emit`, `callFlow`, `dispatchFlow`, `callFunction`, `dispatchFunction`, `publish`, `sendMail`, `storagePut/Read/SignedUrl/Delete`, `secret`, `identityUser`, `checkPolicy`, `metric`, `httpRequest`. |
+| `path` | What follows `/functions/v1/<name>`: `/` when nothing does. |
+| `query` | The query string, as `URLSearchParams`. |
+| `waitUntil(promise)` | Keep working after the response is sent (see [background work](#background-work)). |
+| `signal` | Aborted when the caller goes away or the time runs out: pass it to `fetch` and long waits. |
+| `log(...)` | A line recorded with the run (`console.*` is recorded too). |
+| `env`, `branch`, `project`, `function`, `requestId` | Where and what is running; quote `requestId` to find the run in Studio. |
+
+### Helpers
+
+The kit adds a few small helpers. They are optional, because a plain `Response` always works.
+
+```ts
+import { json, errorResponse, sse, FunctionError } from "@pawabase/functions";
+
+return json({ ok: true }, { status: 201 });
+return errorResponse(422, "invalid", "sku is required", { field: "sku" });   // { error, message, details }
+throw new FunctionError("Out of stock", { status: 409, code: "out_of_stock" });  // the same shape, from anywhere
+return sse(async (send, signal) => {                                            // server-sent events
+  for await (const update of updates(signal)) send({ event: "update", data: update });
+});
+```
+
+## `config`
+
+Export `config` beside the handler. Every field is optional and is checked when you deploy: a bad value stops the deployment with a
+message, so the previous one keeps serving.
+
+```ts
+export const config = {
+  description: "Orders for the signed-in user",
+  auth: "user",          // who may call it (below)
+  methods: ["GET", "POST"],   // others get 405 before the function runs
+  timeout: 60,           // seconds a request may run; capped by the installation (400 by default)
+  memory: 256,           // heap of its workers, in MB; capped by the installation (512 by default)
+  warm: 1,               // workers kept running while idle: no cold start for its requests
+  concurrency: 64,       // requests one worker serves at once before another is started
+  cors: { origins: ["https://app.example.com"] },   // only these origins may read its responses
+};
+```
+
+### Who may call it: `auth`
+
+| `auth` | The request needs | Use it for |
+| --- | --- | --- |
+| `"key"` (default) | any API key of the environment; a user's token is optional | most functions, like Supabase's default |
+| `"user"` | a signed-in user's access token (`401` otherwise) | anything per-user |
+| `"service"` | a secret key (`pb_sk_…`) | server-to-server, admin tasks |
+| `"public"` | nothing: reachable at `/functions/v1/public/<env>/<name>` without a key | webhooks from Stripe, GitHub, Paystack… (verify their signature yourself) |
+| a policy name or condition | whatever the policy allows, evaluated like a resource policy | `"is_admin"`, `{ "auth.roles": { "contains": "editor" } }` |
+
+`verify_jwt: false` is accepted for code moved from Supabase and means `"public"`. An API key that carries scopes needs
+`functions:invoke`. A malformed or expired access token is refused with `401 invalid_token`, except by public functions, which ignore it.
+The caller's `Authorization` and `apikey` headers are passed through to the function, so it can call Pawabase back as the caller with
+the client SDK if it wants to.
+
+## Secrets and environment variables
+
+An environment's [secrets](/operate/secrets) are the environment variables of its functions:
+
+```ts
+const stripe = new Stripe(Deno.env.get("STRIPE_KEY")!);
+```
+
+Every function also sees `PAWABASE_URL`, `PAWABASE_ENVIRONMENT`, `PAWABASE_BRANCH`, `PAWABASE_FUNCTION` and `PAWABASE_DEPLOYMENT_ID`.
+When a secret changes, the function's workers are replaced on its next request, so a new value takes effect without a deploy.
+`ctx.runtime.secret(name)` keeps working too.
+
+## Imports: npm, jsr and URLs
+
+```ts
+import Stripe from "npm:stripe@16";
+import { encodeHex } from "jsr:@std/encoding@1/hex";
+import { z } from "zod";                    // through an import map: "zod": "npm:zod@3"
+import { db } from "@shared/db.ts";         // through an import map: "@shared/": "./_shared/"
+```
+
+Remote modules are **fetched once, when the deployment is activated**, into a cache that belongs to that deployment. Workers then run
+from that copy with Deno's `--cached-only`. They never download anything, so a deployment always runs exactly the code that was fetched
+for it, and a registry outage cannot break a cold start. If a module cannot be fetched, the deployment is refused with the error and
+nothing changes. An operator can turn this off (`PAWABASE_FUNCTION_VENDOR=false`); then a deployment with remote imports is refused
+and you bundle locally instead.
+
+Import maps come from `functions/deno.json` (or `deno.jsonc`, or `import_map.json`) for every function, then the function's own folder.
+A map may not point outside the deployment, and it cannot replace the kit (`@pawabase/functions` and `pawabase` always resolve to the
+platform's kit).
+
+## Outbound requests
+
+`fetch()` works as usual. By default (`guarded` network), the function's worker has no sockets of its own: each request is made by the
+runtime, through the platform's outbound guard, and streamed back. The guard:
+
+- refuses private, loopback, link-local, carrier-grade-NAT, multicast and reserved addresses, unless the operator lists a host in
+  `PAWABASE_OUTBOUND_ALLOW_HOSTS`;
+- checks the address it actually connects to, so a DNS answer that changes between a check and a connection cannot reach an internal
+  service;
+- follows redirects itself, re-checking each hop and dropping `Authorization`, `Cookie` and `apikey` when a redirect leaves the origin;
+- counts requests and bytes per invocation (200 requests and 64 MB by default).
+
+A refused request makes `fetch` reject with a `TypeError` that says why. Libraries that use `fetch` work unchanged. A library that opens
+raw TCP connections itself (some database drivers) needs the operator's `direct` network mode. See
+[the functions runtime](/self-hosting/functions-runtime#network).
+
+## Streaming
+
+Responses stream as the function produces them: server-sent events, NDJSON, large downloads. Request bodies stream in as they arrive,
+so `req.body` can be read chunk by chunk. A caller that disconnects aborts `ctx.signal`.
+
+## Background work
+
+```ts
+ctx.waitUntil(sendReceipt(order));          // or EdgeRuntime.waitUntil(...), for Supabase code
+return new Response(null, { status: 202 }); // the caller gets this at once
+```
+
+Work handed to `waitUntil` keeps running after the response, up to `PAWABASE_FUNCTIONS_BACKGROUND_SECONDS` (300 by default). Its runtime
+calls still act as the original caller. The run's record shows how long it took (`background_ms`). The worker is not stopped while it
+runs.
+
+## Failures and limits
+
+| What happened | The caller gets | The run records |
+| --- | --- | --- |
+| The function threw a `FunctionError` | its status, `{ error: code, message, details }` | `succeeded` for 4xx |
+| The function threw anything else, or returned no `Response` | `500 function_error` (no stack trace) | `failed`, with the error and where it was thrown |
+| It ran past `config.timeout` | `504 function_timeout`; `ctx.signal` aborts | `failed` |
+| Its worker ran out of memory or exited | `502 function_crashed` | `failed`, with the exit reason |
+| Every worker is full and no more may start | `503 function_busy` with `Retry-After` | `failed` |
+| A method outside `config.methods` | `405` with `Allow` | nothing (it never ran) |
+
+## Running locally and testing
+
+```bash
+npm install @pawabase/functions
+npx pawabase-functions new orders          # functions/orders/index.ts
+npx pawabase-functions serve               # http://localhost:54321/functions/v1/orders, restarts on change (needs Deno)
+npx pawabase-functions deploy
+```
+
+`serve` loads `.env` (so `Deno.env.get` sees your secrets). With `PAWABASE_URL` and `PAWABASE_API_KEY` set there, it connects
+`ctx.runtime` to that environment, as the caller whose token the request carries.
+
+Unit tests need neither Deno nor a platform:
+
+```ts tests/orders.test.ts
+import { callHttp, FakeRuntime, user } from "@pawabase/functions/testing";
+
+const runtime = new FakeRuntime({ resources: { orders: [] } });
+const { response, background } = await callHttp(
+  "functions/orders/index.ts",
+  new Request("http://local/functions/v1/orders", { method: "POST", body: JSON.stringify({ sku: "A1" }) }),
+  { runtime, auth: user("u1"), variables: { STRIPE_KEY: "sk_test" } },
+);
+assert.equal(response.status, 201);
+await background;                                   // waitUntil work
+assert.deepEqual(runtime.emitted[0][0], "order.created");
+```
+
+## Calling one from your app
+
+```ts
+const res = await pawabase.functions.fetch("orders", "/", { method: "POST", body: { sku: "A1" } });
+if (res.ok) console.log(await res.json());       // the Response as it is: an error status is returned, not thrown
+```
+
+```python
+r = pb.functions.request("orders", "/", method="POST", json={"sku": "A1"})
+print(r.status_code, r.json())
+```
+
+## Operating
+
+Studio lists HTTP functions beside the others, with their URL, `config`, recent runs (method, path, status, cold start, background time,
+fetches), latency percentiles, the workers running them now, a **Restart** button, and **Try it**, which sends a real request with
+any method, path, headers, body and identity. The same is in the management API:
+
+| | |
+| --- | --- |
+| `GET /platform/v1/envs/<env>/functions` | every function; HTTP ones have `kind: "http"`, `config`, `url` |
+| `GET /platform/v1/envs/<env>/http-functions/<name>` | one HTTP function, with request counts, failures, cold starts, status codes and p50/p95/p99 |
+| `POST /platform/v1/envs/<env>/http-functions/<name>/request` | send it a request (`method`, `path`, `headers`, `body`, `as_user`) |
+| `GET /platform/v1/envs/<env>/functions-runtime` | where functions run, the limits, and every worker |
+| `POST /platform/v1/envs/<env>/functions-runtime/restart` | drain workers (`{"function": "orders"}` for one) |
+| `GET /platform/v1/envs/<env>/function-runs?function=orders` | runs, newest first |

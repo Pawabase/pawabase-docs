@@ -1,457 +1,121 @@
 ---
 title: "Python"
-description: "Calling Pawabase from Python: the `requests` and `httpx` patterns for scripts, workers, and servers — sync and async, authentication, resource operations, flows, and running functions."
+description: "The official Python client: records, accounts, files, functions, flows, realtime, user administration and environment management, with blocking and asyncio clients that share every method."
 icon: "terminal"
 ---
 
-Python has an official package, **`pawabase`**, and the API is also plain REST that you can call with `requests` or `httpx` yourself. The package is for two jobs: calling a project from a script or server, and writing, testing, deploying and emulating [functions](/code/functions) with the [`pawabase` command](/code/cli). It needs only `httpx`.
+The Python client is the package **`pawabase`**. It calls a project from a script, a worker or a web server, and it needs only `httpx`. Writing functions that
+run *on* Pawabase and the `pawabase` command are a separate package, `pawabase-functions` (see [Functions](/code/functions) and the [CLI](/code/cli)); the two
+install into one `pawabase` namespace, so a server that only calls the API never installs the function kit.
 
 ```bash
-pip install pawabase
+pip install pawabase                     # httpx only
+pip install "pawabase[realtime]"         # + websockets, for live channels
 ```
 
 ```python
 from pawabase import Pawabase
 
-with Pawabase("https://api.example.com", "pb_sk_...", project="shop", environment="development") as pb:
-    page = pb.list("orders", sort="-created_at", limit=20)       # data API
-    pb.create("orders", {"total": 12.5})
-    pb.invoke_function("orders.pay", {"order_id": 7})             # POST /functions/v1/orders.pay
-    pb.invoke_flow("send-receipt", {"order": 7})
-    pb.emit_event("order.paid", {"id": 7})                         # needs a secret key: management plane
-    pb.run_schedule("nightly-report")
-    pb.deployments(branch="my-feature")
+pb = Pawabase("https://api.example.com", "pb_pk_…", environment="production")
+# AsyncPawabase is the same client for asyncio: every method is the same, and awaited.
 ```
 
-`AsyncPawabase` has the same methods, each returning an awaitable. Both retry reads on connection errors and `502/503/504`, wait and retry on `429` as the gateway asks, and raise `PawabaseError(status_code, detail)` with `.code`, `.message` and (for a refused deployment) `.problems`. A publishable key (`pb_pk_…`) reaches the data plane under your policies; a **secret** key also reaches the management plane for its own project and environment only.
+A **publishable** key (`pb_pk_…`) is what an app holds: [policies](/policies/conditions) decide what it can do, and a signed-in user's token goes on top. A
+**secret** key (`pb_sk_…`) belongs on servers only: it bypasses policies and unlocks [`pb.admin` and `pb.manage`](/clients/python-management), which cover
+the whole management plane and are scoped to the key's own environment.
 
-The rest of this page shows the same calls with `requests` and `httpx`, which is what the package does underneath.
-
-<CardGroup cols={3}>
-  <Card title="Sync and async" icon="arrows">`requests` for scripts and servers. `httpx` for async Python and workers.</Card>
-  <Card title="A wrapper you own" icon="wrench">`pawabase.Pawabase` is a thin one; the patterns below show how thin.</Card>
-  <Card title="Token refresh" icon="rotate">Every client catches a `401`, exchanges a refresh token for a new pair, and retries the original request once.</Card>
-</CardGroup>
-
-## The two-credential model
-
-Every Python request carries up to two credentials:
-
-| Header | Answers | Who sets it |
-| --- | --- | --- |
-| `apikey` (or `x-api-key`, or `?apikey=`) | Which project and environment is this? Also carries the key's role (`publishable`/`secret`) and scopes. | Your script, once, from environment variables — the same value for every user of your app. |
-| `Authorization: Bearer <access_token>` | Who, specifically, is calling? | Set per request, after the user signs in, from the token Akountz issued them. |
-
-`apikey` is **always required**. `Authorization` is **only required when a policy needs to know who's calling**. For server-to-server calls using the **secret** key, the `apikey` alone is sufficient — the secret key already has full access, and no `Authorization` header is needed.
+## Records
 
 ```python
-# A server-to-server call using the secret key
-import requests
+posts = pb.from_("posts")
 
-res = requests.get(
-    f"{GW}/rest/v1/invoices",
-    headers={"apikey": SECRET_KEY},
-)
+page = posts.eq("status", "live").gte("views", 10).order("-created_at").select("id", "title").expand("author").per_page(20).execute()
+page.data, page.total, page.has_next
 
-# A signed-in user's request — both credentials
-res = requests.get(
-    f"{GW}/rest/v1/orders?filter[store_id]=acme",
-    headers={
-        "apikey": PUBLISHABLE_KEY,
-        "Authorization": f"Bearer {access_token}",
-    },
-)
+for post in posts.eq("status", "live").iterate():          # every row, page after page
+    ...
+posts.where(status="live", views={"gte": 10}).all()          # a list
+posts.eq("slug", "hello").single()                           # NotFoundError if none
+posts.eq("status", "draft").count()
+
+row = posts.create({"title": "Hello"})
+posts.get(row["id"], expand=["author"])
+posts.update(row["id"], {"title": "Hello, world"})           # PATCH
+posts.delete(row["id"])
+posts.create_many(rows)                                      # failures are collected, not raised
 ```
 
-<Warning>
-The secret key is a service credential: it bypasses every policy in your project. Never ship it in a client bundle, a public repository, or a mobile app's assets. Keep it in a server-side secret manager or environment variable that never gets bundled. If one leaks, treat it as compromised: rotate it immediately from Studio's API keys page. See [Security guidance](/concepts/credentials#security-guidance).
-</Warning>
+Operators: `eq neq gt gte lt lte like ilike in_ not_in is_ is_not`. The server applies **one filter per field**; a second filter on a field raises `QueryError`
+before anything is sent, instead of silently dropping one. `eq(col, None)` and `eq(col, True)` become `is`, because `eq.false` matches true rows on the server.
 
-## Sync client: `requests`
-
-For scripts, background workers, and server-side tooling, the synchronous `requests` library is the natural fit:
+## Accounts
 
 ```python
-import requests
-import os
-
-GW = os.environ["PAWABASE_GW"]
-PK = os.environ["PAWABASE_PUBLISHABLE_KEY"]
-SK = os.environ["PAWABASE_SECRET_KEY"]
-
-# List records with filtering, sorting, and pagination
-res = requests.get(
-    f"{GW}/rest/v1/orders",
-    headers={"apikey": PK},
-    params={"filter[store_id]": "acme", "sort": "-placed_at", "limit": 20, "offset": 0},
-)
-res.raise_for_status()
-data = res.json()  # {"data": [...], "total": <int>, "limit": 20, "offset": 0}
-
-# Create a record
-res = requests.post(
-    f"{GW}/rest/v1/orders",
-    headers={"apikey": PK, "content-type": "application/json"},
-    json={"store_id": "acme", "total_minor": 2999, "currency": "usd"},
-    headers={"Idempotency-Key": "order-42-create-2026-09-28"},
-)
-res.raise_for_status()
-order = res.json()
-
-# Get a single record with expanded relations
-res = requests.get(
-    f"{GW}/rest/v1/orders/42?expand=customer,line_items",
-    headers={"apikey": PK, "Authorization": f"Bearer {access_token}"},
-)
-order = res.json()
-
-# Update a record
-res = requests.patch(
-    f"{GW}/rest/v1/orders/42",
-    headers={"apikey": PK, "content-type": "application/json"},
-    json={"status": "paid"},
-)
-res.raise_for_status()
-
-# Delete a record
-res = requests.delete(
-    f"{GW}/rest/v1/orders/42",
-    headers={"apikey": PK, "Authorization": f"Bearer {access_token}"},
-)
-assert res.status_code == 204
+pb.auth.sign_up(email="ada@example.com", password="…", name="Ada")
+result = pb.auth.sign_in_with_password(email="ada@example.com", password="…")
+if result.status == "mfa_required":
+    result = result.verify(input("Code: "))
+pb.auth.get_user(); pb.auth.update_user(name="Ada L.")
+pb.auth.sign_out()                                           # scope="global" signs out everywhere
 ```
 
-### Error handling with `requests`
+The session is kept in memory (pass `session_store=FileSessionStore("~/.myapp/session.json")` to stay signed in between runs), its token goes on every
+request, and an expiring or rejected token is renewed with the refresh token. Also: magic links, social sign-in (`oauth_url`, `exchange_code`), email
+verification, password reset, linked identities, `pb.auth.mfa` (authenticator app, emailed codes, recovery codes), `pb.auth.sessions`, `pb.auth.devices`,
+`pb.auth.api_keys` (keys a user makes for themselves), and `pb.auth.orgs` (organizations, members, invitations, teams).
+
+A web server acts as the visiting user without sharing a connection's credentials:
 
 ```python
-import requests
-from requests.exceptions import HTTPError, ConnectionError, Timeout
-
-def api_request(method: str, path: str, **kwargs) -> dict:
-    res = requests.request(method, f"{GW}{path}", **kwargs)
-    try:
-        res.raise_for_status()
-    except HTTPError as e:
-        err = res.json()
-        raise PawabaseApiError(
-            code=err.get("code", "unknown"),
-            message=err.get("message", str(e)),
-            status=res.status_code,
-            details=err.get("details"),
-        ) from e
-    return res.json()
+with pb.as_user(request_token) as user_client:               # same connection pool, this user's token
+    user_client.from_("orders").execute()
 ```
 
-## Async client: `httpx`
-
-For async Python (FastAPI backends, aiohttp workers, scheduled jobs), `httpx` gives you the same REST surface with async I/O:
+## Files
 
 ```python
-import httpx
-import os
-
-GW = os.environ["PAWABASE_GW"]
-PK = os.environ["PAWABASE_PUBLISHABLE_KEY"]
-
-async def list_orders(store_id: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        res = await client.get(
-            f"{GW}/rest/v1/orders",
-            headers={"apikey": PK},
-            params={"filter[store_id]": store_id, "sort": "-placed_at", "limit": 50},
-            timeout=30.0,
-        )
-        res.raise_for_status()
-        return res.json()
-
-async def create_order(data: dict) -> dict:
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            f"{GW}/rest/v1/orders",
-            headers={"apikey": PK, "content-type": "application/json"},
-            json=data,
-            timeout=30.0,
-        )
-        res.raise_for_status()
-        return res.json()
+avatars = pb.storage.from_("avatars")
+avatars.upload("ada.png", open("ada.png", "rb"), content_type="image/png")
+data = avatars.download("ada.png")
+avatars.list(prefix="2026/"); list(avatars.list_all())
+avatars.public_url("ada.png")                                # public buckets: no key needed
+avatars.transform_url("ada.png", width=200, height=200, fit="cover", format="webp")
+avatars.create_signed_url("report.pdf", expires_in=600)      # a temporary link anyone can read
+avatars.create_signed_upload_url("in/x.png", max_bytes=1_000_000)   # a browser uploads straight to storage
+avatars.create_share_link("report.pdf", expires_in=3600)     # for people with no account (secret key)
 ```
 
-<Note>
-The gateway streams request and response bodies without fully buffering them (see [A streaming request/response](/concepts/architecture#a-streaming-requestresponse-gateway-to-api)). `httpx` handles streaming natively — for large file uploads or downloads, pass `content` as a file-like object or use `httpx.Client(transport=httpx.HTTPTransport(stream_writes=True))` to avoid buffering the entire body in memory.
-</Note>
-
-## The typed wrapper pattern
-
-Because Pawabase resources are user-defined, a hand-rolled wrapper gives you typed call sites without the code-generation step. This wrapper covers the common patterns:
+## Functions, flows, routes
 
 ```python
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, Optional
-import requests
-
-T = TypeVar("T")
-
-@dataclass
-class PawabaseClient:
-    base_url: str
-    api_key: str
-    _token: Optional[str] = None
-    _refresh_token: Optional[str] = None
-
-    def _headers(self, *, with_auth: bool = False) -> dict[str, str]:
-        headers: dict[str, str] = {
-            "apikey": self.api_key,
-            "content-type": "application/json",
-        }
-        if with_auth and self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        return headers
-
-    def _request(self, method: str, path: str, **kwargs) -> dict:
-        res = requests.request(method, f"{self.base_url}{path}", headers=self._headers(), **kwargs)
-        if res.status_code == 401 and method != "POST" and self._refresh_token:
-            self._refresh_token_and_retry()
-            res = requests.request(method, f"{self.base_url}{path}", headers=self._headers(**kwargs), **kwargs)
-        res.raise_for_status()
-        return res.json()
-
-    def _refresh_token_and_retry(self) -> None:
-        data = self._request("POST", "/auth/v1/token/refresh", json={
-            "refresh_token": self._refresh_token,
-        })
-        self._token = data["access_token"]
-        self._refresh_token = data["refresh_token"]
-
-    def list(self, resource: str, params: Optional[dict[str, Any]] = None) -> list[dict]:
-        data = self._request("GET", f"/rest/v1/{resource}", params=params or {})
-        return data["data"]
-
-    def get(self, resource: str, id: str, params: Optional[dict[str, Any]] = None) -> dict:
-        qs = f"?{params}" if params else ""
-        return self._request("GET", f"/rest/v1/{resource}/{id}{qs}")
-
-    def create(self, resource: str, data: dict) -> dict:
-        return self._request("POST", f"/rest/v1/{resource}", json=data)
-
-    def update(self, resource: str, id: str, data: dict) -> dict:
-        return self._request("PUT", f"/rest/v1/{resource}/{id}", json=data)
-
-    def patch(self, resource: str, id: str, data: dict) -> dict:
-        return self._request("PATCH", f"/rest/v1/{resource}/{id}", json=data)
-
-    def delete(self, resource: str, id: str) -> None:
-        self._request("DELETE", f"/rest/v1/{resource}/{id}")
-
-    def auth_signup(self, email: str, password: str) -> dict:
-        return self._request("POST", "/auth/v1/signup", json={"email": email, "password": password})
-
-    def auth_signin(self, email: str, password: str) -> dict:
-        data = self._request("POST", "/auth/v1/token", json={
-            "grant_type": "password", "email": email, "password": password,
-        })
-        self._token = data["access_token"]
-        self._refresh_token = data["refresh_token"]
-        return data
-
-    def auth_signout(self) -> None:
-        self._request("POST", "/auth/v1/logout", json={"scope": "local"})
-        self._token = None
-        self._refresh_token = None
-
-    def flow_run(self, name: str, input: dict) -> dict:
-        return self._request("POST", f"/flows/v1/{name}", json=input)
+pb.functions.invoke("orders.create", {"sku": "A1"})          # branch="my-feature" runs a branch's version
+pb.flows.invoke("welcome", {"email": "ada@example.com"})
+pb.routes.post("orders/42/pay", {"method": "card"})
 ```
 
-Usage is clean and typed:
+## Realtime
 
 ```python
-client = PawabaseClient(base_url=os.environ["PAWABASE_GW"], api_key=os.environ["PAWABASE_PUBLISHABLE_KEY"])
-client.auth_signin("ada@example.com", "correct horse battery staple")
-
-orders = client.list("orders", params={"filter[store_id]": "acme", "sort": "-placed_at", "limit": 20})
-order = client.create("orders", {"store_id": "acme", "total_minor": 2999, "currency": "usd"})
-client.flow_run("pay-order", {"params": {"id": "order_42"}})
+async with AsyncPawabase(url, key) as pb:
+    room = pb.realtime.channel("chat:lobby", presence={"name": "Ada"})
+    room.on("message", lambda m: print(m["payload"]))
+    await room.subscribe()
+    await room.send("message", {"text": "hello"})
+    async for change in pb.realtime.channel("resource:posts"):   # live record changes, as you may read them
+        print(change["event"], change["payload"]["record"])
 ```
 
-## Authentication
+Publishing, presence and history also work over plain HTTP on the blocking client: `pb.realtime.publish(...)`, `.presence(channel)`, `.history(channel)`.
 
-### Sign up and sign in
+Management and user administration have [their own page](/clients/python-management).
 
-```python
-# Sign up
-data = client.auth_signup("ada@example.com", "correct horse battery staple")
-# {"access_token": "eyJhbGciOi…", "refresh_token": "8f2c9e…", "token_type": "bearer", "expires_in": 3600, "user": {…}}
+## Errors and retries
 
-# Sign in (the same flow)
-data = client.auth_signin("ada@example.com", "correct horse battery staple")
+Every failure raises `PawabaseError` (`.status_code`, `.code`, `.message`, `.details`, `.request_id`) or a subclass: `AuthenticationError` (401), `ForbiddenError`
+(403), `QuotaExceededError` (403, the plan's limit: `details` has `limit`, `allowed`, `used`), `NotFoundError`, `ConflictError` (409), `ValidationError` (400/422),
+`RateLimitedError`, `ServerError`, `NetworkError`. Reads are retried on connection errors and `502/503/504`; a `429` waits as the gateway asks.
 
-# Access and refresh tokens are stored by the client
-access_token = data["access_token"]
-refresh_token = data["refresh_token"]
-```
+## Testing code that uses the client
 
-### Token refresh
-
-```python
-# The wrapper handles this automatically on a 401, but you can do it manually:
-data = client._request("POST", "/auth/v1/token/refresh", json={"refresh_token": refresh_token})
-access_token = data["access_token"]
-refresh_token = data["refresh_token"]
-```
-
-Refresh tokens are **rotating**: every use issues a new access token and a new refresh token, and the one just used stops working. See [Refreshing and revocation](/concepts/credentials#refreshing-and-revocation).
-
-### Sign out
-
-```python
-client.auth_signout()
-```
-
-## Resource operations
-
-Full CRUD with filtering, sorting, pagination, and relation expansion:
-
-```python
-# List with filtering, sorting, and pagination
-orders = client.list("orders", params={
-    "filter[store_id]": "acme",
-    "sort": "-placed_at",
-    "limit": 20,
-    "offset": 0,
-})
-# Returns [{"id": "42", "store_id": "acme", …}, …]
-
-# Get a single record with expanded relations
-order = client.get("orders", "42", params={"expand": "customer,line_items"})
-
-# Create
-order = client.create("orders", {"store_id": "acme", "total_minor": 2999, "currency": "usd"})
-
-# Update (full replacement)
-order = client.update("orders", "42", {"status": "paid", "total_minor": 2999})
-
-# Update (partial)
-order = client.patch("orders", "42", {"status": "paid"})
-
-# Delete
-client.delete("orders", "42")
-```
-
-## Calling flows
-
-```python
-# Run a flow by name
-result = client.flow_run("pay-order", {"params": {"id": "order_42"}})
-# The flow runs synchronously — the response is the flow's output
-
-# Run a flow with an auth context (acting on behalf of a specific user)
-result = client.flow_run("pay-order", {"params": {"id": "order_42"}})
-```
-
-Flows can also be triggered by events, schedules, webhooks, and manually from Studio — see [Flows overview](/flows/overview) for the full trigger taxonomy.
-
-## Running functions
-
-For server-side logic that should run as a background job rather than inline:
-
-```python
-# Dispatch a function as a background job
-result = client._request("POST", "/functions/v1/recompute-rankings", json={"store_id": "acme"})
-# Returns {"job_id": "…"} immediately — the function runs asynchronously
-```
-
-See [Functions](/code/overview) for how to define functions and [Flows](/flows/overview) for when to use a flow instead.
-
-## Server-to-server calls with the secret key
-
-A backend you control — a Python worker, a scheduled job, a CI pipeline — calling Pawabase is a client like any other, just usually with the **secret** key and no `Authorization` header:
-
-```python
-import os
-import requests
-
-GW = os.environ["PAWABASE_GW"]
-SECRET_KEY = os.environ["PAWABASE_SECRET_KEY"]
-
-# The secret key bypasses all policies — full access to the environment
-res = requests.get(f"{GW}/rest/v1/invoices", headers={"apikey": SECRET_KEY})
-res.raise_for_status()
-
-# Create records without policy checks
-res = requests.post(f"{GW}/rest/v1/invoices", headers={
-    "apikey": SECRET_KEY,
-    "content-type": "application/json",
-}, json={"student_id": 12, "amount": 210000})
-```
-
-<Warning>
-If a server integration should have *limited* power rather than full access, give it a secret key with [scopes](/concepts/credentials#scopes) narrowed to what it needs (for example `resource:read` only), or issue it a publishable key plus a dedicated service-account user whose role your policies recognise, rather than routing everything through an unscoped secret key.
-</Warning>
-
-## Error handling in practice
-
-```python
-class PawabaseApiError(Exception):
-    def __init__(self, code: str, message: str, status: int, details: list | None = None):
-        self.code = code
-        self.message = message
-        self.status = status
-        self.details = details
-        super().__init__(f"[{status}] {code}: {message}")
-
-def api_request(method: str, path: str, **kwargs) -> dict:
-    res = requests.request(method, f"{GW}{path}", **kwargs)
-    try:
-        res.raise_for_status()
-    except requests.HTTPError:
-        err = res.json()
-        raise PawabaseApiError(
-            code=err.get("code", "unknown"),
-            message=err.get("message", str(res.status_code)),
-            status=res.status_code,
-            details=err.get("details"),
-        ) from None
-    return res.json()
-```
-
-| Error code | Status | Python handling |
-| --- | --- | --- |
-| `validation` | `422` | Inspect `error.details` for per-field messages |
-| `unauthenticated` | `401` | Refresh token and retry, or redirect to sign-in |
-| `missing_role` | `403` | Don't retry — the caller isn't authorized |
-| `rate_limit_exceeded` | `429` | Sleep `error.retry_after` seconds, then retry |
-| `order_not_found` | `404` | Resource doesn't exist — handle gracefully |
-| `timeout` | `504` | The flow timed out — retry the request |
-| `internal_error` | `500` | Server-side failure — log and retry with backoff |
-
-## Streaming large bodies
-
-For large file uploads and downloads, use `requests` streaming mode to avoid buffering the entire body in memory:
-
-```python
-# Streaming upload
-with open("large-file.pdf", "rb") as f:
-    res = requests.put(
-        f"{GW}/storage/v1/receipts/2026/inv-04.pdf",
-        headers={"apikey": SECRET_KEY, "content-type": "application/pdf"},
-        data=f,  # httpx/requests streams this without buffering
-    )
-    res.raise_for_status()
-
-# Streaming download
-res = requests.get(f"{GW}/storage/v1/receipts/2026/inv-04.pdf", headers={"apikey": SECRET_KEY}, stream=True)
-with open("inv-04.pdf", "wb") as f:
-    for chunk in res.iter_content(chunk_size=8192):
-        f.write(chunk)
-```
-
-The gateway proxies streaming request and response bodies without fully buffering them. See [A streaming request/response](/concepts/architecture#a-streaming-requestresponse-gateway-to-api) for the full walkthrough.
-
-## Next
-
-- [REST conventions](/clients/rest-conventions) — every resource operation and the exact filter/sort/pagination/expand syntax
-- [Errors](/clients/errors) — the full status code table and a recommended client-side error-handling pattern
-- [Calling Pawabase from a client](/clients/overview) — the gateway, the two kinds of key, and what's safe to ship
-- [Credentials: keys and tokens](/concepts/credentials) — what each credential proves and how policies see it
-- [Architecture](/concepts/architecture) — the gateway, the internal services, and the request lifecycle
+`Pawabase` takes an `httpx` transport through its `_client`, and everything it sends is plain REST (see [REST conventions](/clients/rest-conventions)), so a
+test double is an `httpx.MockTransport`. The package's own tests do exactly that.

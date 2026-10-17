@@ -1,0 +1,719 @@
+---
+title: "Realtime with TypeScript"
+description: "Manage the shared socket and channel lifecycle, consume messages, publish events, track presence, read history, and recover from disconnects."
+icon: "radio"
+---
+
+Realtime is a persistent connection to named channels.
+The TypeScript client owns one socket and lets many `RealtimeChannel` objects share it.
+Channel rules decide who may subscribe and publish and whether presence and history are enabled.
+
+The mental model has two levels:
+
+```text
+RealtimeClient
+  owns connection, authentication, heartbeat, reconnect, and HTTP helpers
+
+RealtimeChannel
+  owns one name, its listeners, join state, presence snapshot, and replay behavior
+```
+
+In Studio, open **Settings → Realtime**.
+Inspect the matching rule's **Pattern**, **Subscribe** policy, **Publish** policy, **Presence**, and **History depth**.
+Client code cannot enable a server-disabled capability.
+
+## Runtime support
+
+The SDK needs a standards-compatible WebSocket constructor.
+Browsers and Node.js 22 or newer normally provide one globally.
+Node.js 20 needs an adapter such as `ws` supplied by the application.
+
+```typescript
+import WebSocket from "ws";
+
+const client = createClient({
+  url,
+  apiKey,
+  realtime: {
+    webSocket: WebSocket,
+  },
+});
+```
+
+The SDK package does not install `ws`.
+Keeping the adapter in application dependencies avoids forcing a Node-only dependency into browser bundles.
+
+## Realtime configuration
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `webSocket` | Global constructor | Socket implementation |
+| `heartbeatSeconds` | `25` | Seconds between ping frames |
+| `ackTimeoutMs` | `10000` | Wait for an acknowledged socket operation |
+| `connectTimeoutMs` | `10000` | Wait for server welcome |
+| `reconnect` | Enabled | Backoff options, or `false` |
+| `onProtocolError` | None | Callback for malformed or unexpected frames |
+
+Reconnect options can set `baseDelayMs`, `maxDelayMs`, and `maxAttempts`.
+Disabling reconnect changes a dropped connection into a terminal closed state until application code connects again.
+
+```typescript
+const client = createClient({
+  url,
+  apiKey,
+  realtime: {
+    heartbeatSeconds: 20,
+    ackTimeoutMs: 8_000,
+    connectTimeoutMs: 8_000,
+    reconnect: {
+      baseDelayMs: 300,
+      maxDelayMs: 10_000,
+      maxAttempts: 12,
+    },
+    onProtocolError(detail) {
+      logger.warn("Unexpected realtime frame", { detail });
+    },
+  },
+});
+```
+
+## Connection status
+
+`client.realtime.status` is one of five states.
+
+| Status | Meaning |
+| --- | --- |
+| `idle` | No connection attempt has begun |
+| `connecting` | Initial socket connection is opening |
+| `open` | Server welcomed the socket |
+| `reconnecting` | A dropped connection is in recovery |
+| `closed` | Connection is closed without an active attempt |
+
+Listen for changes when the UI needs connectivity state.
+
+```typescript
+const stop = client.realtime.onStatusChange((status) => {
+  renderConnectionBadge(status);
+});
+
+stop();
+```
+
+Status is transport state.
+It does not mean a particular channel has been authorized or joined.
+Use `channel.subscribed` and channel events for that narrower state.
+
+## Explicit connection control
+
+Channels connect automatically during `subscribe()`.
+Explicit `connect()` is useful when the application wants to warm the connection or show connection failure before joining channels.
+
+```typescript
+await client.realtime.connect();
+console.log(client.realtime.connectionId);
+```
+
+`connectionId` is available after the server welcome.
+It is transport identity, not a user ID and not a durable application identifier.
+
+`disconnect()` closes the socket and stops reconnecting.
+Existing channel objects keep their listeners and desired membership.
+A later `connect()` can rejoin them.
+
+`whenOpen(ms?)` waits until the socket is actually open and starts a connection when idle or closed.
+
+```typescript
+await client.realtime.whenOpen(5_000);
+```
+
+## Create a channel
+
+```typescript
+interface ChatPayload {
+  text: string;
+}
+
+interface ChatPresence {
+  display_name: string;
+  typing: boolean;
+}
+
+const room = client.realtime.channel<ChatPayload, ChatPresence>(
+  "chat:lobby",
+  {
+    presence: {
+      display_name: "Ada",
+      typing: false,
+    },
+    replay: 50,
+  },
+);
+```
+
+The first generic is message payload type.
+The second is presence metadata type.
+They improve application typing but do not validate incoming data at runtime.
+
+Channel names are authorized by matching server rules.
+Use a predictable naming convention such as `chat:<room-id>` or `orders:<account-id>` and make the rule pattern and policies match that convention.
+
+## Channel object identity
+
+Calling `channel(name)` twice returns the same object.
+Listeners and subscription state are shared.
+
+```typescript
+const first = client.realtime.channel("chat:lobby");
+const second = client.realtime.channel("chat:lobby");
+
+console.log(first === second); // true
+```
+
+If another part of the application calls `unsubscribe()`, every listener on that object stops receiving.
+Prefer a small ownership layer that subscribes once and distributes application state.
+
+After unsubscribing, `realtime.forget(name)` removes the cached object.
+
+```typescript
+await room.unsubscribe();
+client.realtime.forget("chat:lobby");
+```
+
+## Register listeners before subscribing
+
+Listeners registered before `subscribe()` cannot miss the first delivered message or initial presence event.
+
+```typescript
+const stopMessages = room.on("message", (message) => {
+  appendMessage(message);
+});
+
+const stopPresence = room.on("presence", (change) => {
+  renderMembers(change.members);
+});
+
+room.on("error", (error) => {
+  reportRealtimeError(error);
+});
+
+await room.subscribe();
+```
+
+`on()` returns a function that removes only that handler.
+It does not unsubscribe the channel.
+
+## Channel events
+
+| Event | Payload | Meaning |
+| --- | --- | --- |
+| `message` | `ChannelMessage<T>` | One published message |
+| `presence` | `{ joins, leaves, members }` | Presence state changed |
+| `subscribed` | `undefined` | Join was acknowledged |
+| `closed` | `{ reason }` | Channel stopped receiving for now |
+| `error` | `RealtimeError` | Join, send, track, or connection-related failure |
+
+A `closed` event can describe manual unsubscribe or a dropped connection.
+When reconnect is enabled and the channel still wants membership, the client rejoins automatically.
+
+## Listen to one application event
+
+`onEvent(name, handler)` filters channel messages by their `event` field.
+
+```typescript
+const stopTyping = room.onEvent("typing", (message) => {
+  updateTyping(message.from, message.payload);
+});
+```
+
+Use `on("message")` when one handler needs every event.
+Use `onEvent()` to keep event-specific state changes independent.
+
+## Subscribe
+
+```typescript
+await room.subscribe();
+```
+
+Subscription opens the shared socket if needed, sends a join request, and waits for acknowledgement.
+It is safe to call twice on the same channel.
+
+A rule refusal rejects with `RealtimeError` whose code is `forbidden`.
+Do not retry a forbidden join on a timer without changing user, key, channel, or server policy; the refusal is an authorization decision, not a transient disconnect.
+
+## Publish over the channel
+
+`send(event, payload?)` uses the open socket and resolves when the server accepts the message.
+
+```typescript
+const accepted = await room.send("message", {
+  text: "Hello",
+});
+
+console.log(accepted.id);
+```
+
+Server acceptance does not mean every subscriber rendered the message.
+It means the publish operation was acknowledged under the channel's rule.
+
+The payload generic applies to all events on the channel.
+Use a discriminated payload union when events have different shapes.
+
+```typescript
+type RoomPayload =
+  | { kind: "message"; text: string }
+  | { kind: "typing"; active: boolean };
+```
+
+## Publish without a socket
+
+`realtime.publish(channel, event, payload)` uses the HTTP counterpart.
+
+```typescript
+const result = await client.realtime.publish(
+  "chat:lobby",
+  "announcement",
+  { text: "Maintenance begins in ten minutes" },
+);
+```
+
+It returns the accepted message ID, channel, and event.
+Use it for server processes and occasional publishers that do not need an open subscription.
+The channel's publish policy still applies.
+
+## Message shape
+
+| Field | Meaning |
+| --- | --- |
+| `type` | Always `message` |
+| `id` | Message ID used for de-duplication |
+| `channel` | Channel name |
+| `event` | Application event name |
+| `payload` | Typed application payload |
+| `from` | Sender user ID, `server`, or `null` as supplied |
+| `sent_at` | Server timestamp |
+| `seq` | Sequence when returned from history |
+
+Use the server fields for ordering and identity where the product contract requires them.
+Do not use browser receipt time as a stable message order.
+
+## Presence
+
+Presence is a channel feature configured by its matching rule.
+Initial presence can be supplied when the channel is created.
+
+```typescript
+const room = client.realtime.channel("chat:lobby", {
+  presence: {
+    display_name: "Ada",
+    typing: false,
+  },
+});
+```
+
+After subscribe, `track(meta)` replaces or updates what others see according to server behavior.
+
+```typescript
+await room.track({
+  display_name: "Ada",
+  typing: true,
+});
+```
+
+Presence metadata is visible to everyone authorized for presence on that channel.
+Do not put access tokens, email addresses, private account data, or secrets in it.
+
+## Presence changes
+
+```typescript
+room.on("presence", ({ joins, leaves, members }) => {
+  for (const joined of joins) {
+    showJoined(joined.user_id, joined.meta);
+  }
+
+  for (const left of leaves) {
+    showLeft(left.user_id);
+  }
+
+  renderRoster(members);
+});
+```
+
+Each member includes `presence_ref`, `user_id`, `meta`, and `online_at`.
+`presence_ref` distinguishes connections; one user can have more than one connection.
+If the UI wants unique people rather than connections, group by `user_id` deliberately.
+
+`presenceState()` returns the channel's last local snapshot.
+It is empty until presence data has arrived.
+
+```typescript
+const members = room.presenceState();
+```
+
+## Presence over HTTP
+
+`realtime.presence(channel)` asks for current presence without joining the socket channel.
+
+```typescript
+const members = await client.realtime.presence<ChatPresence>("chat:lobby");
+```
+
+Use it for an occasional snapshot.
+Use a channel subscription for ongoing change delivery.
+
+## History
+
+History is bounded by the server rule's configured depth.
+The client can request recent messages through a joined channel or the HTTP helper.
+
+```typescript
+const recent = await room.history(50);
+```
+
+```typescript
+const recent = await client.realtime.history<ChatPayload>(
+  "chat:lobby",
+  50,
+);
+```
+
+Results are oldest first.
+History availability and maximum useful count depend on the matching channel rule.
+It is not an indefinite event archive.
+
+## Replay after reconnect
+
+Set `replay` on a channel to fetch that many recent messages after reconnect and deliver missed IDs.
+
+```typescript
+const room = client.realtime.channel("orders:account-42", {
+  replay: 100,
+});
+```
+
+The channel de-duplicates replayed and live messages by ID.
+This closes a common short disconnect gap, but it is not a durable exactly-once queue.
+
+| Guarantee | Realtime behavior |
+| --- | --- |
+| Reconnect | Attempts with backoff when enabled |
+| Rejoin | Channels that still want membership are joined again |
+| Gap recovery | Recent history fetched when `replay > 0` |
+| Duplicate suppression | Seen message IDs are not delivered twice within client tracking |
+| Permanent archive | Not provided |
+| Exactly-once business processing | Not provided |
+
+If missing an event would corrupt business state, persist state in a resource or use jobs/events and treat realtime as a notification to refetch.
+
+## Async iteration
+
+A channel is an async iterable of messages.
+
+```typescript
+await room.subscribe();
+
+for await (const message of room) {
+  await processMessage(message);
+}
+```
+
+The iterator ends on `unsubscribe()`.
+Listeners and iteration consume the same delivered channel stream through separate client mechanisms; choose one ownership model per consumer to avoid duplicated application work.
+
+## Authentication changes on an open socket
+
+The realtime client listens to auth state.
+When the access token refreshes or disappears, it informs the server without forcing a new socket solely for that change.
+
+A channel rule can still refuse a later rejoin when the new identity no longer qualifies.
+Signing out should update application channel ownership; do not leave user-specific listeners displaying prior private data merely because the transport remains connected.
+
+## Heartbeats and silent links
+
+The client sends a ping every 25 seconds by default.
+After two silent intervals it recycles the connection.
+This detects half-open links where neither side received a clean close.
+
+Do not disable application awareness of `reconnecting` merely because automatic recovery exists.
+A long outage can leave the UI stale, and finite `maxAttempts` can end recovery.
+
+## Acknowledgement timeouts
+
+Subscribe, publish, track, and history requests wait for a matching acknowledgement.
+If it does not arrive within `ackTimeoutMs`, the operation rejects with `RealtimeError`.
+
+An acknowledgement timeout is ambiguous for publish: the server may have accepted a message whose acknowledgement was lost.
+Use stable payload IDs and idempotent consumer logic when duplicate user submission matters.
+
+## Unsubscribe and cleanup
+
+```typescript
+stopMessages();
+stopPresence();
+await room.unsubscribe();
+```
+
+Unsubscribe leaves the channel and ends pending iterators.
+It does not necessarily close the shared socket because other channels may still use it.
+
+Call `client.dispose()` when discarding the entire SDK client.
+That closes realtime and stops auth lifecycle work.
+
+## Error codes and decisions
+
+`RealtimeError` extends `PawabaseError` and adds `code`.
+
+| Situation | Decision |
+| --- | --- |
+| `forbidden` join | Inspect channel pattern, subscribe policy, user, and key; do not blind-retry |
+| Not connected | Subscribe or call `whenOpen()` before socket-only work |
+| Acknowledgement timeout | Treat publish outcome as potentially ambiguous; inspect connection and server logs |
+| Protocol error callback | Record SDK/server version context and malformed-frame detail |
+| Repeated reconnect | Show stale/offline state and inspect proxy WebSocket support |
+
+HTTP helpers use the normal API error hierarchy rather than socket-only error handling.
+
+## Connection close decisions
+
+Not every socket close should reconnect.
+The client distinguishes ordinary transport loss from a credential refusal that cannot be fixed by retrying the same connection.
+
+| Close condition | Behavior |
+| --- | --- |
+| Network loss or transient socket close | Reconnect with configured backoff |
+| Missing or invalid API key close | Stay closed; the deployment credential must change |
+| Refused user token close | Attempt one managed auth refresh, then reconnect with the replacement |
+| Manual `disconnect()` | Reject pending socket work and do not reconnect |
+| Reconnect attempts exhausted | Remain closed until application action |
+
+This avoids an infinite connection storm for a revoked project key.
+Monitor repeated transitions between `reconnecting` and `closed` and include the SDK version and close reason in diagnostic output.
+
+## Pending request behavior
+
+Socket requests such as join, publish, track, and history wait in a pending map until the server acknowledges their reference.
+When the socket closes, pending work is rejected rather than waiting forever.
+
+Application code must decide whether a rejected publish can be repeated.
+As with an HTTP write, a lost acknowledgement can make outcome ambiguous.
+
+```typescript
+try {
+  const accepted = await room.send("message", {
+    client_message_id: crypto.randomUUID(),
+    text,
+  });
+  markAccepted(accepted.id);
+} catch (error) {
+  markDeliveryUnknown();
+  throw error;
+}
+```
+
+A stable client message ID lets consumers or server behavior deduplicate a user retry when that is part of the application protocol.
+
+## Channel reconfiguration
+
+Requesting an existing channel name returns its cached object and applies the latest supplied options to that object.
+Because listeners are shared, changing replay or initial presence in one component affects the common channel.
+
+Centralize channel creation when options have product meaning.
+
+```typescript
+function accountChannel(accountId: string) {
+  return client.realtime.channel(
+    `account:${accountId}`,
+    {
+      replay: 100,
+    },
+  );
+}
+```
+
+Do not let independently mounted components disagree about whether presence data should be attached to one shared channel name.
+
+## Local message de-duplication
+
+The channel tracks message IDs it has delivered so live and replay paths do not deliver the same ID twice.
+This de-duplication is scoped to the lifetime and memory of the channel object.
+
+After the application forgets the channel or reloads, it must use its own durable IDs if cross-session duplicate suppression matters.
+Do not treat the SDK's in-memory seen set as business-level exactly-once processing.
+
+## Optimistic messages
+
+Chat and collaboration UIs often render a local pending item before `send()` resolves.
+Reconcile the optimistic item with the accepted or echoed server message by a stable client ID.
+
+```typescript
+const clientMessageId = crypto.randomUUID();
+
+addPending({
+  clientMessageId,
+  text,
+});
+
+await room.send("message", {
+  client_message_id: clientMessageId,
+  text,
+});
+```
+
+Without reconciliation, the user can see the optimistic copy and the broadcast copy as two messages even though the transport delivered only one server message.
+
+## Presence is connection-oriented
+
+One user can have a browser tab, phone, and desktop application connected at the same time.
+Each connection has its own `presence_ref`.
+
+Choose the UI model explicitly:
+
+| UI question | Aggregation |
+| --- | --- |
+| How many active connections? | Count presence rows |
+| Which users are online? | Group non-null `user_id` values |
+| Which device is typing? | Keep each presence reference |
+| Is a user offline? | They are offline only after their final reference leaves |
+
+Anonymous presence can have `user_id: null` when the channel rule permits it.
+Use application-generated non-sensitive metadata when anonymous participants need a display label.
+
+## Presence update frequency
+
+`track()` is acknowledged server work and broadcasts presence changes.
+Do not send it for every keystroke or pointer movement.
+
+Debounce typing and activity values.
+Use ordinary ephemeral messages for high-frequency collaboration signals when the channel design permits, and keep presence for state that the current roster should retain.
+
+## History and pagination expectations
+
+The public history helper accepts a limit and returns the recent retained window oldest first.
+It is not a cursor-based archive API.
+
+If the application needs older pages, search, compliance retention, or permanent message history, store messages in a resource and use realtime as delivery notification.
+
+```typescript
+room.onEvent("message_created", async (message) => {
+  await refreshConversation(message.payload.conversation_id);
+});
+```
+
+The resource becomes durable truth; the channel reduces time-to-update.
+
+## Resource change channels
+
+When a resource broadcasts changes, its realtime payload can be used to invalidate or update client state.
+Treat the payload as notification data and consider refetching through the normal resource policy when the latest projected or expanded representation matters.
+
+```typescript
+const changes = client.realtime.channel("resource:posts", {
+  replay: 25,
+});
+
+changes.on("message", (message) => {
+  queryCache.invalidate({
+    resource: "posts",
+    id: message.payload.id,
+  });
+});
+
+await changes.subscribe();
+```
+
+Do not assume a raw change payload has the same transforms, selections, or expansions as a resource read.
+
+## Reconnect budget design
+
+Reconnect backoff prevents a client fleet from reconnecting continuously during an outage.
+
+| Setting | Too small | Too large |
+| --- | --- | --- |
+| `baseDelayMs` | Immediate thundering herd | Slow recovery from a brief mobile handoff |
+| `maxDelayMs` | Sustained connection pressure | Long stale periods during extended outages |
+| `maxAttempts` | Clients give up during recoverable outage | Clients may retry for the entire application lifetime |
+
+Show an offline indicator while recovering.
+Offer a deliberate reconnect action after a finite budget is exhausted.
+
+```typescript
+async function reconnectNow() {
+  client.realtime.disconnect();
+  await client.realtime.connect();
+}
+```
+
+This resets application intent; it does not fix invalid keys or forbidden channels.
+
+## Proxy and deployment requirements
+
+HTTP success does not prove that WebSocket upgrades reach realtime.
+The public gateway or reverse proxy must preserve upgrade headers and long-lived bidirectional connections.
+
+When connections open locally but fail in deployment, compare:
+
+- public scheme and host used to derive the socket URL;
+- TLS certificate and proxy termination;
+- WebSocket upgrade forwarding;
+- idle timeout relative to heartbeat;
+- API key and environment;
+- CORS/origin rules that apply to the connection handshake;
+- **Settings → Realtime** rule authorization.
+
+## Testing reconnect and replay
+
+A complete client integration test should exercise more than one live message.
+
+| Scenario | Expected observation |
+| --- | --- |
+| Initial subscribe | Welcome, join acknowledgement, `subscribed` event |
+| Token refresh | Auth update sent without requiring application resubscribe |
+| Refused subscribe | Promise rejects and channel emits `RealtimeError` |
+| Presence snapshot and diff | Member state reflects joins and leaves |
+| Duplicate message ID | Delivered once |
+| Connection drop | Status becomes reconnecting and channel closes temporarily |
+| Recovery with replay | Channel rejoins and missed unseen IDs arrive |
+| Manual disconnect | Pending work rejects and no automatic reconnect begins |
+| Silent link | Heartbeat recycles the connection |
+| Missing WebSocket constructor | Configuration error explains adapter requirement |
+
+Use a real local environment for channel-policy tests and a controllable fake socket for deterministic timing tests.
+See [server runtimes and testing](/clients/typescript/server-runtimes-testing).
+
+## Troubleshooting map
+
+| Symptom | Client check | Studio or infrastructure check |
+| --- | --- | --- |
+| Socket never opens | URL, key, WebSocket constructor, `connectTimeoutMs` | Reverse proxy WebSocket upgrade and service health |
+| Join is forbidden | User session and exact channel name | **Settings → Realtime** matching pattern and subscribe policy |
+| Send is forbidden | Event/payload and current identity | Publish policy and **Clients may publish** setting |
+| Presence stays empty | Subscribe completed and listeners registered early | Rule has **Presence** enabled |
+| History is empty | Requested channel and limit | Rule **History depth** and prior messages |
+| Messages missed after reconnect | `replay` is nonzero | History depth is large enough for outage volume |
+| Duplicate UI action | Same listener registered twice or optimistic echo plus server message | Use stable message IDs and one ownership layer |
+| Node 20 reports no WebSocket | Adapter not supplied | Install and configure a compatible constructor |
+
+## Security boundaries
+
+Channel names are untrusted input when they include user-controlled IDs.
+The server rule must verify membership rather than relying on secrecy of the name.
+Publish payloads are untrusted data.
+Subscribers must validate payloads before applying security-sensitive state.
+Presence metadata is shared data, not a private profile channel.
+History can expose earlier messages to a newly authorized subscriber, so its depth and policy need deliberate review.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Realtime overview" icon="radio" href="/realtime/overview">
+    Product concepts, channel rules, presence, history, and architecture.
+  </Card>
+  <Card title="Channel rules" icon="shield" href="/realtime/channel-rules">
+    Pattern matching and subscribe/publish authorization.
+  </Card>
+  <Card title="Client configuration" icon="sliders" href="/clients/typescript/client-configuration">
+    WebSocket adapters, auth ownership, and client disposal.
+  </Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/clients/typescript/errors-retries">
+    Distinguish socket errors from normalized HTTP failures.
+  </Card>
+</CardGroup>

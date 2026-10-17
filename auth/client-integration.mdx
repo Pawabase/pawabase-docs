@@ -1,1095 +1,1512 @@
 ---
 title: "Client integration"
-description: "Complete guide to integrating Pawabase auth into frontend and backend clients: SDK usage, token handling, CORS, error patterns, and platform-specific considerations for browser, mobile, and server environments."
-icon: "code"
+description: "Calling Pawabase auth from a real client — fetch and httpx, hand-written token storage and refresh, theft detection, browser vs mobile vs server tradeoffs, CORS, and the error shape you actually have to handle."
+icon: "plug"
 ---
 
-Pawabase provides a comprehensive client integration story that covers every platform and use case: browser-based single-page applications, mobile applications (iOS and Android), backend services, and server-to-server communication. This page is the complete reference for how to integrate Pawabase auth into any client type, covering SDK initialization, sign-up and sign-in flows, token storage and refresh, CORS configuration, service key authentication, mobile-specific considerations, and the complete error handling patterns you'll encounter across every client type.
+Authentication is the part of a backend you touch from every surface at once: a browser tab, a phone, a cron job, and your own API. This page is the integration guide for all four — what to send, where to keep the tokens, how to refresh them, and what happens when something goes wrong.
+
+<Note>
+**There is no first-party SDK for Python or mobile, and this page is written against the wire protocol rather than against any client library.** Pawabase's auth surface is plain REST and JSON over one endpoint, so a browser client uses `fetch`, a server uses `httpx` or `requests`, iOS uses `URLSession` and Android uses `OkHttp`. If you are building a JavaScript or TypeScript app, the official `@pawabase/client` package covers records, storage, functions, flows and realtime and handles the refresh bookkeeping for you — see [JavaScript and TypeScript](/clients/javascript). The rest of this page explains what that library is doing underneath, and is the reference for every other language.
+</Note>
 
 <CardGroup cols={3}>
-  <Card title="Frontend SDK" icon="browser">Complete auth flow with automatic token refresh, theft detection, and session management.</Card>
-  <Card title="Backend service keys" icon="server">Server-to-server authentication with full admin access through the admin API.</Card>
-  <Card title="Platform-specific storage" icon="phone">Keychain on iOS, Keystore on Android, secure memory on the web.</Card>
+  <Card title="One endpoint" icon="key-round">`POST /auth/v1/token` handles sign-in, refresh and MFA. There is no `/oauth/token`.</Card>
+  <Card title="Rotation is mandatory" icon="refresh">Every refresh returns a new refresh token and consumes the old one. Store both, atomically.</Card>
+  <Card title="Reuse kills the family" icon="shield-alert">Presenting a consumed refresh token revokes the whole session family and emits an event.</Card>
 </CardGroup>
 
-## The frontend SDK
+## What you are building on
 
-The Pawabase frontend SDK provides a complete authentication flow for web and mobile applications. It handles every aspect of the authentication lifecycle: sign-up, sign-in, token management, session management, MFA, and error handling.
+Three layers, and it matters which one you are talking to.
 
-<Steps>
-  <Step title="Initialize the SDK">
-    Create a `PawabaseClient` instance with your publishable key, project ID, and environment ID. The SDK validates the key format and loads the environment configuration.
-  </Step>
-  <Step title="Sign up or sign in">
-    Call the appropriate sign-up or sign-in method. The SDK validates inputs, makes the API request, and handles the response.
-  </Step>
-  <Step title="Store tokens securely">
-    The SDK stores the access token and refresh token using the configured storage mechanism (memory, cookie, or platform-specific secure storage).
-  </Step>
-  <Step title="Automatically refresh tokens">
-    Before the access token expires, the SDK silently refreshes using the refresh token. If refresh fails, the SDK clears stored tokens and emits events for the application to handle.
-  </Step>
-  <Step title="Handle session events">
-    The SDK emits events for sign-in, sign-out, token refresh, theft detection, and errors. Subscribe to these events to update the application state.
-  </Step>
-</Steps>
+| Layer | What it does for a client | What it issues |
+| --- | --- | --- |
+| The gateway | Resolves your API key, enforces CORS and rate limits, forwards the request | Nothing |
+| Akountz | Verifies credentials, runs the session lifecycle, owns `akz_*` tables | The token pair |
+| Every other service | Verifies the bearer token on each request | Nothing |
 
-### SDK initialization
+A client only ever talks to the gateway. Akountz is reachable at `/auth/v1/*` through the same public address; it is never a separate host you configure.
 
-Initialize the SDK with your publishable key and project configuration:
+Two headers, two questions:
 
-```typescript
-import { createClient } from '@pawabase/sdk'
+| Header | Answers | When |
+| --- | --- | --- |
+| `apikey` | Which project and environment, and with what role | Every request, always |
+| `Authorization: Bearer <access_token>` | Who specifically is calling | Only when a policy needs identity |
 
-const client = createClient({
-  publishableKey: 'pk_abc123...',
-  projectId: 'acme',
-  envId: 'production',
-  autoRefresh: true,
-  tokenStorage: 'cookie',
-  refreshThreshold: 60,
-})
-```
-
-The SDK configuration accepts the following options:
-
-| Option | Type | Default | Description |
-| --- | --- | --- | --- |
-| `publishableKey` | string | Required | The publishable key (`pk_...` prefix). Identifies the project and environment. |
-| `projectId` | string | Required | The project identifier. |
-| `envId` | string | Required | The environment identifier (`development`, `staging`, `production`). |
-| `autoRefresh` | boolean | `true` | Whether to automatically refresh tokens before expiration. |
-| `tokenStorage` | string | `'memory'` | Token storage mechanism: `'memory'`, `'cookie'`, or `'secure'`. |
-| `refreshThreshold` | number | `60` | Number of seconds before token expiration to trigger a refresh. |
-| `gatewayUrl` | string | Platform default | The URL of the Pawabase gateway. |
-| `retryConfig` | object | Default retry settings | Configuration for retry logic on transient failures. |
-
-The publishable key is safe to use in client-side code because it only grants access to the self-service API. It cannot perform administrative operations — those require a service key. The publishable key identifies the project and environment, and the gateway resolves it to determine which tenant's user directory to use.
-
-### SDK initialization details
-
-When the SDK is initialized, it performs several setup operations:
-
-1. **Key validation**: The SDK validates the publishable key format. If the key doesn't match the expected format (`pk_` prefix), initialization fails with a configuration error.
-2. **Configuration loading**: The SDK fetches the environment's auth configuration (`GET /auth/v1/settings`) to determine which sign-in methods are available.
-3. **Session restoration**: If stored tokens exist, the SDK attempts to restore the session by validating the access token. If the token is valid, the user is considered signed in.
-4. **Auto-refresh setup**: If `autoRefresh` is `true`, the SDK sets up a timer to refresh the token `refreshThreshold` seconds before expiration.
-5. **Event listener registration**: The SDK registers internal event listeners for token refresh, sign-out, and theft detection.
-
-```typescript
-class PawabaseClient {
-  private config: ClientConfig
-  private tokens: TokenStore | null = null
-  private refreshTimer: ReturnType<typeof setTimeout> | null = null
-
-  constructor(config: ClientConfig) {
-    this.config = config
-    this.validateKey(config.publishableKey)
-    this.loadConfiguration()
-    this.restoreSession()
-    if (config.autoRefresh) {
-      this.setupAutoRefresh()
-    }
-  }
-}
-```
-
-### Sign-up with the SDK
-
-```typescript
-const { data, error } = await client.auth.signUp({
-  email: 'chioma@example.com',
-  password: 'correct-horse-battery-staple',
-  name: 'Chioma Nwosu',
-  data: { tier: 'starter' },
-  redirectTo: 'https://app.example.com/auth/callback',
-})
-```
-
-The SDK handles the complete sign-up flow:
-
-1. **Input validation**: The SDK validates the email format, password length, and password policy requirements before sending the request. If the password doesn't meet the policy, the SDK returns a client-side error with specific details about which rules were violated.
-2. **API request**: The SDK sends a `POST /auth/v1/signup` request with the user's information. The request includes the `apikey` header (the publishable key) and the request body containing `email`, `password`, `name`, `data`, and `redirectTo`.
-3. **Response handling**: The SDK processes the response. If sign-up succeeds, the response includes the user object and, if `require_email_verification` is `false`, the session tokens.
-4. **Verification handling**: If `require_email_verification` is `true`, the SDK stores the `redirect_to` URL and the user's email. The application should display a verification prompt and redirect the user after verification is complete.
-5. **Error mapping**: The SDK maps server errors to user-friendly error objects. Each error includes a `statusCode`, `message`, and optional `details` field with structured information about the error.
-
-```typescript
-interface SignUpResponse {
-  user: User
-  session: Session | null
-  verificationRequired: boolean
-}
-```
-
-### Sign-in with the SDK
-
-The SDK supports multiple sign-in methods:
-
-```typescript
-// Password sign-in
-const { data, error } = await client.auth.signIn({
-  email: 'chioma@example.com',
-  password: 'correct-horse-battery-staple',
-})
-
-// Magic link sign-in
-const { data, error } = await client.auth.signInWithMagicLink({
-  email: 'chioma@example.com',
-})
-
-// Social login
-const { data, error } = await client.auth.signInWithOAuth({
-  provider: 'google',
-  options: {
-    redirectTo: 'https://app.example.com/auth/callback',
-    scopes: ['openid', 'email', 'profile'],
-  },
-})
-
-// MFA completion
-const { data, error } = await client.auth.signInWithMFA({
-  mfaToken: 'mfa_token_abc123...',
-  code: '123456',
-})
-```
-
-Each sign-in method follows the same pattern but has different requirements and response shapes. The SDK handles method-specific logic:
-
-- **Password sign-in**: Validates email and password format, sends the request, handles the response including MFA challenges if required.
-- **Magic link**: Sends the magic link request, stores the email for later verification, handles the callback when the user clicks the link.
-- **Social login**: Initiates the OAuth2 flow, handles the redirect, exchanges the authorization code for tokens.
-- **MFA completion**: Sends the TOTP code to the MFA endpoint, handles the response including the new session tokens.
-
-### MFA handling in the SDK
-
-When MFA is enabled and the user signs in with a password, the SDK automatically handles the MFA challenge flow:
-
-```typescript
-// The sign-in response may include an MFA challenge
-const { data, error } = await client.auth.signIn({
-  email: 'chioma@example.com',
-  password: 'correct-horse-battery-staple',
-})
-
-if (data.mfaRequired) {
-  // The SDK detected an MFA challenge
-  // Display the MFA input field to the user
-  const mfaCode = await showMFAInput()
-  
-  // Complete the MFA challenge
-  const { data: mfaData, error: mfaError } = await client.auth.completeMFA({
-    mfaToken: data.mfaToken,
-    code: mfaCode,
-  })
-  
-  // Now the user is signed in with aal2 session
-}
-```
-
-The SDK automatically detects MFA requirements and provides methods for completing the challenge. The `mfaToken` is a one-time token that identifies the MFA challenge session. It must be used within the challenge window and cannot be reused.
-
-### Token storage
-
-The SDK stores tokens using a secure mechanism appropriate for the client type:
-
-#### Browser storage options
-
-The SDK provides three storage mechanisms for browser environments:
-
-1. **Memory storage (default)**: Tokens are stored in JavaScript variables within the SDK instance. This is the most secure option against XSS attacks because tokens are not accessible through `localStorage` or `sessionStorage`. However, tokens are lost when the page is refreshed.
-2. **Cookie storage**: Tokens are stored in httpOnly cookies. This provides persistence across page refreshes and is not accessible to JavaScript. Requires proper CORS and cookie configuration.
-3. **Secure storage**: Tokens are stored using the platform's secure storage mechanism (e.g., Web Crypto API with a derived key).
-
-```typescript
-// Memory storage (default) — most secure against XSS
-const client = createClient({
-  publishableKey: 'pk_abc123...',
-  tokenStorage: 'memory',
-})
-
-// Cookie storage — persists across refreshes
-const client = createClient({
-  publishableKey: 'pk_abc123...',
-  tokenStorage: 'cookie',
-  cookieOptions: {
-    domain: '.example.com',
-    path: '/',
-    sameSite: 'strict',
-    secure: true,
-  },
-})
+```text
+GET /auth/v1/user HTTP/1.1
+Host: api.yourapp.com
+apikey: pb_pk_9f2c3d1a4b8e...
+Authorization: Bearer eyJhbGciOiJIUzI1NiIs...
 ```
 
 <Warning>
-Never store tokens in `localStorage` or `sessionStorage`. These are accessible to any JavaScript running on the page, making them vulnerable to XSS attacks. The SDK should never store tokens in `localStorage` — this is a fundamental security requirement.
+Never send a **secret** key (`pb_sk_…`) from a browser, a mobile binary, or any repository. It is a service credential: the policy engine allows every request made with it before evaluating anything. A leaked secret key makes every policy in your project irrelevant. The [publishable key](/clients/overview#the-two-kinds-of-api-key) is designed to be public — leak that one and the worst case is a caller acting as an ordinary signed-in user, which your policies already handle.
 </Warning>
 
-#### Mobile storage
+## The one endpoint
 
-On mobile platforms, the SDK uses the platform's secure storage:
-
-- **iOS**: Tokens are stored in the iOS Keychain, which is encrypted and protected by the device's biometric authentication. The Keychain persists across app updates and is backed up to iCloud (if enabled).
-- **Android**: Tokens are stored in the Android Keystore, which is hardware-backed on supported devices. The Keystore provides strong encryption and is protected by the device's lock screen.
-
-```typescript
-// On iOS, the SDK automatically uses the Keychain
-const iosClient = createClient({
-  publishableKey: 'pk_abc123...',
-  tokenStorage: 'secure', // Uses Keychain on iOS
-})
-
-// On Android, the SDK automatically uses the Keystore
-const androidClient = createClient({
-  publishableKey: 'pk_abc123...',
-  tokenStorage: 'secure', // Uses Keystore on Android
-})
-```
-
-#### Server-side storage
-
-Backend clients should not use the SDK's built-in token storage. Instead, backend clients should use service keys for authentication and store refresh tokens in a secure server-side session store or database.
+`POST /auth/v1/token` is the entire grant surface:
 
 ```python
-# Backend storage example
-import redis
-from pawabase import PawabaseClient
-
-redis_client = redis.Redis(host='localhost', port=6379, db=0)
-client = PawabaseClient(service_key='sk_abc123...')
-
-# Store refresh token in Redis with TTL
-await redis_client.setex(
-    f"refresh:{user_id}",
-    timeout=config.refresh_ttl,
-    value=refresh_token,
-)
+class TokenRequest(BaseModel):
+    grant_type: Literal["password", "refresh_token", "mfa"] = "password"
+    email: str | None = None
+    password: str | None = None
+    refresh_token: str | None = None
+    mfa_token: str | None = None
+    code: str | None = None
+    #: An organization slug the tokens should be issued for. On refresh, switches
+    #: the session's organization (``null`` leaves it); omit to keep it.
+    org: str | None = Field(default=None, max_length=63)
 ```
 
-### Automatic token refresh
+Three grants, three field sets:
 
-The SDK automatically refreshes tokens before they expire:
-
-```typescript
-class TokenRefresher {
-  private timer: ReturnType<typeof setTimeout> | null = null
-  
-  setupAutoRefresh() {
-    const token = this.getAccessToken()
-    if (!token) return
-    
-    const expiresIn = this.getTokenExpiration(token)
-    const refreshIn = Math.max(0, expiresIn - this.config.refreshThreshold)
-    
-    this.timer = setTimeout(async () => {
-      await this.refresh()
-    }, refreshIn * 1000)
-  }
-  
-  async refresh() {
-    try {
-      const refreshToken = this.getRefreshToken()
-      const { data, error } = await client.auth.refresh(refreshToken)
-      
-      if (error) {
-        throw error
-      }
-      
-      this.storeTokens(data.access_token, data.refresh_token)
-      this.setupAutoRefresh() // Schedule next refresh
-    } catch (err) {
-      this.handleRefreshFailure(err)
-    }
-  }
-}
-```
-
-The refresh flow is:
-
-1. The SDK tracks the `expires_in` value from the token response.
-2. Before the access token expires, the SDK sends a refresh request with the refresh token.
-3. If the refresh succeeds, the SDK updates the stored tokens.
-4. If the refresh fails, the SDK clears the stored tokens and emits a `signedOut` event.
-
-```typescript
-client.on('signedOut', () => {
-  // Clear application state
-  store.clearAuth()
-  router.navigate('/auth/sign-in')
-  showNotification('Your session has expired. Please sign in again.')
-})
-```
-
-The `refreshThreshold` (default: 60 seconds) determines how many seconds before token expiration the SDK initiates a refresh. A shorter threshold means more frequent refresh requests but less risk of the token expiring mid-request. A longer threshold means fewer refresh requests but a higher chance of the token expiring before the refresh completes.
-
-### Refresh token rotation handling
-
-When the SDK refreshes a token, the old refresh token is rotated (replaced by a new one). The SDK handles this transparently:
-
-1. The SDK sends the old refresh token to `POST /auth/v1/token` with `grant_type: "refresh_token"`.
-2. The server validates the refresh token, issues new tokens, and rotates the refresh token.
-3. The SDK stores the new refresh token and uses it for subsequent refresh requests.
-
-If the refresh fails because the old token was already rotated (theft detection), the SDK emits a `theftDetected` event:
-
-```typescript
-client.on('theftDetected', async () => {
-  // The refresh token was used by someone else
-  // Both the legitimate user and the attacker now have valid tokens
-  // The legitimate user should be alerted and asked to sign out all sessions
-  
-  await showTheftWarning()
-  await client.auth.signOut() // Sign out all sessions
-  router.navigate('/auth/sign-in')
-})
-```
-
-The `theftDetected` event is the signal that someone else used the refresh token. The SDK should:
-
-1. Alert the user that their account may have been compromised.
-2. Clear all stored tokens.
-3. Redirect the user to the sign-in page.
-4. Optionally, call `client.auth.signOut()` to revoke all sessions.
-
-<Warning>
-The `theftDetected` event does NOT automatically revoke the attacker's session. Both the legitimate user and the attacker have valid tokens after the theft. The legitimate user must sign out all sessions to revoke the attacker's token.
-</Warning>
-
-### Session restoration
-
-When the application starts, the SDK attempts to restore the user's session:
-
-```typescript
-async function restoreSession() {
-  const accessToken = await client.getAccessToken()
-  if (!accessToken) {
-    // No stored tokens — user is not signed in
-    return { authenticated: false }
-  }
-  
-  // Validate the access token
-  const isValid = await client.auth.validateToken(accessToken)
-  if (!isValid) {
-    // Access token is invalid — try to refresh
-    const refreshToken = await client.getRefreshToken()
-    if (refreshToken) {
-      const { data, error } = await client.auth.refresh(refreshToken)
-      if (error) {
-        // Refresh failed — user must sign in
-        await client.auth.signOut()
-        return { authenticated: false }
-      }
-      // Refresh succeeded — session restored
-      return { authenticated: true, user: data.user }
-    }
-    // No refresh token — user must sign in
-    await client.auth.signOut()
-    return { authenticated: false }
-  }
-  
-  // Access token is valid — session restored
-  return { authenticated: true, user: await client.auth.getUser() }
-}
-```
-
-Session restoration happens automatically during SDK initialization if `autoRefresh` is `true`. The SDK checks for stored tokens, validates the access token, and if invalid, attempts to refresh using the stored refresh token.
-
-### Error handling in the SDK
-
-The SDK provides a structured error handling system:
-
-```typescript
-try {
-  const { data, error } = await client.auth.signIn({
-    email: 'chioma@example.com',
-    password: 'correct-horse-battery-staple',
-  })
-  
-  if (error) {
-    handleError(error)
-    return
-  }
-  
-  // Success — use data.user and data.session
-} catch (err) {
-  // Network errors or unexpected failures
-  handleUnexpectedError(err)
-}
-```
-
-The SDK error object has the following structure:
-
-```typescript
-interface SDKError {
-  statusCode: number
-  message: string
-  code: string
-  details?: Record<string, any>
-  retryAfter?: number
-}
-```
-
-Common error codes include:
-
-| Code | Status | Description |
+| `grant_type` | Requires | Use for |
 | --- | --- | --- |
-| `invalid_credentials` | 400 | Email or password is incorrect. |
-| `account_disabled` | 403 | The account has been disabled by an administrator. |
-| `email_not_verified` | 403 | Email verification is required. |
-| `mfa_required` | 403 | MFA verification is required. |
-| `aal_required` | 403 | Minimum AAL level not met. |
-| `account_locked` | 429 | Account is temporarily locked due to too many failed attempts. |
-| `rate_limit_exceeded` | 429 | Too many requests. |
-| `session_revoked` | 401 | The session has been revoked. |
-| `theft_detected` | 401 | Refresh token was already rotated. |
-| `token_expired` | 401 | The access token has expired. |
+| `password` | `email`, `password` | Signing in |
+| `refresh_token` | `refresh_token` | Getting a new pair, and switching organization |
+| `mfa` | `mfa_token`, `code` | Completing a second factor |
 
-## CORS configuration
+`grant_type` may also be given as a **query parameter**, which takes precedence over the body — the route reads `ctx.query_params.get("grant_type") or body.grant_type`. Both work; pick one and be consistent.
 
-Cross-Origin Resource Sharing (CORS) controls which origins can make requests to the Pawabase API. CORS is configured per environment and is essential for browser-based applications.
+There is no `grant_type=authorization_code`. There is no `/oauth/token`. There is no client-credentials grant for your own application — that is what the secret key is for.
 
-### Configuring CORS
+### The response
+
+Every successful grant returns the same body:
 
 ```json
 {
-  "auth": {
-    "cors_origins": [
-      "https://app.example.com",
-      "https://staging.example.com",
-      "http://localhost:3000"
-    ]
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "8f2c9e4a7b1d...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1772000000,
+  "session_id": "9f2c4a7b1d3e5f6a8b0c2d4e6f8a1b3c5d7e9f1a3b5c7d9e1f3a5b7c9d1e3f5a7b",
+  "org": null,
+  "org_role": null,
+  "user": {
+    "id": "01JX9K2M4P7Q8R3S5T6U7V8W9X",
+    "email": "ada@example.com",
+    "username": "ada",
+    "name": "Ada Lovelace",
+    "email_verified": true,
+    "roles": ["editor"],
+    "mfa_enabled": false,
+    "…": "…"
   }
 }
 ```
 
-The `cors_origins` array specifies the allowed origins. Each origin must match exactly (scheme, host, and port). Wildcards are not supported — each origin must be explicitly listed.
-
-### How CORS works in Pawabase
-
-When the frontend SDK makes a request to the Pawabase API:
-
-1. **Simple requests**: For `GET` requests or `POST` requests with `Content-Type: application/x-www-form-urlencoded`, the browser sends the request directly with the `Origin` header. The server checks if the `Origin` matches any of the configured `cors_origins`. If it matches, the server responds with `Access-Control-Allow-Origin` set to the matching origin.
-2. **Preflight requests**: For `POST` requests with `Content-Type: application/json` or other non-simple requests, the browser sends a preflight `OPTIONS` request first. The server responds with CORS headers indicating the allowed methods, headers, and credentials.
-
-```
-Access-Control-Allow-Origin: https://app.example.com
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
-Access-Control-Allow-Headers: apikey, content-type, authorization
-Access-Control-Allow-Credentials: true
-Access-Control-Max-Age: 86400
-```
-
-### Preflight request handling
-
-The preflight `OPTIONS` request is handled by the gateway before the request reaches the API:
-
-```
-Browser → OPTIONS /auth/v1/token (Origin: https://app.example.com)
-Gateway → Checks Origin against cors_origins
-Gateway → If match, returns CORS headers
-Browser → Sends actual POST /auth/v1/token with CORS headers
-```
-
-The gateway handles preflight requests without calling the API. The CORS headers are cached by the browser for `Access-Control-Max-Age` seconds (default: 86400 / 24 hours).
-
-### CORS and the token endpoint
-
-The `/auth/v1/token` endpoint has special CORS handling because it is used by the frontend SDK:
-
-```
-POST /auth/v1/token
-Origin: https://app.example.com
-apikey: pk_abc123...
-Content-Type: application/json
-```
-
-The gateway validates the `Origin` header against `cors_origins`. If the origin is allowed, the response includes the appropriate `Access-Control-Allow-Origin` header. If the origin is not allowed, the gateway returns a CORS error and the request fails.
-
-<Important>
-If `cors_origins` is empty or not configured, the server accepts requests from any origin. This is convenient for development but should never be used in production. Always configure `cors_origins` to restrict access to known origins.
-</Important>
-
-### CORS configuration per environment
-
-Each environment can have its own CORS configuration:
-
-| Environment | Typical `cors_origins` |
+| Field | Use |
 | --- | --- |
-| Development | `["http://localhost:3000", "http://localhost:5173"]` |
-| Staging | `["https://staging.example.com"]` |
-| Production | `["https://app.example.com", "https://www.example.com"]` |
+| `access_token` | The `Authorization: Bearer` value. Short-lived |
+| `refresh_token` | Exchange for a new pair. **Changes every refresh** |
+| `expires_in` | Seconds until the access token expires |
+| `expires_at` | Absolute expiry as a Unix timestamp — easier to compare than adding `expires_in` |
+| `session_id` | The token family id, reported as the `sid` claim |
+| `org`, `org_role` | The selected organization and your role in it |
+| `user` | The full user view — handy for populating a UI without a second request |
 
-Development should have relaxed CORS to facilitate local development. Production should have an explicit allow-list to prevent unauthorized origins from making requests.
+<Note>
+`expires_at` is `int(datetime.now(UTC).timestamp()) + config.access_ttl`, computed on the server. Comparing against it in the client avoids clock-skew problems that arise from adding `expires_in` to the browser's own clock.
+</Note>
 
-## Backend integration
-
-Backend services interact with Pawabase using service keys rather than the frontend SDK. Service keys provide full administrative access and are used for server-to-server communication.
-
-### Service keys
-
-Service keys are of two types:
-
-| Type | Prefix | Permissions |
-| --- | --- | --- |
-| Publishable key | `pk_` | Read-only access to self-service API. Safe for client-side code. |
-| Secret key | `sk_` | Full admin access. Never expose in client-side code. |
-
-Service keys are issued by the Pawabase platform and are associated with a specific project and environment. They should be stored in a secret manager (AWS Secrets Manager, HashiCorp Vault, etc.) and never in source code or configuration files.
-
-### Service key authentication
-
-Service keys are passed in the `apikey` or `authorization` header:
+## Signing in
 
 ```bash
-# Using the apikey header
-curl -X GET "$GW/projects/acme/envs/production/users" \
-  -H "apikey: sk_abc123..."
-
-# Using the authorization header
-curl -X GET "$GW/projects/acme/envs/production/users" \
-  -H "authorization: Bearer sk_abc123..."
+curl -X POST "$GW/auth/v1/token?grant_type=password" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"email": "ada@example.com", "password": "correct horse battery staple"}'
 ```
 
-Both headers serve the same purpose. The `apikey` header is a convenience header, while `authorization: Bearer` is the standard HTTP authentication header. The choice depends on the API gateway's configuration.
+### Sign-up first
 
-### Server-to-server token management
-
-Backend services can manage tokens programmatically:
+`POST /auth/v1/signup` creates the account and, unless verification is required, signs the user straight in:
 
 ```python
-from pawabase import PawabaseClient
-
-client = PawabaseClient(
-    service_key="sk_abc123...",
-    project_id="acme",
-    env_id="production",
-)
-
-# Create a user
-user = await client.auth.create_user(
-    email="new@example.com",
-    name="New User",
-    data={"department": "Engineering"},
-)
-
-# Sign in a user (creates a session)
-session = await client.auth.sign_in(
-    email="chioma@example.com",
-    password="correct-horse-battery-staple",
-)
-
-# Revoke all sessions for a user
-await client.auth.revoke_all_sessions(user_id=user.id)
-
-# List all sessions for a user
-sessions = await client.auth.list_sessions(user_id=user.id)
+@r.post("/signup", request_model=SignUp, middleware=limits, summary="Create an account")
+async def signup(ctx: HttpContext, body: SignUp):
+    config = await config_for(akountz, ctx)
+    if not config.signup_enabled:
+        raise HTTPException(status_code=403, detail="sign-up is disabled")
+    if body.redirect_to and not config.redirect_allowed(body.redirect_to):
+        raise HTTPException(status_code=400, detail="redirect_to is not an allowed URL")
+    user = await create_account(
+        config,
+        email=body.email,
+        password=body.password,
+        username=body.username,
+        name=body.name,
+        user_metadata=body.data,
+    )
+    await akountz.emit(
+        config.project,
+        config.env,
+        "user.created",
+        {"user_id": str(user.id), "email": user.email, "method": "password"},
+        actor=str(user.id),
+    )
+    if config.require_email_verification:
+        token = await links.issue(akountz, config, "verify", user=user)
+        await emails.send(
+            akountz,
+            config,
+            "verify",
+            user.email,
+            link=links.link(config, "verify", token, body.redirect_to),
+        )
+        return created(
+            {"user": await user_view(user), "session": None, "verification_required": True}
+        )
+    session = await start_session(akountz, config, user, method="password", ctx=ctx)
+    return created({**session, "verification_required": False})
 ```
 
-The backend client handles all the same operations as the frontend SDK but with full administrative privileges. The backend client does not need to handle token storage or refresh — it uses the service key for each request.
+Two shapes come back, and a client must handle both:
 
-### Backend error handling
+```json
+{ "user": { "…": "…" }, "session": null, "verification_required": true }
+```
 
-Backend clients should handle errors differently from frontend clients because they don't have user interaction:
+```json
+{ "access_token": "…", "refresh_token": "…", "…": "…", "verification_required": false }
+```
+
+<Warning>
+The `session` key is **`null`** when verification is required. A client that reads `response.session.access_token` unconditionally will throw on the verification path. Branch on `verification_required`, or on `session === null`.
+</Warning>
+
+The sign-up body:
+
+```python
+class SignUp(BaseModel):
+    email: str = Field(max_length=255)
+    password: str = Field(min_length=1, max_length=1024)
+    username: str | None = Field(default=None, max_length=150)
+    name: str = Field(default="", max_length=200)
+    data: dict[str, Any] = Field(default_factory=dict, description="Initial user_metadata")
+    redirect_to: str | None = None
+```
+
+`data` becomes `user_metadata`, which the user can later edit themselves — so never use it for an entitlement. See [`meta` versus `app`](/auth/auth-in-policies#meta-versus-app).
+
+### What sign-in can refuse, and how
+
+The order of checks in the `password` grant determines which error you get:
+
+```python
+email = normalise_email(body.email)
+user = await find_by_email(config.project, config.env, email)
+refusal = HTTPException(status_code=400, detail="invalid email or password")
+if user is None:
+    await log_event(..., reason="unknown email", ctx=ctx)
+    raise refusal
+if is_locked(user):
+    await log_event(..., reason="locked", ctx=ctx)
+    raise HTTPException(status_code=429, detail="too many failed attempts; try again later")
+if not user.check_password(body.password):
+    await record_failure(
+        user, akountz.settings.lockout_threshold, akountz.settings.lockout_minutes
+    )
+    await log_event(..., reason="wrong password", ctx=ctx)
+    raise refusal
+if user.is_disabled:
+    await log_event(..., reason="disabled", ctx=ctx)
+    raise HTTPException(status_code=403, detail="this account is disabled")
+if config.require_email_verification and user.email_verified_at is None:
+    raise HTTPException(status_code=403, detail="confirm your email address first")
+```
+
+| Status | Detail | What the client should do |
+| --- | --- | --- |
+| `400` | `invalid email or password` | Wrong credentials — the same message for an unknown email and a wrong password, deliberately |
+| `422` | `a valid email address is required` | The email failed normalisation; a client bug, not a user error |
+| `429` | `too many failed attempts; try again later` | Locked out. Back off; do not retry in a loop |
+| `403` | `this account is disabled` | Show the message, offer support |
+| `403` | `confirm your email address first` | Send them to the verification flow |
+| `200` | `{ "mfa_required": true, … }` | Not an error — continue to the MFA branch |
+
+<Note>
+An unknown email and a wrong password produce the **identical** `400 invalid email or password`. That is correct: a different response for "no such account" is an account-enumeration oracle.
+</Note>
+
+### The MFA branch
+
+If the user has MFA enabled and the environment allows it, a successful password check returns a challenge instead of a token pair:
+
+```python
+if user.mfa_enabled and config.mfa_enabled:
+    await require_membership(config, user, body.org)
+    challenge = await links.issue(
+        akountz, config, "mfa", user=user, data={"method": "password", "org": body.org}
+    )
+    await log_event(config.project, config.env, "mfa_challenge", user=user, ctx=ctx)
+    return {
+        "mfa_required": True,
+        "mfa_token": challenge,
+        "factors": ["totp", "recovery_code"],
+    }
+```
+
+Complete it with the `mfa` grant:
+
+```json
+{ "grant_type": "mfa", "mfa_token": "…", "code": "123456" }
+```
+
+```python
+async def _complete_mfa(ctx: HttpContext, config: AuthConfig, body: TokenRequest):
+    if not body.mfa_token or not body.code:
+        raise HTTPException(status_code=400, detail="mfa_token and code are required")
+    row = await links.consume(akountz, config, "mfa", body.mfa_token, peek=True)
+    user = row.user
+    if user is None or user.is_disabled:
+        raise HTTPException(status_code=400, detail="the challenge is no longer valid")
+    used = await mfa.verify(akountz, user, body.code)
+    if used is None:
+        await record_failure(
+            user, akountz.settings.lockout_threshold, akountz.settings.lockout_minutes
+        )
+        await log_event(..., kind="mfa_verify", reason="wrong code", success=False, ctx=ctx)
+        raise HTTPException(status_code=400, detail="the code is not valid")
+    ...
+    session = await start_session(
+        akountz, config, user, method=method, ctx=ctx, aal="aal2", org=org
+    )
+    session["mfa_method"] = used
+    return session
+```
+
+Three things a client must know:
+
+1. **`mfa_token` is single-use and expires in five minutes** — `LIFETIMES["mfa"] = 300`. A wrong code does *not* consume it, so the user keeps their remaining attempts; a successful one does, so a retry after success returns `400 the challenge is no longer valid`.
+2. **A wrong MFA code counts toward account lockout** — `record_failure` is called, the same counter as a wrong password.
+3. **The success response has an extra `mfa_method`**, either `"totp"` or `"recovery_code"`.
+
+```json
+{
+  "access_token": "…",
+  "refresh_token": "…",
+  "aal": "…",
+  "mfa_method": "totp",
+  "org": null,
+  "org_role": null
+}
+```
+
+## Refreshing, and what rotation really means
+
+There is **no background refresh**. Nothing in the gateway renews your access token for you. When it expires, every request with it returns `401`, and the client is responsible for exchanging the refresh token and retrying.
+
+### Rotation
+
+`refresh_token_pair` issues a brand-new pair inside the *same* family:
+
+```python
+async def refresh_token_pair(
+    self, refresh_token: str, secret: str, algorithm: str = "HS256"
+) -> dict:
+    token = _jwt_token()
+    tokens = TokenForUser(self, secret=secret, algorithm=algorithm)
+    try:
+        payload = tokens.verify_no_expire(refresh_token)
+    except Exception:
+        raise ValueError("Invalid refresh token") from None
+    existing = await token.filter(token_jti=payload.get("jti", refresh_token)).first()
+    if existing is None or existing.token_type != "refresh":
+        raise ValueError("Unknown refresh token")
+    if existing.revoked:
+        await token.revoke_family(existing.token_family)
+        raise ValueError("Token family has been revoked — possible token theft")
+    if existing.consumed_at is not None:
+        await token.revoke_family(existing.token_family)
+        raise ValueError("Refresh token already consumed — possible token theft")
+    await existing.consume()
+    access_ttl, refresh_ttl = timedelta(minutes=15), timedelta(days=7)
+    access_jti, refresh_jti = secrets.token_hex(16), secrets.token_hex(16)
+    access = tokens.access_token(access_ttl, jti=access_jti)
+    refresh = tokens.refresh_token(refresh_ttl, jti=refresh_jti)
+    now = datetime.now(UTC)
+    await self._record_pair(
+        existing.token_family, (access_jti, now + access_ttl), (refresh_jti, now + refresh_ttl)
+    )
+    return {
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "bearer",
+        "token_family": existing.token_family,
+    }
+```
+
+Note `token_family: existing.token_family` — the family id is **stable** across the session's whole life. `session_id` in your responses never changes; the two tokens inside it change every time.
+
+<Warning>
+The old refresh token is **consumed**, not merely replaced. If your client sends the same refresh token twice — two tabs racing, a retry after a timeout, a duplicated request — the second one hits the `consumed_at is not None` branch and takes down the entire family.
+</Warning>
+
+### Theft detection
+
+That second-refresh case is treated as theft, deliberately. Two branches revoke the whole family:
+
+| Condition | Raised |
+| --- | --- |
+| `existing.revoked` | `Token family has been revoked — possible token theft` |
+| `existing.consumed_at is not None` | `Refresh token already consumed — possible token theft` |
+
+Both call `revoke_family` before raising. And `refresh_session` reacts to it:
+
+```python
+try:
+    pair = await user.refresh_token_pair(
+        refresh_token, akountz.refresh_secret(config.project, config.env)
+    )
+except ValueError as exc:
+    await log_event(
+        config.project,
+        config.env,
+        "refresh",
+        user=user,
+        method="refresh_token",
+        success=False,
+        reason=str(exc),
+        ctx=ctx,
+    )
+    if "theft" in str(exc):
+        row = await JWTToken.filter(token_jti=claims.get("jti") or "").first()
+        if row is not None:
+            await SessionInfo.filter(family=row.token_family).update(
+                revoked_at=datetime.now(UTC)
+            )
+        await akountz.emit(
+            config.project,
+            config.env,
+            "session.reuse_detected",
+            {"user_id": str(user.id)},
+            actor=str(user.id),
+        )
+    raise HTTPException(status_code=401, detail="invalid refresh token") from exc
+```
+
+Three things to notice:
+
+1. **The client always sees the same `401 invalid refresh token`.** The internal distinction — bad signature, unknown token, revoked family, consumed token — is not leaked. You cannot tell from the response whether theft was detected.
+2. **`session.reuse_detected` is emitted.** This is your signal to alert on, and to tell the user their other sessions were signed out.
+3. **The `SessionInfo` row is revoked too**, so the session listing in Studio immediately reflects it.
+
+<Warning>
+This is the single most important operational fact on this page: **a duplicate refresh is indistinguishable, from the client's side, from a stolen token, and it logs the user out everywhere.** If your client can fire two refreshes concurrently — a React app with two components both hitting a `401`, a mobile app with a background retry, a server handling parallel requests for one user — you must serialise refreshes yourself. See [Serialising refresh](#serialising-concurrent-refreshes).
+</Warning>
+
+### When to refresh
+
+Two strategies, both fine:
+
+| Strategy | How | Cost |
+| --- | --- | --- |
+| Reactive | Wait for a `401`, then refresh and retry once | One failed request per refresh |
+| Proactive | Refresh when `expires_at` is within a skew window | No failed requests; more refreshes |
+
+The skew window exists because clocks disagree. Refresh at `expires_at - 60` rather than at `expires_at`:
+
+```text
+const SKEW_SECONDS = 60;
+function shouldRefresh(session) {
+  if (!session?.access_token) return true;
+  const secondsLeft = session.expires_at - Math.floor(Date.now() / 1000);
+  return secondsLeft <= SKEW_SECONDS;
+}
+```
+
+A hybrid is common and best: refresh proactively when the skew window is entered, but still handle a `401` by refreshing once and retrying, because a token can be revoked out from under you (an admin signing the user out, a family revocation).
+
+<Info>
+Never retry a failed request more than once. If the refresh itself succeeded and the retry still returns `401`, the session is genuinely dead — sign the user out rather than looping.
+</Info>
+
+## In a browser
+
+Everything here is plain `fetch`. If you are on JavaScript or TypeScript and would rather not write this yourself, the official `@pawabase/client` package already does all of it — see [JavaScript and TypeScript](/clients/javascript). The code below is the reference implementation, and is what you need on a platform without that package.
+
+### Storing the tokens
+
+The tradeoff, stated honestly:
+
+| Store | Survives reload | Readable by injected script | Verdict |
+| --- | --- | --- | --- |
+| Module variable | No | No | Best, if you can re-authenticate on reload |
+| `sessionStorage` | Per tab | Yes | Reasonable middle ground |
+| `localStorage` | Yes, shared across tabs | Yes | Common, weakest against XSS |
+| httpOnly cookie set by *your* server | Yes | **No** | Best, if you have a server |
+
+If you have no backend of your own, the honest options are memory or `localStorage`, and the difference is real: **anything in `localStorage` is readable by any script running on your page**, including a successful XSS payload, and a stolen refresh token is valid for `refresh_ttl` — 30 days by default — not for the next hour.
+
+```text
+const SKEW_SECONDS = 60;
+const STORAGE_KEY = "pawabase.session";
+
+export class PawabaseAuth {
+  constructor({ baseUrl, apiKey }) {
+    this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.apiKey = apiKey;
+    this.session = this.#load();
+    this.#inflight = null;   // the single-flight promise
+  }
+
+  #load() {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  #save(session) {
+    this.session = session;
+    if (session) sessionStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+    else sessionStorage.removeItem(STORAGE_KEY);
+    return session;
+  }
+
+  #expired() {
+    if (!this.session?.access_token) return true;
+    return this.session.expires_at - Math.floor(Date.now() / 1000) <= SKEW_SECONDS;
+  }
+
+  async #post(body) {
+    const response = await fetch(`${this.baseUrl}/auth/v1/token`, {
+      method: "POST",
+      headers: { apikey: this.apiKey, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = new Error(payload?.detail ?? `auth failed (${response.status})`);
+      error.status = response.status;
+      error.detail = payload?.detail ?? null;
+      throw error;
+    }
+    return payload;
+  }
+
+  async signIn({ email, password, org }) {
+    // `org` is omitted entirely when there is none — sending null is different.
+    const body = { grant_type: "password", email, password };
+    if (org) body.org = org;
+    const result = await this.#post(body);
+    if (result.mfa_required) return result;      // caller must complete MFA
+    return this.#save(result);
+  }
+
+  async completeMfa({ mfaToken, code }) {
+    return this.#save(
+      await this.#post({ grant_type: "mfa", mfa_token: mfaToken, code }),
+    );
+  }
+
+  async #refresh() {
+    if (!this.session?.refresh_token) throw new Error("no session");
+    return this.#post({
+      grant_type: "refresh_token",
+      refresh_token: this.session.refresh_token,
+    });
+  }
+
+  /**
+   * Single-flight refresh. Concurrent callers share one in-flight request, so
+   * the refresh token is only ever presented once.
+   */
+  async refresh({ force = false } = {}) {
+    if (!force && !this.#expired()) return this.session;
+    if (!this.#inflight) {
+      this.#inflight = this.#refresh()
+        .then((next) => this.#save(next))
+        .catch((error) => {
+          // 401 here means the family is gone: revoked, or reuse was detected.
+          if (error.status === 401) this.clear();
+          throw error;
+        })
+        .finally(() => { this.#inflight = null; });
+    }
+    return this.#inflight;
+  }
+
+  async fetch(path, { method = "GET", body, headers = {}, retry = true } = {}) {
+    await this.refresh();
+    const token = this.session?.access_token;
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers: {
+        apikey: this.apiKey,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(body ? { "content-type": "application/json" } : {}),
+        ...headers,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+
+    if (response.status === 401 && retry && this.session?.refresh_token) {
+      await this.refresh({ force: true });
+      return this.fetch(path, { method, body, headers, retry: false });
+    }
+    return response;
+  }
+
+  clear() {
+    this.session = null;
+    sessionStorage.removeItem(STORAGE_KEY);
+  }
+}
+```
+
+<Warning>
+`sessionStorage` is per-tab and per-origin, which has a useful side effect: two tabs each hold their own copy of the session, and a refresh in one does not invalidate the other's refresh token. `localStorage` is shared, so two tabs refreshing from one stored token will trigger theft detection. If you use `localStorage`, you **must** implement single-flight refresh with cross-tab coordination, or you will log users out at random.
+</Warning>
+
+### Signing out
+
+Sign-out is a separate endpoint, not a grant on `/token`:
+
+```python
+class Logout(BaseModel):
+    scope: Literal["local", "global", "others"] = "local"
+```
+
+```python
+@r.post(
+    "/logout",
+    request_model=Logout,
+    summary="Sign out this session, all sessions, or all others",
+)
+async def logout(ctx: HttpContext, body: Logout):
+    user, principal = await signed_in_user(ctx)
+    current = principal.claims.get("sid")
+    if body.scope == "global":
+        await revoke_all(user)
+    elif body.scope == "others":
+        from app.sessions import list_sessions
+
+        for session in await list_sessions(user):
+            if session["id"] != current:
+                await revoke_session(user, session["id"])
+    elif current:
+        await revoke_session(user, current)
+    await log_event(user.project, user.env, "sign_out", user=user, method=body.scope, ctx=ctx)
+    await akountz.emit(
+        user.project,
+        user.env,
+        "session.revoked",
+        {"user_id": str(user.id), "scope": body.scope},
+        actor=str(user.id),
+    )
+    return {"signed_out": True, "scope": body.scope}
+```
+
+| Scope | Effect |
+| --- | --- |
+| `local` (default) | Revokes this session only |
+| `others` | Revokes every session except this one |
+| `global` | Revokes all sessions, including this one |
+
+```text
+async signOut(scope = "local") {
+  try {
+    await fetch(`${this.baseUrl}/auth/v1/logout`, {
+      method: "POST",
+      headers: {
+        apikey: this.apiKey,
+        authorization: `Bearer ${this.session.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ scope }),
+    });
+  } finally {
+    // Always clear locally, even if the network call failed.
+    this.clear();
+  }
+}
+```
+
+```bash
+curl -X POST "$GW/auth/v1/logout" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"scope": "others"}'
+```
+
+<Info>
+`signOut` needs a **valid access token** — the route calls `signed_in_user`, which refuses with `401 sign in first` without one. If the access token has already expired, sign-out will fail and the session stays alive on the server. In that case, clear locally and let the refresh token lapse, or call it before the token expires.
+</Info>
+
+### Reading the current user
+
+```python
+@r.get("/user", summary="The signed-in user")
+async def me(ctx: HttpContext):
+    user, principal = await signed_in_user(ctx)
+    return {
+        **await user_view(user),
+        "aal": principal.claims.get("aal"),
+        "session_id": principal.claims.get("sid"),
+    }
+```
+
+```bash
+curl "$GW/auth/v1/user" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+Two fields come from the token rather than the database: `aal` and `session_id`. `session_id` is the family id — use it to identify "this session" when you later call logout with `scope: "others"`.
+
+Note what this endpoint is *not*: it does not report the user's organizations, permissions as resolved at evaluation time, or session list. `user_view` includes `roles` and `mfa_enabled`; `permissions` appears only on the admin view, gated behind `admin=True`.
+
+## Serialising concurrent refreshes
+
+Because a duplicate refresh revokes the family, this is not an optimisation — it is a correctness requirement for any client that can issue requests in parallel.
+
+### In one tab
+
+The `#inflight` promise in the class above is the whole mechanism. Ten components hitting `401` at once produce **one** network refresh, because the first caller sets `#inflight` and the other nine `await` the same promise.
+
+### Across tabs
+
+`localStorage` is shared, so tabs race. The cheapest correct fix is a storage lock with a short expiry:
+
+```text
+const LOCK_KEY = "pawabase.refresh.lock";
+const LOCK_TTL_MS = 10_000;
+
+const waitFor = (predicate, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - started > timeoutMs) return reject(new Error("refresh lock timeout"));
+      setTimeout(tick, 50);
+    };
+    tick();
+  });
+
+async function withRefreshLock(fn) {
+  const now = Date.now();
+  const held = JSON.parse(localStorage.getItem(LOCK_KEY) || "null");
+
+  if (held && now < held.until) {
+    // Another tab is refreshing. Wait for it to publish a new session.
+    await waitFor(() => localStorage.getItem(STORAGE_KEY) !== held.token, 5000);
+    return JSON.parse(localStorage.getItem(STORAGE_KEY));
+  }
+
+  const lock = { token: localStorage.getItem(STORAGE_KEY), until: now + LOCK_TTL_MS };
+  localStorage.setItem(LOCK_KEY, JSON.stringify(lock));
+  try {
+    return await fn();
+  } finally {
+    localStorage.removeItem(LOCK_KEY);
+  }
+}
+```
+
+<Info>
+Storage locks are advisory — they work because every tab in your app runs this same code. They do not protect against a genuinely malicious script, which would not bother taking the lock. That is precisely why an httpOnly cookie held by your own server is the stronger answer where you have one.
+</Info>
+
+### On a server
+
+A server acting on behalf of one user has the same hazard and the same fix: one refresh per user at a time, keyed by user id, with everyone else awaiting the result.
 
 ```python
 import asyncio
-from pawabase import PawabaseError
+import time
+import httpx
 
-async def get_valid_access_token(client: PawabaseClient, refresh_token: str) -> str:
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            data = await client.auth.refresh(refresh_token=refresh_token)
-            return data['access_token']
-        except PawabaseError as e:
-            if e.status_code == 401:
-                # Need to re-authenticate
-                data = await client.auth.sign_in(...)
-                return data['access_token']
-            elif e.status_code == 429:
-                # Rate limited — wait and retry
-                await asyncio.sleep(e.retry_after * (2 ** attempt))  # Exponential backoff
-                continue
-            elif e.status_code >= 500:
-                # Server error — retry with exponential backoff
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                raise
-    
-    raise PawabaseError("Failed to get valid access token after retries")
+REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
+SKEW_SECONDS = 60
+
+
+def _lock_for(user_id: str) -> asyncio.Lock:
+    lock = REFRESH_LOCKS.get(user_id)
+    if lock is None:
+        lock = REFRESH_LOCKS[user_id] = asyncio.Lock()
+    return lock
+
+
+async def get_access_token(user_id: str, session: dict, client: httpx.AsyncClient) -> str:
+    """Return a live access token, refreshing at most once per user."""
+    async def live() -> bool:
+        return session.get("expires_at", 0) - int(time.time()) > SKEW_SECONDS
+
+    if await live():
+        return session["access_token"]
+
+    async with _lock_for(user_id):
+        # Re-check inside the lock: another coroutine may have refreshed
+        # while we waited, and the old refresh token is now consumed.
+        if await live():
+            return session["access_token"]
+        response = await client.post(
+            f"{client.base_url}/auth/v1/token",
+            headers={"apikey": client.api_key},
+            json={"grant_type": "refresh_token", "refresh_token": session["refresh_token"]},
+        )
+        response.raise_for_status()
+        session.update(response.json())
+        return session["access_token"]
 ```
 
-Backend error handling patterns:
+<Warning>
+That re-check inside the lock is the part people leave out. Without it, two coroutines queue on the lock, the first refreshes and rotates the token, and the second — using a stale in-memory `session` — presents the consumed refresh token and triggers theft detection against itself.
+</Warning>
 
-1. **Exponential backoff**: For transient errors (429, 500, 502, 503), use exponential backoff with jitter. Double the wait time with each retry, and add a random jitter to avoid thundering herd problems.
-2. **Retry limits**: Set a maximum number of retries (typically 3-5) to prevent infinite retry loops.
-3. **Circuit breaker**: After repeated failures, stop trying for a configurable period. This prevents overwhelming a failing service.
-4. **Logging**: Log all errors with sufficient context (project, environment, user ID, error code) for debugging and auditing.
+## On a server with `httpx`
 
-## Mobile client integration
+A server-to-server client uses the **secret** key and usually no user token at all. If it does act for a specific user, it forwards that user's access token rather than minting one.
 
-Mobile clients use the same SDK architecture as web clients but with platform-specific storage and deep linking capabilities.
+```python
+import time
+import httpx
+from typing import Any
 
-### iOS integration
 
-On iOS, the SDK stores tokens in the Keychain:
+class PawabaseError(Exception):
+    def __init__(self, status: int, detail: Any):
+        super().__init__(f"Pawabase returned {status}: {detail}")
+        self.status = status
+        self.detail = detail
 
-```swift
-import PawabaseSDK
 
-let client = PawabaseClient(
-    publishableKey: "pk_abc123...",
-    projectId: "acme",
-    envId: "production"
-)
+def _detail_of(response: httpx.Response) -> Any:
+    """Akountz returns the detail as the whole JSON body."""
+    try:
+        return response.json()
+    except ValueError:
+        return response.text
 
-// The SDK automatically stores tokens in the Keychain
-let session = await client.auth.signIn(
-    email: "chioma@example.com",
-    password: "correct-horse-battery-staple"
-)
 
-// Access the current user
-let user = await client.auth.getUser()
+class Pawabase:
+    """A small, hand-written client. No SDK required."""
+
+    def __init__(self, base_url: str, api_key: str, *, timeout: float = 10.0):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self._http = httpx.Client(timeout=timeout)
+
+    def close(self) -> None:
+        self._http.close()
+
+    def __enter__(self) -> "Pawabase":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        token: str | None = None,
+        params: dict | None = None,
+    ) -> httpx.Response:
+        headers = {"apikey": self.api_key}
+        if token:
+            headers["authorization"] = f"Bearer {token}"
+        response = self._http.request(
+            method,
+            f"{self.base_url}{path}",
+            headers=headers,
+            json=json,
+            params=params,
+        )
+        if response.status_code >= 400:
+            raise PawabaseError(response.status_code, _detail_of(response))
+        return response
+
+    def token(self, **body: Any) -> dict:
+        """Any grant on POST /auth/v1/token."""
+        body.setdefault("grant_type", "password")
+        return self.request("POST", "/auth/v1/token", json=body).json()
+
+    def sign_in(self, email: str, password: str) -> dict:
+        return self.token(grant_type="password", email=email, password=password)
+
+    def refresh(self, refresh_token: str, *, org: str | None = None) -> dict:
+        body: dict[str, Any] = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        # Only add `org` when switching. Sending null clears the selection.
+        if org is not None:
+            body["org"] = org
+        return self.token(**body)
+
+    def me(self, access_token: str) -> dict:
+        return self.request("GET", "/auth/v1/user", token=access_token).json()
+
+    def sign_out(self, access_token: str, scope: str = "local") -> dict:
+        return self.request(
+            "POST", "/auth/v1/logout", json={"scope": scope}, token=access_token
+        ).json()
 ```
 
-The iOS SDK uses the Keychain for token storage with these properties:
+Usage:
 
-- **Accessibility**: `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` — tokens are only accessible when the device is unlocked and are not backed up to iCloud by default.
-- **Security**: The Keychain is encrypted using the device's hardware security module.
-- **Biometric protection**: Tokens can be protected by biometric authentication (Face ID, Touch ID) using the `kSecAccessControlBiometryCurrentSet` attribute.
-
-### Android integration
-
-On Android, the SDK stores tokens in the Keystore:
-
-```kotlin
-import com.pawabase.sdk.PawabaseClient
-
-val client = PawabaseClient(
-    publishableKey = "pk_abc123...",
-    projectId = "acme",
-    envId = "production"
-)
-
-// The SDK automatically stores tokens in the Keystore
-val session = client.auth.signIn(
-    email = "chioma@example.com",
-    password = "correct-horse-battery-staple"
-)
-
-// Access the current user
-val user = client.auth.getUser()
+```python
+with Pawabase("https://api.yourapp.com", os.environ["PAWABASE_SECRET_KEY"]) as pb:
+    session = pb.sign_in("ada@example.com", os.environ["ADA_PASSWORD"])
+    profile = pb.me(session["access_token"])
+    pb.sign_out(session["access_token"], scope="global")
 ```
 
-The Android SDK uses the Keystore for token storage with these properties:
+The same class in async form, which is what you want inside an application server because it shares one connection pool and one timeout policy:
 
-- **Hardware-backed**: On devices with a hardware Keystore, tokens are stored in hardware-backed secure storage.
-- **Encrypted**: The Keystore uses AES-256 encryption with keys stored in the hardware security module.
-- **Biometric authentication**: Tokens can be protected by biometric authentication using `setUserAuthenticationRequired`.
+```python
+class AsyncPawabase:
+    def __init__(self, base_url: str, api_key: str, *, timeout: float = 10.0):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self._http = httpx.AsyncClient(timeout=timeout)
 
-### Deep linking
+    async def aclose(self) -> None:
+        await self._http.aclose()
 
-Mobile clients handle redirect URLs through deep links. Deep links allow the application to intercept URLs that would otherwise be handled by the browser:
+    async def __aenter__(self) -> "AsyncPawabase":
+        return self
 
-```
-myapp://auth/callback?token=otp_abc123...
-myapp://auth/callback?code=auth_code_abc123...
-myapp://auth/callback?error=access_denied
-```
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
 
-Deep links are used for:
+    async def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json: dict | None = None,
+        token: str | None = None,
+    ) -> httpx.Response:
+        headers = {"apikey": self.api_key}
+        if token:
+            headers["authorization"] = f"Bearer {token}"
+        response = await self._http.request(
+            method, f"{self.base_url}{path}", headers=headers, json=json
+        )
+        if response.status_code >= 400:
+            raise PawabaseError(response.status_code, _detail_of(response))
+        return response
 
-1. **Social login**: The provider redirects to the deep link URL, which the app intercepts to extract the authorization code.
-2. **Magic link**: The email contains the deep link URL, which the app intercepts to extract the token.
-3. **Verification**: The verification link redirects to the deep link URL, which the app processes to verify the email.
-4. **Redirect after sign-in**: After a successful sign-in, the app redirects to the deep link URL to complete the authentication flow.
-
-#### Registering deep link URL schemes
-
-**iOS**: Add URL schemes to `Info.plist`:
-
-```xml
-<key>CFBundleURLTypes</key>
-<array>
-  <dict>
-    <key>CFBundleURLSchemes</key>
-    <array>
-      <string>myapp</string>
-    </array>
-  </dict>
-</array>
-```
-
-**Android**: Add intent filters to `AndroidManifest.xml`:
-
-```xml
-<activity android:name=".auth.AuthCallbackActivity">
-  <intent-filter>
-    <action android:name="android.intent.action.VIEW" />
-    <category android:name="android.intent.category.DEFAULT" />
-    <category android:name="android.intent.category.BROWSABLE" />
-    <data android:scheme="myapp" android:host="auth" android:path="/callback" />
-  </intent-filter>
-</activity>
+    async def refresh(self, refresh_token: str) -> dict:
+        response = await self.request(
+            "POST",
+            "/auth/v1/token",
+            json={"grant_type": "refresh_token", "refresh_token": refresh_token},
+        )
+        return response.json()
 ```
 
-#### Universal Links and App Links
+<Note>
+`requests` works identically if that is what your codebase uses — `session.post(url, headers=…, json=…)` maps one-to-one onto `httpx`. Nothing in Pawabase's auth surface depends on the HTTP client.
+</Note>
 
-For iOS, Universal Links provide a more secure alternative to custom URL schemes:
+## On a phone
+
+Mobile has one advantage over a browser — a real secure store — and one hazard that browser tabs do not have: **background execution**.
+
+### Where to store
+
+| Platform | Store | Notes |
+| --- | --- | --- |
+| iOS | Keychain, `kSecClassInternetPassword` or `kSecClassGenericPassword` | Survives reinstall only if you set `kSecAttrAccessibleAfterFirstUnlock`; excluded from iCloud by default |
+| Android | `EncryptedSharedPreferences`, or `EncryptedFile` | Backed by the Android Keystore; invalidated if the user changes their lock screen |
+| Both | In-memory only | Fine for short sessions; the user signs in again after a cold start |
+
+The rule is the same as on the web but with a better substrate: **never `UserDefaults`, `SharedPreferences` in plain text, or a file in app storage.** Those are readable on a rooted or backed-up device. The system keystore-backed stores are not.
+
+```text
+import Security
+import Foundation
+
+enum Keychain {
+    static let service = "com.example.app.pawabase"
+
+    static func save(_ session: [String: Any]) throws {
+        guard let data = try? JSONSerialization.data(withJSONObject: session) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+        ]
+        SecItemDelete(query as CFDictionary)
+        var insert = query
+        insert[kSecValueData as String] = data
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(insert as CFDictionary, nil)
+    }
+
+    static func load() -> [String: Any]? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let session = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return session
+    }
+
+    static func clear() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+```
+
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` is the important attribute: it lets a background refresh work after a reboot, but keeps the item off iCloud and off other devices.
+
+### Background refresh is the hazard
+
+An iOS background fetch or an Android WorkManager job that wakes up and refreshes while the foreground app also refreshes will present the same refresh token twice — and sign the user out everywhere, including on their other devices.
+
+Two mitigations, and you want both:
+
+<Steps>
+  <Step title="Prefer the access token in the background">
+    If the stored access token has not expired, use it. Only fall back to a refresh when it has.
+  </Step>
+  <Step title="Never refresh from a background task at all if you can avoid it">
+    A background sync that needs fresh data can use the last known access token and let the foreground app refresh. If you must refresh in the background, take a cross-process lock — on iOS, a `dispatch_semaphore` around the refresh; on Android, a `Mutex` in a singleton repository.
+  </Step>
+  <Step title="Handle the 401 by signing out, not by retrying">
+    A `401 invalid refresh token` from a background task means the family is gone. Clear the store and let the UI prompt for sign-in.
+  </Step>
+</Steps>
+
+```text
+// One repository, one mutex, one refresh — for the whole process.
+class SessionRepository(private val store: SecureStore) {
+    private val mutex = Mutex()
+    @Volatile var session: Session? = store.load()
+
+    suspend fun accessToken(): String {
+        session?.takeIf { !it.isExpiringSoon() }?.let { return it.accessToken }
+        return mutex.withLock {
+            // Re-check inside the lock: someone may have refreshed while we waited.
+            session?.takeIf { !it.isExpiringSoon() }?.let { return@withLock it.accessToken }
+            val fresh = PawabaseApi.refresh(session!!.refreshToken)
+            session = fresh.also { store.save(it) }
+            fresh.accessToken
+        }
+    }
+}
+```
+
+## The BFF pattern
+
+If you have a backend of your own, the strongest arrangement is to keep both tokens off the client entirely: an httpOnly cookie holds the refresh token, your server holds nothing at all, and the browser only ever sees the access token in memory.
+
+```text
+// Browser: no tokens in storage at all.
+async function api(path: string, init: RequestInit = {}) {
+  const response = await fetch(path, {
+    ...init,
+    credentials: "include",          // send the httpOnly cookie
+    headers: { "content-type": "application/json", ...init.headers },
+  });
+  if (response.status === 401) {
+    // The cookie expired or was revoked. One refresh attempt, no token in JS.
+    await fetch("/auth/refresh", { method: "POST", credentials: "include" });
+    return fetch(path, { ...init, credentials: "include" });
+  }
+  return response;
+}
+```
+
+```python
+# Your server: exchanges the cookie's refresh token, sets a new cookie.
+@app.post("/auth/refresh")
+async def refresh(request: Request, response: Response):
+    token = request.cookies.get("pb_refresh")
+    if not token:
+        response.delete_cookie("pb_refresh")
+        raise HTTPException(401, "no session")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = await client.post(
+            f"{GATEWAY}/auth/v1/token",
+            headers={"apikey": PUBLISHABLE_KEY},
+            json={"grant_type": "refresh_token", "refresh_token": token},
+        )
+
+    if upstream.status_code == 401:
+        # The family is gone — revoked, or reuse was detected upstream.
+        response.delete_cookie("pb_refresh")
+        raise HTTPException(401, "session ended")
+
+    upstream.raise_for_status()
+    session = upstream.json()
+    response.set_cookie(
+        "pb_refresh",
+        session["refresh_token"],
+        httponly=True,          # not readable by JavaScript
+        secure=True,            # https only
+        samesite="lax",         # not sent on cross-site POSTs
+        max_age=60 * 60 * 24 * 7,
+        path="/auth",           # only sent to your auth routes
+    )
+    return {"user": session["user"], "org": session["org"], "org_role": session["org_role"]}
+```
+
+Why this is worth the extra hop:
+
+- An XSS payload cannot read the refresh token, so it cannot escalate a one-request compromise into a 30-day one.
+- Scoping the cookie to `path="/auth"` means it is not attached to every API call.
+- `SameSite=Lax` blocks the cookie from cross-site POSTs, which closes the CSRF hole that comes with cookie auth.
+- Your server can serialise refreshes per user, which is the only reliable place to do it when several tabs exist.
+
+<Warning>
+You are now holding the publishable key on your server and proxying, or using the secret key. Use the **publishable** key and forward the user's access token, so your policies still apply. A secret key here would make your backend a full-access service, and every request through it would bypass policies.
+</Warning>
+
+## CORS
+
+CORS applies only to **publishable** keys from a browser, where an `Origin` header is present. The gateway enforces it before your backend is reached:
+
+```python
+origins = (info or {}).get("cors_origins") or []
+origin = headers.get("origin")
+if context.role == "anon" and origins and origin and origin not in origins:
+    await _json(
+        send,
+        403,
+        {"error": "origin_not_allowed", "message": f"{origin} may not use this key."},
+    )
+    return
+```
 
 ```json
-// /Users/admin/sillo.build/apple-app-site-association
-{
-  "applinks": {
-    "details": [
-      {
-        "appID": "TEAMID.com.example.myapp",
-        "paths": ["/auth/callback/*"]
-      }
-    ]
-  }
-}
+{ "error": "origin_not_allowed", "message": "https://evil.example may not use this key." }
 ```
 
-For Android, App Links provide similar functionality with domain verification.
-
-### Mobile-specific considerations
-
-1. **Network reliability**: Mobile networks are less reliable than Wi-Fi. The SDK should implement retry logic for network failures and handle intermittent connectivity gracefully.
-2. **Background app state**: When the app is in the background, token refresh requests may be delayed. The SDK should handle this by refreshing tokens when the app returns to the foreground.
-3. **Secure storage**: Always use the platform's secure storage (Keychain/Keystore). Never store tokens in `AsyncStorage`, `UserDefaults`, or similar insecure storage.
-4. **Biometric authentication**: The SDK can optionally require biometric authentication before accessing stored tokens. This provides an additional layer of security on mobile devices.
-5. **Deep link handling**: The SDK must correctly intercept and parse deep link URLs. Malformed or unexpected deep links should be handled gracefully.
-
-## Token refresh patterns
-
-### Frontend pattern
-
-The frontend SDK handles token refresh automatically:
-
-```typescript
-// Automatic refresh (default behavior)
-const client = createClient({
-  publishableKey: 'pk_abc123...',
-  autoRefresh: true,
-  refreshThreshold: 60, // Refresh 60 seconds before expiration
-})
-
-// Manual refresh
-const { data, error } = await client.auth.refresh()
-```
-
-The automatic refresh mechanism:
-
-1. The SDK tracks the `expires_at` timestamp from the token response.
-2. `refreshThreshold` seconds before `expires_at`, the SDK initiates a refresh.
-3. The refresh request includes the stored refresh token.
-4. If successful, the SDK updates stored tokens and schedules the next refresh.
-5. If the refresh fails, the SDK emits a `signedOut` event and clears stored tokens.
-
-### Backend pattern
-
-Backend clients should implement their own refresh logic:
-
-```python
-async def get_valid_access_token(client: PawabaseClient, refresh_token: str) -> str:
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            data = await client.auth.refresh(refresh_token=refresh_token)
-            return data['access_token']
-        except PawabaseError as e:
-            if e.status_code == 401:
-                # Refresh token is invalid — need to re-authenticate
-                session = await client.auth.sign_in(
-                    email=stored_email,
-                    password=stored_password,
-                )
-                return session['access_token']
-            elif e.status_code == 429:
-                # Rate limited
-                await asyncio.sleep(e.retry_after * (2 ** attempt))
-                continue
-            elif e.status_code >= 500:
-                # Server error
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                raise
-    raise PawabaseError("Failed to get valid access token")
-```
-
-Backend clients should also implement:
-
-1. **Token caching**: Cache the access token in memory or a short-lived cache to avoid unnecessary refresh requests.
-2. **Refresh token rotation**: Track the current refresh token and update it after each successful refresh.
-3. **Graceful degradation**: If the refresh token expires, fall back to service key authentication for admin operations or prompt the user to re-authenticate.
-
-### Handling refresh failures
-
-When a refresh fails, the client must re-authenticate:
-
-1. **Token expired**: The access token has expired and the refresh token is also expired. Re-authenticate with credentials.
-2. **Session revoked**: The session has been explicitly revoked. Re-authenticate with credentials.
-3. **Theft detected**: The refresh token was already rotated by an attacker. Sign out all sessions and re-authenticate.
-4. **Rate limited**: Too many refresh requests. Wait and retry with exponential backoff.
-5. **Network failure**: The request failed due to a network issue. Retry with exponential backoff.
-
-```typescript
-async function ensureValidToken(client: PawabaseClient): Promise<string> {
-  const accessToken = client.getAccessToken()
-  if (accessToken && !client.isTokenExpired(accessToken)) {
-    return accessToken
-  }
-  
-  const refreshToken = client.getRefreshToken()
-  if (!refreshToken) {
-    throw new Error('No refresh token available')
-  }
-  
-  try {
-    const { data, error } = await client.auth.refresh(refreshToken)
-    if (error) {
-      throw error
-    }
-    return data.access_token
-  } catch (err) {
-    if (err.statusCode === 401) {
-      // Session revoked or theft detected
-      await client.auth.signOut()
-      throw new Error('Session expired. Please sign in again.')
-    }
-    throw err
-  }
-}
-```
-
-## Platform-specific integration patterns
-
-### Server-side rendering (SSR)
-
-For SSR applications, the SDK must be configured differently:
-
-```typescript
-// Server-side SDK initialization
-const serverClient = createClient({
-  publishableKey: 'pk_abc123...',
-  tokenStorage: 'memory', // Use memory on the server
-  autoRefresh: false, // Disable auto-refresh on the server
-})
-
-// On each request, restore the session from cookies
-app.use(async (req, res, next) => {
-  const cookie = req.cookies['pawabase_token']
-  if (cookie) {
-    await serverClient.auth.restoreSession(cookie)
-  }
-  next()
-})
-```
-
-SSR considerations:
-
-1. **Token storage**: Use memory storage on the server. Do not use cookie storage on the server-side — cookies are a client-side mechanism.
-2. **Session restoration**: Restore the session from cookies on each request. The cookie contains the refresh token.
-3. **Auto-refresh**: Disable auto-refresh on the server-side. The server should refresh tokens on-demand, not on a timer.
-4. **CSRF protection**: Ensure CSRF protection is in place for all state-changing operations.
-
-### Real-time applications
-
-For real-time applications (WebSockets, Server-Sent Events), tokens must be refreshed independently of the SDK's HTTP client:
-
-```typescript
-class RealTimeClient {
-  private ws: WebSocket
-  private refreshInterval: ReturnType<typeof setInterval>
-  
-  constructor(private client: PawabaseClient, private wsUrl: string) {
-    this.connect()
-    this.setupTokenRefresh()
-  }
-  
-  private async connect() {
-    const token = await this.ensureValidToken()
-    this.ws = new WebSocket(`${this.wsUrl}?token=${token}`)
-  }
-  
-  private setupTokenRefresh() {
-    this.refreshInterval = setInterval(async () => {
-      const token = await this.ensureValidToken()
-      // Send the new token to the WebSocket server
-      this.ws.send(JSON.stringify({ type: 'token_refresh', token }))
-    }, 60000) // Refresh every 60 seconds
-  }
-}
-```
-
-Real-time applications need to handle token refresh separately from the HTTP client because the WebSocket connection is long-lived and cannot be easily refreshed.
-
-### Microservices architecture
-
-In a microservices architecture, each service should have its own service key:
-
-```
-Frontend → Gateway → Auth Service (public key)
-Gateway → User Service (service key)
-Gateway → Order Service (service key)
-```
-
-Each service should have a service key with only the permissions it needs:
-
-```python
-# User service key — read-only access to user data
-user_client = PawabaseClient(
-    service_key="sk_user_readonly_...",
-    permissions=["user:read"],
-)
-
-# Order service key — read and write access to orders
-order_client = PawabaseClient(
-    service_key="sk_order_full_...",
-    permissions=["order:read", "order:write"],
-)
-```
-
-Service keys should be rotated regularly and stored in a centralized secret manager.
-
-## Error patterns across client types
-
-### Browser client errors
-
-| Error | Status | Cause | SDK handling |
-| --- | --- | --- | --- |
-| `401 invalid refresh token` | 401 | Token expired or revoked | SDK clears tokens and emits `signedOut` |
-| `401 session revoked` | 401 | Session was explicitly revoked | SDK clears tokens and emits `signedOut` |
-| `401 theft detected` | 401 | Refresh token was already rotated | SDK emits `theftDetected` event |
-| `403 confirm your email address first` | 403 | `require_email_verification` is `true` | SDK shows verification prompt |
-| `403 mfa token and code are required` | 403 | MFA is required | SDK shows MFA input field |
-| `403 aal2 authentication required` | 403 | `require_aal` check failed on refresh | SDK shows MFA prompt |
-| `429 too many failed attempts` | 429 | Account locked | SDK shows lockout message |
-| `409 an account with this email already exists` | 409 | Duplicate email on sign-up | SDK shows error message |
-| `429 rate limit exceeded` | 429 | Too many requests | SDK shows rate limit message |
-| `400 redirect_to is not an allowed URL` | 400 | Redirect URL not in `redirect_urls` | SDK shows error message |
-
-### Mobile client errors
-
-Mobile clients handle errors similarly to browser clients but with additional considerations:
-
-- **Deep link failures**: If the deep link URL is not intercepted correctly, the OAuth2 flow fails. Ensure the app's URL scheme is registered in the platform's configuration.
-- **Network errors**: Mobile apps may have intermittent connectivity. The SDK should implement retry logic for transient network errors.
-- **Secure storage failures**: If the secure storage is compromised, tokens must be revoked immediately. The SDK should detect secure storage failures and clear stored tokens.
-- **Biometric authentication failures**: If biometric authentication fails, the SDK should fall back to password authentication or session restoration.
-- **Background state**: When the app returns from the background, the SDK should check if the token has expired and refresh if necessary.
-
-### Backend client errors
-
-| Error | Status | Cause | Handling |
-| --- | --- | --- | --- |
-| `401 invalid refresh token` | 401 | Token expired or revoked | Log the error and re-authenticate |
-| `401 session revoked` | 401 | Session was explicitly revoked | Log the error and re-authenticate |
-| `401 theft detected` | 401 | Refresh token was already rotated | Log the error, sign out all sessions |
-| `403 forbidden` | 403 | Service key lacks permissions | Check the service key's permissions |
-| `409 an account with this email already exists` | 409 | Duplicate email on creation | Handle gracefully (update existing user) |
-| `429 rate limit exceeded` | 429 | Too many requests | Implement exponential backoff |
-| `500 internal server error` | 500 | Server-side error | Retry with exponential backoff |
-| `502 bad gateway` | 502 | Gateway error | Retry with exponential backoff |
-| `503 service unavailable` | 503 | Service unavailable | Retry with exponential backoff |
-| `504 gateway timeout` | 504 | Gateway timeout | Retry with exponential backoff |
-
-### Error classification and handling
-
-Errors can be classified into four categories:
-
-1. **Client errors (4xx)**: The request is invalid. The client should not retry without fixing the request. Examples: `400`, `401`, `403`, `404`, `409`, `422`.
-2. **Rate limit errors (429)**: Too many requests. The client should wait and retry after the `retry_after` period.
-3. **Server errors (5xx)**: The server encountered an error. The client should retry with exponential backoff.
-4. **Network errors**: The request failed due to a network issue. The client should retry with exponential backoff.
-
-## Common mistakes
+with status `403`. Four details that matter:
 
 <AccordionGroup>
-  <Accordion title="Storing tokens in localStorage">
-    This is vulnerable to XSS attacks. The SDK should use httpOnly cookies or secure storage. Never store tokens in localStorage or sessionStorage. If the SDK stores tokens in localStorage, any XSS vulnerability in the application can steal all authenticated sessions.
+  <Accordion title="Only when the list is non-empty">
+    `and origins` — an empty allow-list means no restriction. Convenient in development, worth tightening before you ship.
   </Accordion>
-  <Accordion title="Exposing service keys in client-side code">
-    Service keys have full admin access — exposing them in client-side code gives anyone who can inspect the page full control over all user accounts. Always use service keys from backend servers. Service keys should never appear in browser DevTools, mobile app binaries, or any client-side artifact.
+  <Accordion title="Only for `anon` role keys">
+    `context.role == "anon"` — a secret key is not checked, because a secret key is not a browser credential.
   </Accordion>
-  <Accordion title="Not configuring CORS in production">
-    Without CORS configuration, the server accepts requests from any origin. This allows any website to make authenticated requests to the Pawabase API. Always configure `cors_origins` in production with an explicit allow-list.
+  <Accordion title="Only when an Origin is actually sent">
+    `and origin` — a server-side call with no `Origin` header passes through regardless of the list.
   </Accordion>
-  <Accordion title="Not handling the `signedOut` event">
-    When the SDK emits `signedOut`, the client must redirect the user to the sign-in page. Ignoring this event leads to users making API calls with expired tokens, resulting in confusing error messages and a poor user experience.
-  </Accordion>
-  <Accordion title="Assuming refresh tokens never expire">
-    They do — refresh tokens have a configurable lifetime (`refresh_token_ttl`, default 30 days). After that, the user must sign in again. The SDK should handle the case where the refresh token has expired by redirecting the user to the sign-in page.
-  </Accordion>
-  <Accordion title="Not implementing retry logic for backend clients">
-    Backend clients should implement exponential backoff for rate-limited errors (429) and server errors (500). Without retry logic, transient failures cause permanent errors. The retry logic should include exponential backoff with jitter and a maximum retry count.
-  </Accordion>
-  <Accordion title="Ignoring theft detection">
-    If the `theftDetected` event fires, the SDK should alert the user and sign out all sessions. Ignoring this signal leaves the attacker's session active and the legitimate user vulnerable to further unauthorized access.
-  </Accordion>
-  <Accordion title="Using the same service key across multiple environments">
-    If a key is compromised in `development`, it's also compromised in `production`. Use separate service keys for each environment. Each environment should have its own service key with appropriate permissions.
-  </Accordion>
-  <Accordion title="Not setting `refreshThreshold` appropriately">
-    A `refreshThreshold` that is too high causes unnecessary refresh requests. A threshold that is too low causes tokens to expire before the refresh completes. The default of 60 seconds is a good starting point for most applications.
-  </Accordion>
-  <Accordion title="Not validating redirect URLs in production">
-    Without proper `site_url` and `redirect_urls` configuration, an attacker can redirect users to malicious URLs after sign-in. Always configure `site_url` and an explicit `redirect_urls` allow-list in production.
+  <Accordion title="It is exact string matching">
+    `origin not in origins`. No wildcard handling, no subdomain suffix matching, no `*.example.com`. List each exact origin, including scheme and port.
   </Accordion>
 </AccordionGroup>
+
+```json
+["http://localhost:5173", "https://app.yourapp.com"]
+```
+
+`https://app.yourapp.com` and `https://app.yourapp.com:443` are the same origin to a browser but different strings to this check. Use the form your browser sends.
+
+<Info>
+Nothing about CORS is configured client-side. The browser sends `Origin` automatically and the gateway's response headers decide whether the preflight succeeds. If your dev server runs on an unusual port, add that exact origin to the list rather than looking for a way to disable the check.
+</Info>
+
+## The error shape you actually have to handle
+
+There are **two** error formats, and a client that assumes one will break on the other.
+
+### Gateway errors — an object
+
+The gateway always returns this shape, and these are the only errors with a stable `code`:
+
+```json
+{ "error": "missing_api_key", "message": "Send a valid project API key in the apikey header." }
+{ "error": "invalid_api_key", "message": "…" }
+{ "error": "origin_not_allowed", "message": "https://evil.example may not use this key." }
+{ "error": "rate_limit_exceeded", "retry_after": 42 }
+```
+
+Note the third key: `retry_after` is a **number of seconds**, not a timestamp, and there is no `message` on the rate-limit form.
+
+```python
+await _json(
+    send,
+    429,
+    {"error": "rate_limit_exceeded", "retry_after": max(int(result.retry_after), 1)},
+    [(b"retry-after", str(max(int(result.retry_after), 1)).encode())],
+)
+```
+
+### Akountz errors — the detail *is* the body
+
+This is the part that trips people up. When a Sillo `HTTPException` is raised, the handler returns the detail as the entire JSON body — not wrapped in an `error`/`message` envelope:
+
+```python
+async def http_exception(
+    self, ctx: HttpContext, exc: HTTPException
+) -> BaseResponse:
+    """Handle an HTTPException by producing an appropriate error response.
+    ...
+    """
+    assert isinstance(exc, HTTPException)
+    if exc.status_code in {204, 304}:
+        return BaseResponse(
+            body=b"", status_code=exc.status_code, headers=exc.headers
+        )
+    return json(exc.detail, status_code=exc.status_code, headers=exc.headers)
+```
+
+So a failed sign-in is **not** `{"error": "invalid_email_or_password"}`. It is:
+
+```json
+"invalid email or password"
+```
+
+A bare JSON string. A `403` on organization switching is:
+
+```json
+"you are not a member of that organization"
+```
+
+<Warning>
+A client that reads `body.error` for every non-2xx response gets `undefined` on every Akountz error, and a client that assumes `body.message` gets `undefined` too. Read the body **once**, and handle both shapes: an object with `error` (gateway) or a bare string (service).
+</Warning>
+
+There is one exception inside Akountz: the password policy failure carries a nested object, because its `detail` is a dict:
+
+```python
+raise HTTPException(
+    status_code=422,
+    detail={"message": "the password does not meet the policy", "problems": problems},
+)
+```
+
+```json
+{
+  "message": "the password does not meet the policy",
+  "problems": ["Password must be at least 12 characters."]
+}
+```
+
+And request-body validation failures come from a different handler entirely:
+
+```python
+return json({"detail": exc.errors}, status_code=422)
+```
+
+```json
+{
+  "detail": [
+    { "loc": ["query", "page"], "msg": "...", "type": "..." }
+  ]
+}
+```
+
+So a `422` from Akountz is one of **three** shapes depending on which layer rejected the request. Read `problems` if present, fall back to `detail`, and never assume a fixed key.
+
+### A defensive error reader
+
+```text
+export class PawabaseError extends Error {
+  constructor(status, body) {
+    const message =
+      typeof body === "string"
+        ? body                                        // Akountz: detail is the body
+        : body?.message                              // gateway, or password policy
+        ?? body?.detail?.message
+        ?? body?.error
+        ?? `request failed (${status})`;
+    super(message);
+    this.name = "PawabaseError";
+    this.status = status;
+    this.body = body;
+    this.code = body?.error ?? null;                 // gateway only
+    this.retryAfter = body?.retry_after ?? null;      // 429 only
+    this.problems = body?.problems ?? null;           // password policy only
+  }
+}
+
+export async function readError(response) {
+  const body = await response.json().catch(() => null);
+  return new PawabaseError(response.status, body);
+}
+```
+
+```python
+class PawabaseError(Exception):
+    def __init__(self, status: int, body):
+        self.status = status
+        self.body = body
+        super().__init__(f"{status}: {_message(status, body)}")
+
+
+def _message(status: int, body) -> str:
+    if isinstance(body, str):
+        return body                                   # Akountz detail
+    if isinstance(body, dict):
+        if "problems" in body:                        # password policy
+            return "; ".join(body["problems"])
+        if "message" in body:
+            return body["message"]
+        if "error" in body:
+            return body["error"]
+        if "detail" in body:
+            return str(body["detail"])
+    return f"request failed ({status})"
+```
+
+### The statuses a client must branch on
+
+| Status | Meaning | Retry? |
+| --- | --- | --- |
+| `400` | Malformed request, bad credentials, invalid or used link | No — fix the request |
+| `401` | No token, expired token, wrong environment, revoked session | Refresh once, then sign out |
+| `403` | Authenticated but refused: policy, disabled account, unverified email, wrong org | No |
+| `404` | Not found — or "no such organization", which also covers "not a member" | No |
+| `409` | Conflict — slug taken, last owner, already a member | No |
+| `422` | Validation or password policy | No — show `problems` |
+| `429` | Rate limited | Yes, after `retry_after` seconds |
+| `500`+ | Server fault | Yes, with backoff |
+
+The two `401`s are worth separating. A `401` from **your API** means the access token expired — refresh and retry. A `401` from **`/auth/v1/token`** means the refresh token is dead — do not retry, sign the user out. The endpoint tells them apart.
+
+A `401` from the API can also mean a **wrong-environment** token, and no amount of refreshing will fix that:
+
+```python
+def verify_user_token(token: str, master: str, *, project: str, env: str) -> dict[str, Any]:
+    """Verify a user access token for *project*/*env*. Raises :class:`TokenInvalid`."""
+    claims = _decode(token, derive_env_secret(master, project, env), audience=USER_AUDIENCE)
+    if claims.get("typ") != "access":
+        raise TokenInvalid("not an access token")
+    if claims.get("prj") != project or claims.get("env") != env:
+        raise TokenInvalid("token belongs to another environment")
+    return claims
+```
+
+If refreshing succeeds and the retried request still returns `401`, suspect this: your client is pointed at staging with a production token, or the API key and the token belong to different environments.
+
+## Rate limits
+
+Two independent limiters can apply.
+
+The gateway limits per key, or per client IP when there is no key:
+
+```python
+result = await self.limiter.check(HttpContext(scope, receive))
+if result is not None and not result.allowed:
+    self.stats["rate_limited"] += 1
+    note("rate_limited", True)
+    await _json(
+        send,
+        429,
+        {"error": "rate_limit_exceeded", "retry_after": max(int(result.retry_after), 1)},
+        [(b"retry-after", str(max(int(result.retry_after), 1)).encode())],
+    )
+    return
+```
+
+Akountz limits its own auth routes:
+
+```python
+limits = rate_limit_middleware(
+    {"limit": 30, "window": 60}, "akz:auth", akountz.settings.redis_url
+)
+```
+
+applied to `POST /signup` and `POST /token`. MFA endpoints use `{"limit": 10, "window": 60}` under the `akz:mfa` namespace. The backing store is `redis_url` when configured, otherwise an in-process counter — so a multi-worker deployment without Redis gets a per-worker limit, not a global one.
+
+Route-level limits answer with a slightly different body and helpful headers:
+
+```python
+return json_response(
+    {
+        "error": "rate_limit_exceeded",
+        "message": "Too many requests. Slow down and retry later.",
+        "retry_after": retry_after,
+    },
+    status_code=429,
+    headers={
+        "Retry-After": str(retry_after),
+        "X-RateLimit-Limit": str(result.limit),
+        "X-RateLimit-Remaining": "0",
+    },
+)
+```
+
+So `429` from the gateway has **no `message`**, and `429` from an Akountz route **does**. Read `retry_after`, falling back to the `Retry-After` header.
+
+<Warning>
+`POST /auth/v1/token` shares a 30-per-60-seconds budget with `POST /auth/v1/signup`. A client that refreshes on every request — rather than on expiry — will exhaust it. Refresh on a schedule, not per request.
+</Warning>
+
+```text
+async function withBackoff(fn, { attempts = 3 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const response = await fn();
+    if (response.status !== 429) return response;
+    const error = await readError(response);
+    const wait = error.retryAfter
+      ?? Number(response.headers.get("retry-after"))
+      ?? 2 ** i;
+    if (i === attempts - 1) return response;
+    await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+  }
+}
+```
+
+## Per-environment configuration
+
+The client should read the environment's capabilities rather than hard-coding assumptions. `GET /auth/v1/settings` is public and returns what the environment offers:
+
+```python
+@r.get("/settings", summary="What this environment offers for sign-in")
+async def settings(ctx: HttpContext):
+    config = await config_for(akountz, ctx)
+    return {
+        "signup_enabled": config.signup_enabled,
+        "email_verification_required": config.require_email_verification,
+        "magic_link_enabled": config.magic_link_enabled,
+        "mfa_enabled": config.mfa_enabled,
+        "providers": config.enabled_providers(),
+        "password_policy": {
+            "kind": config.password_policy,
+            "min_length": config.password_min_length,
+        },
+    }
+```
+
+```bash
+curl "$GW/auth/v1/settings" -H "apikey: $PUBLISHABLE_KEY"
+```
+
+```json
+{
+  "signup_enabled": true,
+  "email_verification_required": false,
+  "magic_link_enabled": true,
+  "mfa_enabled": true,
+  "providers": ["google", "github"],
+  "password_policy": { "kind": "strict", "min_length": 12 }
+}
+```
+
+This lets a sign-in screen render only the affordances that will work, and a sign-up form validate the length client-side before a round trip. `enabled_providers()` filters on both `enabled` and the presence of a `client_id`:
+
+```python
+def enabled_providers(self) -> list[str]:
+    return sorted(
+        name
+        for name, conf in self.providers.items()
+        if conf.get("enabled", True) and conf.get("client_id")
+    )
+```
+
+<Warning>
+This endpoint reads a **cached** configuration:
+
+```python
+key = f"authcfg:{project}:{env}"
+cached = await akountz.cache_get(key)
+```
+
+A configuration change made in Studio is not visible immediately. If you cache the settings client-side, use a short TTL and expect the change to land within `config_ttl` seconds.
+</Warning>
+
+## Putting it together: a checklist
+
+<Steps>
+  <Step title="One base URL, one API key per environment">
+    Never share a key across environments. A token is valid only for the environment that issued it, and `verify_user_token` rejects a mismatch outright.
+  </Step>
+  <Step title="Two headers, always">
+    `apikey` on every request. `Authorization: Bearer` once someone is signed in. The publishable key in clients, the secret key only on servers.
+  </Step>
+  <Step title="Store both tokens as one unit">
+    They are written together and read together. A refresh that stores only the access token leaves you unable to refresh again.
+  </Step>
+  <Step title="Serialise refresh">
+    One in-flight refresh per tab, per process, or per user. A duplicate is treated as theft and revokes the family.
+  </Step>
+  <Step title="Refresh on a skew window, retry a 401 exactly once">
+    Proactive at `expires_at - 60`, reactive as a fallback. Never loop.
+  </Step>
+  <Step title="Read both error shapes">
+    Gateway `{"error": …}` and Akountz bare-string detail. One reader that handles both.
+  </Step>
+  <Step title="Sign out on a `401` from the token endpoint">
+    Do not retry it. Clear local state and send the user back to sign-in.
+  </Step>
+  <Step title="Never put the secret key in a client">
+    Not in a bundle, not in a mobile binary, not in an environment variable that a build tool inlines.
+  </Step>
+</Steps>
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| `401 invalid refresh token` in SDK | Token expired or was rotated | SDK handles automatically — check if `signedOut` event was emitted |
-| `CORS error` in browser | Origin not in `cors_origins` | Configure `cors_origins` to include the app's origin |
-| `403 forbidden` with service key | Service key lacks the required permission | Check the service key's permissions in the admin dashboard |
-| `400 email and password are required` | Missing email or password in sign-in request | Ensure both fields are provided |
-| `403 magic links are disabled` | `magic_link_enabled` is `false` | Enable magic links in the configuration or use a different sign-in method |
-| Deep link not intercepted on mobile | URL scheme not registered | Register the URL scheme in the platform's configuration |
-| `theftDetected` event fires unexpectedly | Another device used the refresh token | Alert the user, sign out all sessions, and re-authenticate |
-| Tokens not persisting across page refresh | Using `memory` storage | Switch to `cookie` storage or `localStorage` (with security warnings) |
-| `403 aal2 authentication required` on refresh | `require_aal` check failed | User needs to complete MFA to elevate their session |
-| `409 an account with this email already exists` | User already exists | Use sign-in instead of sign-up, or use a different email |
-
-## FAQ
+| Every request returns `401`, even right after signing in | Token and API key are from different environments | `verify_user_token` compares `prj` and `env`. Use one environment's pair throughout |
+| Users are logged out at random | Two concurrent refreshes — same token presented twice | Serialise refresh; the second one revoked the family |
+| A `session.reuse_detected` event fired and nobody stole anything | Almost always a client bug: a retry, a double-mounted effect, a background task | Fix the duplicate refresh; the event is your only signal |
+| `body.error` is `undefined` on a sign-in failure | Akountz returns the detail as the whole body, a bare string | Read the body and handle both shapes |
+| `mfa_required: true` and the client crashed reading the session | The `password` grant returns a challenge, not a pair | Branch on `mfa_required` before touching `access_token` |
+| `session` is `null` after sign-up | Email verification is required in this environment | Send the user to the verification flow; do not expect a token |
+| `403 you are not a member of that organization` | The `org` slug has no membership for this user here | Confirm with `GET /orgs`; have them accept an invitation |
+| The active organization reset to none | The client sent `org: null` on a refresh | Omit the key — `null` clears the selection, omission keeps it |
+| A role change is not reflected in the UI | The access token predates the change | Refresh; `org_role` and `roles` are read at issue time |
+| `429` shortly after a page load | Several components each triggered a refresh | One shared session with single-flight refresh, not per-component state |
+| `429` on refresh specifically | `/token` shares a 30-per-minute budget with `/signup` | Refresh on a schedule, not per request |
+| `403 origin_not_allowed` in development | The dev server's exact origin is not on the list | Add the exact origin including scheme and port |
+| `401` after signing out | Sign-out requires the access token it is revoking | Sign out before the token expires, or accept that the session lapses |
+| `422` with no useful message | One of three different `422` shapes | Read `problems`, then `detail`, then fall back |
+| Password accepted at sign-up, rejected at sign-in | The account was created without a password — `set_unusable_password()` | Use a recovery link to set one; password sign-in cannot succeed until then |
+| A user cannot sign in with a password at all after an OAuth login | Same cause — OAuth-created accounts have no usable password | Expected. Set a password through recovery |
 
 <AccordionGroup>
-  <Accordion title="Can I use multiple SDK instances?">
-    Yes — you can create multiple `createClient` instances with different publishable keys for different projects or environments. Each instance manages its own tokens and sessions independently. This is useful for multi-tenant applications where the same user might have accounts in different projects.
+  <Accordion title="Why is my refresh token different every time?">
+    Because rotation is mandatory: `refresh_token_pair` consumes the old row and issues a new one inside the same family. `session_id` is stable; the tokens are not. Store both from every response.
   </Accordion>
-  <Accordion title="Can I use the SDK with a custom API gateway?">
-    The SDK is configured to use the Pawabase gateway URL. If you're using a custom gateway, configure the `gatewayUrl` option in the SDK initialization. All API calls will be directed to the custom gateway.
+  <Accordion title="Can I keep using the same refresh token forever?">
+    No. Presenting a consumed token revokes the entire family, logs every device out, and emits `session.reuse_detected`. There is no non-rotating mode.
   </Accordion>
-  <Accordion title="Does the SDK support SSR?">
-    Yes — the SDK can be used in server-side rendering contexts. Token storage should be configured to use server-side sessions (e.g., HTTP-only cookies) rather than client-side storage. The `tokenStorage: 'memory'` option is recommended for SSR.
+  <Accordion title="How long does a stolen refresh token last?">
+    Until `refresh_ttl` — 30 days by default — or until it is used once (which revokes the family and strands the thief too, though the legitimate client then also fails). That asymmetry is why the refresh token is the thing worth protecting.
   </Accordion>
-  <Accordion title="Can I use the SDK without auto-refresh?">
-    Yes — set `autoRefresh: false` in the SDK configuration. You'll need to manually call `client.auth.refresh()` before each API call that requires an access token. This is useful for applications that need precise control over when tokens are refreshed.
+  <Accordion title="Do I need a CSRF token?">
+    Only if you move to cookie authentication. With `Authorization: Bearer` on every request, a third-party site cannot make your client attach a credential. The BFF pattern introduces the cookie, and with it the need for `SameSite` and/or a CSRF token.
   </Accordion>
-  <Accordion title="How do I handle token expiration in a polling app?">
-    For polling apps (e.g., background workers), use a service key instead of the SDK. Service keys authenticate directly with the API and don't need token refresh handling. The SDK is designed for interactive applications, not long-running background processes.
+  <Accordion title="Can I verify tokens myself instead of calling the API?">
+    No — and you should not try. `derive_env_secret` derives a per-environment key from a master secret your installation holds, and no verification endpoint is exposed. Verification happens at the services.
   </Accordion>
-  <Accordion title="What is the maximum number of concurrent sessions?">
-    Pawabase does not limit the number of concurrent sessions per user. Each sign-in creates a new `SessionInfo` row. All sessions remain valid until explicitly revoked or until the refresh token TTL expires.
+  <Accordion title="Should the client decode the JWT?">
+    You may read the claims for UI decisions, but never make an authorization decision from them. The server verifies the signature; a client-decoded claim is only as trustworthy as the connection it arrived over.
   </Accordion>
-  <Accordion title="How does the SDK handle token rotation transparently?">
-    When the SDK refreshes a token, it automatically updates the stored refresh token. The application does not need to handle the rotation manually — the SDK stores the new refresh token and uses it for subsequent refresh requests. Only if the refresh fails does the SDK emit events for the application to handle.
-  </Accordion>
-  <Accordion title="Can I use the SDK with a WebSocket connection?">
-    Yes — the SDK provides `client.auth.getAccessToken()` to retrieve the current access token for WebSocket authentication. The token should be sent as a query parameter or in the `Authorization` header when establishing the WebSocket connection. The token should be refreshed independently of the SDK's HTTP client.
+  <Accordion title="What about a service key and no user token?">
+    That is the normal shape for a backend. Send `apikey` only, no `Authorization`. Be aware that it bypasses every policy, so scope the key if the integration does not need full access.
   </Accordion>
 </AccordionGroup>
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Security model" icon="shield-check" href="/auth/security-model">Threat model, credential hygiene, and production validation.</Card>
-  <Card title="Overview" icon="fingerprint" href="/auth/overview">Complete map of the auth model.</Card>
-  <Card title="Auth in policies" icon="code" href="/auth/auth-in-policies">Using `$auth` in policy expressions.</Card>
+  <Card title="Calling Pawabase from a client" icon="plug" href="/clients/overview">The gateway, the two kinds of key, and the full request lifecycle.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">The three token kinds, the claim set, and the rotation and revocation rules in depth.</Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/clients/errors">The full status-code table and which failures are safe to retry.</Card>
+  <Card title="JavaScript and TypeScript" icon="code" href="/clients/javascript">Typed queries, filters and the realtime socket for browser clients.</Card>
 </CardGroup>

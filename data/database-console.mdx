@@ -297,76 +297,82 @@ Remember that your edits last only until the next click in the builder, so finis
 
 ## Reads and writes: how the console decides
 
-Every statement is classified before it runs, and the class decides **which path** it takes, not only whether it is allowed.
+Every statement is parsed before it runs (with [sqlglot](https://github.com/tobymao/sqlglot), in the environment's SQL dialect), and the parse decides **which path** it takes, not only whether it is allowed.
 
 | Class | Path | Result shape | Audited | Clears caches |
 | --- | --- | --- | --- | --- |
-| **Read** | Fetch rows | `{"rows": [...], "truncated": false}` | No | No |
+| **Read** | Fetch rows, in a transaction the database holds read-only | `{"rows": [...], "truncated": false}` | No | No |
 | **Write** | Execute and count | `{"rows": [], "affected": N}` | Yes, as `database.write` | Yes, every resource |
 
-The classifier is deliberately simple. A statement is a **read** only when all of these hold:
+A statement is accepted only when the text parses into **exactly one** statement of one of these kinds:
 
-1. After trimming whitespace and one trailing `;`, **no `;` remains anywhere** in the text.
-2. It **starts with** `select`, `with`, `explain`, `pragma`, `show` or `describe`, in any case.
-3. It does not contain any of the words `insert`, `update`, `delete`, `drop`, `alter`, `create`, `truncate`, `grant` or `attach`, **with a space on each side**.
+| Kind | Examples | Class |
+| --- | --- | --- |
+| A query | `SELECT`, `WITH … SELECT`, `UNION`, `VALUES` | **Read**, unless anything inside it writes (a data-modifying `WITH`, `SELECT … INTO`, `FOR UPDATE`) |
+| A describing statement | `EXPLAIN …`, `SHOW …`, `DESCRIBE t`, SQLite `PRAGMA` | **Read** |
+| A data change | `INSERT`, `UPDATE`, `DELETE` | **Write** |
+| A schema change | `CREATE`, `ALTER`, `DROP` | **Write** |
 
-Anything else is a write. A write without **allow writes** is refused with `400` and the message `this statement writes; set allow_write to run it`.
+Anything else (two statements, `BEGIN`/`COMMIT`, `SET`, `SET ROLE`, `COPY`, `GRANT`, `VACUUM`, `ATTACH`, text that does not parse) is refused with `400` and the code `unsupported_sql`. A write without **allow writes** is refused with `400` and the message `this statement writes; set allow_write to run it`.
 
 <Note>
-**allow writes** does not turn a read into a write or the other way around. It is only permission. A clean `SELECT` with **allow writes** ticked still takes the read path and returns rows. The path follows the classifier.
+**allow writes** does not turn a read into a write or the other way around. It is only permission. A clean `SELECT` with **allow writes** ticked still takes the read path and returns rows.
 </Note>
 
-### Every case, as it was run
+### The database enforces the read path
 
-These ran against a real API on SQLite, with a `things` resource holding three rows. "Read path" means the classifier called it a read.
+The parser decides where a statement goes; the **database** decides what a read can do. A read runs like this:
 
-| Statement | **allow writes** | What happened |
+| Database | How a read is held to reading |
+| --- | --- |
+| PostgreSQL | Inside a transaction started with `SET TRANSACTION READ ONLY` |
+| MySQL | Inside `START TRANSACTION READ ONLY`, then rolled back |
+| SQLite | With an authorizer on the connection that allows reading the main database, ordinary functions and inspecting pragmas, and refuses everything else |
+
+So a write the parser cannot see is still stopped. A `SELECT` that calls a function which deletes rows, or `EXPLAIN ANALYZE DELETE …` (which executes the `DELETE`), fails on PostgreSQL with `cannot execute DELETE in a read-only transaction`, and nothing changes. On SQLite, `PRAGMA user_version = 5` or `PRAGMA writable_schema = 1` is refused even with **allow writes** ticked, and the inspecting pragmas (`table_info`, `index_list`, `foreign_key_list`, `integrity_check`, …) and the read forms of settings (`PRAGMA user_version`) work.
+
+### Every case
+
+| Statement | **allow writes** | What happens |
 | --- | --- | --- |
 | `SELECT 1 AS ok` | off | Read path, `{"rows":[{"ok":1}],"truncated":false}` |
-| `SELECT 1 AS ok;` | off | Read path. One trailing `;` is trimmed |
-| `SELECT code FROM things WHERE note = 'update me'` | off | Read path. The word is next to a quote, not a space, so it passes |
-| `SELECT code FROM things WHERE note = 'x;y'` | off | **Refused.** A `;` inside a string literal still counts |
-| `SELECT code FROM things WHERE note = 'x;y'` | on | **Ran as a write**, and returned `{"rows":[],"affected":1}`. The row you wanted was not returned |
-| `-- hi` newline `SELECT 1 AS ok` | off | **Refused.** A statement that starts with a comment does not start with `select` |
-| `SELECT code FROM things WHERE code = ?` with `params: ["a"]` | off | Read path, one row. Parameters work through the API |
-| `EXPLAIN QUERY PLAN SELECT * FROM things WHERE code = 'a'` | off | Read path. The plan came back as a row |
+| `-- note` newline `SELECT email FROM accounts WHERE email = 'a;b@x.io'` | off | Read path. Comments and a `;` inside a string are understood |
+| `SELECT code FROM things WHERE code = ?` with `params: ["a"]` | off | Read path. Parameters work through the API |
+| `EXPLAIN QUERY PLAN SELECT * FROM things WHERE code = 'a'` | off | Read path. The plan comes back as rows |
 | `PRAGMA table_info(things)` | off | Read path. One row per column |
-| `SELECT * FROM nope` | off | `400`, `OperationalError: no such table: nope` |
-| `SELECT * FROM things WHERE id = 999` | off | Read path, `{"rows":[],"truncated":false}` |
+| `WITH gone AS (DELETE FROM things RETURNING id) SELECT * FROM gone` | off | **Refused**, `400`. The `DELETE` inside is seen |
+| `SELECT 1; DELETE FROM things` | on | **Refused**, `400` `unsupported_sql`. Neither runs |
 | `UPDATE things SET qty = 5 WHERE code = 'a'` | off | **Refused**, `400` |
-| `SELECT 1; SELECT 2` | off | **Refused.** Two statements |
 | `UPDATE things SET qty = 5 WHERE code = 'a'` | on | Write path, `{"rows":[],"affected":1}` |
-| `CREATE TABLE scratch_t (a INTEGER)` | on | Write path, `{"rows":[],"affected":0}` |
-| `INSERT INTO scratch_t (a) VALUES (1)` | on | Write path, `affected: 1` |
-| `DROP TABLE scratch_t` | on | Write path, `affected: 0` |
+| `CREATE TABLE scratch_t (a INTEGER)` | on | Write path |
+| `SET ROLE postgres` | on | **Refused**, `400` `unsupported_sql` |
 
-Two of those rows deserve a second look.
+### Which environment a statement can reach
 
-**A `;` inside a quoted string makes the statement a write.** That is the classifier being cautious, and the cost is that a perfectly innocent read needs **allow writes** and then comes back with `affected` and no rows. If you need to search for text that contains a semicolon, pass the value as a parameter through the API (`WHERE note = ?` with `["a;b"]` in `params`). The semicolon is then not in the SQL text, and the statement stays a read.
+On the platform's default PostgreSQL, environments share one database, one schema each. A `search_path` only says where unqualified names resolve, so the console does not run your SQL as the platform's own database user. It runs it as a **login role of the environment's own** (named `pb_sql_…`), which:
 
-**A statement that starts with a comment is a write.** Put the comment on the end, or leave it out.
+- may read, write and create in **its environment's schema**, and owns that schema's tables, so `ALTER TABLE` and `DROP TABLE` work on tables Pawabase made;
+- is granted **nothing else**: `SELECT * FROM pb_other_schema.orders` and the platform's own tables in `public` answer `permission denied`;
+- logs in as itself, so neither `SET ROLE` nor `set_config('role', …)` can switch back to the platform's user.
 
-### The guard is a safeguard, not a security boundary
+Pawabase creates the role the first time SQL runs for an environment and keeps it in step afterwards; its password is derived from `PAWABASE_MASTER_KEY`, so nothing new is stored. Creating it needs the platform's database user to hold `CREATEROLE` (the bundled Docker Compose user is a superuser, so it does). When the role cannot be made, the console answers `503` with the code `sql_isolation_unavailable` instead of running the SQL unconfined.
 
-The classifier looks for forbidden words **surrounded by spaces**. A word at the start of a line, after a bracket, or after a tab is not seen. In one run, this statement was sent with **allow writes off**:
+The same confined connection serves a function's raw SQL (`ctx.runtime.db()`, `ctx.runtime.transaction()`, `db_query`), so function code cannot reach another environment either.
 
-```sql
-WITH x AS (SELECT 1)
-DELETE FROM things WHERE code = 'c'
-```
+| Setting | Values | Meaning |
+| --- | --- | --- |
+| `PAWABASE_SQL_ISOLATION` | `role` (default), `off` | `off` runs console and function SQL as the platform's user. Use it only on a single-tenant install where everyone with SQL access may read every environment |
 
-The `DELETE` follows a newline, so it was not matched. The statement started with `with`, so it was classed as a read, ran down the read path, answered `{"rows":[],"truncated":false}`, and **the row was deleted**: a count afterwards went from 3 to 2. Because it took the read path, no `database.write` audit event was written and no cache was cleared.
+An environment with its own database (`<ENV>_DATA_URL` or a project database binding) or a SQLite file is already separate, and runs on its own connection as before. The catalogue stays readable as on any PostgreSQL: another schema's **name** can be listed, its contents cannot.
 
-What that means in practice:
+### What access control still has to do
 
-- **Do not rely on the unticked checkbox to make a session safe.** Its job is to stop accidents by a careful person: a mistyped `UPDATE`, a pasted `DELETE`. It does not stop someone who is trying.
-- **Access control is the real protection.** Only operator sessions reach these routes, and an operator already holds the right to write. Limit who holds it, and treat a Studio login with Database access as a database login.
-- **If you give a person a read-only view of the data, give them a database role, not a console session.** A role that can only `SELECT` is enforced by the database. See [Your database](/data/your-database#a-role-for-pawabase).
-- **Audit coverage is incomplete for statements that evade the classifier.** The `database.write` event covers writes the classifier recognised.
+- **Treat a Studio login with Database access as a database login for that environment.** Within the environment, the console still bypasses field validation and policies; that is its job.
+- **For a person who should only read, the console's read path is now enforced by the database**, but **allow writes** is a checkbox, not a permission. Give such a person a role without Database access, or a database role of their own.
 
 ## What a write does around the statement
 
-A write the classifier recognised runs, and then Pawabase does two things.
+A write runs, and then Pawabase does two things.
 
 | After a successful write | Detail |
 | --- | --- |
@@ -394,7 +400,10 @@ If something downstream must hear about a change, make the change through the AP
 
 | Status | Message | Meaning |
 | --- | --- | --- |
-| `400` | `this statement writes; set allow_write to run it` | The classifier called it a write and **allow writes** was off |
+| `400` | `this statement writes; set allow_write to run it` | The statement writes and **allow writes** was off |
+| `400` | `unsupported_sql` | Not exactly one accepted statement: two statements, a transaction or session command, or text that does not parse |
+| `400` | `cannot execute … in a read-only transaction` (PostgreSQL), `not authorized` (SQLite) | A read tried to change something; the database refused it |
+| `503` | `sql_isolation_unavailable` | The environment's SQL role could not be created; see [Which environment a statement can reach](#which-environment-a-statement-can-reach) |
 | `400` | `<ExceptionType>: <message>` | The database rejected the statement. The text after the colon is the database's own |
 | `404` | `no table '<name>'` | The table browser asked for a table that does not exist |
 | `504` | `the query timed out` | The statement ran past the environment's `query_timeout`, **15 seconds** by default |
@@ -722,7 +731,7 @@ The catalogs are where a database describes itself, and the console reads them l
 | The create statement | `\d+ tickets` in `psql` (not SQL) | `SHOW CREATE TABLE tickets` | `SELECT sql FROM sqlite_master WHERE name = 'tickets'` |
 | Foreign keys | `SELECT conname FROM pg_constraint WHERE contype = 'f'` | `SELECT * FROM information_schema.key_column_usage WHERE referenced_table_name IS NOT NULL` | `PRAGMA foreign_key_list(tickets)` |
 
-All of these are reads. The ones that start with `select`, `show`, `describe` or `pragma` pass the classifier. On SQLite, `PRAGMA table_info(things)` returned one row per column:
+All of these are reads and take the read path (`\d+` excepted, which is a `psql` command, not SQL). On SQLite, `PRAGMA table_info(things)` returned one row per column:
 
 ```json
 { "cid": 1, "name": "code", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0 }
@@ -872,36 +881,31 @@ Two consequences:
 
 ## A reproduced session
 
-This is a real sequence from a clean API on SQLite, in the order it ran, because it shows the classifier's edges better than a description does.
+This sequence, on SQLite, shows where the parser and the database draw the lines. Each step is covered by the platform's tests (`tests/platform/test_data_correctness.py`, `test_sql_isolation.py`).
 
 <Steps>
-  <Step title="Create three rows">
-    A `things` resource is created, migrated, and given three rows through the API with `code` values `a`, `b` and `c`. The second row's `note` is `x;y`, and the first's is `update me`.
+  <Step title="Create rows">
+    An `accounts` resource is created, migrated, and given rows through the API, one of them with the email `a;b@x.io`.
   </Step>
-  <Step title="Read with a quoted word">
-    `SELECT code FROM things WHERE note = 'update me'` returns `a`. The word `update` is next to a quote, not a space, so the classifier does not see it.
+  <Step title="Read with a quoted semicolon and a comment">
+    `-- who` on its own line, then `SELECT email FROM accounts WHERE email = 'a;b@x.io'`, takes the read path and returns the row. The parser knows a `;` inside a string is not a statement break.
   </Step>
-  <Step title="Read with a quoted semicolon">
-    `SELECT code FROM things WHERE note = 'x;y'` is refused: `this statement writes; set allow_write to run it`. The semicolon is inside a string and still counts.
+  <Step title="Look at the structure and the plan">
+    `PRAGMA table_info(accounts)` returns one row per column, and `EXPLAIN QUERY PLAN SELECT * FROM accounts WHERE email = 'a'` returns the plan as rows.
   </Step>
-  <Step title="Force it through with allow writes">
-    The same statement with **allow writes** runs, and answers `{"rows": [], "affected": 1}`. It ran as a write, so no rows came back. The fix is a parameter.
+  <Step title="Try to change a setting from a read">
+    `PRAGMA user_version = 5` is refused with `400`, even with **allow writes** ticked: the read path's authorizer allows the read form of a setting, not the assignment.
   </Step>
-  <Step title="Use a parameter">
-    `SELECT code FROM things WHERE code = ?` with `["a"]` returns the row. A value containing a semicolon passed the same way also works as a read.
+  <Step title="Hide a write in a read">
+    `WITH gone AS (DELETE FROM accounts RETURNING id) SELECT * FROM gone` is refused with `400`: the parser sees the `DELETE` inside. A `COUNT(*)` afterwards is unchanged.
   </Step>
-  <Step title="Look at the plan">
-    `EXPLAIN QUERY PLAN SELECT * FROM things WHERE code = 'a'` returns `SEARCH things USING INDEX ix_things_code (code=?)`: the index created by the migration is used.
+  <Step title="Batch a write behind a read">
+    `SELECT 1; DELETE FROM accounts` is refused with `400` `unsupported_sql` even with **allow writes**. Neither statement runs.
   </Step>
-  <Step title="Try to write without permission">
-    `UPDATE things SET qty = 5 WHERE code = 'a'` is refused with `400`. With **allow writes** it runs and reports `affected: 1`.
-  </Step>
-  <Step title="Test the guard">
-    A statement beginning `WITH x AS (SELECT 1)`, then a newline, then `DELETE FROM things WHERE code = 'c'`, is sent **without** **allow writes**. It is accepted as a read, answers `{"rows": [], "truncated": false}`, and the row is gone. The next `COUNT(*)` reads 2, not 3. No audit event was written for it.
+  <Step title="Write with permission">
+    `UPDATE accounts SET nickname = 'x'` is refused without **allow writes** and runs with it, reporting `affected`.
   </Step>
 </Steps>
-
-The last step is why the earlier section says the unticked checkbox is a safeguard against accidents, not a security boundary.
 
 ## What values look like in results
 
@@ -1272,13 +1276,13 @@ Filter the action to `database.write` and you have the answer to "who changed th
 
 Three limits on what the trail can tell you:
 
-1. **It records recognised writes only.** A statement the classifier treated as a read (including the newline case described earlier) leaves no event.
+1. **It records writes, not reads.** A read cannot change anything (the database holds it read-only), so reads are not audited.
 2. **It records the statement, not the effect.** The log does not say how many rows changed, only what was sent.
 3. **It records nothing about direct connections.** A change made with `psql` is in the database's own log and nowhere in Pawabase.
 
 ## The same guard in flows
 
-Flows have a `db.query` block for SQL reads, and it uses the **same classifier** as the console. A flow author who needs a join or an aggregate writes SQL in that block, and the block refuses a statement the classifier calls a write. So everything on this page about what passes as a read applies there as well, including the space-delimited word check.
+Flows have a `db.query` block for SQL reads, and it uses the **same parser and the same read-only execution** as the console, on the same [confined connection](#which-environment-a-statement-can-reach). A flow author who needs a join or an aggregate writes SQL in that block, and the block refuses a statement that writes.
 
 For several writes that must land together, a flow uses `db.transaction` over resource operations, which goes through validation hooks and events in a way the console does not. If a repair must be atomic, that is the tool, not the console. See [Data blocks](/flows/data-blocks).
 
@@ -1418,7 +1422,7 @@ The builder uses only the first row and the boolean literal, which is why a buil
 | The Database page shows an error | The environment's database is unreachable. The page's overview is a plain 500 in that case | Check the connection with a read through `/rest/v1`. See [Your database](/data/your-database) |
 | *No tables yet.* | The database has no tables, for example right after a switch | Migrate each resource |
 | A resource has no badge in the Tables card | Not a resource table, or a prefixed `pb_` table on the shared PostgreSQL default | Match it by name |
-| `this statement writes; set allow_write to run it` | The classifier called it a write | Tick **allow writes**, or rewrite it as a read |
+| `this statement writes; set allow_write to run it` | The statement writes | Tick **allow writes**, or rewrite it as a read |
 | A read returned `affected` and no rows | It was classed as a write, probably because of a `;` or a leading comment | Remove it, or use a parameter |
 | `<Type>: no such table` / `relation does not exist` | The table name is wrong or unmigrated, or it is the unprefixed name on the shared default | Check the Tables card |
 | `OperationalError: near "X": syntax error` | A typo, or SQL from another dialect | Check against the table of differences |
@@ -1433,10 +1437,10 @@ The builder uses only the first row and the boolean literal, which is why a buil
 
 <AccordionGroup>
   <Accordion title="Is the console read-only by default?">
-    Yes, in the sense that **allow writes** starts unticked and a statement the classifier calls a write is refused. The classifier is a safeguard against mistakes, not a security boundary, so access control is what keeps the database safe.
+    Yes. **allow writes** starts unticked, a statement that writes is refused, and every read runs in a transaction the database itself holds read-only. Ticking **allow writes** is still only a checkbox, so who may open the Database page is what decides who can write.
   </Accordion>
   <Accordion title="Can I run several statements at once?">
-    No. Each run is one statement. A statement containing `;` is classed as a write, and with **allow writes** the driver refuses two statements (on SQLite, `You can only execute one statement at a time`).
+    No. Each run is one statement; two statements are refused with `400` `unsupported_sql`, and neither runs.
   </Accordion>
   <Accordion title="Can I use a transaction?">
     Not across runs. Each run is its own statement with nothing to roll back. For atomic work use a flow with `db.transaction`, or a direct connection.
@@ -1444,8 +1448,8 @@ The builder uses only the first row and the boolean literal, which is why a buil
   <Accordion title="Does a console write trigger webhooks and realtime?">
     No. It is audited and it clears resource caches, and that is all. Use the API or a flow if downstream systems must hear about the change.
   </Accordion>
-  <Accordion title="Why did my SELECT return `affected` and no rows?">
-    The classifier treated it as a write, usually because of a `;` inside a quoted value or a comment at the start. Use a parameter through the API, or remove the cause.
+  <Accordion title="Why was my SELECT refused as a write?">
+    Something inside it writes: a data-modifying `WITH`, `SELECT … INTO`, or `FOR UPDATE`. Or, on the read path, the database refused a write it attempted (a function that changes rows). Run the write part separately with **allow writes**.
   </Accordion>
   <Accordion title="Why is there no history of my queries?">
     The window keeps none. Keep the statements you reuse in your own notes or in source control. Writes are in the audit log, cut to 2,000 characters.
@@ -1472,8 +1476,8 @@ The builder uses only the first row and the boolean literal, which is why a buil
 - **The console skips everything the API adds**: validation, policies, transformers, events, realtime.
 - **Two surfaces**: the table browser (read only) and the SQL window (with **allow writes**).
 - **The builder writes SQL from clicks.** Read it before you run it, and watch for a missing `WHERE`.
-- **A statement is a read only if it has no `;`, starts with a read keyword and contains no space-delimited write word.** Everything else is a write.
-- **The classifier is not a security boundary.** A newline defeats the word check. Control operator access.
+- **Statements are parsed**: exactly one query, describing statement, data change or schema change. Reads run in a database-enforced read-only transaction.
+- **SQL is confined to the environment**: on the shared PostgreSQL it runs as the environment's own role, which cannot reach other schemas or the platform's tables.
 - **Writes are audited and clear every resource's cache.** They publish no events.
 - **Limits**: one statement, 5,000 rows, 15 seconds, 100,000 characters.
 - **Errors carry the database's own message**, which makes the console the best place to diagnose a failed migration.
@@ -1486,9 +1490,9 @@ The builder uses only the first row and the boolean literal, which is why a buil
 | **Table browser** | The left card and table view of the Database page. Read only |
 | **SQL window** | The modal opened by the **SQL** button |
 | **Query builder** | The click-through section inside the SQL window that writes the statement |
-| **allow writes** | The checkbox that permits a statement the classifier calls a write |
+| **allow writes** | The checkbox that permits a statement that writes |
 | **Classifier** | The check that decides whether a statement is a read |
-| **Read path / write path** | Fetching rows, or executing and counting. The classifier picks one |
+| **Read path / write path** | Fetching rows in a read-only transaction, or executing and counting. The parsed statement picks one |
 | **`database.write`** | The audit event for a recognised console write, with the SQL cut to 2,000 characters |
 | **`query_timeout`** | The environment's limit on a statement's run time, 15 seconds by default |
 | **Physical table name** | The table's real name in the database, possibly `pb_<hash>_` prefixed |

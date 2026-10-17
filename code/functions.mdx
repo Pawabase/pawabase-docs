@@ -134,7 +134,67 @@ async with ctx.runtime.transaction() as db:             # commit on success, rol
 field definitions: JSON columns come back as dicts, booleans as `True`/`False`, datetimes as `datetime`. A conditional `UPDATE … WHERE on_hand >= ?` that returns `0` is the whole
 concurrency story for "reserve stock without overselling".
 
-SQL runs as the application, so no resource policy applies: check what the caller may do first.
+SQL runs as the application, so no resource policy applies: check what the caller may do first. It is confined to the function's own environment: on the platform's
+shared PostgreSQL it runs as that environment's own database role, which cannot read another environment's schema or the platform's tables (see
+[Which environment a statement can reach](/data/database-console#which-environment-a-statement-can-reach)).
+
+## TypeScript functions
+
+Functions can also be written in TypeScript, run by Deno. A project's functions are **one language**: Python or TypeScript. A bundle that mixes `.py` and `.ts` files is refused, and deploying TypeScript to a project whose functions are Python (or the other way round) answers `409`.
+
+```ts
+// functions/orders.ts
+import { fn, FunctionError } from "pawabase";
+
+export const create = fn("orders.create", { policy: "authenticated", timeout: 30 }, async (ctx) => {
+  if (!ctx.input.total) throw new FunctionError("total is required", { status: 422, code: "invalid" });
+  ctx.log("creating an order");
+  return await ctx.runtime.resourceCreate("orders", ctx.input);
+});
+```
+
+Everything else is the same as for Python: `pawabase deploy`, branches and rollback, `POST /functions/v1/orders.create`, calls from flows, routes, schedules and events, run records in Studio, timeouts, and plan limits. `ctx.runtime` has the same capabilities with camel-case names (`resourceList`, `resourceGet`, `resourceCreate`, `resourceUpdate`, `resourceDelete`, `dbQuery`, `emit`, `callFunction`, `callFlow`, `publish`, `sendMail`, `storagePut`, `storageRead`, `secret`, `httpRequest`, …); `ctx.runtime.call(method, args, kwargs)` reaches any runtime method by its Python name.
+
+A TypeScript function runs in a Deno worker confined like a Python one, and Deno's own permissions add a second layer: no network (use `ctx.runtime.httpRequest`), no environment variables, no subprocesses, and reading only the deployment. Imports are local files in the bundle: `npm:` and URL imports are not fetched on the server. Dates arrive as ISO strings.
+
+## Where a function runs
+
+A deployed function runs in a **worker process** of its own, not in the server. A worker serves one deployment, one call at a time; more concurrent calls start more
+workers (4 per deployment by default), and one idle for 5 minutes is stopped. Everything `ctx.runtime` does (data, events, secrets, `http_request`) is a request back to
+the server, which answers it with the caller's identity and the function's environment. The worker itself holds no secrets: it starts with an empty environment, no
+database address and no credentials.
+
+On Linux, the worker is also **confined**, with two kernel features an unprivileged process can apply to itself (no extra container privileges needed):
+
+| Confinement | What it allows | What it refuses |
+| --- | --- | --- |
+| **Landlock** (filesystem) | Reading Python, the platform's packages, your deployment and its libraries; writing the worker's own temporary directory (`TMPDIR`) | Every other path: other deployments, `/etc`, `/proc` of other processes, the server's files |
+| **Landlock** (network, kernel 6.7+) | — | TCP `connect` and `bind` |
+| **seccomp** | Ordinary computation, threads, `asyncio`, starting `python` subprocesses | Opening any socket; tracing or reading other processes; signalling anything but itself; mounting; new namespaces; loading kernel modules or BPF; `io_uring` |
+
+So a function reaches the network only through `ctx.runtime.http_request`, which goes out from the server and through its guard against private addresses. A
+function that opens a socket itself gets `PermissionError`.
+
+| Limit | Value | Beyond it |
+| --- | --- | --- |
+| Memory (address space) | `PAWABASE_SANDBOX_MEMORY_MB`, 1024 MB | `MemoryError`, or the worker is stopped (`SandboxCrashed`) |
+| Wall time | The function's `timeout` (30 s by default) | `504`, and the worker is stopped |
+| CPU time | The function's `timeout`, counted across all its threads | The worker is stopped (`CpuLimitExceeded`) |
+| Open files | 256 | `OSError` |
+| Size of a written file | 64 MB | `OSError` |
+
+A worker stopped for any reason takes nothing else with it: the next call starts a fresh one.
+
+| Setting | Values | Meaning |
+| --- | --- | --- |
+| `PAWABASE_FUNCTION_ISOLATION` (or `<ENV>_FUNCTION_ISOLATION`) | `process` (default), `inprocess` | `inprocess` runs functions on the server's event loop, with no worker and no confinement |
+| `PAWABASE_SANDBOX_CONFINEMENT` | `auto` (default), `required`, `off` | `auto`: confinement is **required** on Linux and skipped with a warning elsewhere (macOS development). `required`: a worker that cannot be confined runs nothing, and the call fails with `SandboxConfinementUnavailable`. `off`: worker processes without confinement, for code you trust |
+
+<Note>
+Confinement needs a Linux kernel with Landlock (5.13+, enabled in most distributions and in Docker Desktop) and seccomp. On a kernel without Landlock, the default
+refuses to run functions rather than run them unconfined; the error says so and names the setting. Things a confined function cannot do: run programs other than
+Python (`/bin/sh` is not readable), signal its own child processes, or read files outside its deployment.
+</Note>
 
 ## Helper packages
 

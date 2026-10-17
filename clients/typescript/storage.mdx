@@ -1,0 +1,529 @@
+---
+title: "Storage with TypeScript"
+description: "Upload, download, stream, list, and remove objects, and use public and signed URLs without confusing URL possession with bucket policy."
+icon: "folder"
+---
+
+Storage keeps application files in named buckets while policies decide who may read and write them.
+The TypeScript client separates bucket selection from object operations:
+
+```text
+client.storage            all bucket metadata
+client.storage.from(name) one bucket's objects and URLs
+```
+
+In Studio, open **Build → Storage** to inspect buckets.
+The bucket's public setting, accepted content types, maximum size, and read/write policies remain authoritative for SDK calls.
+
+## List buckets
+
+`listBuckets()` returns the buckets available in the active environment.
+
+```typescript
+const buckets = await client.storage.listBuckets();
+```
+
+| Bucket field | Meaning |
+| --- | --- |
+| `name` | Stable bucket name used by `from()` |
+| `public` | Whether public-object URLs are supported |
+| `accepts` | Allowed content-type patterns |
+| `max_bytes` | Maximum accepted object size |
+
+Bucket visibility is not the same as object read permission.
+An application may know a bucket name and still be refused by its policy.
+
+## Select a bucket
+
+```typescript
+const avatars = client.storage.from("avatars");
+```
+
+The returned `BucketClient` keeps the bucket name and uses it for every object request.
+It does not check that the bucket exists until an operation reaches the server.
+
+## Object keys
+
+An object key is the full name inside a bucket.
+Slash characters create a prefix convention, not a separate directory resource.
+
+```text
+users/01J.../avatar.png
+invoices/2026/10/invoice-1042.pdf
+```
+
+Design keys around authorization and lifecycle.
+A user ID prefix makes it easier for a storage policy to associate a path with the caller.
+Do not trust a filename supplied by a browser as an authorization boundary.
+
+## Upload bodies
+
+`upload()` accepts standard web body types.
+
+| Body type | Typical runtime | Notes |
+| --- | --- | --- |
+| `Blob` or `File` | Browser | Blob type becomes the default content type |
+| `ArrayBuffer` | Browser, Node, edge | In-memory bytes |
+| `ArrayBufferView` | Typed arrays and Node buffers | In-memory bytes |
+| `string` | Any | Sent as content with configured/default type |
+| `ReadableStream<Uint8Array>` | Streaming runtimes | Avoids buffering; cannot be retried safely |
+| `URLSearchParams` | Web runtimes | Encoded body |
+| `FormData` | Web runtimes | Multipart body; use only when the endpoint semantics fit |
+
+## Upload an object
+
+```typescript
+const object = await avatars.upload(
+  `users/${user.id}/avatar.png`,
+  file,
+  {
+    contentType: "image/png",
+    timeoutMs: 30_000,
+    signal: controller.signal,
+  },
+);
+```
+
+The operation uploads or overwrites the key.
+It returns `StoredObject` metadata.
+
+| Stored field | Meaning |
+| --- | --- |
+| `bucket` | Bucket name |
+| `key` | Object key |
+| `size` | Stored byte count |
+| `content_type` | Stored media type |
+| `etag` | Entity tag when supplied by the backend |
+
+The bucket's write policy, `accepts`, and `max_bytes` limits apply.
+A refused type or size becomes an error; the SDK does not truncate the file.
+
+<Warning>
+  `contentType` is caller input.
+  Do not assume a client-provided media type proves file content is safe.
+  Apply the bucket restrictions and application-side content handling appropriate to the threat model.
+</Warning>
+
+## Upload retry behavior
+
+Upload replaces the object at a stable key with `PUT`, so the client marks it safe to repeat.
+Replayable bodies can therefore retry after an eligible network failure, timeout, `502`, `503`, or `504` under the configured transport policy.
+A `ReadableStream` is consumable only once and is not retried.
+
+If an upload response is lost after the retry budget, reconcile by reading object metadata or using an application-specific stable key before telling a user to resubmit.
+Replacing a deterministic avatar key is easier to reconcile than generating a new random key on every click.
+
+## Download forms
+
+The bucket client exposes several parsing choices so the application does not need to manually reinterpret every response.
+
+| Method | Result | Use |
+| --- | --- | --- |
+| `download(key)` | `Blob` | Browser object URLs, media, generic bytes |
+| `downloadText(key)` | `string` | Text documents |
+| `downloadJson<T>(key)` | Parsed `T` | JSON stored as an object |
+| `downloadStream(key)` | `ReadableStream<Uint8Array>` | Incremental processing of large objects |
+| `downloadResponse(key)` | Raw `Response` | Read headers such as ETag, type, or length |
+
+```typescript
+const blob = await avatars.download(key);
+const objectUrl = URL.createObjectURL(blob);
+```
+
+```typescript
+const profile = await profiles.downloadJson<ProfileSnapshot>(key);
+```
+
+The generic on `downloadJson<T>()` is a compile-time assertion.
+It does not validate untrusted JSON at runtime.
+Validate stored documents when their producer or schema cannot be trusted.
+
+## Stream a large object
+
+```typescript
+const stream = await archive.downloadStream(key, {
+  signal: controller.signal,
+  timeoutMs: 60_000,
+});
+
+for await (const chunk of stream) {
+  await sink.write(chunk);
+}
+```
+
+The request timeout covers obtaining the response under the transport semantics.
+The surrounding runtime still needs cancellation and backpressure appropriate to the complete stream lifecycle.
+
+## Inspect response headers
+
+```typescript
+const response = await avatars.downloadResponse(key);
+
+const etag = response.headers.get("etag");
+const contentType = response.headers.get("content-type");
+const contentLength = response.headers.get("content-length");
+```
+
+Use the raw response when cache validation or download metadata matters.
+Non-success responses still become SDK errors before a `Response` is returned.
+
+## Remove an object
+
+```typescript
+await avatars.remove(key, {
+  signal: controller.signal,
+  timeoutMs: 10_000,
+});
+```
+
+A missing object, or an object hidden by policy, produces `NotFoundError`.
+Deletion is policy-checked.
+
+Use deterministic cleanup around application records.
+Deleting a database row does not imply its referenced object was removed unless your application or automation explicitly coordinates both.
+
+## List one page
+
+`list()` returns files immediately below a prefix plus child prefixes and a cursor.
+
+```typescript
+const listing = await avatars.list({
+  prefix: `users/${user.id}/`,
+  limit: 100,
+});
+```
+
+| Listing field | Meaning |
+| --- | --- |
+| `files` | Objects in this page |
+| `prefixes` | Distinct child prefixes, similar to folders |
+| `cursor` | Opaque value for the next page; empty at the end |
+
+Each file entry includes `key`, `size`, `content_type`, and `modified`.
+
+Pass the returned cursor unchanged.
+
+```typescript
+let cursor = "";
+
+do {
+  const page = await avatars.list({
+    prefix,
+    cursor: cursor || undefined,
+    limit: 100,
+  });
+
+  renderFiles(page.files);
+  cursor = page.cursor;
+} while (cursor);
+```
+
+Do not parse or manufacture cursor values.
+
+## Iterate all objects below a prefix
+
+`listAll()` handles cursors and yields file entries.
+
+```typescript
+for await (const file of avatars.listAll({
+  prefix: `users/${user.id}/`,
+  pageSize: 200,
+  signal: controller.signal,
+})) {
+  await inspect(file);
+}
+```
+
+This is lazy iteration, but the complete scan can still be expensive.
+Use a narrow prefix and cancel work that the user no longer needs.
+
+## Public URLs
+
+`getPublicUrl(key)` constructs a URL for an object in a public bucket.
+It does not make a network request.
+
+```typescript
+const imageUrl = avatars.getPublicUrl(key);
+```
+
+The publishable key is part of the URL because it is intended to be public.
+The method refuses a secret key to prevent embedding a policy-bypassing credential in HTML or shared content.
+
+<Info>
+  A public URL is appropriate only for a bucket intentionally configured as public.
+  Possessing a URL does not turn a private bucket public.
+</Info>
+
+## Signed download URLs
+
+`createSignedUrl()` asks Pawabase for a temporary bearer URL that can read one object without an API key or user token.
+
+```typescript
+const signed = await documents.createSignedUrl(key, {
+  expiresIn: 300,
+});
+```
+
+The result contains `url`, `expires_at`, and `method: "GET"`.
+The caller must already have permission to create the signed URL.
+Anyone who receives it can use its authority until expiry.
+
+Do not log signed URLs.
+Use short lifetimes and transport them only to the intended recipient.
+
+## Signed upload URLs
+
+A signed upload URL delegates permission to write one key without sharing an API key or user session.
+
+```typescript
+const slot = await documents.createSignedUploadUrl(key, {
+  expiresIn: 300,
+  contentType: "application/pdf",
+  maxBytes: 5_000_000,
+});
+```
+
+The signature can pin content type and maximum size.
+Use the narrowest values that fit the upload.
+
+The untrusted device can then upload through the signed URL.
+
+```typescript
+const stored = await documents.uploadToSignedUrl(
+  slot.url,
+  file,
+  {
+    contentType: "application/pdf",
+    signal: controller.signal,
+  },
+);
+```
+
+`uploadToSignedUrl()` sends neither the configured API key nor a user token.
+The URL itself is the credential.
+It can therefore be used by a different device or direct-to-storage browser flow.
+
+## Public, authenticated, and signed access
+
+| Access model | Credential on object request | Best fit |
+| --- | --- | --- |
+| Public URL | Publishable key encoded in URL | Public images and assets |
+| SDK download/upload | API key plus optional user token | Application users under bucket policy |
+| Signed read URL | Signature in URL | Short-lived download by a client that should not receive Pawabase credentials |
+| Signed upload URL | Signature in URL | Direct upload to one key under fixed limits |
+
+Signed URLs are bearer credentials.
+Public URLs are not suitable for private data.
+Ordinary SDK calls are the clearest choice when the application already has a session and needs policy evaluation for every operation.
+
+## Content-type defaults
+
+Upload chooses a media type in this order:
+
+| Priority | Source |
+| --- | --- |
+| Highest | Explicit `options.contentType` |
+| Next | Non-empty `Blob.type` |
+| Next | String body becomes `text/plain; charset=utf-8` |
+| Fallback | `application/octet-stream` |
+
+```typescript
+await bucket.upload("notes/readme.txt", "Hello");
+
+await bucket.upload(
+  "exports/report.bin",
+  bytes,
+  { contentType: "application/vnd.example.report" },
+);
+```
+
+For `FormData`, the SDK does not set its own content-type header because the runtime must add the multipart boundary.
+Manually setting a bare `multipart/form-data` value can produce an unreadable body.
+
+## Key normalization and encoding
+
+Object keys are encoded by path segment while slash separators are retained.
+Spaces and Unicode characters therefore remain part of a key without altering the request path.
+
+```typescript
+await bucket.upload(
+  "users/ada/profile photo.png",
+  file,
+);
+```
+
+Normalize application input before constructing a key.
+Avoid accepting `.` or `..` segments, repeated separators, control characters, or visually confusable tenant identifiers even when the storage service treats them as literal key text.
+
+Keep the canonical key in application data rather than reconstructing it later from a display filename.
+
+## Stable overwrite semantics
+
+Upload uses `PUT` to one key.
+Repeating a replayable upload replaces that key with the same body, which is why the SDK permits transient retry.
+
+This does not make a sequence of related uploads atomic.
+If an application writes an original and several derived thumbnails, a failure can leave only some keys updated.
+Use an application state record, versioned prefix, or server-side workflow when consumers must switch all related objects together.
+
+```text
+assets/document-42/v7/original.pdf
+assets/document-42/v7/preview.png
+assets/document-42/current.json
+```
+
+The final pointer can move only after every versioned object succeeds.
+
+## Cache validation
+
+`downloadResponse()` exposes ETag and content headers for application-managed caching.
+
+```typescript
+const response = await bucket.downloadResponse(key);
+const etag = response.headers.get("etag");
+
+if (etag !== cached.etag) {
+  const bytes = await response.arrayBuffer();
+  await cache.put(key, { etag, bytes });
+}
+```
+
+The SDK does not maintain an object cache.
+Browser HTTP caches, CDNs, signed-URL query strings, and application caches can each affect observed freshness.
+Define versioned keys for immutable assets when long cache lifetimes are required.
+
+## Range and conditional behavior
+
+The high-level download methods do not expose a dedicated byte-range API.
+Use the documented public storage contract and a raw public request only if the endpoint supports the required headers.
+Do not assume that adding `Range` or `If-Match` creates supported semantics.
+
+For video, large archives, or resumable transfers, confirm the deployed storage backend and public API behavior before building a client around range requests.
+
+## Signed-upload handoff design
+
+A common direct-upload design has three trust transitions.
+
+```text
+Untrusted application
+  requests an upload slot with intended metadata
+        │
+Trusted route
+  authorizes user and chooses exact bucket/key/type/size/expiry
+        │
+Untrusted application
+  uploads bytes to the returned signed URL
+        │
+Trusted route or event
+  records or verifies completed object metadata
+```
+
+Do not let an untrusted caller freely choose a key that escapes its tenant prefix.
+The trusted slot-issuing behavior should derive the final key and narrow `contentType`, `maxBytes`, and expiry.
+
+## Signed URL clock behavior
+
+`expires_at` is a Unix timestamp in seconds.
+Use it to avoid presenting a link that is already near expiry.
+
+```typescript
+const signed = await bucket.createSignedUrl(key, {
+  expiresIn: 300,
+});
+
+const remainingSeconds = signed.expires_at - Math.floor(Date.now() / 1000);
+```
+
+Client clock skew can make a locally computed remaining duration imprecise.
+Treat server refusal as authoritative and request a new URL when the application still has permission.
+
+## Object metadata is not application metadata
+
+`StoredObject` contains storage-level fields such as size, type, and ETag.
+It does not contain arbitrary business metadata, ownership, alt text, moderation state, or document status.
+
+Store those values in a protected resource keyed to the object key.
+Enforce both the resource policy and bucket policy so changing one path cannot expose the other.
+
+## Listing consistency and mutation
+
+Object listings are cursor-based.
+Concurrent uploads and deletes can change what later cursors observe.
+Do not use a long `listAll()` scan as a transactionally stable snapshot.
+
+For a cleanup job, make deletion idempotent and record progress.
+For a user file browser, refresh the current prefix after a mutation rather than splicing an assumed final list into cache indefinitely.
+
+## Server-side streaming
+
+When proxying a download through a trusted server, preserve backpressure and cancellation.
+
+```typescript
+const stream = await bucket.downloadStream(key, {
+  signal: request.signal,
+});
+
+return new Response(stream, {
+  headers: {
+    "content-type": contentType,
+  },
+});
+```
+
+Proxying consumes application bandwidth and removes the direct-storage advantage.
+Prefer a short-lived signed read URL when exposing the storage origin and bearer URL fits the product's security model.
+
+## Testing storage behavior
+
+Use a fake fetch for application branching and a real test bucket for bucket enforcement.
+
+| Behavior | Unit fake | Integration environment |
+| --- | --- | --- |
+| Correct encoded key and content type | Yes | Optional |
+| Replayable upload retry | Yes | Optional |
+| Stream not retried | Yes | Optional |
+| Accepted media pattern | No | Yes |
+| Maximum size | No | Yes |
+| Read/write policy | No | Yes |
+| Signed URL expiry and authority | Limited | Yes |
+| Public URL with secret-key refusal | Yes | Yes for actual access |
+
+Dispose the client after tests, and never snapshot a signed URL or credential-bearing public URL into committed fixtures.
+
+## Error decisions
+
+| Error | Storage meaning |
+| --- | --- |
+| `NotFoundError` | Missing object/bucket, or policy-hidden object |
+| `PermissionError` | Bucket policy or credential scope refused the operation |
+| `ValidationError` | Invalid key, list input, signing input, or request shape |
+| `PayloadTooLargeError` | Object exceeds an accepted limit |
+| `AuthenticationError` | Invalid key/token or required identity absent |
+| `TimeoutError` | Transfer attempt exceeded its SDK deadline |
+| `AbortError` | Caller cancelled the transfer |
+| `NetworkError` | No HTTP response was obtained |
+
+For a rejected upload, compare the object's actual byte size and chosen content type with the bucket shown in **Build → Storage**.
+For a `403`, inspect both key scope and the bucket's write policy.
+
+## Common mistakes
+
+| Mistake | Consequence | Better model |
+| --- | --- | --- |
+| Put a secret key in an image URL | Complete credential exposure | Public bucket with publishable URL, or signed read URL |
+| Treat slash prefixes as transactional folders | Partial cleanup and surprising list results | Keys are independent objects grouped by prefix |
+| Trust a generic on `downloadJson<T>()` as validation | Malformed data reaches application logic | Runtime-validate untrusted JSON |
+| Retry a consumed stream | Empty or failed replay | Recreate the stream or reconcile the stable key |
+| Use a signed URL as permanent access | Long-lived bearer exposure | Short expiry and reissue on demand |
+| Assume deleting a database row deletes its file | Orphaned object | Coordinate lifecycle through application behavior or a flow |
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Storage product model" icon="database" href="/storage/overview">
+    Buckets, public access, policies, accepted types, and object behavior.
+  </Card>
+  <Card title="Client errors" icon="triangle-alert" href="/clients/typescript/errors-retries">
+    Distinguish not-found, policy refusal, size limits, cancellation, and network failures.
+  </Card>
+</CardGroup>
