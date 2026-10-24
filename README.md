@@ -29,7 +29,7 @@ npm run validate     # docs.json and page frontmatter
 | Path | What |
 | --- | --- |
 | `docs.json` | Site config: theme, brand colours, fonts, navigation (tabs → groups → pages) |
-| `style.css` | Brand layer (pastel palette, hero, pills) |
+| `style.css` | Pawabase brand layer: dark surfaces, orange signals, typography, and homepage compositions |
 | `logo/`, `favicon.svg` | Brand marks for light and dark |
 | `openapi/` | Gateway-facing OpenAPI specs; the Reference tab's API pages are generated from them |
 | `images/` | Screenshots |
