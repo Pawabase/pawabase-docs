@@ -1,1515 +1,502 @@
 ---
 title: "Authentication"
-description: "How Pawabase authentication is layered, why every user belongs to one project and environment, and how the whole section fits together."
+description: "Sign people up and in, keep their sessions, and protect your data, using the Pawabase SDKs."
 icon: "users"
 ---
 
-Pawabase authentication is not one service and one database. It is three cooperating layers, and almost every confusing behaviour you will hit while debugging sign-in falls out of *which layer you are looking at*. This page establishes that layering, states the tenancy rule that makes the whole system coherent, and maps every page in the Authentication section.
+Pawabase gives every environment a complete account system: sign-up and sign-in with passwords, magic links, emailed codes, passkeys and social providers; sessions that renew themselves; second factors; roles; and organizations. You use all of it from the SDK. Your users are separate from your team: they belong to the app you are building, not to your Pawabase account.
 
-<CardGroup cols={3}>
-  <Card title="Identity lives in Akountz" icon="fingerprint">Users, passwords, identities, sessions, MFA, organizations and roles. It issues tokens and owns the tables behind them.</Card>
-  <Card title="Configuration lives in the API" icon="sliders">Each environment owns an `auth` settings block. Akountz reads that block and never writes it, which is why an unset key silently means "the default".</Card>
-  <Card title="Verification lives in the gateway" icon="shield-halved">Every other service verifies the bearer token on the request. It issues nothing and holds no user database.</Card>
-</CardGroup>
+This page shows how to set up a client, sign someone up and in, and read back who is signed in. It also maps every sign-in method to the page that covers it.
 
-The section starts here because the terms used on every other page — `project`, `env`, session, token, role, claim — only mean something once you know which layer owns them. Read this page once and the rest of the section stops being a list of endpoints to memorise and becomes a system you can reason about.
+## Set up a client
 
-If you are here to make one thing work rather than to build a mental model, jump straight to [Authentication configuration](/auth/configuration) to prepare an environment, or to [Passwords](/auth/passwords) if you are wiring a sign-in form. Everything else here is context that makes those two pages predictable.
+Install the SDK for your language and create one client for your app. Authentication uses a **publishable key** (`pb_pk_…`), which is safe to ship in a browser or mobile app. A **secret key** (`pb_sk_…`) is for servers only and is what you use to manage other people's accounts; see [Managing users](/auth/managing-users).
 
-## Three layers, one identity
-
-The split exists for a concrete engineering reason. Identity has to be writable in exactly one place, configurable per environment without a code change, and verifiable everywhere without a network round trip to the identity service on every single request. Those three jobs have incompatible requirements, so Pawabase separates them rather than forcing one component to do all of them badly.
-
-| Layer | What it owns | What it does not own |
-| --- | --- | --- |
-| **Akountz** (identity) | Users, passwords, identities, sessions, MFA, organizations, roles. Owns `akz_users`, `akz_sessions`, `akz_login_events`, `permissions`, `perm_*`, `jwt_tokens`, `token_blacklist`. | The `auth` settings block. It reads that block and applies defaults. |
-| **The API** (project config) | Each environment's `auth` settings block, including provider credentials referenced as secrets. | User records. It does not know which users exist. |
-| **Gateway / `pawabase_core`** | Verifying bearer tokens at every other service. | Issuing anything. It mints no user tokens and holds no user database. |
-
-The consequence that matters most in practice: **only one layer is writable.** When a user changes, Akountz wrote it. When a setting changes, the API wrote it. The gateway is read-only by design, which is what makes "revoke this session" and "this token is forged" separate concerns rather than the same mechanism.
-
-### The same symptom, three different causes
-
-Reading a behaviour from the wrong layer is the most common source of wasted debugging time. These are the symptoms that reliably get misdiagnosed:
-
-| Symptom | The layer that actually explains it |
-| --- | --- |
-| A token works in staging and 401s in production. | Gateway — the signing key is derived per `project` + `env` pair. |
-| Turning a setting off in Studio has no effect for several seconds. | API and Akountz — the environment config is cached briefly. |
-| An account exists in staging but sign-in says the email is unknown. | Akountz — users are scoped to a `project` + `env` pair. |
-| A policy denies a request even though the role looks correct. | Gateway — the role was read at token issue time, not at request time. |
-| A provider switch is on but the client shows no buttons. | Akountz — a provider with no `client_id` is filtered out of the settings response. |
-| Sign-out returns 200 but the next request still works. | Akountz — you revoked one session family, not the access token you were holding. |
-| Roles edited in Studio do not appear in a live token. | Akountz — the token response embeds the role list it read at issue time. |
-
-<Note>
-A useful debugging habit: before investigating a sign-in problem, write down which environment each artifact came from — the key, the token, the config. Most "impossible" auth bugs are three artifacts from three different environments.
-</Note>
-
-## The tenancy rule
-
-If you remember one thing from this page, make it this: **every user belongs to exactly one `project` + `env` pair.**
-
-Not one project that happens to hold several environments' worth of users — one account, in one project, in one environment. The email address is not the identity. The `(project, env, email)` triple is.
-
-An email address may hold an account in `acme/production` and a completely separate account in `acme/staging`. Those are different rows with different identifiers, different passwords, different roles, and entirely separate sessions. Signing in to one has no effect on the other. Changing the password on one leaves the other untouched.
-
-### Why this is the rule that makes the rest coherent
-
-Every other design decision leans on it. The per-environment signing key exists because the account is per-environment. The per-environment config block exists because behaviour differs per-environment. The roles-are-grouped-not-modelled decision exists because permission names are stored with an environment prefix precisely so environments cannot collide.
-
-The rule is enforced on nearly every query Akountz runs. Finding a user by id, finding one by email, resolving a role, reading a session, revoking a token — each filters on `project` and `env` alongside whatever else it searches for. This is why a perfectly valid user id from one environment reads as "no such user" in another even though the row exists in the database.
-
-<Warning>
-"The user exists but sign-in says the email is unknown" is almost never a caching bug or a normalisation bug. It is nearly always the wrong environment. Check the `project` and `env` on the key you are using before you go looking for anything else.
-</Warning>
-
-### What the rule changes about ordinary work
-
-| Situation | What the rule means in practice |
-| --- | --- |
-| Promoting a definition from development to production | Definitions move. Users do not. Production starts with zero application users, and someone has to provision them. |
-| Testing with a real customer's email in staging | You are creating — or hitting — a different account from the production one. It will not have their data. |
-| Reusing a staging access token against production | The `prj` and `env` claims do not match the environment, so verification fails. See below. |
-| Deleting a user | Only that environment's row is affected. The same email in another environment survives untouched. |
-| Attaching a role to a user | The role is stored with an environment prefix and stripped back to its bare name on the way out, so you always see `editor`, never `acme/production/editor`. |
-| Running a backup and restore | The payload is per-environment. Restoring it does not merge two environments together. |
-| Rotating a signing secret | The master secret feeds every derived key. Rotating it invalidates tokens in all environments, not one. |
-
-## Why a token only works where it was issued
-
-A corollary of the tenancy rule catches people out constantly: **a token is only valid for the environment that issued it.**
-
-This is not a check bolted on afterwards. The signing key itself is derived per environment. Given the installation's master secret, the project slug, and the environment name, Pawabase computes a deterministic per-environment secret and signs user tokens with it.
-
-The derivation is deliberately a keyed hash of a string naming the project and environment under the master secret. That choice buys three things at once: every service can verify without asking Akountz, because the derivation is pure and needs no lookup; the key is independent per environment, so compromising one exposes exactly one; and there is no key material to store per environment anywhere.
-
-Refresh tokens are signed with their own derivation, separate from the access token key — the same master secret, a different derivation. An access token therefore cannot be presented where a refresh token is expected, or the reverse.
-
-Three things must line up for verification to succeed:
-
-| Check | What fails if it does not line up |
-| --- | --- |
-| The signature verifies under the key derived for *this* environment. | A token from another environment is signed with a different key. Verification fails. |
-| The token's type marker says it is an access token. | A refresh token, a service token, or a context token presented as a bearer token is rejected. |
-| The `prj` and `env` claims equal the ones this environment expects. | A token carrying the right claims but pointed at the wrong environment is rejected. |
-
-If any of those fail, verification fails, and the gateway does not distinguish "expired" from "wrong environment" from "forged" to the caller. A perfectly valid staging token presented to a production route is cryptographically indistinguishable from an attacker's forgery, because the key it was signed with is not the production key.
-
-<Info>
-This is also why an API key and a user access token must come from the same environment. A key that resolves to `acme/staging` paired with a token minted for `acme/staging` works. Pairing them across environments does not, and the error will not tell you which half was wrong.
-</Info>
-
-### Token claims you can rely on
-
-The access token carries enough context that most services never need to call back to Akountz to authorise a request. These are the claims worth knowing by heart:
-
-| Claim | Meaning |
-| --- | --- |
-| `sub` | The user id, as a ULID. This is the identity that policies compare against. |
-| `prj`, `env` | The project and environment this token is valid for. |
-| `sid` | The session identifier — the token family hex string. |
-| `jti` | The token id. Also exists as a row in the token table, which is what makes rotation and revocation work. |
-| `aal` | Authentication assurance level: `aal1` by default, `aal2` after MFA. |
-| `email`, `roles`, `perms` | Identity facts read at issue time. A role change needs a refresh to take effect. |
-| `org`, `org_role` | The organization the session is scoped to and the caller's role in it. |
-| `meta` | `user_metadata`, which the user can edit. Policies must not trust it. |
-| `app` | `app_metadata`, which only an admin can edit. Policies may rely on it. |
-
-That `meta` versus `app` split is the security-relevant one. Both end up in the token, both look like data, and only one of them is trustworthy for authorisation decisions. See [Auth in policies](/auth/auth-in-policies).
-
-## What Akountz owns
-
-Akountz is the only writable layer. These are the real models, and they are worth naming precisely because this data model is public — you will meet these names in API responses, in event payloads, in Studio, and in backups.
-
-| Model | Holds | Why it exists |
-| --- | --- | --- |
-| `AuthUser` | Email, username, name, avatar, metadata, disabled state, lock counters, MFA flag | One row per `project` + `env` + email. The account itself. |
-| `Identity` | A link between a user and an external provider identity | Lets one account sign in with a password *and* with a social provider. |
-| `SessionInfo` | Token family, user, project, env, method, assurance level, org, IP, user agent | This is what the Studio session list renders and what sign-out revokes. |
-| `LoginEvent` | One row per sign-in attempt, success or failure, with a reason string | The source of the **Sign-in activity** tab. |
-| `OneTimeToken` | A single-use, time-limited token for a purpose | Backs verification, recovery, magic links, MFA challenges, identity linking, and invitations. |
-| `MfaFactor` | An encrypted TOTP secret, confirmation state, last used step | One or more per user. |
-| `RecoveryCode` | A hashed MFA recovery code | Stored hashed only — the raw code is shown once and never recoverable. |
-| `Organization` | A tenant inside one environment, addressed by slug | Groups users into customer teams. |
-| `Membership` | One user's role in one organization | Feeds the `org` and `org_role` claims. |
-| `Team`, `TeamMember` | A narrower grouping inside an organization | Teams sit under an organization, not under the environment. |
-| `Invitation` | A pending invitation to an organization | Created by a route, delivered by email, accepted by the invitee. |
-| `Permission`, `Group` | Named permissions and named permission bundles | A "role" is a `Group` plus its permissions. |
-| `UserPermission`, `UserGroup`, `GroupPermission` | Direct grants and group membership | The join tables that make up a user's effective permission set. |
-| `JWTToken`, `TokenBlacklist` | Tracked token ids, families, consumption, revocation | What makes single-use rotation and theft detection possible. |
-
-### Naming, stated plainly
-
-Several of these names are not what you would guess, and previous generations of this documentation got several of them wrong. Fix them now:
-
-<Warning>
-**There is no `Role` model and there is no `RoleAssignment`.** A "role" is a `Group` plus the permissions attached to it. Studio calls it a role because that is the word operators use; the database calls it a group.
-
-**There is no `MFARecoveryCode` model.** Recovery codes are rows on the user, stored hashed only.
-
-**There are no `Org` or `OrgMember` models.** They are `Organization` and `Membership`.
-
-**There is no role assignment table in the roles model** and no TOML policy expression syntax anywhere in auth configuration — configuration is JSON throughout. Permission checks happen in policies, comparing the verified claim lists.
-</Warning>
-
-One more naming trap: the `session_id` in a token response is not a surrogate database id. It is the **token family hex string**, which is the same value as the `family` column on the session row. When you see a session id in Studio's session table and in an API response, they are the same identifier.
-
-### A subclassing hazard worth knowing
-
-`Group.get_or_create` is overridden in Pawabase's permission models, and the reason is instructive. The inherited implementation calls `super(cls, cls)`, which on a subclass lands back in the override rather than reaching the base class — an infinite loop that only manifests when you actually call it. The override exists to sidestep that. If you extend these models yourself, this is the trap you will hit first.
-
-The uniqueness rules are worth knowing too, because they constrain what a role editor will accept: `UserGroup` is unique on `(user_id, group)` and `GroupPermission` is unique on `(group, permission)`. Adding the same permission to the same role twice is a no-op rather than an error.
-
-## Where the configuration comes from
-
-Identity behaviour is per environment, and the environment's `auth` settings block is owned by the API — not by Akountz. Akountz fetches it, caches it briefly, and applies a default for anything the environment did not set.
-
-That ownership split is the answer to the most common configuration question in this whole system: *why didn't turning this off work?* Because the key was unset, not set to `false`, so the default applied — and several defaults are permissive.
-
-| Question | Answer |
-| --- | --- |
-| Who stores the `auth` block? | The API, as part of the environment payload. |
-| Who reads it? | Akountz, on every request that needs behaviour settings. |
-| Who edits it in the UI? | Studio's **Users & auth** → **Configuration** tab. |
-| Is `project` or `env` part of the block? | No. Both are supplied by the caller. |
-| What happens to a key you leave out? | The default applies silently. |
-| How long does a change take to take effect? | Up to the config cache TTL, default ten seconds. |
-| Is there a TOML file for this? | No. Configuration is JSON throughout. |
-
-<Info>
-The full field table, every default, and the Studio walkthrough for each control are on [Authentication configuration](/auth/configuration). This page only needs the ownership model; that page needs the fields.
-</Info>
-
-Two structural points about the fields themselves. First, `project` and `env` are dataclass fields but are *not* copied from the payload — the caller supplies them, because they are how the config is looked up in the first place. `project_name` and `public_url` are likewise not copied from the `auth` object; they come from the surrounding environment payload. Everything else comes straight out of `auth`.
-
-Second, and this is the one that bites: **a key explicitly set to `null` is treated as absent.** The copy from the API payload ignores null values. So `"signup_enabled": null` does not mean "off" or "unknown" — it means "use the default", which is on.
-
-## The three layers in one request
-
-With the model in place, a single authenticated request is far easier to follow than it looks. The gateway attaches context, the user backend verifies, and a `Principal` appears for policies — with no call back to the identity service on the request path.
-
-<Steps>
-  <Step title="The gateway attaches request context">
-    The gateway signs a context token naming the project, environment, and credential on the request, and forwards it in the `X-Pawabase-Context` header. Every service reads project and environment from that header rather than from a URL path. A context header that fails verification is dropped rather than rejecting the request, so public routes keep working; routes that genuinely need a project ask for the context explicitly.
-  </Step>
-  <Step title="The user backend verifies the bearer token">
-    The user backend reads `project` and `env` from the request context and passes them into token verification along with the installation's master secret. Verification checks the per-environment signature, confirms the token is an access token, and confirms the `prj` and `env` claims match.
-  </Step>
-  <Step title="A verified caller becomes a Principal">
-    The verified claims are packed into the identity string the framework carries on the request, and the principal loader turns them back into an object. Nothing is fetched — the claims were already verified, so no database round trip to Akountz happens while serving a request.
-  </Step>
-  <Step title="Policies read the auth context">
-    Storage rules, route policies, and realtime channel rules all read the same `auth` object. It exposes `authenticated`, `kind`, `user_id`, `email`, `roles`, `permissions`, `org`, `org_role`, `aal`, `session_id`, and the raw `claims`.
-  </Step>
-</Steps>
-
-The reason step two needs the context at all is worth stating explicitly: **the verifier cannot know which environment to check against without being told.** That is the entire reason context exists. Without it there would be no way to decide which derived key to verify against, and the per-environment isolation described earlier would collapse.
-
-<Note>
-Order matters inside a service. The context middleware is registered after the authentication backends are constructed, because the framework builds middleware inside-out — the context must be resolved before the user backend runs, or the backend has no `project` and `env` to verify against. If you add auth to your own service, that ordering is not optional.
-</Note>
-
-## Four callers, not one
-
-Policies do not see "a signed-in user". They see a caller with a `kind`, and the four kinds behave differently enough that a policy which ignores `kind` will surprise you.
-
-| `kind` | Who it is | How it authenticates | What it can do |
-| --- | --- | --- | --- |
-| `user` | A project's end user | A bearer access token issued by Akountz for one project and environment | Whatever its roles and permissions allow. |
-| `operator` | A Studio operator | A bearer token for the reserved platform environment | Elevated. A caller with the `admin` role in this kind passes permission checks broadly. |
-| `service` | Another Pawabase service | A short-lived token addressed to that service by name | Elevated in the same way, when it carries the `admin` role. |
-| `anonymous` | Nobody | No credentials | Nothing. The auth context is the empty one. |
-
-The elevated cases are the reason to be careful. A service token or an operator token that carries `admin` satisfies a permission check without holding any specific permission at all. A policy that only tests `authenticated` will therefore let those callers through to operations that were meant for ordinary users.
-
-<Warning>
-If a policy reads only `$auth.authenticated` and you later add an operator-only or service-to-service caller to that operation, the policy grants access by accident. Test `kind` explicitly, or require a specific permission, on anything an internal caller has no business reaching.
-</Warning>
-
-The empty auth context that an unauthenticated request gets is not the same as having no context at all. An anonymous request still carries project and environment context; what it lacks is `user_id`. That distinction lets you write "public, but scoped to this project" policies without special-casing.
-
-### What the auth context looks like to a policy
-
-| Field | Anonymous | Authenticated |
-| --- | --- | --- |
-| `authenticated` | `false` | `true` |
-| `kind` | `"anonymous"` | `"user"`, `"operator"`, or `"service"` |
-| `user_id` | `null` | The subject claim |
-| `email` | `null` | The email claim, if present |
-| `roles` | `[]` | The roles read at issue time |
-| `permissions` | `[]` | The permissions read at issue time |
-| `org`, `org_role` | `null` | The session's organization and the caller's role in it |
-| `aal` | `null` | `"aal1"` or `"aal2"` |
-| `session_id` | `null` | The token family |
-| `claims` | `{}` | The full verified claim set |
-
-Writing policies against this is covered on [Auth in policies](/auth/auth-in-policies), with the context conditions themselves in [Conditions](/policies/conditions) and the surrounding model in [Policy context](/policies/context).
-
-## Headers a client actually sends
-
-Pawabase authentication is a handful of headers. The TypeScript SDK sets them and manages a user
-session; other clients can follow the same wire contract described in
-[Client integration](/auth/client-integration).
-
-| Header | Carries | Notes |
-| --- | --- | --- |
-| `Authorization: Bearer <access_token>` | A project user's access token | The only thing that makes a request an application user. |
-| `apikey: <key>` | A project API key | Identifies the project and environment for service-level calls. |
-| `X-Pawabase-Context` | A gateway-signed context token | Names project, environment, and credential. Not something a browser sets by hand. |
-| `x-pawabase-service` | The calling service's name | Present on service-to-service calls. |
-
-Two mistakes account for most header-related failures. The first is sending the key and the user token from different environments — the gateway resolves the environment from the key, then verifies the token against *that* environment, and a mismatch fails. The second is attempting to construct the context header yourself. It is signed by the gateway; a hand-built one fails verification and is silently dropped, at which point the request loses its project entirely and any route that needs one rejects it.
-
-<Info>
-An unauthenticated context and an anonymous context are different things. A request with no bearer token still has context — project and environment are known. What it lacks is `user_id`. Context is about *where* the request is; authentication is about *who* is making it.
-</Info>
-
-For how the key and token are obtained and stored, see [API keys](/operate/api-keys) and [Tokens and sessions](/auth/tokens-and-sessions).
-
-## One endpoint, three grants
-
-Everything that produces a token pair goes through **one** endpoint: `POST /auth/v1/token`. The `grant_type` field selects which of three things you are asking for.
-
-| `grant_type` | Required fields | What it does |
-| --- | --- | --- |
-| `password` | `email`, `password` | Verifies a password and, if MFA is enrolled, returns a challenge instead of tokens. |
-| `refresh_token` | `refresh_token` | Rotates the pair. Optionally switches the session's organization. |
-| `mfa` | `mfa_token`, `code` | Completes a challenge and issues an `aal2` session. |
-
-There is no `/oauth/token`. There is no `grant_type=authorization_code`. There is no client-credentials grant here — service-to-service calls use service tokens, described in [Secrets](/operate/secrets). Readers coming from an OAuth mental model will look for endpoints that do not exist, so it is worth stating this early.
-
-`grant_type` defaults to `password` if omitted, and it can also be supplied as a query parameter, which takes precedence over the body.
-
-### The optional `org` field, and its three-way distinction
-
-`org` names an organization slug for the tokens being issued. On a password grant it scopes the session. On a refresh grant its behaviour is subtler, and it is expressed in source by a module-level sentinel rather than by a null check:
-
-| What you send | What happens to the session's organization |
-| --- | --- |
-| `"org": "acme"` | Switches the session to that organization. Membership is required, or the request is rejected with 403. |
-| `"org": null` | Leaves the session with **no** organization. This is not the same as omitting it. |
-| `org` omitted entirely | Keeps whatever organization the session already had. |
-
-Three states, one field, and the difference between the second and third is invisible unless you know about it. An SDK or a form serialiser that always sends `org: null` will silently strip the organization from every refresh.
-
-<Warning>
-If your client's refresh call includes `"org": null` because the object was built from a template, you are detaching the session from its organization on every single refresh. The correct default is to omit the key entirely.
-</Warning>
-
-### Why the sign-in response is shaped the way it is
-
-The token response is identical across password sign-in, refresh, magic-link completion, and MFA completion. One shape means one code path in your client. The exact fields are covered under [Tokens and sessions](/auth/tokens-and-sessions); the reason it is stable across all four is that all four produce the same thing — a session — and only differ in how the caller proved who they are first.
-
-## The token response
-
-Every successful grant returns the same body. This is the shape to code against:
-
-```json
-{
-  "access_token": "...",
-  "refresh_token": "...",
-  "token_type": "bearer",
-  "expires_in": 900,
-  "expires_at": 1750000000,
-  "session_id": "<token family hex>",
-  "org": null,
-  "org_role": null,
-  "user": { }
-}
+<CodeGroup>
+```bash TypeScript
+npm install @pawabase/client
 ```
 
-<ResponseField name="access_token">The bearer token. Short-lived, and the only credential you attach to resource requests.</ResponseField>
-<ResponseField name="refresh_token">Rotates on every use. Persist the replacement and never send the old one twice.</ResponseField>
-<ResponseField name="token_type">Always `bearer`.</ResponseField>
-<ResponseField name="expires_in">Seconds until the access token expires, from the environment's `access_ttl`.</ResponseField>
-<ResponseField name="expires_at">An absolute Unix timestamp. Convenient for a client that wants one timer instead of a countdown.</ResponseField>
-<ResponseField name="session_id">The token family hex string. This is the session identifier you revoke against, and it is what Studio's session table shows.</ResponseField>
-<ResponseField name="org">The organization slug, or `null`. See the three-way distinction above.</ResponseField>
-<ResponseField name="org_role">The caller's role in `org`, or `null`.</ResponseField>
-<ResponseField name="user">The user record, in the shape described under [Managing users](/auth/managing-users).</ResponseField>
+```bash Python
+pip install pawabase
+```
+</CodeGroup>
 
-<Info>
-`expires_in` and `expires_at` come from `access_ttl` at the moment of issue, so two clients holding tokens from the same environment can see different values if the setting was changed between their sign-ins. Trust `expires_in` over a hardcoded 900 in your client.
-</Info>
+<CodeGroup>
+```typescript TypeScript
+import { createClient } from "@pawabase/client";
 
-### Reading claims safely
+export const pawabase = createClient({
+  url: "https://api.example.com",
+  apiKey: "pb_pk_…",
+  environment: "production",
+});
+```
 
-Decoding a token to read its claims does not verify it. Pawabase exposes that as a distinct operation — peeking at unverified claims — and the distinction matters because a peeked claim set is attacker-controlled.
+```python Python
+from pawabase import Pawabase
 
-Verification checks the signature against the key derived for the environment, checks the audience is the one user tokens use, and confirms the token type marker. Only then are the claims trustworthy. Peeking skips all of that, and it exists in the system for one narrow purpose: learning which environment a token claims to belong to, before you know which key to verify it with.
+pb = Pawabase("https://api.example.com", "pb_pk_…", environment="production")
+```
+</CodeGroup>
 
-<Warning>
-Never make an authorisation decision from peeked claims, and never trust them for anything. A token you did not verify is a string someone handed you. The verification path is the only path where `sub`, `roles`, and `perms` mean anything.
-</Warning>
+`url` is your project's API address, shown on the project page in the dashboard. `environment` names the environment the app talks to. The key already identifies one, so you can leave it out for most calls, but social sign-in, passkey and token helpers, realtime and the management clients use it, so it is good practice to always set it.
 
-Token decoding carries a small leeway — five seconds — so that clock skew between services does not reject a token that is technically a few seconds past its expiry. That is the only tolerance built in.
-
-### How long each token lives
-
-| Token | Lifetime | Source |
-| --- | --- | --- |
-| Access token | `access_ttl`, default 900 seconds | The environment config, read at issue time |
-| Refresh token | `refresh_ttl`, default 30 days | The environment config, read at issue time |
-| One-time link tokens | Per purpose, from fifteen minutes to seven days | Fixed, not configurable |
-
-The relationship between the two session tokens is the interesting design decision. The access token is short because it is self-contained: it carries its own claims, so nothing has to look anything up, and a short life bounds how long a leaked one is useful. The refresh token is long because it is only ever presented to one service, is tracked row by row, and is single-use — so its length costs less than it appears to.
-
-A leaked access token is valid until it expires and can be used freely. A leaked refresh token is valid until it is used, and using it tells the legitimate client something is wrong. The asymmetry is intentional: the credential that is easiest to use is the one that expires fastest.
-
-<Info>
-Because both lifetimes are read from the environment at issue time, an existing session keeps the lifetimes it was created with until it refreshes. Changing `access_ttl` affects new tokens immediately and old tokens at their next refresh — not retroactively.
-</Info>
-
-## How the principal is assembled
-
-Verification produces a set of claims. Turning that into the object your route handler sees takes two steps, and both are worth understanding because they explain why there is no lookup on the request path.
-
-The verified claims are packed into a single identity string, prefixed so the framework can recognise it, and returned by the authentication backend. The framework then calls the principal loader with that string, which unpacks it back into a `Principal`. Nothing is fetched from a database — the claims were already verified, so there is no reason to ask again.
-
-<Info>
-This is why authorisation is fast. A policy reading `roles` is comparing against a list that arrived with the request. The trade is the staleness window described above: role changes need a refresh. Everything else about the design follows from making the request path free of identity queries.
-</Info>
-
-### What a service sees, and what it does not
-
-| Available on the principal | Not available without a call |
-| --- | --- |
-| User id, email, roles, permissions, org, org role, `aal`, session id | Whether the account is *currently* disabled |
-| The full claim set | Any field not placed into the token |
-| — | Anything needing a database read |
-
-That last row has a security consequence worth stating. **Disabling an account does not invalidate tokens already issued.** The sign-in path checks the disabled flag, so a disabled user cannot obtain new tokens and cannot refresh. But an access token they already hold keeps working until it expires.
-
-<Warning>
-For an account you are removing rather than pausing, use both: revoke the sessions *and* disable the account. Revoking stops refreshes producing new access tokens; disabling stops sign-in. Neither reaches an access token already in flight, so shortening `access_ttl` is the only way to bound that window.
-</Warning>
-
-### Adding auth to your own service
-
-Two things have to be true, and the order between them is not a style preference.
-
-The user backend must be configured with the installation's master secret, because that is what the per-environment key is derived from. And the context middleware must be registered so it runs *before* the backend, since the backend needs `project` and `env` from the context to know which key to verify against. The framework composes middleware inside-out, which is why registering the context layer at the right point is what produces the correct execution order.
-
-There is also a deliberate leniency: an unverifiable context header is dropped rather than rejected. The request continues with no context, which keeps public routes working. Routes that need a project ask for the context explicitly and fail if it is missing — so a missing context produces a clear error at the point of use rather than an opaque rejection at the edge.
+The Python client has an async twin, `AsyncPawabase`, with the same methods returning awaitables. Everything on this page works on both; examples show the blocking client.
 
 <Note>
-This leniency is why a broken or hand-built context header does not produce a 401. It produces a request with no project, and the failure surfaces later, at whichever route needed the context. When debugging, that is a useful signature to recognise.
+Accounts are scoped to one environment. The same email address can have a separate account in `staging` and in `production`, with different passwords, roles and sessions. If a user "exists" but sign-in says the email is unknown, you are almost always pointing at the wrong environment.
 </Note>
 
-## Sessions are token families
+## Sign up, sign in, sign out
 
-A session in Pawabase is not a row you look up by id. It is a **token family** — an identifier that groups the access and refresh tokens descended from one sign-in, together with a session row describing it.
+<CodeGroup>
+```typescript TypeScript
+const { session, verificationRequired } = await pawabase.auth.signUp({
+  email: "ada@example.com",
+  password: "correct horse battery staple",
+  name: "Ada Lovelace",
+});
 
-That indirection is what makes rotation and theft detection possible. Because every token in a family shares one identifier, revoking "the session" means revoking the whole family, and detecting that a consumed refresh token came back means you know which family to kill.
+const result = await pawabase.auth.signInWithPassword({
+  email: "ada@example.com",
+  password: "correct horse battery staple",
+});
 
-The session row carries what you need to describe a session to a user:
+if (result.status === "mfa_required") {
+  await result.verify(codeFromAuthenticator);
+}
+
+const user = await pawabase.auth.getUser();
+await pawabase.auth.signOut();
+```
+
+```python Python
+outcome = pb.auth.sign_up(
+    email="ada@example.com",
+    password="correct horse battery staple",
+    name="Ada Lovelace",
+)
+# outcome.session, outcome.verification_required
+
+result = pb.auth.sign_in_with_password(email="ada@example.com", password="correct horse battery staple")
+
+if result.status == "mfa_required":
+    result.verify(code_from_authenticator)
+
+user = pb.auth.get_user()
+pb.auth.sign_out()
+```
+</CodeGroup>
+
+That is the whole loop. After a successful sign-in the SDK keeps the session, sends the access token on every request, and renews it before it expires. You do not handle tokens yourself unless you want to; see [Tokens and sessions](/auth/tokens-and-sessions).
+
+The details of each step, including what happens when a project requires email confirmation, are in [Passwords](/auth/passwords).
+
+## Find out what is enabled
+
+Which methods work depends on how the environment is configured. Ask the API instead of hard-coding it, so one build of your app works against every environment:
+
+<CodeGroup>
+```typescript TypeScript
+const settings = await pawabase.auth.settings();
+
+settings.signup_enabled;
+settings.email_verification_required;
+settings.magic_link_enabled;
+settings.email_code_enabled;
+settings.anonymous_enabled;
+settings.passkeys_enabled;
+settings.mfa_enabled;
+settings.providers;                      // ["github", "google"]
+settings.password_policy.min_length;     // 8
+```
+
+```python Python
+settings = pb.auth.settings()
+
+settings["signup_enabled"]
+settings["email_verification_required"]
+settings["magic_link_enabled"]
+settings["email_code_enabled"]
+settings["anonymous_enabled"]
+settings["passkeys_enabled"]
+settings["mfa_enabled"]
+settings["providers"]                    # ["github", "google"]
+settings["password_policy"]["min_length"]  # 8
+```
+</CodeGroup>
+
+This call needs only the publishable key, so you can make it before anyone signs in. A provider with no credentials configured is left out of `providers`, so a button you render from this list always works.
 
 | Field | Meaning |
 | --- | --- |
-| `family` | The token family hex string. This is what `session_id` in a token response refers to. |
-| `user` | The account this session belongs to. |
-| `project`, `env` | The environment it was created in. |
-| `method` | How the session started: `password`, an OAuth provider name, or similar. |
-| `aal` | Assurance level, `"aal1"` by default and `"aal2"` after MFA. |
-| `org` | The organization the session is scoped to, or null. |
-| `ip` | The address the session was created from. |
-| `user_agent` | The client that created it. This is the "Device" column in Studio. |
-| `last_refreshed_at` | When the pair last rotated. |
-| `revoked_at` | Set when the session ends. |
+| `signup_enabled` | New accounts may be created. When `false`, `signUp` fails with 403. |
+| `email_verification_required` | A new account must confirm its email before it can sign in. |
+| `magic_link_enabled` | [Magic links](/auth/magic-links) are available. |
+| `email_code_enabled` | [Emailed codes](/auth/passkeys-and-codes#emailed-codes) are available. |
+| `anonymous_enabled` | [Guest sessions](/auth/passkeys-and-codes#guest-sessions) are available. |
+| `passkeys_enabled` | [Passkeys](/auth/passkeys-and-codes#passkeys) are available. |
+| `mfa_enabled` | Users may enrol a [second factor](/auth/mfa). |
+| `providers` | Social providers with working credentials ([Social login](/auth/social-login)). |
+| `password_policy` | The rule a new password must meet: `kind` (`basic` or `strict`) and `min_length`. |
 
-A session counts as active only if it is unrevoked *and* has an unexpired, unconsumed, unrevoked refresh token behind it. That is why a session can vanish from Studio's list without anyone signing it out — the refresh token expired.
+## Settings that need the dashboard
 
-### What sign-out actually does
+Most of authentication is code. A few switches are project configuration, and you set them once in Studio under **Users & auth** before the matching SDK call will work:
 
-Sign-out takes a scope, and the three scopes behave very differently:
-
-| Scope | Effect |
+| You want to… | Configure first |
 | --- | --- |
-| `local` | Ends this session only. |
-| `global` | Revokes every token for the user, across all their sessions. |
-| `others` | Ends every session except the one making the request. |
+| Let people register | Turn on sign-up. |
+| Require email confirmation | Turn on email verification, and add your app's address to the allowed redirect URLs. |
+| Use magic links, emailed codes, guests or passkeys | Turn the method on. Passkeys also need your site's domain. |
+| Offer social sign-in | Add the provider's client id and secret, and allow your redirect URL. |
+| Set a stronger password rule | Choose the `strict` policy and a minimum length. |
+| Add roles | Create the roles and default roles you want new users to get. |
 
-Revocation revokes the token family, and the session row is marked revoked in the same operation. Both happen so that the two sources of truth do not drift.
+[Authentication configuration](/auth/configuration) explains each setting and what the SDK sees when it changes. Anything not listed here, you do in code.
 
-<Warning>
-Sign-out revokes the *family*. An access token you were already holding may still verify until it expires, because access tokens are self-contained and short-lived — that is the point of the short lifetime. Revocation stops the family from ever producing another access token. If you need the current token dead immediately, shorten `access_ttl` or treat client-side sign-out as authoritative for that device.
-</Warning>
+## The user
 
-### Theft detection
+`getUser()` returns the signed-in person, fresh from the server. The same object is cached on the session as `session.user`.
 
-Refresh tokens are single-use. Presenting one that was already consumed is treated as a compromise, not as a client bug:
-
-| What you present | What happens |
-| --- | --- |
-| A refresh token whose `jti` is unknown | It fails. Nothing is revoked — there is no family to revoke. |
-| A refresh token whose row is already revoked | The **entire family** is revoked, and the failure says possible token theft. |
-| A refresh token that was already consumed | The **entire family** is revoked, and the failure says possible token theft. |
-
-This is deliberately aggressive, and it is correct. If a refresh token comes back after being consumed, either an attacker replayed a stolen token or a legitimate client is broken — and in both cases the safe assumption is that the family is compromised. The legitimate client still holds a working token; the attacker holds a used one. Killing the family forces both to re-authenticate, which is the outcome you want.
-
-A reuse event also emits an event you can subscribe to, so you can alert on it rather than discovering it from user reports. See [Events](/events/overview).
-
-### Why theft detection is aggressive on purpose
-
-Rotation and theft detection are two halves of one mechanism, and you cannot have the first without accepting the second.
-
-A single-use refresh token gives you a strong property: a stolen refresh token is useful exactly once. But that property creates a new problem. If the legitimate client and an attacker both hold the same token, whichever uses it first gets a new token and the other is left holding a dead one. Without detection, the attacker's refresh simply fails while the legitimate user's session mysteriously breaks — and you have no signal.
-
-So a reused token is treated as evidence of compromise rather than as a client error. The whole family dies. The attacker is cut off. The legitimate user is signed out and signs in again, which is a mild inconvenience instead of a silent account takeover.
-
-<Warning>
-The cost is real, and it is concentrated on one client bug: two concurrent refreshes. Every protected request that discovers an expired token and refreshes independently will occasionally fire two at once, and one of them will be treated as theft. Serialise refreshes in the client — one in-flight refresh per environment, with other requests waiting on it — and this failure mode disappears. It is the single most valuable piece of advice on this page.
-</Warning>
-
-The distinguishing detail is that an *unknown* token does not trigger family revocation, because there is no family to revoke and no evidence of anything. Only a token with a known identity that is already revoked or already consumed counts as reuse.
-
-### What a client must do
-
-| Requirement | Why |
-| --- | --- |
-| Persist the replacement refresh token immediately. | The old one is consumed. Not storing it means signing the user out. |
-| Never send the same refresh token twice. | The second attempt is treated as theft. |
-| Allow exactly one in-flight refresh. | Concurrent refreshes are the main benign cause of false theft detection. |
-| Handle a revoked session distinctly from an expired token. | A revoked session will not recover by retrying. Send the user back to sign-in. |
-| Sign out locally when the server rejects the session. | Otherwise the client loops against a dead credential. |
-
-See [Client integration](/auth/client-integration) for the code, and [Tokens and sessions](/auth/tokens-and-sessions) for the full rotation reference.
-
-### Why a role change needs a refresh
-
-Roles and permissions are read **at token issue time** and baked into the access token. Nothing reads them from the database while serving a request.
-
-That is a deliberate trade. It means authorisation is a local, side-effect-free comparison against verified claims rather than a database query per request. The cost is that a role change is invisible to already-issued tokens until they are replaced.
-
-| What you change | When existing tokens see it |
-| --- | --- |
-| A user's roles in Studio | On the next refresh, or the next sign-in. |
-| A role's permission set | On the next refresh. Existing tokens keep the old permission list. |
-| An organization membership | On the next refresh. `org_role` is read at issue time. |
-| Disabling the account | Immediately. The sign-in path checks the disabled flag, and an already-loaded principal is rejected. |
-| Revoking a session | Immediately for future refreshes. A held access token lasts out its lifetime. |
-
-<Warning>
-An access token's default lifetime is fifteen minutes. That is the window in which a removed role still grants access. It is a deliberate trade of a small, bounded staleness window against a per-request authorisation query.
-</Warning>
-
-The practical consequence for testing: after changing a role in Studio, refresh the token before asserting the new behaviour. Otherwise you will conclude the role change did not apply when it applied perfectly.
-
-## The `auth` block at a glance
-
-The full reference is on [Authentication configuration](/auth/configuration). This table is the shape of the block, so you can recognise which key you are looking at.
-
-| Key | Default | Governs |
+| Field | Type | Notes |
 | --- | --- | --- |
-| `project`, `env` | — | Supplied by the caller. Not part of the payload. |
-| `project_name` | `""` | Display name used in emails. |
-| `signup_enabled` | `true` | Whether `POST /auth/v1/signup` creates accounts. |
-| `require_email_verification` | `false` | Whether unverified users are refused at sign-in. |
-| `password_policy` | `"basic"` | Length rule, or the full validator under `strict`. |
-| `password_min_length` | `8` | Characters. |
-| `access_ttl` | `900` | Seconds. Fifteen minutes. |
-| `refresh_ttl` | `2592000` | Seconds. Thirty days. |
-| `magic_link_enabled` | `true` | Whether passwordless link sign-in is offered. |
-| `mfa_enabled` | `true` | Whether users may enrol TOTP. |
-| `site_url` | `""` | The application base URL redirects land on. |
-| `redirect_urls` | `[]` | Extra allowed redirect prefixes. |
-| `providers` | `{}` | Per-provider OAuth config, keyed by name. |
-| `default_roles` | `[]` | Roles granted at account creation. |
-| `emails` | `{}` | Per-message subject and text overrides. |
-| `public_url` | `""` | Where Akountz itself is reachable. Falls back to its own setting. |
+| `id` | string | Stable identifier. Use it as the foreign key in your own tables. |
+| `email` | string | Lower-cased. `null` for a guest. |
+| `username` | string | Optional; derived from the email when you do not set one. |
+| `name`, `avatar_url` | string | Profile fields the user can edit. |
+| `email_verified`, `email_verified_at` | boolean, time | Whether the address was confirmed. |
+| `user_metadata` | object | Profile data the **user** may edit. Never use it for authorization. |
+| `app_metadata` | object | Data only your server (a secret key) or Studio can edit. Safe for authorization. |
+| `roles` | string[] | Roles granted to the user. |
+| `mfa_enabled` | boolean | Whether a second factor is on. |
+| `identities` | array | Linked sign-in methods (a password, GitHub, and so on). |
+| `created_at`, `last_sign_in_at` | time | |
+| `is_anonymous` | boolean | `true` for a guest session. |
 
-Two behaviours behind that table are worth carrying into every other page:
+`getUser()` also reports `aal` (the assurance level: `aal1` after a password, `aal2` after a second factor) and `session_id` for the current session.
 
-**An unset key means the default, not "off".** Every default above is permissive in some way: sign-up on, verification off, magic links on, MFA on. If you expected a disabled feature, check that the key is actually set to `false` rather than absent.
+Update the profile with `updateUser`; see [Passwords](/auth/passwords#change-profile-password-or-email).
 
-**Editing the block does not take effect instantly.** Each environment's config is cached for the config TTL, default ten seconds. A save in Studio, then an immediate retry, can hit the old config.
+## The session
 
-<Warning>
-A key explicitly set to `null` is treated as absent. `{"signup_enabled": null}` enables sign-up.
-</Warning>
+A successful sign-in produces a session:
 
-## The reserved platform environment
+| Field | Notes |
+| --- | --- |
+| `access_token` | A short-lived signed token (15 minutes by default) sent on every request. |
+| `refresh_token` | Used once to get the next pair. The SDK handles it. |
+| `expires_in`, `expires_at` | Lifetime in seconds, and the Unix time it ends. |
+| `session_id` | Identifies this sign-in; use it to list and revoke sessions. |
+| `org`, `org_role` | The organization the token was issued for, and the user's role in it, when the user works inside one. |
+| `user` | The user object above. |
 
-Not every environment is yours to configure. There is one reserved environment, `_platform`, which holds Studio's own operators — the accounts you sign into Studio with.
+## Every way in
 
-It is configured in Akountz rather than in the API, because the API does not host it. That means it is **hardcoded and not editable from Studio's Configuration tab**. Its values differ from the ordinary defaults, and the differences are deliberate:
-
-| Setting | Ordinary default | Platform value |
+| Method | SDK entry points | Page |
 | --- | --- | --- |
-| `signup_enabled` | `true` | `false` |
-| `password_policy` | `"basic"` | `"strict"` |
-| `password_min_length` | `8` | `10` |
-| `access_ttl` | `900` | `3600` |
-| `refresh_ttl` | 30 days | 7 days |
-| `magic_link_enabled` | `true` | `false` |
+| Email and password | `signUp`, `signInWithPassword` | [Passwords](/auth/passwords) |
+| Confirm an email address | `verifyEmail`, `resendVerification` | [Email verification](/auth/email-verification) |
+| Forgotten password | `requestPasswordReset`, `resetPassword` | [Password recovery](/auth/password-recovery) |
+| Magic link | `signInWithMagicLink`, `verifyMagicLink` | [Magic links](/auth/magic-links) |
+| Emailed code | `sendEmailCode`, `verifyEmailCode` | [Passkeys, codes and guests](/auth/passkeys-and-codes) |
+| Passkey | `passkeys.register`, `passkeys.signIn` | [Passkeys, codes and guests](/auth/passkeys-and-codes) |
+| Guest | `signInAnonymously`, `upgradeAnonymous` | [Passkeys, codes and guests](/auth/passkeys-and-codes) |
+| GitHub, Google and others | `signInWithOAuth`, `exchangeCode` | [Social login](/auth/social-login) |
+| Second factor | `mfa.*`, `verifyMfa` | [Multi-factor authentication](/auth/mfa) |
 
-Read that as a statement about what operators are: nobody self-registers into the platform environment, passwords must satisfy the full validator and be at least ten characters, and magic-link sign-in — which relies on unattended email delivery — is off. Sessions last longer than ordinary user sessions because an operator session that expires mid-deploy is an operational problem, but not longer than a week because an operator credential is high-value.
+Naming follows each language: TypeScript uses `camelCase` (`signInWithPassword`), Python uses `snake_case` (`sign_in_with_password`). Python keyword arguments mirror the TypeScript object fields.
 
-<Note>
-This is also why a Studio operator account and an application user account are different things. Signing into Studio proves nothing about whether your application's sign-in works, and granting a role in your application's environment has no effect on Studio's own access. If you are testing your app, use an application user in the environment you are testing.
-</Note>
+## After sign-in
 
-## Rate limits
+| To… | Use |
+| --- | --- |
+| Keep, renew and end sessions; run auth on a server | [Tokens and sessions](/auth/tokens-and-sessions) |
+| Let users work inside a company or team | [Organizations](/auth/organizations) |
+| Grant permissions | [Roles and permissions](/auth/roles-and-permissions) |
+| Create, find, update and disable accounts from your server | [Managing users](/auth/managing-users) |
+| Write rules that read the signed-in user | [Auth in policies](/auth/auth-in-policies) |
+| Build sign-in screens for React or mobile | [Client integration](/auth/client-integration) |
 
-Two rate-limit namespaces cover the auth surface, and they are not interchangeable:
+## Handle errors
 
-| Namespace | Limit | Window | Covers |
+Failures arrive as typed errors in both SDKs, so you branch on the class or the status rather than parsing a message.
+
+| Situation | Status | TypeScript | Python |
 | --- | --- | --- | --- |
-| `akz:auth` | 30 | 60 seconds | Sign-up and the token endpoint. |
-| `akz:mfa` | 10 | 60 seconds | The MFA endpoints. |
-
-Both share one bucket across sign-up and token exchange, so they compete: a burst of sign-up attempts consumes the same allowance as sign-in attempts. The MFA namespace is tighter because guessing a six-digit code is cheap per attempt, and ten a minute is enough for a legitimate human.
-
-The counters are backed by Redis when a Redis URL is configured. Without one they fall back to an in-process counter, which means the limit is per process rather than shared — relevant if you run more than one instance and expect the limit to hold globally.
-
-<Info>
-These are per-client limits on top of the per-account lockout described below. They are independent mechanisms answering different attacks: rate limiting slows a distributed guessing attempt against many accounts, while lockout stops repeated guessing against one account from one client.
-</Info>
-
-## Account lockout
-
-Lockout is per account and is driven by a counter on the user row. It is **not** part of the per-environment `auth` config, which surprises people who go looking for a `lockout_threshold` key next to `password_min_length`.
-
-| Setting | Default | Scope |
-| --- | --- | --- |
-| `lockout_threshold` | 10 | Failed sign-ins before the account locks. |
-| `lockout_minutes` | 15 | How long the lock lasts. |
-
-<Warning>
-These are Akountz **installation** settings, not per-environment auth configuration. The lockout policy is therefore global across every environment on that instance, while the failure counters it operates on live per environment. One shared threshold, per-environment state.
-</Warning>
-
-The behaviour is deliberately blunt, and reading the implementation closely explains it:
-
-- A failed sign-in increments `failed_logins`.
-- When the counter reaches the threshold, `locked_until` is set to now plus the lock duration **and the counter resets to zero**. That reset is why a long-lived attack gets a fresh window rather than being locked out forever.
-- An account is locked exactly when `locked_until` is set and in the future. A stale `locked_until` in the past is simply ignored — there is no separate "is locked" flag to clear.
-- A successful sign-in resets the counter and clears the lock.
-
-<Note>
-Because the counter resets when the lock is applied, an attacker who keeps trying is re-locked every threshold attempts rather than being permanently locked out. That bounds the damage without permanently denying service to a legitimate user who fat-fingers their password repeatedly.
-</Note>
-
-MFA code failures feed the same counter. There is no separate MFA lockout.
-
-## How the account record is shaped
-
-Sign-in looks users up by normalised email, but the record carries more identity than that. Two fields drive a surprising amount of downstream behaviour.
-
-### Email is normalised, and everything follows from it
-
-Email normalisation strips surrounding whitespace and lowercases the whole address, then requires a shape with an `@`, no whitespace in the local or domain part, and at least one dot after the `@`. An address failing that check, or one longer than 255 characters, is rejected outright.
-
-<Warning>
-Because the address is lowercased before it is stored, **every lookup is lowercase**. A user who signs up as `Ada@Example.com` is stored as `ada@example.com`, and searching for the capitalised form finds nothing. This is the second most common cause of "the account does not exist" after the environment mismatch.
-</Warning>
-
-Duplicate emails inside one `project` + `env` pair are refused. The same email in two environments is not a duplicate, because those are different accounts by the tenancy rule.
-
-### Usernames are derived, not chosen
-
-Every user gets a username, and it is generated rather than required from the caller. The algorithm explains the odd values you will see:
-
-1. Start from the supplied name, or the email's local part if none was supplied.
-2. Lowercase it, strip every character outside `a-z`, `0-9`, `_`, `.` and `-`.
-3. Truncate to 40 characters.
-4. If nothing survives, fall back to `"user"`.
-5. If that is taken in this environment, append a random number below 10,000 and retry.
-
-So `Ada Lovelace` becomes `adalovelace`, and `ada+work@example.com` becomes `adawork`. The collision suffix is random rather than sequential, so you should never parse meaning out of a username. If you supplied a username explicitly and it collides, that is a hard error instead — the fallback only applies to derived names.
-
-<Note>
-The uniqueness check is per environment, so two environments can derive the same username for the same email without either of them noticing.
-</Note>
-
-## Usernames and emails
-
-(Username derivation and email normalisation are covered above, under [How the account record is shaped](#how-the-account-record-is-shaped).) The rules that follow from them apply everywhere a user is looked up by hand — Studio search, admin routes, backups, and support.
-
-<AccordionGroup>
-  <Accordion title="Case sensitivity">
-    Emails are stored and compared lowercase, always. There is no case-sensitive path and no way to have two accounts differing only in case. Usernames are also lowercased during derivation. Nothing else is normalised — a display name keeps whatever case you supplied.
-  </Accordion>
-  <Accordion title="Length limits">
-    Email is capped at 255 characters and the cap is enforced during validation, not by a silent truncation. Name is capped at 200, username at 150, the derived username at 40, avatar URL at 2048, and IP at 64.
-  </Accordion>
-  <Accordion title="Deleting vs disabling">
-    A disabled account keeps its row, its roles and its history, and is refused at sign-in with a distinct reason. A deleted account is soft-deleted and disappears from lookups. Both are scoped to one environment. The difference matters for support: disabling is reversible, deleting is not, and the sign-in event log distinguishes them.
-  </Accordion>
-</AccordionGroup>
-
-## Users who have no password
-
-An account can exist without a password. This is not a corrupt state — it is the normal state for OAuth-only accounts and for accounts an operator created in Studio.
-
-When an account is created without a password, the password is set to **unusable** rather than empty. The distinction matters: an unusable password can never match any input, so password sign-in fails cleanly, while an empty-string password would in principle match an empty submission.
-
-That is why an admin-created user cannot sign in with a password until one is set — through Studio's **Set password** action, or by having the user use a recovery link. The Studio hint on the **New user** modal says exactly this: *"Leave empty to have the user set one through a recovery link."*
-
-| How the account was created | Does it have a password? |
-| --- | --- |
-| `POST /auth/v1/signup` | Yes, always. The field is required. |
-| Studio **New user** with a password | Yes. |
-| Studio **New user** with the password left empty | No. Unusable until set. |
-| First social sign-in | No. The user has an identity, not a password. |
-| Magic link first | No. Same as above. |
-
-<Note>
-This also means "let people sign in with a password *or* a provider" needs no special handling — but "let people who signed up with a provider later use a password" does. They set one via recovery, and once set it coexists with the provider identity. See [Social login](/auth/social-login).
-</Note>
-
-## Auth emails
-
-Exactly five kinds of message exist, and every one of them can be overridden per environment:
-
-| Kind | Sent when | Default subject |
-| --- | --- | --- |
-| `verify` | Sign-up with verification required, or a resend request | `Confirm your email for {project}` |
-| `recovery` | A password reset is requested | `Reset your {project} password` |
-| `magic` | A sign-in link is requested | `Your {project} sign-in link` |
-| `invite` | Someone is invited to an organization | `You are invited to {organization} on {project}` |
-| `email_change` | A user requests a new email address | `Confirm your new email for {project}` |
-
-Placeholders available are `{project}`, `{link}`, and `{email}`, plus `{organization}` and `{role}` for invitations.
-
-<Info>
-An unknown placeholder is left in the message literally rather than raising an error. A typo therefore shows up as stray text in the delivered mail rather than as a failed send. This is a deliberate choice — a broken template should be visible to the person receiving it rather than silently swallowed.
-</Info>
-
-Two things about delivery are worth knowing before you debug "the email never arrived". First, delivery goes through the API's mail service, so it uses the **environment's** SMTP settings — an environment with working mail and one without produce completely different behaviour from identical templates. Second, the plain-text template is also HTML-escaped and converted for the HTML part, with newlines becoming line breaks and the `{link}` value wrapped in an anchor. A template containing raw HTML will appear escaped.
-
-### Where the link points
-
-The destination of a link depends on whether the environment has a `site_url`:
-
-| `site_url` | Where the link goes |
-| --- | --- |
-| Set | Your application, at `{site_url}/auth/callback?token=...&type=...` |
-| Empty | Akountz's own hosted page, at `{public_url}/auth/v1/links/{project}/{env}/{kind}?...` |
-
-This is a real, visible difference: with no `site_url`, users land on an Akountz-hosted page rather than inside your application. It works, but it is not branded and it does not share your application's session handling. `redirect_to` is added to the link when the caller supplied one.
-
-<Warning>
-An environment with no `site_url` still works, but magic-link and OAuth redirects land on Akountz's own domain. If you are seeing a Pawabase-branded page where you expected your app, the environment's **Site URL** is empty — it is on the **URLs** section of the Configuration tab.
-</Warning>
-
-Per-message overrides are edited under **Email templates** in Studio's Configuration tab, with a **Reset to default** button per message. Editing a template does not configure delivery; mail still has to be working.
-
-## One-time tokens
-
-Behind every emailed link is a row and a signature. The token itself is a signed reference to that row, and the two halves do different jobs: the signature makes it unforgeable and time-limited, and the row makes it single-use and revocable.
-
-A one-time token row carries an id, the project and environment it belongs to, a purpose, the user it concerns, an expiry, and — critically — the moment it was used.
-
-| Purpose | Default lifetime |
-| --- | --- |
-| `magic` | 15 minutes |
-| `mfa` | 5 minutes |
-| `link` | 10 minutes |
-| `recovery` | 1 hour |
-| `verify` | 24 hours |
-| `email_change` | 24 hours |
-| `invite` | 7 days |
-
-The lifetimes are ordered by how much the user is trusted to act quickly. A sign-in link is short because it grants access; a verification link is long because the user may not check their inbox for hours and the link only confirms an address.
-
-### Consumption is a race, and it is won safely
-
-Validating a token verifies the signature against the per-purpose maximum age, then looks up the row and checks it. All three of those failures produce the *same* error: already used, expired, and nonexistent are indistinguishable to the caller.
-
-The interesting part is how single-use is enforced. Rather than read-then-write, consumption performs a **conditional update**: it updates the row only where `used_at` is still null, and if that update matched zero rows, someone else got there first. The request that loses the race is told the token is invalid.
-
-<Note>
-This matters more than it looks. A double-clicked magic-link button, or a link prefetcher in a mail client hitting the URL before the user does, is a real occurrence. With a read-then-write implementation both requests would succeed and two sessions would be created from one link. With a conditional update, one succeeds and the other is rejected.
-</Note>
-
-There is also a peek mode that validates without consuming, which is what lets a page render its form before the user submits anything. Peeking twice is harmless; consuming twice is not.
-
-<Warning>
-The error message for a used link is the same as for an expired one. If a user reports "I clicked the link and it said invalid" and they genuinely clicked it seconds ago, look for a prefetcher or a double submission rather than assuming the expiry is too aggressive.
-</Warning>
-
-## Social sign-in, in outline
-
-Only four providers ship with Pawabase. Any other name is treated as a generic OAuth provider, which means **you must supply its endpoints**:
-
-| Key | Class |
-| --- | --- |
-| `google` | `GoogleOAuthProvider` |
-| `github` | `GithubOAuthProvider` |
-| `discord` | `DiscordOAuthProvider` |
-| `microsoft` | `MicrosoftOAuthProvider`, which accepts a `tenant` |
-
-<Warning>
-There is no Apple, Facebook, or LinkedIn provider. If you need one, it is a generic provider and you supply `authorize_endpoint`, `token_endpoint`, and `userinfo_endpoint`. A generic provider missing any of those three fails with a 500 saying it needs them. OIDC is used when `openid` appears among the scopes.
-</Warning>
-
-The callback URL is `{public_url}/auth/v1/callback/{project}/{env}/{provider}`. Both the project and the environment are **in the path**, unlike every other route, because these are browser navigations rather than context-scoped API calls — there is no gateway header to read the environment from.
-
-### The rule that catches people
-
-A provider is only reported to clients if it is enabled *and* has a `client_id`. Both the settings endpoint and the provider builder apply that same filter, so a provider you believe you enabled but gave no client id to is **invisible in the client and 404s on use**. There is no partial state in between.
-
-### How an account is resolved
-
-The callback decides which account to sign into, and the order of the checks is the substance of social sign-in:
-
-1. If the state carries a link token, consume it and attach the identity to that user. If the identity already belongs to somebody else, it fails as already linked.
-2. Otherwise, look up an `Identity` by project, environment, provider, and subject.
-3. Otherwise — and **only if the provider says the email is verified** — match an existing account by email.
-4. Otherwise, create an account, but only if sign-up is enabled. An existing unverified account conflicts, and a profile with no email cannot be used.
-5. Finally, if the account is disabled, the attempt fails as a disabled account.
-
-Step three's verified-email requirement is the security-relevant line in that list: an unverified provider email never attaches itself to an existing account.
-
-Errors come back as a redirect to the target with the code in the **URL fragment**, not the query string — as do success payloads carrying the tokens. Fragments are not sent to servers or written to access logs on the redirect hop, which is exactly why they are used.
-
-See [Social login](/auth/social-login) for the full flow, and note that credentials are referenced as `secret://NAME` rather than pasted into the configuration.
-
-## Multi-factor authentication, in outline
-
-MFA raises a session's assurance level rather than replacing it. A session starts at `aal1`; completing a challenge moves it to `aal2`, and that value is what policies check when they want to require a second factor.
-
-The shape of the flow is the same for every method that needs a second factor:
-
-1. The first factor succeeds, but because the user has MFA enrolled and the environment allows it, the response is a challenge rather than tokens — `mfa_required`, an `mfa_token`, and the accepted factor kinds.
-2. The client collects a code.
-3. The client posts it back with the `mfa` grant.
-4. The session is issued at `aal2`.
-
-| Field | Meaning |
-| --- | --- |
-| `mfa_token` | A one-time token identifying the pending challenge. Five-minute lifetime. |
-| `factors` | Which kinds of code the client should collect. Currently `totp` and `recovery_code`. |
-| `code` | What the user typed. |
-
-An `mfa_token` is **not** an access token. It authorises nothing and cannot be attached to resource requests. Treating it as one is the most common MFA integration bug.
-
-<Warning>
-Recovery codes are shown exactly once. They are stored hashed, so they cannot be recovered, displayed later, or reset without invalidating the old set. The **MFA reset** action in Studio deletes both factors and recovery codes together — a user who loses their authenticator needs new recovery codes, not just a new factor.
-</Warning>
-
-See [MFA](/auth/mfa) for enrolment, the challenge, and recovery-code handling.
-
-## Roles and permissions, in outline
-
-There is no role model. A role is a `Group` plus the permissions attached to it, and the permissions on a user are the union of their group's permissions and any granted directly.
-
-Because permission names in the underlying tables are unique across a whole database while Akountz serves many environments, names are stored prefixed with the environment — `acme/production/editor` internally — and the prefix is stripped on the way out. You therefore always work with bare names like `editor`, and you can create a role with the same name in two environments without them colliding.
-
-| Concept | Real model |
-| --- | --- |
-| A named permission | `Permission` |
-| A named bundle of permissions | `Group` |
-| A permission granted straight to a user | `UserPermission` |
-| A user belonging to a group | `UserGroup` |
-| A permission belonging to a group | `GroupPermission` |
-
-`GET /auth/v1/settings` does not report roles, so a client discovers what a user has from the token response and from `GET /auth/v1/user` — not from a separate roles endpoint at sign-in time.
-
-<Note>
-A wildcard permission of `*` grants everything. It is convenient in development and almost never appropriate in production, because it also satisfies checks for permissions that do not exist yet — including ones added later without you revisiting the grant.
-</Note>
-
-See [Roles and permissions](/auth/roles-and-permissions) for the Studio workflow and the grant API.
-
-## Organizations, in outline
-
-An organization is a grouping *inside* one environment — one customer's team, one department, one tenant in your product. It is not the same axis as `project` + `env`, and the two do not nest.
-
-| Model | Holds |
-| --- | --- |
-| `Organization` | A name and a slug, scoped to one environment. |
-| `Membership` | One user's role in one organization. The role is a plain string. |
-| `Team`, `TeamMember` | A narrower grouping inside an organization. |
-| `Invitation` | A pending invitation, with the role that would be granted. |
-
-The role is a string, not a foreign key to a role model. That is worth understanding because it is what makes `org_role` in a token a plain value a policy can compare directly.
-
-<Note>
-A user who is not a member of an organization does not produce an error on a token request. Both `org` and `org_role` come back `null` instead. The exception is when the organization was **named explicitly** on the request — then membership is checked first and a 403 is raised. So a session with no organization is silently un-scoped, but asking for one you are not in fails loudly.
-</Note>
-
-There is no per-organization override of the assurance level. A session's `aal` is a property of the session, not of the organization it is scoped to.
-
-See [Organizations](/auth/organizations).
-
-## Reading sign-in failures
-
-Every sign-in attempt writes a row, successful or not, and the failure rows carry a short reason string. That reason string is what Studio's **Sign-in activity** tab renders in its Result column, in red, when the attempt failed.
-
-| Reason | What it means |
-| --- | --- |
-| `unknown email` | No account with that normalised email exists in this environment. |
-| `wrong password` | The account exists; the password did not match. The counter incremented. |
-| `locked` | The account is locked. No counter change; the lock is already applied. |
-| `disabled` | The account exists and the password was correct, but the account is disabled. |
-
-MFA verification writes its own row with `wrong code` when a submitted code fails. Refresh failures record the underlying reason too, so a theft-detection event is visible in the same table as an ordinary bad password.
-
-<Note>
-Two of these are deliberately indistinguishable to the caller. An unknown email and a wrong password both return the same generic refusal. That is what stops the endpoint being used to enumerate which addresses have accounts. The distinction exists only in the event log, where an operator — not an attacker — can see it.
-</Note>
-
-The disabled case is worth noticing: it returns a different status and a different message from a bad password, and it is checked *after* the password check. An attacker who already has the right password learns the account is disabled, which is acceptable because at that point they have the credential anyway.
-
-<AccordionGroup>
-  <Accordion title="Why the generic refusal exists">
-    If unknown emails returned a distinct error, anyone could POST candidate addresses to `/auth/v1/token` and build a list of your users. The uniform refusal costs legitimate users a slightly vaguer error message and buys you that protection. Your client should not try to distinguish the two cases.
-  </Accordion>
-  <Accordion title="What the IP column is for">
-    The recorded address is the first entry in `x-forwarded-for` when that header is present, otherwise the socket peer. Behind a proxy, that is the client's address as your proxy saw it. If it is showing your own proxy's address, the forwarding header is not being set.
-  </Accordion>
-  <Accordion title="How far back the log goes">
-    The tab shows recent activity for the environment and can be filtered to failures only. It is an operational debugging aid, not an audit trail — for anything you need to retain or prove, use the events and the audit log instead.
-  </Accordion>
-</AccordionGroup>
-
-## Events worth subscribing to
-
-Akountz emits events for the identity changes that matter operationally. If you react to auth state rather than discovering it, these are the ones to wire up.
-
-| Event | Fires when |
-| --- | --- |
-| `user.created` | An account is created, by sign-up or by an operator. |
-| `user.deleted` | An account is removed. |
-| `user.updated` | The profile changes. The payload lists which fields changed. |
-| `user.signed_in` | A session starts. The payload carries the method. |
-| `user.password_changed` | A user changes their own password. |
-| `user.password_reset` | A password is set through a recovery link. |
-| `user.verified` | An email address is confirmed. |
-| `user.email_changed` | A new address is confirmed. |
-| `user.disabled` / `user.enabled` | The account's disabled state changes. |
-| `user.mfa_enabled` / `user.mfa_disabled` | A factor is confirmed or removed. |
-| `user.mfa_reset` | An operator resets MFA. |
-| `session.revoked` | A session ends. The payload carries the scope. |
-| `session.reuse_detected` | A consumed refresh token came back. |
-| `identity.linked` / `identity.unlinked` | A provider identity is attached or removed. |
-
-<Warning>
-`session.reuse_detected` is the one to alert on rather than log. It means a refresh token was presented twice, which under the rotation rules means the whole family was revoked at that moment. If you see this for a user who is not under attack, you are more likely looking at a client bug — most often two tabs refreshing at once.
-</Warning>
-
-The two-tab refresh race is worth dwelling on, because it is the most common benign cause. A refresh token is single-use, so two concurrent refreshes mean one wins and one is treated as theft. The fix belongs in the client: serialise refreshes per environment rather than firing one per failed request.
-
-See [Events](/events/overview) for delivery, and [Outbound webhooks](/webhooks/outbound) for verifying what arrives.
-
-## In Studio
-
-Every user-facing account operation lives in one place. Open your project, pick an environment, then **Users & auth**.
-
-The page's own description tells you its scope: *"End users of this environment, managed by Akountz: accounts, sessions, MFA, roles and organizations."* Note the phrase **of this environment** — the tab is scoped, and switching environments switches the entire page.
-
-| Tab | What it holds |
-| --- | --- |
-| **Users** | Accounts, their roles, their sessions, and the per-user actions. |
-| **Roles** | Named permission bundles. |
-| **Organizations** | Organizations with their member counts. |
-| **Sign-in activity** | Recent sign-in attempts, filterable to failures. |
-| **Configuration** | Everything in the environment's `auth` block. |
-
-<Warning>
-Every one of these tabs operates on the selected environment. The most expensive mistake in this UI is saving a setting in staging that you meant for production, or creating a test user in production while trying to debug a staging problem. Check the environment selector before you click Save.
-</Warning>
-
-The per-user modal is titled with the user's email address rather than a generic label, so if you are looking at the wrong account you can see it immediately in the title bar.
-
-### The five tabs
-
-The order is fixed, and it roughly follows the lifecycle: the accounts, what they may do, what they belong to, what happened, and how the environment behaves.
-
-<CardGroup cols={2}>
-  <Card title="Users" icon="users">Search, create, and open any account. Every per-user action lives here.</Card>
-  <Card title="Roles" icon="user-shield">Define permission bundles and see how many members each has.</Card>
-  <Card title="Organizations" icon="building">Name, slug, member count, and creation date.</Card>
-  <Card title="Sign-in activity" icon="clock-rotate-left">Recent attempts with a failures-only filter.</Card>
-  <Card title="Configuration" icon="sliders">The environment's `auth` block, one section per concern.</Card>
-</CardGroup>
-
-### Users: search, create, inspect
-
-The search field's placeholder is **"Search email or name"**. Beside it is a status filter with three options — all, disabled, and unverified — which is the fastest way to answer "who has not finished signing up yet".
-
-The **New user** modal has exactly three fields, and the third carries the hint that explains the unusable-password behaviour described earlier:
-
-| Field | Label | Hint |
-| --- | --- | --- |
-| 1 | **Email** | — |
-| 2 | **Name** | — |
-| 3 | **Password** | *"Leave empty to have the user set one through a recovery link."* |
-
-Each row shows the user's email in bold, name, roles as badges, a **State** group, and last sign-in. The State group is worth reading carefully because it distinguishes four things that look similar in a list: a red **disabled** badge, a green **active** badge, a yellow **unverified** badge, and a blue **MFA** badge.
-
-<Note>
-There is no Username field in the New user modal. The username is derived from the name or the email local part, exactly as described earlier. If you need a specific username, it cannot be set at creation through this UI.
-</Note>
-
-Opening a user gives you a modal titled with their email, the action buttons, the roles and direct permissions editor, the full record as JSON, and the sessions table.
-
-### The sessions table inside a user
-
-| Column | Source |
-| --- | --- |
-| **Session** | The first eight characters of the family hex, not the whole thing. |
-| **Device** | The user agent string. |
-| **IP** | The address the session started from. |
-| **Last active** | The last refresh, falling back to creation. |
-
-When there are none, the empty state reads **"No active sessions."** Each row has a **Revoke** button that ends that one session and reports **Session revoked** when it lands.
-
-<Warning>
-Revoking a session here ends that family. It does not invalidate an access token the user is already holding, which lasts out its remaining lifetime — usually under a quarter of an hour at the default setting. If you are removing a compromised account rather than tidying up, use **Signed out everywhere** *and* disable the account.
-</Warning>
-
-### Roles
-
-The **Roles** tab lists role name, description, permissions as badges, and member count. The **New role** button opens a modal with three fields:
-
-| Field | Label | Note |
-| --- | --- | --- |
-| 1 | **Name** | Disabled when editing an existing role — you cannot rename one in place. The placeholder for a new role is `editor`. |
-| 2 | **Description** | Free text. |
-| 3 | **Permissions** | Comma-separated, e.g. `posts:write, posts:publish`. |
-
-The Permissions hint spells out that `*` grants everything. Saving reports the toast **"Roles saved"**.
-
-<Info>
-Because the name field is disabled when editing, a typo in a role name means deleting the role and creating it again — and reassigning it to whoever had it. Read the name before saving the first time.
-</Info>
-
-Direct permissions are granted per user rather than through a role, in the user modal. There is a **Direct permissions** row showing each granted permission with an `✕` to revoke it, plus an input — placeholder `posts:write` — and a **Grant** button. Roles and direct permissions are unioned, so a direct grant is an addition to whatever the roles already provide, not a replacement.
-
-See [Roles and permissions](/auth/roles-and-permissions) for the permission naming and grant API.
-
-### Organizations
-
-Four columns: **Name**, **Slug**, **Members**, **Created**. Clicking a row opens the organization's detail as JSON, including its members and teams.
-
-Note what is *not* here: there is no create button. Organizations are created through the API — the empty state says so directly: *"No organizations. Users create them through /auth/v1/orgs."* That is a deliberate division. An operator can inspect and audit organizations, but the customers themselves create them, so the slug uniqueness checks and the membership rules run in the same place the creation happens.
-
-<Note>
-The empty state text is worth reading as documentation rather than as an error message. If you expected to create an organization from Studio and cannot, nothing is broken.
-</Note>
-
-See [Organizations](/auth/organizations).
-
-### Sign-in activity
-
-Five columns — **When**, **Event**, **Email**, **Result**, **IP** — with a checkbox labelled **failures only** in the card header. The Result badge is the useful one: it renders `ok` in green on success, and on failure it renders the **reason string** in red. So the same value you would look for in a log is the value you read here.
-
-| Column | What it shows |
-| --- | --- |
-| **When** | The attempt's timestamp. |
-| **Event** | The kind — `sign_in`, `mfa_challenge`, `mfa_verify`, `refresh`, `sign_out`. |
-| **Email** | The address attempted, which exists even when no account does. |
-| **Result** | `ok`, or the failure reason in red. |
-| **IP** | Where the attempt came from. |
-
-<Warning>
-This tab only shows the selected environment's activity. A user who signs in successfully against production and fails against staging produces two rows in two different environments' tabs — and if you are looking at the wrong tab, one of those simply does not exist from your point of view.
-</Warning>
-
-Ticking **failures only** is the fastest way to answer "is somebody trying to break into an account" without reading successes. Combined with the IP column it usually identifies the pattern immediately: one address failing repeatedly against one account is lockout behaviour working; many addresses failing against many accounts is credential stuffing against the rate limit.
-
-### Configuration
-
-One card, titled **"Akountz configuration"**, containing six sections in a fixed order. Every control in it maps to one key of the environment's `auth` block, and the Save button writes the whole block back to the environment.
-
-| Section | Controls |
-| --- | --- |
-| **Sign-up** | **Sign-up enabled**, **Require email verification**, **Default roles** |
-| **Passwords** | **Policy**, **Minimum length**, **Access token lifetime**, **Refresh token lifetime** |
-| **Sign-in methods** | **Magic links**, **MFA (TOTP)** |
-| **URLs** | **Site URL**, **Additional allowed redirect URLs** |
-| **OAuth providers** | Per provider: **Enabled**, **Client ID**, **Client secret**, and for non-shipped providers the three endpoint fields. **Scopes** for all. |
-| **Email templates** | Per message: **Subject** and **Body**, with **Reset to default**. |
-
-The section descriptions are written to explain intent rather than mechanics, and they are worth reading once:
-
-| Section | Description in the UI |
-| --- | --- |
-| Sign-up | *"Who can create an account, and whether their email must be confirmed first."* |
-| Passwords | *"Password strength and how long sessions last."* |
-| Sign-in methods | *(none)* |
-| URLs | *"Where a browser is allowed to land after an OAuth or magic-link redirect."* |
-| OAuth providers | *"Social sign-in. Reference credentials as secret://NAME rather than pasting them here."* |
-| Email templates | *"Subject and body for each auth email. Leave blank to use the built-in default."* |
-
-Note the Credentials hint again: **credentials are referenced as `secret://NAME`, never pasted.** The **Client secret** field's placeholder is `secret://GITHUB_SECRET`, which is the intended shape of the value. A literal secret pasted here is stored where it will end up in configuration reads and backups.
-
-Removing a provider uses an icon button labelled **Remove {name}**. For a shipped provider, the three endpoint fields are not shown at all — there is nothing to configure — but a shipped provider can still be overridden by supplying them anyway.
-
-<Warning>
-The Save button is disabled until something actually changes, and saving writes the entire block. Read the environment selector, then read the block, then save. A Save in the wrong environment is the single most consequential mistake available in this UI.
-</Warning>
-
-The full field reference, every default, and what each setting breaks when it is wrong are on [Authentication configuration](/auth/configuration).
-
-### Per-user actions
-
-Opening a user gives a row of buttons. The label is what you will see; the right-hand text is the toast that confirms it landed, and the two are not always the same wording.
-
-| Button | Toast | Effect |
-| --- | --- | --- |
-| **Disable** / **Enable** | **Disabled** / **Enabled** | Toggles the account's disabled state. |
-| **Mark verified** | **Marked verified** | Confirms the email address without sending anything. Only shown when unverified. |
-| **Sign out everywhere** | **Signed out everywhere** | Revokes every session for the user. |
-| **Reset MFA** | **MFA reset** | Deletes factors *and* recovery codes, then clears the MFA flag. Only shown when MFA is on. |
-| **Set password** | **Password set** | Prompts for a new password and sets it directly. |
-| **Delete** | **Deleted** | Removes the account, after a confirmation naming the user. |
-
-Below them sits the roles editor: a **Role** field with the hint *"Comma-separated role names from the Roles tab."*, and a **Save roles** button reporting **Roles saved**.
-
-<Warning>
-**Set password** sets a password without knowing the old one, because an operator is not the user. It is the recovery path for an account created without a password, and it is also a way to take over a user's account — which is appropriate for an operator who already controls the environment, and worth remembering if you are reasoning about who can do what in a shared installation.
-</Warning>
-
-**Reset MFA** is heavier than it looks: it removes the authenticator factors *and* invalidates every recovery code. A user who was using a recovery code as their backup will find that backup gone as well, so warn them rather than doing it silently.
-
-## The route surface
-
-Everything user-facing lives under `/auth/v1`. Knowing the shape of the surface tells you a lot about the design: routes that carry project and environment in the path are browser navigations, and everything else reads them from the context.
-
-### Routes that read the environment from context
-
-| Route | Method | What it does |
-| --- | --- | --- |
-| `/auth/v1/settings` | GET | Reports what this environment offers, so a client can render the right buttons. |
-| `/auth/v1/signup` | POST | Creates an account. |
-| `/auth/v1/token` | POST | Sign in, refresh, or complete MFA. |
-| `/auth/v1/logout` | POST | Ends this session, all sessions, or all others. |
-| `/auth/v1/user` | GET | The signed-in user. |
-| `/auth/v1/user` | PATCH | Update the signed-in user's profile or password. |
-| `/auth/v1/verify/request` | POST | Send or resend a verification link. |
-| `/auth/v1/verify` | POST | Confirm an email address. |
-| `/auth/v1/recover` | POST | Send a password reset link. |
-| `/auth/v1/recover/confirm` | POST | Set a new password with a reset link. |
-| `/auth/v1/magic-link` | POST | Email a sign-in link. |
-| `/auth/v1/magic-link/verify` | POST | Sign in with a magic link token. |
-| `/auth/v1/email/confirm` | POST | Confirm an email change. |
-| `/auth/v1/mfa/totp/enroll` | POST | Start enrolling an authenticator app. |
-| `/auth/v1/mfa/totp/verify` | POST | Confirm enrolment with a code. |
-| `/auth/v1/mfa/disable` | POST | Turn MFA off. Requires a current code. |
-| `/auth/v1/mfa/recovery-codes` | POST | Replace the recovery codes. |
-| `/auth/v1/mfa` | GET | MFA status. |
-| `/auth/v1/sessions` | GET | Active sessions. |
-| `/auth/v1/sessions/{session_id}` | DELETE | Sign out one session. |
-| `/auth/v1/history` | GET | Recent sign-in activity. |
-| `/auth/v1/identities/link` | POST | A URL that links a provider to the current account. |
-| `/auth/v1/identities/{identity_id}` | DELETE | Unlink an identity. |
-
-### Routes that carry the environment in the path
-
-| Route | Method | Why the path |
-| --- | --- | --- |
-| `/auth/v1/authorize/{project}/{env}/{provider}` | GET | Starts a social sign-in. A browser navigation. |
-| `/auth/v1/callback/{project}/{env}/{provider}` | GET | Finishes one. Also a browser navigation, and excluded from the schema. |
-| `/auth/v1/links/{project}/{env}/{kind}` | GET | An Akountz-hosted link page, used when the environment has no `site_url`. Excluded from the schema. |
-| `/auth/v1/links/{project}/{env}/recovery` | POST | The form post from that hosted page. Excluded from the schema. |
-
-<Info>
-The pattern is consistent: a route with `{project}/{env}` in the path is one a browser arrives at directly. A browser cannot carry a gateway-signed context header, so the environment has to be in the URL. Everything called from your application's code uses the context instead.
-</Info>
-
-### Organization routes
-
-Organizations have their own group of routes, all context-scoped:
-
-| Route | Method | What it does |
-| --- | --- | --- |
-| `/auth/v1/orgs` | GET | The organizations the caller belongs to. |
-| `/auth/v1/orgs` | POST | Create an organization. |
-| `/auth/v1/orgs/{slug}` | GET | One organization. |
-| `/auth/v1/orgs/{slug}` | PATCH | Update it. |
-| `/auth/v1/orgs/{slug}` | DELETE | Delete it. Owners only. |
-| `/auth/v1/orgs/{slug}/members` | GET | Members. |
-| `/auth/v1/orgs/{slug}/members/{user_id}` | PUT | Change a member's role. |
-| `/auth/v1/orgs/{slug}/members/{user_id}` | DELETE | Remove a member, or leave. |
-| `/auth/v1/orgs/{slug}/invitations` | POST | Invite someone by email. |
-| `/auth/v1/orgs/{slug}/invitations` | GET | Pending invitations. |
-| `/auth/v1/orgs/{slug}/invitations/{invitation_id}` | DELETE | Revoke an invitation. |
-| `/auth/v1/orgs/{slug}/accept` | POST | Accept an invitation. |
-| `/auth/v1/orgs/{slug}/teams` | GET, POST | List or create teams. |
-| `/auth/v1/orgs/{slug}/teams/{team}/members/{user_id}` | PUT, DELETE | Add or remove a team member. |
-
-<Note>
-The delete-member route serves two purposes from one endpoint: a member removing themselves, and an owner removing somebody else. Which one you are doing is inferred from who you are, not from the URL.
-</Note>
-
-### Admin routes
-
-A separate base, under `/projects/{project}/envs/{env}`, authenticated with a service key rather than a user token. Studio calls these with its own management key, which is why they are not usable from a browser as an end user.
-
-| Route | Method | What it does |
-| --- | --- | --- |
-| `{base}/users` | GET | Search users. |
-| `{base}/users` | POST | Create a user. |
-| `{base}/users/{user_id}` | GET, PATCH, DELETE | One user; update, disable, verify or unlock; delete. |
-| `{base}/users/{user_id}/sessions/revoke` | POST | Sign a user out everywhere. |
-| `{base}/users/{user_id}/sessions/{session_id}` | POST | End one session. |
-| `{base}/users/{user_id}/mfa/reset` | POST | Remove a user's second factors. |
-| `{base}/users/{user_id}/history` | GET | A user's sign-in history. |
-| `{base}/users/{user_id}/permissions` | POST, DELETE | Grant or revoke direct permissions. |
-| `{base}/roles` | GET, PUT | Roles with their permissions; create or replace a role. |
-| `{base}/roles/{name}` | DELETE | Delete a role. |
-| `{base}/orgs` | GET | All organizations. |
-| `{base}/orgs/{slug}` | GET | One organization with members and teams. |
-| `{base}/events` | GET | Authentication events. |
-| `{base}/stats` | GET | Identity statistics. |
-
-There are also backup and restore routes under the same base, including one that returns every role, every user *with password hashes*, and every organization. Treat that export as a secret: it is a complete credential dump.
-
-<Warning>
-A backup payload containing password hashes is as sensitive as the passwords themselves, and is covered by the same handling rules. Anyone holding it can attempt offline cracking against every account. See [Security model](/auth/security-model) for handling.
-</Warning>
-
-## Discovering what an environment offers
-
-Before building a sign-in screen, ask the environment what it supports. `GET /auth/v1/settings` is the one call that answers it, and reading it at runtime rather than hardcoding is what lets one client work across environments with different configurations.
-
-```json
-{
-  "signup_enabled": true,
-  "email_verification_required": false,
-  "magic_link_enabled": true,
-  "mfa_enabled": true,
-  "providers": ["github", "google"],
-  "password_policy": { "kind": "basic", "min_length": 8 }
+| Missing or invalid API key | 401 | `AuthenticationError` | `AuthenticationError` |
+| Wrong email or password | 400 | `ApiError` (`status === 400`) | `ValidationError` |
+| Password too weak, invalid email | 422 | `ValidationError` | `ValidationError` |
+| Email already registered | 409 | `ConflictError` | `ConflictError` |
+| Sign-up disabled, account disabled, unverified | 403 | `PermissionError` | `ForbiddenError` |
+| Too many attempts | 429 | `RateLimitError` | `RateLimitedError` |
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, ConflictError, RateLimitError, ValidationError } from "@pawabase/client";
+
+try {
+  await pawabase.auth.signUp({ email, password });
+} catch (error) {
+  if (error instanceof ConflictError) showMessage("That email already has an account.");
+  else if (error instanceof ValidationError) showMessage(error.message);
+  else if (error instanceof RateLimitError) showMessage("Please wait a moment and try again.");
+  else if (error instanceof ApiError) showMessage(error.message);
+  else throw error;
 }
 ```
 
-<ResponseField name="signup_enabled">Whether to render a registration form at all.</ResponseField>
-<ResponseField name="email_verification_required">Whether a fresh sign-up ends in a "check your email" state rather than a session.</ResponseField>
-<ResponseField name="magic_link_enabled">Whether to offer the passwordless option.</ResponseField>
-<ResponseField name="mfa_enabled">Whether to offer authenticator enrolment. It does not mean any user *has* enrolled.</ResponseField>
-<ResponseField name="providers">The names to render buttons for. Only enabled providers with a client id appear.</ResponseField>
-<ResponseField name="password_policy">The kind and the minimum length, so a client-side hint can match the server rather than guessing.</ResponseField>
+```python Python
+from pawabase import ConflictError, RateLimitedError, ValidationError, PawabaseError
 
-<Warning>
-`password_policy.kind` reports the configured value. Under `basic` that means a length rule only — it does not mean the server will accept anything of that length, because the 1024-character ceiling always applies. Do not present the client-side check as the policy; present it as a hint that reduces failed submissions.
-</Warning>
-
-What the response deliberately omits is as informative as what it includes. There is no list of roles, no user, no token, and no indication of whether *this* caller is signed in — it is a public description of the environment. Call it before sign-in and cache it; call it again after an error if you suspect the configuration changed.
-
-## A worked sign-in, end to end
-
-This is the wire shape of a correct client using `fetch`. The TypeScript SDK wraps this exchange,
-but the raw form remains useful for debugging and for languages without managed auth support.
-
-```bash
-curl -X POST https://api.example.com/auth/v1/token \
-  -H "apikey: pk_live_..." \
-  -H "content-type: application/json" \
-  -d '{"grant_type":"password","email":"ada@example.com","password":"correct horse"}'
+try:
+    pb.auth.sign_up(email=email, password=password)
+except ConflictError:
+    show_message("That email already has an account.")
+except ValidationError as error:
+    show_message(error.message)
+except RateLimitedError:
+    show_message("Please wait a moment and try again.")
+except PawabaseError as error:
+    show_message(error.message)
 ```
+</CodeGroup>
 
-The environment resolves from the key, so no project or environment is sent in the body. A successful response is the token shape shown earlier. Attach the access token to every subsequent call:
+Sign-in deliberately answers the same way for an unknown email and a wrong password (400, "invalid email or password"), so the form cannot be used to find out who has an account. Show one message for both. Every error carries a `requestId` (`request_id` in Python) you can quote to support. The full catalogue is in [Errors](/clients/errors).
 
-```bash
-curl https://api.example.com/data/requests \
-  -H "apikey: pk_live_..." \
-  -H "Authorization: Bearer eyJhbGciOi..."
-```
+## Limits to design for
 
-When `expires_in` has elapsed, rotate. Note what is *not* in the body — `org` is omitted entirely, so the session keeps whatever organization it had:
-
-```bash
-curl -X POST https://api.example.com/auth/v1/token \
-  -H "apikey: pk_live_..." \
-  -H "content-type: application/json" \
-  -d '{"grant_type":"refresh_token","refresh_token":"..."}'
-```
-
-<Warning>
-The two `curl` calls above deliberately carry the same API key. Sending the key from one environment with a token from another is the single most common cause of a 401 that looks inexplicable, and the error will not tell you which half was wrong.
-</Warning>
-
-Four behaviours this example implies, each covered in depth elsewhere:
-
-| Behaviour | Why it matters |
+| Limit | Value |
 | --- | --- |
-| Read `GET /auth/v1/settings` first. | The buttons you render should match what the environment offers. |
-| Treat a response without an access token as a state, not a failure. | A sign-up awaiting verification, and an MFA challenge, both look like that. |
-| Persist the replacement refresh token on every rotation. | The old one is consumed the moment it is used. |
-| Allow one in-flight refresh at a time. | Two concurrent refreshes revoke the family as suspected theft. |
+| Access token lifetime | 15 minutes |
+| Sign-up and sign-in requests per client | 30 per minute, shared |
+| Second-factor attempts per client | 10 per minute |
+| Failed password attempts before an account locks | 10, then locked for 15 minutes |
+| Longest accepted password | 1,024 characters |
 
-## Where auth meets the rest of Pawabase
+A locked account answers 429. Do not retry in a loop: tell the person to wait. See [Passwords](/auth/passwords#lockout-and-rate-limits) for how the two limits differ.
 
-Authentication produces an identity and nothing else. These are the places that consume one, and what each needs from it.
+## Security checklist
 
-| Consumer | What it reads | Where to read more |
+- Ship only the publishable key in browsers and apps. Keep secret keys on servers.
+- Show one message for "wrong email" and "wrong password".
+- Treat `user_metadata` as untrusted input. Put anything that grants access in `app_metadata` or in roles.
+- Restrict redirect URLs to your own origins; the API refuses any address that is not on the list.
+- Choose the `strict` password policy for anything holding real data, and offer a second factor.
+- Call `signOut({ scope: "global" })` after a password change if you want other devices signed out.
+
+## A complete sign-in screen
+
+This is the shape most apps end up with: read what the environment offers, try the method the person chose, finish a second factor if one is asked for, and land on one result. It uses only calls covered in this section.
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, PermissionError, RateLimitError, ValidationError } from "@pawabase/client";
+
+type Outcome = { ok: true; user: { id: string; email: string } } | { ok: false; message: string };
+
+export async function signIn(email: string, password: string, askForCode: () => Promise<string>): Promise<Outcome> {
+  try {
+    let result = await pawabase.auth.signInWithPassword({ email, password });
+    if (result.status === "mfa_required") {
+      const session = await result.verify(await askForCode());
+      return { ok: true, user: session.user };
+    }
+    return { ok: true, user: result.session.user };
+  } catch (error) {
+    if (error instanceof RateLimitError) return { ok: false, message: "Too many attempts. Wait a few minutes." };
+    if (error instanceof PermissionError) return { ok: false, message: error.message };
+    if (error instanceof ValidationError || (error instanceof ApiError && error.status === 400)) {
+      return { ok: false, message: "Wrong email or password." };
+    }
+    throw error;
+  }
+}
+```
+
+```python Python
+from pawabase import ForbiddenError, RateLimitedError, ValidationError
+
+
+def sign_in(email: str, password: str, ask_for_code):
+    try:
+        result = pb.auth.sign_in_with_password(email=email, password=password)
+        if result.status == "mfa_required":
+            session = result.verify(ask_for_code())
+            return {"ok": True, "user": session.user}
+        return {"ok": True, "user": result.session.user}
+    except RateLimitedError:
+        return {"ok": False, "message": "Too many attempts. Wait a few minutes."}
+    except ForbiddenError as error:
+        return {"ok": False, "message": error.message}
+    except ValidationError:
+        return {"ok": False, "message": "Wrong email or password."}
+```
+</CodeGroup>
+
+Two details are worth copying. The function returns a message for every expected failure and rethrows anything else, so a genuine bug (a network failure, a 500) is not shown to the user as "wrong password". And it never says which of the email or the password was wrong.
+
+## Run it anywhere
+
+The same client works on every runtime. What changes is where the session lives and which key you use.
+
+| Where your code runs | Key | Session storage | Notes |
+| --- | --- | --- | --- |
+| Browser app (React, Vue, plain JS) | Publishable | `localStorage` (default) | Renewal runs on a timer. Several tabs share one session. |
+| Mobile app (React Native) | Publishable | Pass `auth.storage` backed by secure storage | `localStorage` does not exist; see [Client integration](/auth/client-integration). |
+| Server rendering, API route, edge function | Publishable, with the caller's token | None: pass `accessToken` per request | One client per request, or per process with a token function. See [Tokens and sessions](/auth/tokens-and-sessions#use-sessions-on-a-server). |
+| Background job or script acting for itself | Secret | None needed | Use it for [`admin`](/auth/managing-users) and [`manage`](/operate/api-keys), never to sign people in. |
+| Command-line tool or desktop app | Publishable | `FileSessionStore` (Python) or your own storage | The user signs in once and stays signed in between runs. |
+| Tests | Publishable | In memory | Create a fresh client per test and `dispose()` it (TypeScript) so timers stop. |
+
+<Warning>
+A secret key bypasses your policies and can manage every account. The TypeScript client refuses to start with one in a browser unless you set `dangerouslyAllowBrowser`, and you should never set it. If a secret key has been in client code, revoke it and create a new one.
+</Warning>
+
+## Authentication and the rest of Pawabase
+
+Signing in changes what every other Pawabase service does for the caller, because they all read the same signed-in user. You do not pass the token around yourself.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.signInWithPassword({ email, password });
+
+const { data: mine } = await pawabase.from("orders");                       // rows your policy lets this user read
+await pawabase.storage.from("avatars").upload("me.png", file);              // uploads as this user
+const room = pawabase.realtime.channel("chat:lobby");                        // joins with this user's identity
+await room.subscribe();
+```
+
+```python Python
+pb.auth.sign_in_with_password(email=email, password=password)
+
+mine = pb.from_("orders").execute()                                          # rows your policy lets this user read
+pb.storage.from_("avatars").upload("me.png", open("me.png", "rb"))           # uploads as this user
+# realtime channels (async client): pb.realtime.channel("chat:lobby")
+```
+</CodeGroup>
+
+| Service | What the signed-in user changes |
+| --- | --- |
+| [Data](/data/resources) | [Policies](/policies/overview) read the user's id, roles and organization, so the same query returns different rows for different people. |
+| [Storage](/storage/overview) | Bucket rules can limit access to the owner or to a role. |
+| [Realtime](/realtime/overview) | Channel rules decide who may subscribe and publish; presence shows the user. |
+| [Flows](/flows/overview) | A route can require a signed-in user, and the flow sees who called. |
+| [Webhooks](/webhooks/outbound) and [events](/events/overview) | Account events such as `user.created` can start flows and be delivered to your servers. |
+
+When a signed-out client makes one of these calls, it is the anonymous caller: your policies decide whether that is allowed. See [Auth in policies](/auth/auth-in-policies).
+
+## Quick reference
+
+Every method on the auth client, in both languages. Parts such as `mfa` and `orgs` are groups of related methods covered on their own pages.
+
+| Task | TypeScript `pawabase.auth` | Python `pb.auth` |
 | --- | --- | --- |
-| Resource policies | The whole `auth` context | [Auth in policies](/auth/auth-in-policies) |
-| Storage rules | User id, roles, and ownership fields on the object | [Storage](/storage/overview) |
-| Realtime channels | The auth context at subscribe time | [Realtime](/realtime/overview) |
-| Custom routes | The principal your handler receives | [Flows](/flows/overview) |
-| Events and webhooks | Identity changes, as outbound notifications | [Events](/events/overview) |
-| Studio | Everything, as an operator | [Studio](/concepts/studio) |
+| What is enabled | `settings()` | `settings()` |
+| Create an account | `signUp({ email, password, … })` | `sign_up(email=, password=, …)` |
+| Sign in with a password | `signInWithPassword({ email, password, org? })` | `sign_in_with_password(email=, password=, org=)` |
+| Finish a second factor | `verifyMfa({ mfaToken, code })` | `verify_mfa(mfa_token=, code=)` |
+| Magic link | `signInWithMagicLink`, `verifyMagicLink` | `sign_in_with_magic_link`, `verify_magic_link` |
+| Emailed code | `sendEmailCode`, `verifyEmailCode` | `send_email_code`, `verify_email_code` |
+| Guest | `signInAnonymously`, `upgradeAnonymous` | `sign_in_anonymously`, `upgrade_anonymous` |
+| Passkeys | `passkeys.register`, `passkeys.signIn`, `passkeys.list`, `passkeys.remove` | `passkeys.register_options` and `register_verify`, `authenticate_options` and `authenticate_verify`, `list`, `remove` |
+| Social sign-in | `signInWithOAuth`, `signInWithOAuthUrl`, `exchangeCode`, `getSessionFromUrl` | `oauth_url`, `exchange_code` |
+| Current session | `getSession`, `getAccessToken`, `getCachedUser` | `session`, `access_token`, `user` |
+| Adopt or renew tokens | `setSession`, `refreshSession`, `switchOrg` | `set_session`, `refresh_session`, `switch_org` |
+| Watch for changes | `onAuthStateChange` | `on_auth_state_change` |
+| Sign out | `signOut({ scope })` | `sign_out(scope=)` |
+| Read and edit the user | `getUser`, `updateUser` | `get_user`, `update_user` |
+| Confirm an email | `verifyEmail`, `resendVerification`, `confirmEmailChange` | `verify_email`, `resend_verification`, `confirm_email_change` |
+| Forgotten password | `requestPasswordReset`, `resetPassword` | `request_password_reset`, `reset_password` |
+| Linked identities | `identities`, `linkIdentityUrl`, `unlinkIdentity` | `identities`, `link_identity_url`, `unlink_identity` |
+| Tokens for other services | `issueToken`, `jwks` | `issue_token`, `jwks` |
+| Second factors | `mfa.*` | `mfa.*` |
+| Sessions and history | `sessions.list`, `revoke`, `history` | `sessions.list`, `revoke`, `history` |
+| Devices | `devices.list`, `forget` | `devices.list`, `forget` |
+| A user's own API keys | `apiKeys.list`, `create`, `revoke` | `api_keys.list`, `create`, `revoke` |
+| Organizations | `orgs.*` | `orgs.*` |
+
+Python methods return values directly on the blocking client and awaitables on `AsyncPawabase`. Python objects are plain dictionaries (`user["email"]`), TypeScript objects are typed (`user.email`).
+
+## When something does not work
+
+| Symptom | Likely cause | What to check |
+| --- | --- | --- |
+| Every call answers 401 "Send a valid API key" | The key is missing, mistyped, or from another environment. | Print the key prefix (`pb_pk_`) and confirm `url` and `environment`. |
+| A user exists but sign-in says "invalid email or password" | You are pointing at a different environment than the one the account is in. | Compare the `environment` and key in your client with where the account was created. |
+| Sign-up returns no session | The environment requires confirmed email addresses. | Read `verificationRequired`, then see [Email verification](/auth/email-verification). |
+| The sign-up call fails with 403 | Sign-up is switched off, or the user limit is reached. | Read `settings().signup_enabled`. |
+| `redirect_to is not an allowed URL` | The address is not on the environment's list. | Add the exact origin in Studio, including the scheme and port. |
+| A social button shows but nothing happens | The provider lacks credentials or the redirect URL is not allowed. | See [Social login](/auth/social-login). |
+| A user is signed out unexpectedly | The refresh token was revoked, used twice, or storage was cleared. | See [Failure behaviour](/auth/tokens-and-sessions#failure-behaviour). |
+| A role you recently granted has no effect | The token still carries the old roles. | Call `refreshSession()`, or have the user sign in again. |
+| 429 on sign-in | The shared rate limit or the account lock. | Wait; see [Lockout and rate limits](/auth/passwords#lockout-and-rate-limits). |
+| Works locally, fails in production | A different environment, key or redirect list. | Treat each environment's configuration as separate. |
+
+Every error includes a request id (`error.requestId`, `error.request_id`). Quote it in a support request and the request can be found exactly.
+
+## Where to keep what
+
+A user record has two places for your own data, and a third place that is yours entirely. Choosing well early avoids a security bug later.
+
+| Kind of data | Put it in | Why |
+| --- | --- | --- |
+| Display preferences, theme, onboarding progress | `user_metadata` | The user can edit it, which is what you want for things they control. |
+| Anything that grants access: a plan, a staff flag, a tenant id | `app_metadata` or a [role](/auth/roles-and-permissions) | Only your server (with a secret key) or Studio can change it, so a user cannot promote themselves. |
+| Application data about people: addresses, orders, histories | Your own [resource](/data/resources) with a `user_id` column | It can grow, be queried and filtered, and be protected by [policies](/policies/overview). |
+
+Write `app_metadata` from a server:
+
+<CodeGroup>
+```typescript TypeScript
+import { admin } from "@pawabase/client/admin";
+
+const accounts = admin(pawabaseWithSecretKey);
+await accounts.users.update(userId, { appMetadata: { plan: "pro" } });
+```
+
+```python Python
+pb_server.admin.users.update(user_id, app_metadata={"plan": "pro"})
+```
+</CodeGroup>
+
+The change reaches the user's next token (within 15 minutes, or immediately after `refreshSession()`), and [policies](/auth/auth-in-policies) can read it. See [Managing users](/auth/managing-users) for the full admin API.
 
 <Warning>
-Storage rules and realtime channels enforce separately from your resource policies. A rule that permits something your resource policy forbids is still a leak, and vice versa. Authorise at every enforcement point rather than assuming the first one covers the rest.
+Never decide access from `user_metadata`. A signed-in user can write anything to it with `updateUser({ data })`, including `{ "role": "admin" }`.
 </Warning>
 
-The wider concepts pages carry the surrounding model: [Mental model](/concepts/mental-model) for how the platform fits together, [Organizations](/concepts/organizations) for the tenancy picture, [Credentials](/concepts/credentials) for how secrets are referenced, [Request lifecycle](/concepts/request-lifecycle) for where context is resolved, and [Definitions as data](/concepts/definitions-as-data) for why promoting a definition does not move users.
+## Choosing sign-in methods
 
-For the parts of the platform you configure around auth: [Environments and promotion](/operate/environments-and-promotion), [Secrets](/operate/secrets), [Rate limits and CORS](/operate/rate-limits-and-cors), and [Audit log](/operate/audit-log).
+Offer fewer methods, done well. A typical consumer app uses one primary method and one fallback; a business app often uses a password with a second factor, or social sign-in with the company's provider.
 
-## Common misconceptions
-
-Each of these is a belief that produces wrong code, with the correction.
-
-| You might think | Actually |
+| Your users are… | Offer |
 | --- | --- |
-| Signing in grants access to my data. | It establishes an identity. Every operation still needs a policy. |
-| The email address identifies the user. | The `(project, env, email)` triple does. The same address is two accounts in two environments. |
-| There is a `Role` table. | A role is a `Group` plus its permissions. Studio's naming is not the schema's. |
-| I can add a role to a token I already hold. | Roles are read at issue time. Refresh or sign in again. |
-| Disabling a user kills their session immediately. | It stops sign-in and refresh. A held access token lasts out its lifetime. |
-| Sign-out invalidates the access token I was using. | It revokes the family. The held token expires on its own schedule. |
-| `redirect_urls` accepts exact matches only. | They are prefixes. A base matches itself, anything below it, and query-string variants. |
-| A provider with `enabled: true` is enabled. | It also needs a `client_id`. Without one it is invisible to clients and 404s. |
-| An unset config key means off. | It means the default, which is usually on. |
-| `null` disables a setting. | Null is treated as absent, so the default applies. |
-| The `/oauth/token` endpoint exists. | There is one token endpoint with three grant types. |
-| A 200 from a recovery request means the mail sent. | The response is deliberately identical whether or not the account exists. |
-| `"false"` in the JSON block disables a flag. | That is a non-empty string, which is truthy. Use a boolean. |
-| Recovery codes can be looked up later. | They are stored hashed. The raw codes are shown once. |
-| Studio operators and app users are the same accounts. | Two separate systems, in different environments, with different access. |
+| The general public, on phones | A [passkey](/auth/passkeys-and-codes#passkeys) first, [emailed codes](/auth/passkeys-and-codes#emailed-codes) as the fallback. |
+| Employees of one company | [Social login](/auth/social-login) with the company's provider, with a second factor enforced there. |
+| Developers | GitHub, plus an email and password. |
+| Anyone, with no friction at first | [Guest sessions](/auth/passkeys-and-codes#guest-sessions) that upgrade later. |
+| Accounts holding money or sensitive records | A password or passkey **and** a [second factor](/auth/mfa). |
 
-<Info>
-Every row in that table is a variation on one theme: the system's behaviour is usually the documented behaviour, and what fails is an assumption that it should have been more convenient.
-</Info>
+Whatever you choose, plan the way back in. People lose phones and forget passwords, so a recovery path ([password recovery](/auth/password-recovery), a second passkey, or an emailed code) must exist before you launch.
 
-## The section map
+## A learning path
 
-Every page in this section, what it is for, and when you need it.
+If you are building sign-in for the first time, this order covers the essentials with the least reading.
+
+| Step | Read | You will be able to |
+| --- | --- | --- |
+| 1 | This page | Create a client, sign up, sign in, and read the user. |
+| 2 | [Passwords](/auth/passwords) | Handle every sign-up and sign-in outcome and error. |
+| 3 | [Tokens and sessions](/auth/tokens-and-sessions) | Keep people signed in, react to changes, and run on a server. |
+| 4 | [Email verification](/auth/email-verification) and [Password recovery](/auth/password-recovery) | Confirm addresses and let people get back in. |
+| 5 | [Multi-factor authentication](/auth/mfa) | Protect accounts with a second factor. |
+| 6 | [Roles and permissions](/auth/roles-and-permissions) and [Auth in policies](/auth/auth-in-policies) | Decide who can do what with your data. |
+
+## Where to go next
 
 <CardGroup cols={2}>
-  <Card title="Authentication configuration" icon="sliders" href="/auth/configuration">Every `auth` key, its default, the Studio control that edits it, and what breaks when it is unset or wrong. Read before building a sign-in screen.</Card>
-  <Card title="Passwords" icon="lock" href="/auth/passwords">The password grant end to end: sign-up, policy, hashing, sign-in, lockout, profile updates, and the full error catalogue.</Card>
-  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">The response shape, lifetimes, rotation, the theft rule, and how to keep a client refreshing correctly.</Card>
-  <Card title="Email verification" icon="envelope-circle-check" href="/auth/email-verification">Requiring confirmation, the link, the resend path, and what an unverified user cannot do.</Card>
-  <Card title="Password recovery" icon="key" href="/auth/password-recovery">The reset flow, its one-hour lifetime, and what it does to existing sessions.</Card>
-  <Card title="Magic links" icon="wand-magic-sparkles" href="/auth/magic-links">Passwordless sign-in by emailed link, the fifteen-minute lifetime, and the single-use rule.</Card>
-  <Card title="Social login" icon="users-gear" href="/auth/social-login">The four shipped providers, generic providers, identity linking, and the account-resolution order.</Card>
-  <Card title="MFA" icon="shield-check" href="/auth/mfa">TOTP enrolment, the challenge flow, `aal2`, and recovery codes.</Card>
-  <Card title="Managing users" icon="user-gear" href="/auth/managing-users">Creating, disabling, verifying, and revoking sessions, from Studio and from the admin routes.</Card>
-  <Card title="Roles and permissions" icon="user-shield" href="/auth/roles-and-permissions">The `Group`-based model, permission naming, and direct grants.</Card>
-  <Card title="Organizations" icon="building" href="/auth/organizations">Organizations, memberships, teams, and invitations.</Card>
-  <Card title="Auth in policies" icon="gavel" href="/auth/auth-in-policies">Writing policies against the `auth` context, and which claims to trust.</Card>
-  <Card title="Client integration" icon="code" href="/auth/client-integration">Hand-written client code: storage, refresh serialisation, and the states your UI must handle.</Card>
-  <Card title="Security model" icon="shield" href="/auth/security-model">The threat model, credential hygiene, and what to validate before going to production.</Card>
+  <Card title="Passwords" icon="lock" href="/auth/passwords">Sign-up, sign-in, policies, lockout and profile changes.</Card>
+  <Card title="Tokens and sessions" icon="key" href="/auth/tokens-and-sessions">Storage, renewal, events, server usage and session management.</Card>
 </CardGroup>
-
-## How the pages fit together
-
-The section is not arbitrary, and the order reflects when you hit each concern. Preparing an environment comes before building a screen against it. A working screen comes before securing it.
-
-<Steps>
-  <Step title="Preparing an environment">
-    [Authentication configuration](/auth/configuration) fixes what the environment offers: whether people can sign up, whether their email must be confirmed, which providers exist, where redirects land, and how long tokens last. Do this first, because everything else is written against it — a client that assumes magic links will break the moment that switch is off.
-  </Step>
-  <Step title="Wiring the client">
-    [Client integration](/auth/client-integration) covers what your application code has to do: attach the token, refresh before expiry, serialise concurrent refreshes, handle the several distinct "signed in but not finished" states, and clear state when a different user signs in on the same device.
-  </Step>
-  <Step title="Authorising">
-    [Auth in policies](/auth/auth-in-policies) turns a verified identity into access decisions. Sign-in establishes who someone is; policies decide what that person may do, and a signed-in identity satisfies neither by itself.
-  </Step>
-  <Step title="Hardening">
-    [Security model](/auth/security-model) covers what to validate before real users exist. Everything before this point is a working system; this page is the one that tells you whether it is a safe one.
-  </Step>
-</Steps>
-
-<Info>
-A useful constraint that falls out of the design: your client must be able to run with **every** sign-in method switched off and with sign-up disabled, because that is the configuration of an internal or invite-only environment. If your sign-in screen hardcodes a "Sign in with GitHub" button that only renders when `GET /auth/v1/settings` lists a provider, it will work everywhere. If it renders unconditionally, it will break the moment someone disables one.
-</Info>
-
-## Terms, precisely
-
-The vocabulary in this section is load-bearing. These are the definitions the rest of the section uses without restating.
-
-| Term | Means |
-| --- | --- |
-| **Akountz** | The identity service. Owns users, sessions, identities, MFA, organizations, roles. |
-| **Environment** | One `project` + `env` pair. The unit of tenancy and of configuration. |
-| **Environment context** | The gateway-signed token naming the project, environment, and credential on a request. |
-| **`Principal`** | The verified caller on a request, carrying a `kind` and the token's claims. |
-| **`kind`** | Which of `user`, `operator`, `service`, `anonymous` the caller is. |
-| **Session** | One sign-in's token family, plus the row describing it. |
-| **Token family** | The identifier shared by every token descended from one sign-in. What `session_id` refers to. |
-| **Rotation** | Replacing a refresh token on use, and marking the old one consumed. |
-| **Theft detection** | Revoking the whole family when a consumed refresh token is presented again. |
-| **`aal`** | Authentication assurance level. `aal1` normally, `aal2` after MFA. |
-| **Role** | A `Group` plus its permissions. Not a model. |
-| **Permission** | A named capability. `*` means all of them. |
-| **Organization** | A grouping of users inside one environment, addressed by slug. |
-| **`AuthConfig`** | One environment's authentication settings, with defaults applied. |
-| **Platform environment** | The reserved `_platform` environment holding Studio's operators. Not configurable. |
-| **One-time token** | A signed, single-use, time-limited reference to a row. Backs every emailed link. |
-| **`secret://NAME`** | A reference to a stored secret, used instead of a literal credential. |
-
-<Warning>
-Two of these are routinely confused. An **organization** is a tenant *inside* an environment; an **environment** is a deployment target. And a **role** is a **group**; there is no role table to look up.
-</Warning>
-
-### Sign-in works in development but not in production
-
-Work through the layers in order rather than assuming one cause.
-
-The most common cause is artifacts from different environments. An access token from development presented against production fails verification because the derived key differs — and the error will not say so. The second most common is that production genuinely has no users: promoting definitions moves configuration, not accounts, so the email you have been signing in with in development does not exist in production at all.
-
-After that, check the configuration itself. Sign-up may be disabled in production while enabled in development. Email verification may be required where it is not, in which case sign-in is refused with a 403 asking for confirmation. A provider may be enabled in development and absent from production's block, so its button never renders. And `site_url` will differ, so redirects land somewhere you did not expect.
-
-<Warning>
-Promotion does not create users, and it does not necessarily carry secrets. Provider credentials referenced as `secret://NAME` must exist in the target environment too — a reference that resolves in development may be dangling in production, and a provider whose client id or secret cannot be resolved is not an enabled provider.
-</Warning>
-
-### The API returns an MFA challenge
-
-The password was correct. The user has MFA enrolled and the environment has `mfa_enabled` on, so instead of tokens you received `mfa_required`, an `mfa_token`, and the list of accepted factors.
-
-This is not an error and there is nothing to fix. Complete it with the `mfa` grant, passing the `mfa_token` and the user's code. The session you get back is `aal2` rather than `aal1`.
-
-The one thing to check is that your client is not treating the challenge as a failure and clearing its state. A client that reacts to any response without a `access_token` by signing the user out will loop: sign in, get challenged, sign out, repeat. See [MFA](/auth/mfa).
-
-<Note>
-If MFA is enabled in the environment but the user has not enrolled, they sign in normally at `aal1`. Enrolment is per user, not imposed by the environment — which is why the environment switch means "users *may* enrol", not "users must".
-</Note>
-
-### A role change does not take effect
-
-The change was saved and the user still gets denied. Almost always this is the issue-time read described earlier: roles and permissions are embedded in the access token, and the token you are testing with was issued before the change.
-
-Refresh the token, or sign in again, and the new role appears. If it still does not, the change did not land where you think: check you are in the right environment, because role assignment is scoped to one, and confirm the role name in the user's **Role** field matches exactly what the policy tests.
-
-There is a related trap in the other direction. If you are testing that a *removed* role denies access, and you do not refresh, the token still carries the old role and the request succeeds. That is the staleness window working as designed, not a policy failure — and it is worth knowing that you cannot demonstrate a revocation using a token you already hold.
-
-<Warning>
-A stale token can grant access for up to `access_ttl` after a role is removed. In production that is fifteen minutes by default. If your threat model needs faster revocation than that, shortening `access_ttl` is the lever — there is no per-request role lookup to make it immediate.
-</Warning>
-
-### The client shows no provider buttons
-
-`GET /auth/v1/settings` returns the providers that are enabled *and* have a client id. Anything missing a client id is not reported, and using it anyway returns a 404 saying the provider is not enabled.
-
-There is no in-between state. You will never see a provider listed but unusable, so if the list is missing a provider you expected, the cause is one of:
-
-| Cause | How to confirm |
-| --- | --- |
-| The provider is absent from the environment's `auth` block entirely. | Open **Configuration** → **OAuth providers**. |
-| It is present but **Enabled** is off. | The switch is in the provider's card. |
-| It is present and enabled but **Client ID** is empty. | This is the one that looks correct in the UI. |
-| The client is caching the settings response. | Re-fetch and compare. |
-| You are looking at a different environment. | Check the environment selector. |
-
-<Note>
-The third case is worth internalising: a provider card with every field filled in except the client id looks essentially complete. The switch is on. It simply does not exist as far as any client is concerned, and the failure mode is a missing button rather than an error.
-</Note>
-
-A generic provider — any name outside `google`, `github`, `discord`, `microsoft` — additionally needs `authorize_endpoint`, `token_endpoint`, and `userinfo_endpoint`. Missing any of the three produces a 500 naming the provider, but only when it is used rather than when it is listed, which is why it can look like a broken button rather than a configuration error.
-
-### Auth email links never arrive
-
-Three things have to be true, and the response you get back will not tell you which one failed. In order of likelihood:
-
-**Delivery is not configured.** Emails go through the API's mail service using the environment's SMTP settings. An environment with no working mail service accepts the request and sends nothing. Editing a template does not fix this, and neither does a correct-looking default subject.
-
-**The environment has no `site_url`.** The mail is sent, and the link points at Akountz's own hosted page rather than your application. The message arrives; it just does not go where you expected.
-
-**The address has no account.** The recovery and magic-link endpoints deliberately answer identically whether or not the address exists, so a success response proves nothing. This is the anti-enumeration property described earlier, not a bug.
-
-<Warning>
-A generic success response is not a delivery confirmation. If you are testing the mail path, watch the SMTP side — the API's mail logs — rather than inferring from the API's response.
-</Warning>
-
-When the email does arrive but the link fails, it is almost always the single-use rule. The link is consumed on first use; a second click — from a double-click, a mail-client prefetcher, or the user being curious — is rejected with the same error as an expired link. Peeking before submitting is safe; consuming twice is not.
-
-<Info>
-One-time token lifetimes differ sharply by purpose: fifteen minutes for a magic link, one hour for recovery, a full day for verification. If a verification link "expired immediately", check that the link in the message is the verification link and not something else.
-</Info>
-
-### A configuration change has no effect
-
-Two causes, and they are easy to distinguish once you know to look.
-
-**The cache.** Each environment's config is cached for the config TTL, default ten seconds. A save followed by an immediate retry reads the previous config. Wait and retry before concluding anything is wrong.
-
-**The key was never set.** An absent key — and a key explicitly set to `null` — falls back to the default. Since the defaults are permissive, a feature you believe you turned off may be on because you cleared the value rather than setting it to `false`.
-
-| What you did | What Akountz sees |
-| --- | --- |
-| Set `signup_enabled` to `false` | Disabled. |
-| Removed the `signup_enabled` key entirely | Enabled — that is the default. |
-| Set `signup_enabled` to `null` | Enabled. Null is treated as absent. |
-| Set `"signup_enabled": "false"` | A non-empty string, which is truthy. Enabled. |
-
-<Warning>
-The last row catches people writing configuration by hand. In JSON, `false` is a boolean and `"false"` is a string, and a non-empty string is truthy. If you are editing the block outside Studio, check the types — the same applies to the numeric fields, where a quoted `"900"` will not behave like a number.
-</Warning>
-
-## Two audiences, two account systems
-
-Pawabase has two entirely separate account systems, and confusing them wastes more time than any configuration mistake.
-
-| | Studio operators | Application users |
-| --- | --- | --- |
-| Where they live | The reserved `_platform` environment | A project and environment you choose |
-| How they are created | The first operator is created at startup from installation settings. No sign-up. | Sign-up, magic link, social login, or an operator creating one |
-| Where they are managed | Studio's own organisation and team settings | **Users & auth** in the project |
-| What access means | Permission to configure projects and environments | An identity your application's policies can authorise |
-| Configurable? | No. The platform config is hardcoded. | Yes, through the environment's `auth` block |
-
-Signing into Studio does not test your application's sign-in. A Studio operator cannot sign into your application, and an application user cannot sign into Studio. If you are testing your product, use an application user in the environment you are testing.
-
-<Warning>
-The inverse mistake is just as common: granting a role to an application user and expecting it to change what they can do in Studio. Studio's access comes from operator roles in the platform environment, which are a different set entirely.
-</Warning>
-
-## Provisioning users
-
-Because accounts are per environment and definitions are not, **somebody has to create users in production.** There are three routes into an account, and they suit different situations.
-
-| Route | When to use it |
-| --- | --- |
-| Self sign-up | Your product is open to anyone. Requires `signup_enabled`. |
-| An operator creating the account | Internal tools, seeded demo data, or an invite-only product. Studio's **New user**, leaving the password empty so the user sets their own. |
-| Inviting to an organization | Your product groups users into customer teams. The invitation carries the role and lands as an email. |
-
-The middle route is worth explaining in detail because it is the one operators reach for first. Creating a user in Studio with the password empty produces an account with an unusable password. That account cannot sign in with a password, cannot be brute-forced, and is not a usable credential for anyone. The user sets a password themselves through a recovery link, which also proves they control the address.
-
-<Note>
-The password field in the **New user** modal exists for the cases where an operator genuinely needs to set one — a shared kiosk login, or a test account in a throwaway environment. For real users, leaving it empty is the better default: it hands credential choice to the user and gives you a verified address as a side effect.
-</Note>
-
-For a product serving multiple customer teams, the invitation route is usually the right one, because it establishes both the account and the organization membership in a single step. See [Organizations](/auth/organizations).
-
-## Authentication is not authorisation
-
-A successful sign-in establishes who someone is. It grants nothing. Every operation still needs a policy, and the distinction is where most security design errors come from.
-
-The gap is easy to underestimate because the two feel continuous. A signed-in user has an identity, roles, permissions, possibly an organization and an assurance level — and every one of those is a *claim*, not an authorisation. The policy is what turns them into a decision on a specific operation.
-
-For a leave-request resource, a plausible design is: any authenticated employee may create a request; the owner may read their own; HR reviewers may approve. Nothing in authentication knows about leave requests. Authentication hands you an employee id and whatever roles that person holds; the policy decides what that combination may do.
-
-<Warning>
-Hiding the approval button in your frontend is a usability improvement, not a security control. The update operation has to enforce the reviewer policy independently, because anyone with a token can call the route directly. The same applies to storage rules and realtime channels — each enforces separately.
-</Warning>
-
-A second gap worth naming: **an anonymous caller still has context.** Project and environment are known even with no credentials. A policy that checks only for a valid context, without checking `authenticated`, will expose data to anyone who can reach the endpoint.
-
-See [Policies](/policies/overview), [Auth in policies](/auth/auth-in-policies), and [Storage](/storage/overview).
-
-## What to take away
-
-Four things, and they are enough to make every other page predictable.
-
-**Authentication is layered, and only one layer writes.** Akountz owns identity. The API owns each environment's `auth` block and Akountz merely reads it. The gateway only verifies. When a behaviour surprises you, the layer you are looking at determines the explanation.
-
-**Every user belongs to one `project` + `env`.** The same email in two environments is two accounts. Tokens are signed per environment, so a token works only where it was issued. Most "the user doesn't exist" reports are the wrong environment.
-
-**An unset key is a permissive default.** Not "off". Sign-up, magic links, and MFA all default on, and a key set to `null` counts as unset. Changes also take up to ten seconds to land because the config is cached.
-
-**Sign-in is not authorisation.** A token carries claims; a policy makes decisions. Both the frontend and each enforcement point decide independently.
-
-From here, [Authentication configuration](/auth/configuration) prepares an environment, [Passwords](/auth/passwords) covers the most common sign-in path in full, and [Security model](/auth/security-model) covers what to validate before real users arrive.

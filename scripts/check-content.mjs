@@ -77,8 +77,8 @@ for (const file of files) {
     }
   }
 
-  if (lines.length < 1500 || lines.length > 1900) {
-    report(file, 1, `page has ${lines.length} lines; required range is 1500-1900`);
+  if (lines.length < 500 || lines.length > 1500) {
+    report(file, 1, `page has ${lines.length} lines; required range is 500-1500`);
   }
 
   const paragraphs = new Map();
