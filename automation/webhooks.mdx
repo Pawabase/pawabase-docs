@@ -1,0 +1,214 @@
+---
+title: "Webhooks"
+description: "Send signed events to your own URL with retries and replay, verify them on arrival, and receive calls from Stripe, GitHub and others."
+icon: "webhook"
+---
+
+A webhook is an HTTP call between systems. Pawabase supports both directions:
+
+- **Outbound:** Pawabase sends events to a URL you control (your server, a partner, an automation tool).
+- **Inbound:** another service (Stripe, GitHub) sends requests to a Pawabase URL, which verifies them and starts a flow or emits an event.
+
+## Outbound
+
+### Create
+
+<CodeGroup>
+```typescript TypeScript
+await m.webhooks.create({
+  name: "partner-orders",
+  url: "https://partner.example.com/hooks/pawabase",
+  events: ["orders.created", "orders.updated"],
+  secret: process.env.WEBHOOK_SECRET,          // at least 16 characters
+  max_attempts: 5,
+  headers: { "x-source": "pawabase" },
+});
+
+await m.webhooks.test("partner-orders");        // one test event, one attempt, no retries
+```
+
+```python Python
+pb.manage.webhooks.create({
+    "name": "partner-orders",
+    "url": "https://partner.example.com/hooks/pawabase",
+    "events": ["orders.created", "orders.updated"],
+    "secret": os.environ["WEBHOOK_SECRET"],
+    "max_attempts": 5,
+})
+pb.manage.webhooks.test("partner-orders")
+```
+</CodeGroup>
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Letters, digits and dashes |
+| `url` | Where to send. Use HTTPS. Private and loopback addresses are refused outside development |
+| `events` | Event names or [patterns](/automation/events#wildcards). Default `["*"]` |
+| `headers` | Extra headers sent with every request |
+| `secret` | Signs each request. At least 16 characters. Keep it in an environment variable |
+| `max_attempts` | Tries before a delivery is marked failed, 1 to 10. Default 5 |
+| `enabled` | `false` pauses it |
+
+### What your endpoint receives
+
+```json
+{
+  "id": "evt_abc123",
+  "event": "orders.created",
+  "project": "acme",
+  "env": "production",
+  "data": { "id": "ord_001", "total": 2999, "status": "pending" },
+  "sent_at": 1727520000
+}
+```
+
+Reply `2xx` within 30 seconds. Anything else is a failed attempt and is retried.
+
+### Retries
+
+| Attempt | Waits before it |
+| --- | --- |
+| 1 | Immediately |
+| 2 | About 10 seconds |
+| 3 | About 1 minute |
+| 4 | About 5 minutes |
+| 5 | About 30 minutes |
+| 6 | About 2 hours |
+| 7 | About 6 hours |
+| 8 | About 12 hours |
+| 9, 10 | About 24 hours |
+
+Waits vary by up to 20%. With the default of 5 attempts a delivery keeps trying for about 36 minutes; with 10, about 3 days. If your endpoint needs slow work, answer `200` at once and process in the background.
+
+### Verify the signature
+
+Anyone who knows your URL can post to it. The `Pawabase-Signature` header proves a request came from Pawabase:
+
+```text
+Pawabase-Signature: t=1700000000,v1=a1b2c3…
+```
+
+`v1` is the hex HMAC-SHA256, keyed with your secret, of the text `"<t>.<raw body>"`. Reject requests more than 5 minutes old. Always sign over the **raw** body, not re-serialised JSON.
+
+<CodeGroup>
+```typescript TypeScript
+import crypto from "node:crypto";
+import express from "express";
+
+const app = express();
+
+app.post("/hooks/pawabase", express.raw({ type: "application/json" }), (req, res) => {
+  const header = req.get("Pawabase-Signature") ?? "";
+  const parts = Object.fromEntries(header.split(",").map((p) => p.split("=", 2)));
+  const t = Number(parts.t);
+  if (!t || Math.abs(Date.now() / 1000 - t) > 300) return res.sendStatus(403);
+
+  const expected = crypto.createHmac("sha256", process.env.WEBHOOK_SECRET!).update(`${t}.`).update(req.body).digest("hex");
+  const given = Buffer.from(parts.v1 ?? "", "hex");
+  const want = Buffer.from(expected, "hex");
+  if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return res.sendStatus(403);
+
+  const event = JSON.parse(req.body.toString());
+  // handle event.event / event.data; ignore a repeated event.id
+  res.sendStatus(200);
+});
+```
+
+```python Python
+import hashlib, hmac, json, os, time
+from fastapi import FastAPI, HTTPException, Request
+
+app = FastAPI()
+
+def verify(body: bytes, header: str, secret: str) -> bool:
+    parts = dict(item.split("=", 1) for item in header.split(",") if "=" in item)
+    try:
+        stamp = int(parts.get("t", ""))
+    except ValueError:
+        return False
+    if abs(time.time() - stamp) > 300:
+        return False
+    expected = hmac.new(secret.encode(), f"{stamp}.".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, parts.get("v1", ""))
+
+@app.post("/hooks/pawabase")
+async def hook(request: Request):
+    body = await request.body()
+    if not verify(body, request.headers.get("Pawabase-Signature", ""), os.environ["WEBHOOK_SECRET"]):
+        raise HTTPException(status_code=403)
+    return {"ok": True}
+```
+</CodeGroup>
+
+If verification always fails, you parsed the body before verifying, or the secret differs. If it fails sometimes, your server's clock is more than five minutes off.
+
+### Delivery history and redelivery
+
+<CodeGroup>
+```typescript TypeScript
+const failed = await m.webhooks.deliveries({ status: "failed", endpoint: "partner-orders", limit: 50 });
+
+await m.webhooks.redeliver("dlv_123");
+
+const preview = await m.webhooks.redeliverMany({ endpoint: "partner-orders", status: "failed", sinceMinutes: 480, dryRun: true });
+await m.webhooks.redeliverMany({ endpoint: "partner-orders", status: "failed", sinceMinutes: 480 });
+```
+
+```python Python
+failed = pb.manage.webhooks.deliveries(status="failed", endpoint="partner-orders", limit=50)
+pb.manage.webhooks.redeliver("dlv_123")
+preview = pb.manage.webhooks.redeliver_many(endpoint="partner-orders", status="failed", since_minutes=480, dry_run=True)
+pb.manage.webhooks.redeliver_many(endpoint="partner-orders", status="failed", since_minutes=480)
+```
+</CodeGroup>
+
+Statuses are `pending`, `retrying`, `delivered` and `failed`. `redeliverMany` takes `ids` (up to 500) or filters: `status` (default `failed`), `endpoint`, `event`, `sinceMinutes`, and `limit` (default 100, up to 500). Always run a dry run first. Each resend creates a new delivery with the same payload, so your endpoint should treat a repeated `id` as a duplicate.
+
+To send an event to every subscribed webhook on demand from a flow, use the `webhook.send` block.
+
+## Inbound
+
+An **inbound hook** gives another service a URL to call.
+
+```typescript
+await m.inboundHooks.create({
+  name: "stripe",
+  slug: "stripe",
+  verification: "hmac-sha256-ts",
+  signature_header: "stripe-signature",
+  secret: process.env.STRIPE_WEBHOOK_SECRET,
+  target_type: "flow",
+  target: "handle-stripe",
+});
+
+const { url } = await m.inboundHooks.url("stripe");    // give this to the sender
+```
+
+```python
+pb.manage.inbound_hooks.create({
+    "name": "stripe", "slug": "stripe", "verification": "hmac-sha256-ts",
+    "signature_header": "stripe-signature", "secret": os.environ["STRIPE_WEBHOOK_SECRET"],
+    "target_type": "flow", "target": "handle-stripe",
+})
+url = pb.manage.inbound_hooks.url("stripe")["url"]
+```
+
+The URL is `https://<your api host>/hooks/v1/<environment>/<slug>`. It needs no API key, because the signature is the credential.
+
+| Field | Meaning |
+| --- | --- |
+| `slug` | The last part of the URL |
+| `verification` | `hmac-sha256` (default), `hmac-sha512`, `hmac-sha256-ts` (HMAC over timestamp and body), `pawabase` (Pawabase's own header), `token` (shared token) or `none` |
+| `signature_header` | The header carrying the signature. Default `x-signature` |
+| `secret` | The shared secret, at least 16 characters |
+| `target_type` | `flow`, or `event` to emit an event |
+| `target` | The flow name or event name |
+
+Match `verification` and `signature_header` to what the sender does, and check the sender's documentation: GitHub uses HMAC-SHA256 in `x-hub-signature-256`. Avoid `none`; without a check, anyone with the URL can start your flow.
+
+The request's JSON body is the flow's `input`. A bad signature gets `403`; a verified request gets `202` and the flow runs in the background, with failures visible in the [job log](/automation/jobs-and-schedules#failures-and-replay).
+
+<CardGroup cols={2}>
+  <Card title="Events" icon="bolt" href="/automation/events">What webhooks carry.</Card>
+  <Card title="Jobs and schedules" icon="list-checks" href="/automation/jobs-and-schedules">Retry what failed.</Card>
+</CardGroup>

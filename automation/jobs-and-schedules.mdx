@@ -1,0 +1,148 @@
+---
+title: "Jobs and schedules"
+description: "Run slow work in the background, retry and replay failures, monitor queues, and run flows on a cron or interval."
+icon: "list-checks"
+---
+
+A **job** is one unit of background work: a flow started by an event, a webhook delivery, an email. Because it runs outside the request, the caller gets a fast answer and the slow work has its own status, attempts and record.
+
+## Start background work
+
+From a flow, hand work to a queue and move on. Both blocks return as soon as the job is stored.
+
+```json
+{ "id": "dispatch", "data": { "block": "queue.flow", "config": { "flow": "generate_report", "input": { "month": "{{ input.body.month }}" }, "queue": "default", "delay": 0 } } }
+```
+
+```json
+{ "id": "sync", "data": { "block": "queue.function", "config": { "function": "sync_customer", "input": { "id": "{{ steps.create.output.id }}" } } } }
+```
+
+| Field | Meaning |
+| --- | --- |
+| `flow` / `function` | What to run |
+| `input` | Becomes `input` in the dispatched work |
+| `queue` | A queue name; default `default`. Use a separate name for heavy work (`bulk`) so it cannot hold up quick work |
+| `delay` | Seconds before it may start (relative, "not before") |
+
+The output is `{ "job_id": "…" }`. Pass identifiers in `input`, not whole records: the job should read the current row when it runs.
+
+From your own code, emit an [event](/automation/events) that a flow subscribes to; that flow runs as a job.
+
+## Job states
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | Waiting, or waiting out a delay |
+| `active` | Running |
+| `retrying` | An attempt failed; another is scheduled |
+| `succeeded` | Finished |
+| `failed` | Gave up |
+
+A job gets **one attempt** by default. Retrying arbitrary business logic can charge a card twice, so Pawabase does not guess. Add a `control.retry` step around the part that can fail for a passing reason:
+
+```json
+{ "id": "retry_send", "data": { "block": "control.retry", "config": { "attempts": 3, "base_delay": 2 } } }
+```
+
+Make anything with side effects safe to repeat: check a marker first (a `receipt_sent_at` column is best), and use idempotency keys with providers.
+
+## Look at jobs
+
+<CodeGroup>
+```typescript TypeScript
+const queues = await m.jobs.queues();                                     // depth and counts per queue
+const active = await m.jobs.list({ status: "active", queue: "flows", limit: 25 });
+const job = await m.jobs.detail("job_123");
+const policies = await m.jobs.retryPolicies();                            // attempts and waits per kind of work
+```
+
+```python Python
+queues = pb.manage.jobs.queues()
+active = pb.manage.jobs.list(status="active", queue="flows", limit=25)
+job = pb.manage.jobs.detail("job_123")
+policies = pb.manage.jobs.retry_policies()
+```
+</CodeGroup>
+
+Read queue depth as a trend. Steady and low is healthy; growing means work arrives faster than it finishes; growing with many `retrying` means a dependency is down.
+
+To show progress to a user, keep the state in a **record** (`status: "preparing"` → `"ready"`) that the job updates, and let the app read it or listen to it over [realtime](/realtime/record-changes). Do not poll jobs from the browser.
+
+## Failures and replay
+
+<CodeGroup>
+```typescript TypeScript
+const failed = await m.jobs.failed();
+await m.jobs.retry("job_123");
+
+const preview = await m.jobs.replay({ status: "failed", queue: "mail", sinceMinutes: 120, dryRun: true });
+await m.jobs.replay({ status: "failed", queue: "mail", sinceMinutes: 120 });
+
+await m.jobs.dismissFailed("job_123");
+```
+
+```python Python
+failed = pb.manage.jobs.failed()
+pb.manage.jobs.retry("job_123")
+preview = pb.manage.jobs.replay(status="failed", queue="mail", since_minutes=120, dry_run=True)
+pb.manage.jobs.replay(status="failed", queue="mail", since_minutes=120)
+pb.manage.jobs.dismiss_failed("job_123")
+```
+</CodeGroup>
+
+`replay` takes `ids`, or filters `status` (default `failed`), `queue`, `job`, `sinceMinutes`, `limit` (default 200) and `dryRun`. Read an error before you retry: a bug fails the same way again. A retry reuses the original input and cannot know how far the first attempt got.
+
+After an outage: read two or three errors, wait for recovery, dry-run the replay over the outage window, run it, then list failures again.
+
+## Schedules
+
+A **schedule** runs something by the clock.
+
+<CodeGroup>
+```typescript TypeScript
+await m.schedules.create({
+  name: "nightly-rollup",
+  cron: "0 3 * * *",
+  timezone: "Africa/Lagos",
+  target_type: "flow",
+  target: "rollup",
+  overlap: "skip",
+  payload: { full: false },
+});
+
+await m.schedules.run("nightly-rollup");     // fire now, to test
+```
+
+```python Python
+pb.manage.schedules.create({
+    "name": "nightly-rollup", "cron": "0 3 * * *", "timezone": "Africa/Lagos",
+    "target_type": "flow", "target": "rollup", "overlap": "skip",
+})
+pb.manage.schedules.run("nightly-rollup")
+```
+</CodeGroup>
+
+| Field | Meaning |
+| --- | --- |
+| `cron` | Five fields: minute, hour, day of month, month, day of week (0 is Sunday) |
+| `interval_seconds` | Run every N seconds instead (10 or more). Use `cron` or this |
+| `timezone` | An IANA name such as `Europe/London`. Cron is read in this zone. Default UTC |
+| `target_type`, `target` | A `flow`, a `function`, or an `event` to emit |
+| `payload` | Extra data for the target |
+| `overlap` | `allow` (default) or `skip` while the previous run is still going |
+| `catch_up` | `true` runs occurrences missed during downtime. Default `false` |
+| `enabled` | `false` pauses it |
+
+When it fires, the target receives `{ "scheduled_at": "…" }` with your payload. Use `scheduled_at`, not "now", so a late run still works on the right window.
+
+Common cron expressions: `*/5 * * * *` every 5 minutes; `0 * * * *` hourly; `0 3 * * *` daily at 03:00; `0 9 * * 1-5` weekdays at 09:00; `0 0 1 * *` the first of each month.
+
+**Prefer sweeps to delayed jobs.** Instead of one delayed job per invoice, run a short schedule that finds whatever is due (`due_at` passed and `reminded` false), handles it, and marks it. A missed run only delays things until the next one.
+
+Manage with `list`, `replace(name, definition)` and `remove(name)`.
+
+<CardGroup cols={2}>
+  <Card title="Events" icon="bolt" href="/automation/events">Trigger work from events.</Card>
+  <Card title="Mail" icon="mail" href="/automation/mail">Email as background work.</Card>
+</CardGroup>
