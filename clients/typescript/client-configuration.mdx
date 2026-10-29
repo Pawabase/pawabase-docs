@@ -1,0 +1,1666 @@
+---
+title: "Client configuration"
+description: "Every option of createClient, what each one changes about identity, sessions, timeouts, retries and realtime, and how to use the raw request API, hooks and the client lifecycle."
+icon: "sliders-horizontal"
+---
+
+`createClient(options)` builds one client from an options object.
+The options decide four things: where requests go, which credentials they carry, how the user's session is kept, and how the client reacts when the network or the server fails.
+
+This page explains each option by the decision it represents, then covers the parts of the client that are not about a particular service: raw requests, health checks, hooks and the client's lifecycle.
+
+## The mental model
+
+A client's options are fixed when it is created.
+There is no `setApiKey()` or `setUrl()`.
+If you need different settings, you create another client, or use `asUser(token)`, which creates a client with the same options and a different identity.
+
+This immutability is deliberate.
+A client holds a session and possibly a WebSocket, and those are only valid for the URL, key and environment they were created for.
+Changing the key under a live session would send one environment's tokens to another.
+
+The options group into five concerns:
+
+| Concern | Options | Question it answers |
+| --- | --- | --- |
+| Destination | `url`, `environment`, `project` | Which gateway and which environment do requests reach? |
+| Credentials | `apiKey`, `accessToken`, `dangerouslyAllowBrowser` | Who is calling, and with what authority? |
+| Session | `auth` | Where is the signed-in user's session kept, and how is it refreshed? |
+| Transport | `timeoutMs`, `retry`, `fetch`, `headers`, `hooks` | How are requests sent, timed, repeated and observed? |
+| Realtime | `realtime` | How is the WebSocket opened, kept alive and reconnected? |
+
+## The options at a glance
+
+<CodeGroup>
+```typescript TypeScript
+import { createClient } from "@pawabase/client";
+
+const pawabase = createClient({
+  url: "https://api.example.com",
+  apiKey: "pb_pk_live_…",
+  environment: "production",
+  timeoutMs: 30_000,
+  retry: { retries: 2, baseDelayMs: 300, maxDelayMs: 8000, maxRetryAfterMs: 30_000 },
+  headers: { "x-app-version": "4.2.0" },
+  hooks: {},
+  auth: { persistSession: true, autoRefreshToken: true, refreshMarginSeconds: 60 },
+  realtime: { heartbeatSeconds: 25, ackTimeoutMs: 10_000, connectTimeoutMs: 10_000 },
+});
+```
+
+```python Python
+from pawabase import MemorySessionStore, Pawabase
+
+pb = Pawabase(
+    "https://api.example.com",
+    "pb_pk_live_…",
+    environment="production",       # defaults to "development"
+    timeout=30.0,                   # seconds per attempt
+    retries=2,                      # extra attempts for reads after network failures and 502/503/504
+    session_store=MemorySessionStore(),
+    auto_refresh=True,
+    headers={"x-app-version": "4.2.0"},
+)
+```
+
+```bash cURL
+# Options are client behavior; on the wire every request carries the same few headers:
+curl "$PAWABASE_URL/rest/v1/orders" \
+  -H "apikey: pb_pk_live_…" -H "x-environment: production" -H "x-app-version: 4.2.0" \
+  --max-time 30
+```
+</CodeGroup>
+
+| Option | Type | Default | Required |
+| --- | --- | --- | --- |
+| `url` | `string` | none | Yes |
+| `apiKey` | `string` | none | Yes |
+| `environment` | `string` | none | No, but recommended |
+| `project` | `string` | none | No |
+| `timeoutMs` | `number` | `30000` | No |
+| `retry` | `RetryOptions \| false` | `{ retries: 2, baseDelayMs: 300, maxDelayMs: 8000, maxRetryAfterMs: 30000 }` | No |
+| `fetch` | `(input, init) => Promise<Response>` | The global `fetch` | Only where there is no global `fetch` |
+| `headers` | `Record<string, string>` | `{}` | No |
+| `hooks` | `Hooks` | `{}` | No |
+| `auth` | `AuthOptions` | See [Session options](#session-options) | No |
+| `realtime` | `RealtimeOptions` | See [Realtime options](#realtime-options) | No |
+| `accessToken` | `string \| () => string \| null \| Promise<string \| null>` | none | No |
+| `dangerouslyAllowBrowser` | `boolean` | `false` | No |
+
+`createClient` checks the options it can check without a network call, and throws `ConfigError` immediately when something is wrong.
+That makes configuration mistakes fail at startup, in the place where you can fix them.
+
+| Problem | Error message |
+| --- | --- |
+| `url` is missing or empty | `createClient needs the gateway url.` |
+| `apiKey` is missing or empty | `createClient needs an apiKey.` |
+| `url` cannot be parsed | `"<url>" is not a valid URL.` |
+| `url` is not `http:` or `https:` | `The url must start with http:// or https://.` |
+| A secret key in a browser | `A secret key (pb_sk_…) must never run in a browser…` |
+| No `fetch` anywhere | `No fetch is available. Pass one in the options.` |
+
+## Destination options
+
+### url
+
+The origin of your Pawabase gateway.
+Every service is reached through it: the data API at `/rest/v1`, auth at `/auth/v1`, storage at `/storage/v1`, realtime at `/realtime/v1`, flows at `/flows/v1`, and the management plane at `/platform/v1`.
+
+You find it in Studio under **Access → API keys**, in the **Health check** card at the top of the page, which also tells you whether a key resolves through that gateway.
+For a local stack it is the port your gateway listens on, such as `http://localhost:8080`.
+
+The client removes trailing slashes and then appends service paths to whatever you gave it.
+That has two consequences worth knowing.
+
+A gateway served under a path prefix works.
+If your reverse proxy exposes Pawabase at `https://example.com/pawabase`, pass exactly that, and the client calls `https://example.com/pawabase/rest/v1/…`.
+The realtime socket URL is built the same way, keeping the prefix and switching the scheme to `wss:` or `ws:`.
+
+A URL that already contains a service path breaks every call.
+`https://api.example.com/rest/v1` produces `https://api.example.com/rest/v1/rest/v1/orders`.
+If you copied a URL from the API Explorer, strip it back to the origin.
+
+| You passed | Requests go to | Correct? |
+| --- | --- | --- |
+| `https://api.example.com` | `https://api.example.com/rest/v1/orders` | Yes |
+| `https://api.example.com/` | `https://api.example.com/rest/v1/orders` | Yes |
+| `https://example.com/pawabase` | `https://example.com/pawabase/rest/v1/orders` | Yes, for a prefixed proxy |
+| `https://api.example.com/rest/v1` | `https://api.example.com/rest/v1/rest/v1/orders` | No |
+| `api.example.com` | none; `ConfigError` | No |
+
+### environment
+
+The name of the environment the key belongs to, such as `development`, `production`, or a preview's name.
+
+A key already identifies its environment, so for data, auth, storage and flows the gateway does not need this value.
+The client still uses it in four places:
+
+| Use | What happens |
+| --- | --- |
+| Every request | Sent as the `x-environment` header. |
+| Social sign-in | Part of the authorization URL: `/auth/v1/authorize/<environment>/<provider>`. |
+| Realtime | Added to the socket URL as `environment=<name>`. |
+| `manage()` and `admin()` | The default environment of management paths: `/platform/v1/envs/<environment>/…`. |
+
+When you omit it, social sign-in falls back to the `env` claim of the signed-in user's access token, and fails with `ConfigError` when nobody is signed in.
+`manage()` and `admin()` fall back to `development`, which is almost never what a production script wants.
+Pass it explicitly.
+
+### project
+
+The project's reference.
+When given, it is sent as the `x-project-id` header.
+The gateway already knows the project from the key, so this is a scope hint for proxies and logs, not an authority.
+Most applications leave it out.
+
+## Credential options
+
+### apiKey
+
+The key every request carries in the `apikey` header.
+The [overview](/clients/javascript#the-api-key) explains publishable and secret keys; this section covers how the client treats them.
+
+The client recognizes a secret key by its prefix: `pb_sk_`, or `sk_` for keys from older installations.
+It uses that recognition in four places.
+
+| Place | Behavior with a secret key |
+| --- | --- |
+| `createClient` in a browser | Throws `ConfigError` unless `dangerouslyAllowBrowser` is `true`. |
+| `auth.signInWithOAuthUrl()` | Throws `ConfigError`; the key would appear in a URL. |
+| `storage.from(b).getPublicUrl()` | Throws `ConfigError`; the key would appear in a URL. |
+| `manage()` and `admin()` | Required; with a publishable key they throw `ConfigError`. |
+
+"In a browser" means a global `window` and a global `document` both exist.
+Server-side rendering in Node has neither, so a secret key on the server side of a Next.js page is accepted.
+A web worker has no `document`, so the check does not fire there; do not put secret keys in workers that run in a user's browser.
+
+Keys can be narrowed further when they are created, independently of their type.
+
+| Restriction | Set in Studio as | Effect on a client using the key |
+| --- | --- | --- |
+| Scopes | **Permissions** | Requests outside the scopes get `403` from the gateway, before any policy. |
+| Expiry | **Expires** | After the date, every request gets `401 invalid_api_key`. |
+| Allowed IP ranges | **Allowed IP ranges** | Requests from other addresses are refused. Useful for secret keys on servers with fixed egress. |
+| Allowed routes | **Allowed routes** | Requests to other paths are refused, for example a key that may only call `GET /rest/v1/*`. |
+
+A key can be rotated in Studio.
+Rotation issues a replacement and keeps the old key working for a grace period you choose, 24 hours by default, so deployed clients can switch without downtime.
+Because the key is fixed in a client, switching means deploying with the new key; there is nothing to call on a running client.
+
+### accessToken
+
+A user's access token to send instead of a stored session.
+It accepts a string, or a function that returns a string, `null`, or a promise of either.
+
+Setting `accessToken` puts the client in **stateless** mode.
+This is the mode for code that handles one request for one user and already holds that user's token, typically from a cookie.
+
+| Behavior | Normal client | Stateless client (`accessToken` set) |
+| --- | --- | --- |
+| Where the token comes from | The stored session | The `accessToken` option, read before each request |
+| Session storage | `localStorage` in browsers, memory elsewhere | Memory only, empty |
+| Automatic refresh | Yes | No |
+| After a `401` | One refresh and one replay | The error is thrown; refreshing is your job |
+| Reading the URL fragment for social sign-in | Yes, in browsers | No |
+| Realtime socket | Carries the session's token, updated on refresh | Opens without a user token |
+
+The function form is useful when a framework owns the session and the token can change during a request:
+
+<CodeGroup>
+```typescript TypeScript
+import { createClient } from "@pawabase/client";
+
+const pawabase = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  environment: "production",
+  accessToken: async () => (await getSessionFromFramework())?.accessToken ?? null,
+});
+
+declare function getSessionFromFramework(): Promise<{ accessToken: string } | null>;
+```
+
+```python Python
+from pawabase import Pawabase
+
+# A fixed token for one request:
+pb = Pawabase(PAWABASE_URL, PUBLISHABLE_KEY, environment="production", access_token=token, auto_refresh=False)
+
+# More often: one client per process, a view per request
+view = base.as_user(token)
+```
+
+```bash cURL
+curl "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+</CodeGroup>
+
+`pawabase.asUser(token)` builds exactly this kind of client from an existing one, copying every other option.
+It is the method you will use most of the time; the option exists for code that creates clients directly.
+
+Note the realtime row.
+A stateless client's realtime connection does not carry the user's token, so channels whose rules require a signed-in user refuse it.
+Server code rarely needs a live socket; when it does, give it a normal client with a session adopted through `auth.setSession()`.
+
+### dangerouslyAllowBrowser
+
+Turns off the check that refuses a secret key in a browser.
+The name is the documentation: a secret key in a browser can be read by anyone who opens developer tools, and it bypasses every policy.
+
+The legitimate uses are internal tools that run on a trusted machine and never reach the public internet, such as a local data-repair page served from `localhost`.
+If you are unsure whether your case is one of them, it is not.
+
+## Session options
+
+The `auth` option configures how the signed-in user's session is kept.
+It does not affect requests made with a secret key, which have no session.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `storage` | `SessionStorage` | `localStorage` when the browser allows it, otherwise memory | Where the session is saved between page loads or app launches |
+| `storageKey` | `string` | `pawabase.auth.<host>.<first 14 characters of the key>` | The key under which the session is saved |
+| `persistSession` | `boolean` | `true` | `false` keeps the session in memory only |
+| `autoRefreshToken` | `boolean` | `true` | Refresh the access token before it expires |
+| `refreshMarginSeconds` | `number` | `60` | How long before expiry a token counts as expiring |
+| `detectSessionInUrl` | `boolean` | `true` in browsers | Read tokens a social sign-in left in the URL fragment |
+
+### storage
+
+A session store has three methods, each of which may be synchronous or return a promise:
+
+```typescript
+interface SessionStorage {
+  getItem(key: string): string | null | Promise<string | null>;
+  setItem(key: string, value: string): void | Promise<void>;
+  removeItem(key: string): void | Promise<void>;
+}
+```
+
+The browser's `localStorage` fits this interface, which is why it is the default.
+The client probes it before use, because privacy modes and some embedded browsers throw on access; when the probe fails, the session lives in memory and the user signs in again on the next load.
+
+Other environments need an adapter.
+
+| Environment | A good store | Why |
+| --- | --- | --- |
+| Browser | The default `localStorage` | Survives reloads; shared by tabs of the same origin. |
+| Browser, stricter isolation | `sessionStorage` | Each tab has its own session; closing the tab signs out. |
+| React Native and Expo | `expo-secure-store` or the Keychain and Keystore | The session is a credential; the platform's secure storage protects it at rest. |
+| Electron | The main process's `safeStorage`, reached over IPC | Keeps tokens out of a renderer's storage. |
+| Node script that should stay signed in | A file readable only by the owner | Survives runs of a command-line tool. |
+| Server handling many users | None; use `asUser(token)` | A shared store would mix users. |
+
+The `MemoryStorage` class is exported for tests and for code that wants an explicit in-memory store:
+
+<CodeGroup>
+```typescript TypeScript
+import { createClient, MemoryStorage } from "@pawabase/client";
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  auth: { storage: new MemoryStorage() },
+});
+```
+
+```python Python
+from pawabase import MemorySessionStore, Pawabase
+
+pb = Pawabase(url, key, environment="production", session_store=MemorySessionStore())
+```
+</CodeGroup>
+
+A file store for a command-line tool takes a few lines:
+
+```typescript
+import { promises as fs } from "node:fs";
+import type { SessionStorage } from "@pawabase/client";
+
+export function fileStorage(path: string): SessionStorage {
+  return {
+    async getItem() {
+      try {
+        return await fs.readFile(path, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    async setItem(_key, value) {
+      await fs.writeFile(path, value, { mode: 0o600 });
+    },
+    async removeItem() {
+      await fs.rm(path, { force: true });
+    },
+  };
+}
+```
+
+The store holds both tokens and the user object as JSON.
+A refresh token is a long-lived credential, so treat the store with the care you would give a password.
+
+### storageKey
+
+The default key combines the gateway host and the first 14 characters of the API key.
+Two clients with the same URL and key therefore share a stored session, and clients for different environments do not collide.
+
+Set it explicitly when you deliberately run two independent sessions against the same environment in one browser, for example a support tool that signs in a staff member and, separately, a customer being helped.
+
+### persistSession
+
+`false` keeps the session in memory only.
+The user signs in again after every reload.
+That is appropriate for kiosks, shared devices, and high-security screens where a session should not outlive the page.
+
+When `persistSession` is `false`, the client also stops listening for session changes from other tabs and does not take the cross-tab refresh lock, because there is nothing shared to coordinate.
+
+### autoRefreshToken and refreshMarginSeconds
+
+With automatic refresh on, the client schedules a timer to refresh the access token `refreshMarginSeconds` before it expires.
+Independently of the timer, any request that finds the token expiring refreshes first, and any request that gets `401` refreshes once and repeats.
+
+| Setting | When to change it |
+| --- | --- |
+| `autoRefreshToken: false` | When something else owns refresh, such as a server that refreshes tokens in a cookie. |
+| A larger `refreshMarginSeconds` | When requests are slow to reach the server and a token that is valid when sent could expire in flight. |
+| A smaller `refreshMarginSeconds` | Rarely; a smaller margin only reduces refresh traffic slightly. |
+
+On Node, the refresh timer does not keep the process alive.
+A script that finishes its work exits even if it never calls `dispose()`.
+
+When a timed refresh fails for a reason that may pass, such as being offline, the client tries again 10 seconds later, for as long as it holds a session.
+When it fails because the server refused the refresh token with `400`, `401` or `403`, the session is cleared and listeners receive `SIGNED_OUT`.
+
+### detectSessionInUrl
+
+After a social sign-in, the auth service redirects back to your app with the tokens in the URL fragment: `#access_token=…&refresh_token=…`.
+With `detectSessionInUrl` on, the client reads them on startup, stores the session, and removes the fragment from the address bar with `history.replaceState`.
+
+It also recognizes three other fragments the auth service can send: `#error=…`, `#mfa_required=…&mfa_token=…`, and `#linked=<provider>` after linking an identity.
+Turn it off when another part of your app handles the redirect, and call `auth.getSessionFromUrl(url)` yourself.
+Mobile apps turn it off and call `getSessionFromUrl` from their deep-link handler.
+
+## Transport options
+
+### timeoutMs
+
+The longest a single attempt may take, in milliseconds.
+The default is 30 seconds; `0` disables the timeout.
+
+The timeout applies **per attempt**, not per call.
+A call that is retried twice can take up to three timeouts plus the backoff between them.
+
+| Settings | Worst case for one call |
+| --- | --- |
+| `timeoutMs: 30000`, `retries: 2` | About 90 seconds plus backoff (at most 8 seconds per wait) |
+| `timeoutMs: 10000`, `retries: 2` | About 30 seconds plus backoff |
+| `timeoutMs: 10000`, `retry: false` | 10 seconds |
+
+When an attempt times out, the client raises `TimeoutError`.
+Timeouts are retried like network failures: only for requests that are safe to repeat.
+
+Most queries finish in milliseconds.
+A long timeout mainly matters for uploads, for flows that call slow third parties, and for management operations such as backups.
+Prefer raising the timeout for those calls only:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.flows.run("generate-report", { month: "2026-09" }, { timeoutMs: 120_000 });
+```
+
+```python Python
+# The Python client's timeout is set per client; use a second client for long calls.
+slow = Pawabase(url, key, environment="production", timeout=120)
+slow.flows.invoke("generate-report", {"month": "2026-09"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/flows/v1/generate-report" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" -d '{"month": "2026-09"}' --max-time 120
+```
+</CodeGroup>
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.storage.from("videos").upload("intro.mp4", file, { timeoutMs: 0 });
+```
+
+```python Python
+uploads = Pawabase(url, key, environment="production", timeout=None)   # httpx: None means no timeout
+uploads.storage.from_("videos").upload("intro.mp4", Path("intro.mp4"))
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/storage/v1/object/videos/intro.mp4" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: video/mp4" --data-binary @intro.mp4
+```
+</CodeGroup>
+
+### retry
+
+The policy for repeating failed requests.
+`false` turns retries off for the whole client.
+An object sets any of four fields; the others keep their defaults.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `retries` | `2` | Extra attempts after the first. `0` disables retries. |
+| `baseDelayMs` | `300` | The ceiling of the first backoff. |
+| `maxDelayMs` | `8000` | The largest backoff. |
+| `maxRetryAfterMs` | `30000` | The longest `Retry-After` the client will wait. A longer request to wait is thrown as `RateLimitError` instead. |
+
+The client retries only what is safe to repeat:
+
+| Failure | `GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE` | `POST`, `PATCH` |
+| --- | --- | --- |
+| `429` rate limited | Retried | Retried |
+| `502`, `503`, `504` | Retried | Only when marked idempotent |
+| Network failure | Retried | Only when marked idempotent |
+| Timeout | Retried | Only when marked idempotent |
+| Any other status | Not retried | Not retried |
+
+A `429` is always safe to repeat because the gateway answers it before the request reaches a service.
+A `502` after a `POST` is not: the service may have created the record before the connection failed.
+
+`PUT` and `DELETE` are treated as safe because repeating them leaves the same final state.
+Repeating a `DELETE` that succeeded the first time can produce `404` on the second attempt; the client surfaces that `404`, which you may choose to treat as success.
+
+A request body that is a `ReadableStream` is never retried, because a stream can be read only once.
+
+Backoff uses full jitter: each wait is a random value between zero and `min(maxDelayMs, baseDelayMs × 2^attempt)`.
+Randomness spreads out clients that failed at the same moment, so they do not all return at the same moment.
+When the server sends `Retry-After`, the client waits that long instead of using backoff.
+
+Per-call options merge with the client's policy.
+Several methods accept `retry` and `idempotent` through the raw request API; `flows.run` and `routes` accept `idempotent`:
+
+```typescript
+await pawabase.routes.post("carts/7/recalculate", undefined, { idempotent: true });
+```
+
+Turn retries off for the whole client in tests that assert on exact request counts, and in short-lived scripts where a fast failure is better than a slow success.
+
+### fetch
+
+The function the client uses to send requests, with the same signature as the global `fetch`.
+The default is the global `fetch`, called through a wrapper so that environments that require `fetch` to be called unbound work.
+
+You pass your own for four reasons.
+
+The runtime has no global `fetch`.
+Node 18 and later, Deno, Bun, browsers and React Native all have one, so this is rare today.
+
+You want to instrument requests below the client, for example to add tracing headers or record timings in an APM tool:
+
+```typescript
+import { createClient } from "@pawabase/client";
+
+const tracedFetch: typeof fetch = async (input, init) => {
+  const headers = new Headers(init?.headers);
+  headers.set("traceparent", currentTraceparent());
+  return fetch(input, { ...init, headers });
+};
+
+const pawabase = createClient({ url, apiKey, fetch: tracedFetch });
+
+declare function currentTraceparent(): string;
+```
+
+You need a framework's `fetch` extensions, for example Next.js caching options:
+
+```typescript
+const cachedFetch: typeof fetch = (input, init) =>
+  fetch(input, { ...init, next: { revalidate: 60 } } as RequestInit);
+
+const publicContent = createClient({ url, apiKey, fetch: cachedFetch });
+```
+
+Only use caching like this for data that is the same for every visitor.
+A cached response to one user's request must never be served to another user.
+
+You want a test double that answers without a network, which the [servers and testing page](/clients/typescript/server-runtimes-testing) shows.
+
+### headers
+
+Extra headers sent on every request.
+They are added after the client's own headers, so a header with the same name replaces the client's value.
+
+Useful extras are an application version, a tenant hint your proxy routes on, or a header your firewall rules match.
+Do not put credentials here; the client already sends the key and token where they belong, and a credential in `headers` would also be sent to places the client deliberately sends nothing, such as the logs of your own hooks.
+
+Signed URLs are the exception: calls to an absolute signed URL send neither the key nor the client's extra headers.
+
+### hooks
+
+Four optional callbacks that observe requests.
+They exist for logging, metrics and error tracking.
+A hook that throws is ignored, so observability can never break a request.
+
+| Hook | Called | Receives |
+| --- | --- | --- |
+| `onRequest` | Before each attempt is sent | `method`, `url`, `attempt`, `headers` with `apikey` and `authorization` masked |
+| `onResponse` | After each attempt gets a response, success or not | `method`, `url`, `attempt`, `status`, `durationMs`, `requestId` |
+| `onRetry` | Before waiting to repeat an attempt | `method`, `url`, `attempt`, `reason`, `delayMs` |
+| `onError` | When the client is about to throw | The error, and `method`, `url`, `attempt` |
+
+`attempt` counts from `0`.
+A request that succeeded on its first try produces one `onRequest` and one `onResponse` with `attempt: 0`.
+
+`reason` in `onRetry` is either `status 429`, `status 503` and so on, or the error class name, such as `NetworkError` or `TimeoutError`.
+
+A small metrics bridge looks like this:
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onResponse: ({ method, url, status, durationMs }) => {
+      const route = new URL(url).pathname.split("/").slice(0, 4).join("/");
+      metrics.histogram("pawabase.request.ms", durationMs, { method, route, status: String(status) });
+    },
+    onRetry: ({ reason }) => metrics.increment("pawabase.request.retry", { reason }),
+  },
+});
+
+declare const metrics: {
+  histogram(name: string, value: number, tags: Record<string, string>): void;
+  increment(name: string, tags: Record<string, string>): void;
+};
+```
+
+Group URLs into routes before tagging metrics with them.
+A raw URL contains record ids and query strings, and a metric with one tag value per id becomes expensive and useless.
+
+## Realtime options
+
+The `realtime` option configures the WebSocket connection that channels share.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `webSocket` | A WebSocket constructor | The global `WebSocket` | The implementation to use; on Node 20, pass the `ws` package's `WebSocket` |
+| `heartbeatSeconds` | `number` | `25` | Seconds between pings; a connection silent for two intervals is recycled |
+| `ackTimeoutMs` | `number` | `10000` | How long to wait for the server to acknowledge a subscribe, publish or presence update |
+| `connectTimeoutMs` | `number` | `10000` | How long to wait for the connection to open and be welcomed |
+| `reconnect` | `false` or `{ baseDelayMs, maxDelayMs, maxAttempts }` | Reconnect forever, 500 ms to 15 s backoff | Whether and how to reconnect after a drop |
+| `onProtocolError` | `(detail: string) => void` | none | Called for frames the client does not understand |
+
+```typescript
+import WebSocket from "ws";
+import { createClient } from "@pawabase/client";
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "production",
+  realtime: {
+    webSocket: WebSocket as unknown as import("@pawabase/client").WebSocketConstructor,
+    reconnect: { baseDelayMs: 1000, maxDelayMs: 30_000, maxAttempts: 20 },
+    onProtocolError: (detail) => console.warn("realtime", detail),
+  },
+});
+```
+
+The [realtime page](/clients/typescript/realtime) explains what each of these changes for channels.
+
+## How the client sends a request
+
+Every method in the client goes through one transport, `pawabase.http`.
+Knowing its rules lets you predict how any call behaves, including raw calls you make yourself.
+
+### Which token a request carries
+
+For each request, the transport picks a user token in this order:
+
+| Situation | Token sent |
+| --- | --- |
+| The request goes to an absolute URL (a signed URL) | None, and no API key either |
+| The call passed an explicit `accessToken` | That token |
+| The call passed `auth: "none"` | None; the API key alone |
+| The client is stateless (`accessToken` option) | The value of that option |
+| Otherwise | The stored session's access token, refreshed first if it is expiring |
+
+Auth endpoints that must work for signed-out users, such as sign-in, sign-up and password recovery, are sent with `auth: "none"`.
+That is why signing in works even when a stale session is stored.
+
+### How the body is encoded
+
+| You pass | Sent as | `content-type` |
+| --- | --- | --- |
+| A plain object or array | JSON text | `application/json`, unless you set one |
+| A `string` | As is | Whatever you set; none by default |
+| `Blob` or `File` | As is | The blob's type, if the method sets it |
+| `ArrayBuffer` or a typed array | As is | Whatever you set |
+| `FormData` | As is | Set by the runtime, with a boundary |
+| `URLSearchParams` | As is | Set by the runtime |
+| `ReadableStream` | Streamed, with `duplex: "half"` | Whatever you set |
+| `undefined` or `null` | No body | none |
+
+### How the answer is read
+
+By default the answer is parsed as JSON.
+An empty body, a `204` or a `205` gives `undefined`.
+A body that is not valid JSON is returned as text rather than failing, because some endpoints answer with plain text.
+
+Other parse modes exist for downloads and raw access:
+
+| `parse` | Returns |
+| --- | --- |
+| `"json"` (default) | Parsed JSON, text if it is not JSON, or `undefined` if empty |
+| `"text"` | The body as a string |
+| `"blob"` | A `Blob` |
+| `"arrayBuffer"` | An `ArrayBuffer` |
+| `"stream"` | The body's `ReadableStream` |
+| `"response"` | The `Response` object itself |
+
+An error status throws before parsing, after retries are exhausted, unless the request asked for `throwOnError: false`.
+
+## Raw requests
+
+`pawabase.request(method, path, options)` calls any path on the gateway with the same credentials, retries and errors as the rest of the client.
+Use it for endpoints the client has no method for, and to explore the API while you develop.
+
+<CodeGroup>
+```typescript TypeScript
+const settings = await pawabase.request<{ signup_enabled: boolean }>("GET", "/auth/v1/settings");
+
+const created = await pawabase.request("POST", "/rest/v1/orders", {
+  body: { customer_id: "c_1", total_minor: 1200 },
+});
+
+const filtered = await pawabase.request("GET", "/rest/v1/orders", {
+  query: { "filter[status]": "eq.open", per_page: 5 },
+});
+```
+
+```python Python
+settings = pb.request("GET", "/auth/v1/settings")
+
+created = pb.request("POST", "/rest/v1/orders", json={"customer_id": "c_1", "total_minor": 1200})
+
+filtered = pb.request("GET", "/rest/v1/orders", params={"filter[status]": "eq.open", "per_page": 5})
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/settings" -H "apikey: $PAWABASE_KEY"
+
+curl -X POST "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" -d '{"customer_id": "c_1", "total_minor": 1200}'
+
+curl -G "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "filter[status]=eq.open" --data-urlencode "per_page=5"
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `body` | An object is sent as JSON; other bodies are sent as they are |
+| `query` | Query parameters; `undefined` and `null` values are left out |
+| `headers` | Extra headers for this call |
+| `signal` | An `AbortSignal` to cancel the call |
+
+The path is relative to the gateway origin and should start with `/`.
+Query values are encoded for you; arrays repeat the parameter.
+
+`request()` is deliberately small.
+When you need the transport's advanced options, call `pawabase.http.request()` or `pawabase.http.send()` directly.
+
+| Option on `http.request` | Purpose |
+| --- | --- |
+| `parse` | Choose `text`, `blob`, `arrayBuffer`, `stream` or `response` |
+| `timeoutMs` | A timeout for this call |
+| `retry` | A retry policy for this call, or `false` |
+| `idempotent` | Allow retrying a `POST` or `PATCH` after a network failure or gateway error |
+| `auth` | `"none"` to send the API key without the user's token |
+| `accessToken` | A specific user token for this call |
+| `absoluteUrl` | Call a full URL as it is, with no key, token or extra headers |
+| `throwOnError` | `false` to get an error `Response` back instead of an exception |
+
+<CodeGroup>
+```typescript TypeScript
+const csv = await pawabase.http.request<string>({
+  path: "/rest/v1/x/reports/monthly.csv",
+  query: { month: "2026-09" },
+  parse: "text",
+  timeoutMs: 60_000,
+});
+```
+
+```python Python
+# A body that is not JSON comes back as text
+csv = pb.request("GET", "/rest/v1/x/reports/monthly.csv", params={"month": "2026-09"})
+
+# or streamed, for large answers
+with pb.stream("GET", "/rest/v1/x/reports/monthly.csv", params={"month": "2026-09"}) as response:
+    for chunk in response.iter_bytes():
+        sink.write(chunk)
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/rest/v1/x/reports/monthly.csv" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "month=2026-09" -o monthly.csv
+```
+</CodeGroup>
+
+```typescript
+const response = await pawabase.http.send({
+  method: "GET",
+  path: "/rest/v1/orders/42",
+  throwOnError: false,
+});
+if (response.status === 404) console.log("gone or hidden");
+```
+
+`http.send()` returns the `Response`; `http.request()` reads and parses it.
+Both apply the same retry and refresh rules.
+
+## Health checks
+
+`pawabase.status()` asks the gateway for the health of the services behind it.
+It sends the API key without a user token, and it needs no particular policy.
+
+<CodeGroup>
+```typescript TypeScript
+const status = await pawabase.status();
+// { ok: true, services: { api: { ok: true }, auth: { ok: true }, realtime: { ok: true } } }
+```
+
+```python Python
+status = pb.status()   # GET /health/v1
+```
+
+```bash cURL
+curl "$PAWABASE_URL/v1/status" -H "apikey: $PAWABASE_KEY"
+```
+</CodeGroup>
+
+Use it in readiness probes for services that depend on Pawabase, and as the first step when diagnosing "nothing works".
+It answers the question "is the installation up and is my key accepted" without involving your resources or policies.
+
+| Result | Meaning |
+| --- | --- |
+| `ok: true` | The gateway and its services answered. |
+| `ok: false` with a service `ok: false` | That service is down or unreachable from the gateway. |
+| `AuthenticationError` | The key is not accepted by this gateway. |
+| `NetworkError` | The gateway itself could not be reached. |
+
+## The client's lifecycle
+
+A client has a short lifecycle, and three moments in it matter.
+
+### Construction
+
+`createClient` validates the options, builds the transport, and starts reading the stored session.
+Reading the session is asynchronous, so construction returns before it finishes.
+In a browser, if the URL fragment carries tokens from a social sign-in, the client adopts them during this step.
+
+Nothing is sent to the network during construction, except the user lookup that adopting tokens from a URL requires.
+Creating a client is cheap.
+
+### Ready
+
+`pawabase.auth.initialized()` resolves once the stored session has been read.
+You rarely need to await it: every method that depends on the session waits for it internally, and `onAuthStateChange` delivers `INITIAL_SESSION` once it is done.
+
+```typescript
+await pawabase.auth.initialized();
+const user = await pawabase.auth.getCachedUser();
+```
+
+### Disposal
+
+`pawabase.dispose()` stops the refresh timer, removes cross-tab listeners, removes auth listeners, and closes the realtime connection.
+After disposal the client can still send HTTP requests, but it no longer refreshes sessions or keeps a socket.
+
+Dispose a client when you discard it:
+
+| Situation | Why dispose |
+| --- | --- |
+| Tests | Timers and sockets keep the test runner alive or leak into the next test. |
+| Hot module reload | Each reload would otherwise add a refresh timer and listeners. |
+| Short-lived clients in long-running processes | A secret-key client per job, for example. |
+| A user switching accounts in a multi-account app that uses separate clients | The old client's timers would keep refreshing a session nobody uses. |
+
+A hot-reload-safe module in Vite looks like this:
+
+```typescript
+import { createClient } from "@pawabase/client";
+
+export const pawabase = createClient({
+  url: import.meta.env.VITE_PAWABASE_URL,
+  apiKey: import.meta.env.VITE_PAWABASE_KEY,
+});
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => pawabase.dispose());
+}
+```
+
+## Acting as a user: asUser
+
+`pawabase.asUser(token)` returns a new client with the same options and a fixed user token.
+It is the configuration you use on servers that act for one user per request.
+
+<CodeGroup>
+```typescript TypeScript
+const base = createClient({ url, apiKey: publishableKey, environment: "production" });
+
+export async function handler(request: Request) {
+  const token = readAccessTokenCookie(request);
+  const pawabase = token ? base.asUser(token) : base;
+  const orders = await pawabase.from("orders").perPage(20);
+  return Response.json(orders);
+}
+
+declare function readAccessTokenCookie(request: Request): string | null;
+```
+
+```python Python
+base = AsyncPawabase(url, publishable_key, environment="production")
+
+
+async def handler(request):
+    token = read_access_token_cookie(request)
+    pb = base.as_user(token) if token else base
+    page = await pb.from_("orders").per_page(20).execute()
+    return JSONResponse(dict(page.raw))
+```
+
+```bash cURL
+curl "$PAWABASE_URL/rest/v1/orders?per_page=20" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+</CodeGroup>
+
+The returned client is stateless: no stored session, no refresh timer, no URL detection.
+It is cheap to create, so create one per request and let it go when the request ends.
+The token may also be a function, which is read before every call.
+
+Do not share an `asUser` client between requests.
+It holds one user's token, and sharing it would let one user's request run with another user's identity.
+
+## Studio: where the values come from
+
+| Value | Where in Studio |
+| --- | --- |
+| Gateway URL | **Access → API keys**, in the **Health check** card |
+| Publishable and secret keys | **Access → API keys**; **New key** creates one; the full key appears once in **Your new key** |
+| Environment names | The environment switcher at the top of Studio; also **Project → Settings** |
+| Allowed browser origins | **Access → Networking** |
+| Key scopes and restrictions | The **Permissions** and **Limits** sections of the **New API key** sheet |
+| When a key was last used | The **Last used** column on **Access → API keys** |
+| Rate limits that cause `429` | **Access → Networking** and [rate limits and CORS](/operate/rate-limits-and-cors) |
+| Requests made by your client | **Project → Activity**, searchable by request id |
+
+The keys table shows each key's **Name**, **Role** (publishable or secret), **Prefix**, **Scopes**, **Restrictions**, **Last used** and **State**.
+The **Last used** column is a quick way to find keys that no deployed client uses any more, so you can revoke them.
+
+## Recipes
+
+### A client per environment, chosen at runtime
+
+Some applications choose the environment at runtime, for example an internal tool with an environment picker.
+Create clients lazily and keep one per environment.
+
+```typescript
+import { createClient, type PawabaseClient } from "@pawabase/client";
+
+const keys: Record<string, string> = {
+  development: import.meta.env.VITE_PAWABASE_KEY_DEVELOPMENT,
+  staging: import.meta.env.VITE_PAWABASE_KEY_STAGING,
+};
+
+const clients = new Map<string, PawabaseClient>();
+
+export function clientFor(environment: string): PawabaseClient {
+  let client = clients.get(environment);
+  if (!client) {
+    const apiKey = keys[environment];
+    if (!apiKey) throw new Error(`No key configured for ${environment}`);
+    client = createClient({ url: import.meta.env.VITE_PAWABASE_URL, apiKey, environment });
+    clients.set(environment, client);
+  }
+  return client;
+}
+```
+
+Each client has its own stored session, because the storage key includes the API key.
+A user signs in separately to each environment, which is correct: users are per environment.
+
+### No retries for one sensitive route
+
+A route that charges a card should never be repeated by the transport, even on a gateway error.
+`POST` is not retried after a gateway error by default, but making the intent explicit protects against a later refactor:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.http.request({
+  method: "POST",
+  path: "/rest/v1/payments/charge",
+  body: { order_id: orderId },
+  retry: false,
+});
+```
+
+```python Python
+# The Python client never repeats a POST after a network failure or a 502/503/504.
+# A client with retries=0 also stops repeating reads.
+pb.request("POST", "/rest/v1/payments/charge", json={"order_id": order_id})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/payments/charge" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" -d '{"order_id": "o_42"}'
+```
+</CodeGroup>
+
+### A strict client for scripts
+
+A script that changes data should fail fast and loudly.
+
+```typescript
+const pawabase = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  environment: process.env.PAWABASE_ENV!,
+  retry: { retries: 1, maxRetryAfterMs: 5000 },
+  timeoutMs: 15_000,
+  hooks: {
+    onRetry: ({ method, url, reason }) => console.error(`retrying ${method} ${url}: ${reason}`),
+  },
+});
+```
+
+### A client behind a corporate proxy on Node
+
+Node's built-in `fetch` does not read `HTTPS_PROXY` by itself.
+Use undici's proxy agent and pass a `fetch` that uses it.
+
+```typescript
+import { ProxyAgent, fetch as undiciFetch } from "undici";
+import { createClient } from "@pawabase/client";
+
+const agent = new ProxyAgent(process.env.HTTPS_PROXY!);
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  fetch: (input, init) => undiciFetch(input, { ...init, dispatcher: agent } as never) as unknown as Promise<Response>,
+});
+```
+
+### Separate sessions for two people in one browser
+
+A support console where a staff member signs in to an admin environment and also signs in as a test customer needs two sessions:
+
+```typescript
+const staff = createClient({ url, apiKey: staffKey, auth: { storageKey: "support.staff" } });
+const customer = createClient({ url, apiKey: customerKey, auth: { storageKey: "support.customer" } });
+```
+
+## Complete setups for each runtime
+
+The options above combine differently in each runtime.
+This section gives a complete, working configuration for the runtimes TypeScript developers use most, with the reasoning for each choice.
+
+### A Vite single-page application
+
+A browser app needs a publishable key, the environment name for social sign-in and realtime, and the default session storage.
+
+```typescript
+// src/lib/pawabase.ts
+import { createClient } from "@pawabase/client";
+import type { Database } from "./database";
+
+export const pawabase = createClient<Database>({
+  url: import.meta.env.VITE_PAWABASE_URL,
+  apiKey: import.meta.env.VITE_PAWABASE_KEY,
+  environment: import.meta.env.VITE_PAWABASE_ENV,
+});
+
+if (import.meta.hot) import.meta.hot.dispose(() => pawabase.dispose());
+```
+
+Nothing else is needed.
+The session is kept in `localStorage`, refreshed automatically, shared across tabs, and picked up from the URL after a social sign-in.
+
+### Next.js with the App Router
+
+A Next.js application usually needs three clients, each in its own module so that the bundler cannot mix them up.
+
+```typescript
+// lib/pawabase/browser.ts — imported by client components
+"use client";
+import { createClient } from "@pawabase/client";
+import type { Database } from "./types";
+
+export const pawabase = createClient<Database>({
+  url: process.env.NEXT_PUBLIC_PAWABASE_URL!,
+  apiKey: process.env.NEXT_PUBLIC_PAWABASE_KEY!,
+  environment: process.env.NEXT_PUBLIC_PAWABASE_ENV,
+  auth: { persistSession: false },
+});
+```
+
+```typescript
+// lib/pawabase/server.ts — imported by server components, actions and route handlers
+import "server-only";
+import { cookies } from "next/headers";
+import { createClient } from "@pawabase/client";
+import type { Database } from "./types";
+
+const base = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  environment: process.env.PAWABASE_ENV,
+});
+
+export async function pawabaseForRequest() {
+  const token = (await cookies()).get("pb-access")?.value ?? null;
+  return token ? base.asUser(token) : base;
+}
+```
+
+```typescript
+// lib/pawabase/service.ts — privileged server work only
+import "server-only";
+import { createClient } from "@pawabase/client";
+import type { Database } from "./types";
+
+export const pawabaseService = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  environment: process.env.PAWABASE_ENV,
+});
+```
+
+The browser client here uses `persistSession: false` because the server owns the session in an HTTP-only cookie.
+If your Next.js app keeps the session in the browser instead, drop that line and do not use the cookie-based server module for user data.
+Pick one owner for the session; two owners refresh the same refresh token and end the session.
+
+### SvelteKit
+
+SvelteKit's `hooks.server.ts` runs for every request, which makes it the natural place to build the per-request client.
+
+```typescript
+// src/hooks.server.ts
+import type { Handle } from "@sveltejs/kit";
+import { createClient } from "@pawabase/client";
+import { PUBLIC_PAWABASE_URL, PUBLIC_PAWABASE_KEY, PUBLIC_PAWABASE_ENV } from "$env/static/public";
+
+const base = createClient({ url: PUBLIC_PAWABASE_URL, apiKey: PUBLIC_PAWABASE_KEY, environment: PUBLIC_PAWABASE_ENV });
+
+export const handle: Handle = async ({ event, resolve }) => {
+  const token = event.cookies.get("pb-access") ?? null;
+  event.locals.pawabase = token ? base.asUser(token) : base;
+  return resolve(event);
+};
+```
+
+Load functions then read `locals.pawabase` and never create clients themselves.
+
+### Remix and React Router
+
+Loaders and actions run on the server and receive the request, so they build the per-request client from the cookie header.
+
+```typescript
+// app/pawabase.server.ts
+import { createClient } from "@pawabase/client";
+
+const base = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  environment: process.env.PAWABASE_ENV,
+});
+
+export function pawabaseFor(request: Request) {
+  const cookie = request.headers.get("cookie") ?? "";
+  const token = /(?:^|;\s*)pb-access=([^;]+)/.exec(cookie)?.[1] ?? null;
+  return token ? base.asUser(decodeURIComponent(token)) : base;
+}
+```
+
+The `.server.ts` suffix keeps the module out of the browser bundle.
+
+### A Node command-line tool
+
+A command-line tool that users sign in to should remember the session between runs, in a file only the user can read.
+
+<CodeGroup>
+```typescript TypeScript
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createClient } from "@pawabase/client";
+import { fileStorage } from "./file-storage";
+
+export const pawabase = createClient({
+  url: process.env.PAWABASE_URL ?? "https://api.example.com",
+  apiKey: process.env.PAWABASE_KEY ?? "pb_pk_live_…",
+  environment: process.env.PAWABASE_ENV ?? "production",
+  auth: {
+    storage: fileStorage(join(homedir(), ".config", "mytool", "session.json")),
+    detectSessionInUrl: false,
+  },
+  retry: { retries: 1 },
+});
+```
+
+```python Python
+import os
+from pathlib import Path
+
+from pawabase import FileSessionStore, Pawabase
+
+pb = Pawabase(
+    os.environ.get("PAWABASE_URL", "https://api.example.com"),
+    os.environ.get("PAWABASE_KEY", "pb_pk_live_…"),
+    environment=os.environ.get("PAWABASE_ENV", "production"),
+    session_store=FileSessionStore(Path.home() / ".config" / "mytool" / "session.json"),
+    retries=1,
+)
+```
+</CodeGroup>
+
+A publishable key is correct here even though the tool runs on a developer's machine.
+The tool acts for the person who signed in, and their policies should apply.
+
+### Deno and Bun
+
+Both have `fetch` and `WebSocket` globally, so no adapters are needed.
+Import the package through npm specifiers in Deno.
+
+```typescript
+// Deno
+import { createClient } from "npm:@pawabase/client";
+
+const pawabase = createClient({
+  url: Deno.env.get("PAWABASE_URL")!,
+  apiKey: Deno.env.get("PAWABASE_SECRET_KEY")!,
+  environment: Deno.env.get("PAWABASE_ENV"),
+});
+```
+
+```typescript
+// Bun
+import { createClient } from "@pawabase/client";
+
+const pawabase = createClient({
+  url: Bun.env.PAWABASE_URL!,
+  apiKey: Bun.env.PAWABASE_SECRET_KEY!,
+  environment: Bun.env.PAWABASE_ENV,
+});
+```
+
+### Cloudflare Workers and other edge runtimes
+
+Edge runtimes give you configuration per request, through the handler's `env` argument, and may reuse an isolate across many requests.
+Create a base client once per isolate, lazily, and `asUser` per request.
+
+```typescript
+import { createClient, type PawabaseClient } from "@pawabase/client";
+
+interface Env {
+  PAWABASE_URL: string;
+  PAWABASE_PUBLISHABLE_KEY: string;
+  PAWABASE_ENV: string;
+}
+
+let base: PawabaseClient | null = null;
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    base ??= createClient({
+      url: env.PAWABASE_URL,
+      apiKey: env.PAWABASE_PUBLISHABLE_KEY,
+      environment: env.PAWABASE_ENV,
+      timeoutMs: 10_000,
+    });
+    const token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+    const pawabase = token ? base.asUser(token) : base;
+    return Response.json(await pawabase.from("articles").eq("status", "live").perPage(10));
+  },
+};
+```
+
+Edge runtimes limit how long a request may run, so a shorter timeout gives a clearer error than the platform killing the request.
+
+### React Native and Expo
+
+Mobile apps need secure session storage and no URL detection.
+
+```typescript
+import * as SecureStore from "expo-secure-store";
+import { createClient } from "@pawabase/client";
+
+export const pawabase = createClient({
+  url: process.env.EXPO_PUBLIC_PAWABASE_URL!,
+  apiKey: process.env.EXPO_PUBLIC_PAWABASE_KEY!,
+  environment: process.env.EXPO_PUBLIC_PAWABASE_ENV,
+  auth: {
+    storage: {
+      getItem: (key) => SecureStore.getItemAsync(key.replace(/[^A-Za-z0-9._-]/g, "_")),
+      setItem: (key, value) => SecureStore.setItemAsync(key.replace(/[^A-Za-z0-9._-]/g, "_"), value),
+      removeItem: (key) => SecureStore.deleteItemAsync(key.replace(/[^A-Za-z0-9._-]/g, "_")),
+    },
+    detectSessionInUrl: false,
+  },
+});
+```
+
+`expo-secure-store` accepts only some characters in keys, and the default storage key contains the gateway host.
+The adapter above replaces other characters so the key is always valid.
+
+### Electron
+
+In Electron, keep the client in the renderer if your app is a web app in a window, and give it a storage adapter that calls the main process, where `safeStorage` encrypts the session at rest.
+Never give the renderer a secret key: a renderer can be inspected like any browser page.
+
+## How options interact
+
+Most options are independent, but a few combine in ways worth knowing.
+
+| Combination | Result |
+| --- | --- |
+| `accessToken` and `auth` | The stateless defaults are applied first, then your `auth` options. Passing `auth: { autoRefreshToken: true }` to a stateless client does not make it refresh, because it has no refresh token. |
+| `environment` and `auth` | The client's `environment` is passed to auth, and overrides any value in `auth`. |
+| `retry: false` and a per-call `retry` | A per-call policy wins for that call; it merges with the defaults, not with `false`. |
+| `headers` and `environment` or `project` | Your headers are added after `x-environment` and `x-project-id`, so a header of the same name replaces them. |
+| `timeoutMs: 0` and retries | No per-attempt timeout; only network failures and statuses trigger retries. |
+| `fetch` and `hooks` | Hooks run around your `fetch`; your `fetch` sees the final headers, including `apikey` and `authorization`. |
+| `dangerouslyAllowBrowser` and `manage()` | The browser check is skipped; `manage()` still requires a secret key. |
+| `realtime.webSocket` and a stateless client | The socket opens with the API key only, whatever implementation you pass. |
+
+## One request, followed through the options
+
+The timeline below follows a single `pawabase.from("orders").create(row)` on a client with default options, during a moment when the gateway is restarting.
+
+```text
+t=0 ms      the session is expiring (within 60 s of expires_at)
+            → POST /auth/v1/token (refresh), auth: none
+t=40 ms     new session stored; listeners get TOKEN_REFRESHED
+t=41 ms     POST /rest/v1/orders, attempt 0, with the new token
+            onRequest(attempt 0)
+t=45 ms     the connection is refused: NetworkError
+            POST is not idempotent → no retry
+            onError(NetworkError)
+            the call rejects with NetworkError
+```
+
+The same call as `pawabase.from("orders").replace(id, row)`, which is a `PUT`:
+
+```text
+t=41 ms     PUT /rest/v1/orders/9, attempt 0
+t=45 ms     NetworkError; PUT is safe to repeat; 0 < 2 retries
+            onRetry(reason NetworkError, delayMs random in 0..300)
+t=230 ms    PUT, attempt 1
+t=236 ms    503 with Retry-After: 2
+            onRetry(reason "status 503", delayMs 2000)
+t=2236 ms   PUT, attempt 2
+t=2290 ms   200 → the replaced row is returned
+```
+
+The difference is the method, not the resource.
+When a create must survive a restart, the dependable pattern is a create that a unique field makes safe to repeat, retried by your own code after checking whether the first attempt landed.
+
+## Testing your configuration
+
+Configuration is code, and the transport can be tested without a server by passing a `fetch` that records what it was asked.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient } from "@pawabase/client";
+
+test("sends the key, the environment and the client version", async () => {
+  const seen: Array<{ url: string; headers: Headers }> = [];
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test_123",
+    environment: "staging",
+    fetch: async (url, init) => {
+      seen.push({ url, headers: new Headers(init?.headers) });
+      return new Response(JSON.stringify({ data: [], page: 1, per_page: 20, total: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  await pawabase.from("orders").perPage(20);
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, "https://api.example.test/rest/v1/orders?per_page=20");
+  assert.equal(seen[0].headers.get("apikey"), "pb_pk_test_123");
+  assert.equal(seen[0].headers.get("x-environment"), "staging");
+  assert.match(seen[0].headers.get("x-client-info") ?? "", /^pawabase-js\//);
+  pawabase.dispose();
+});
+
+test("refuses a secret key in a browser", () => {
+  const g = globalThis as Record<string, unknown>;
+  g.window = {};
+  g.document = {};
+  try {
+    assert.throws(() => createClient({ url: "https://api.example.test", apiKey: "pb_sk_test_123" }), /must never run in a browser/);
+  } finally {
+    delete g.window;
+    delete g.document;
+  }
+});
+```
+
+Tests like these catch the mistakes that otherwise reach production unnoticed: a missing environment, a wrong URL in one build target, a header that a refactor dropped.
+
+## Configuration across the delivery pipeline
+
+The same application runs on a laptop, in CI, in preview deployments and in production.
+Each stage needs slightly different configuration, and getting the mapping right once prevents most "works on my machine" problems.
+
+| Stage | URL | Key | Environment | Notes |
+| --- | --- | --- | --- | --- |
+| Local development against a local stack | `http://localhost:<gateway port>` | The local `development` publishable key | `development` | Plain `http:` is accepted. |
+| Local development against a shared installation | The shared gateway | The `development` publishable key | `development` | Several developers share data; prefer seed data with clear owners. |
+| Unit tests | Any; requests go to a fake `fetch` | Any string with the right prefix | Any | No network. |
+| Integration tests in CI | The shared gateway, or a stack started in CI | A secret key for setup, a publishable key for the app under test | A preview or a dedicated `ci` environment | Clean up what the tests create. |
+| Preview deployments | The shared gateway | The preview environment's publishable key | The preview's name | One preview per branch or pull request. |
+| Production | The production gateway | The production publishable key | `production` | Secret keys only on servers. |
+
+Preview deployments deserve a note.
+Hosting platforms create a deployment per branch, and Pawabase can create an environment per branch.
+Map one to the other with a naming rule, such as the branch name in lowercase with non-alphanumerics replaced by hyphens, and set the preview's key in the hosting platform's per-branch configuration.
+The management module can create the preview environment from CI; see [Environment management](/clients/typescript/management).
+
+## Watching a client in production
+
+Hooks are enough to answer the three questions that matter about a client in production: how fast are requests, how often do they fail, and which ones are retried.
+
+A practical setup samples successful requests and records every failure:
+
+```typescript
+const SAMPLE = 0.05;
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onResponse: (info) => {
+      const failed = info.status >= 400;
+      if (failed || Math.random() < SAMPLE) {
+        telemetry.record("pawabase.response", {
+          method: info.method,
+          path: new URL(info.url).pathname,
+          status: info.status,
+          durationMs: info.durationMs,
+          attempt: info.attempt,
+          requestId: info.requestId,
+        });
+      }
+    },
+    onRetry: (info) => telemetry.record("pawabase.retry", { reason: info.reason, delayMs: info.delayMs }),
+  },
+});
+
+declare const telemetry: { record(name: string, fields: Record<string, unknown>): void };
+```
+
+Three signals deserve alerts.
+A rising share of `429` responses means you are near your rate limit and users are about to wait.
+A rising number of retries with reason `status 503` means the installation is struggling.
+A rising number of `401` responses after refresh means sessions are being revoked or refresh tokens reused, which can indicate two parts of your app refreshing the same session.
+
+## The exported option types
+
+Every option type is exported, so wrappers and configuration helpers can be typed precisely.
+
+```typescript
+import type {
+  ClientOptions,
+  AuthOptions,
+  RealtimeOptions,
+  RetryOptions,
+  Hooks,
+  FetchLike,
+  SessionStorage,
+  WebSocketConstructor,
+  RequestInfo,
+  ResponseInfo,
+  TokenProvider,
+} from "@pawabase/client";
+```
+
+| Type | Describes |
+| --- | --- |
+| `ClientOptions` | The whole options object of `createClient` |
+| `AuthOptions` | The `auth` option |
+| `RealtimeOptions` | The `realtime` option |
+| `RetryOptions` | The `retry` option and per-call retry overrides |
+| `Hooks` | The `hooks` option |
+| `RequestInfo`, `ResponseInfo` | What hooks receive |
+| `FetchLike` | The `fetch` option's function type |
+| `SessionStorage` | A session store adapter |
+| `WebSocketConstructor`, `WebSocketLike` | A WebSocket implementation for realtime |
+| `TokenProvider` | The interface the transport uses to get and refresh tokens |
+
+A configuration helper typed with `ClientOptions` lets a team share defaults without hiding them:
+
+```typescript
+import { createClient, type ClientOptions } from "@pawabase/client";
+
+const teamDefaults: Partial<ClientOptions> = {
+  timeoutMs: 20_000,
+  retry: { retries: 2, maxRetryAfterMs: 15_000 },
+  headers: { "x-app": "orders-web" },
+};
+
+export function makeClient(options: Pick<ClientOptions, "url" | "apiKey" | "environment"> & Partial<ClientOptions>) {
+  return createClient({ ...teamDefaults, ...options });
+}
+```
+
+## Tuning for slow or unreliable networks
+
+The defaults assume a reasonable connection.
+Many real users are on mobile networks that drop packets, switch towers, and stall for seconds at a time.
+A few option changes make the client behave much better there.
+
+| Symptom on poor networks | Option to change | Suggested value | Effect |
+| --- | --- | --- | --- |
+| Interactive calls hang for a long time | `timeoutMs` | `10000` to `15000` | A stalled attempt is abandoned sooner and retried if safe. |
+| Reads fail on brief drops | `retry.retries` | `3` | One more chance for safe requests. |
+| Retries arrive in bursts after an outage | `retry.baseDelayMs` | `500` | Wider spread between clients. |
+| The realtime socket looks connected but delivers nothing | `realtime.heartbeatSeconds` | `15` | A dead link is detected after about 30 seconds instead of 50. |
+| Reconnects hammer a struggling server | `realtime.reconnect.maxDelayMs` | `30000` | Clients back off further. |
+| Uploads fail halfway | per-call `timeoutMs` on uploads | `0` or several minutes | Large uploads are not cut off by the interactive timeout. |
+
+Pair these with UI that reflects state.
+Show when realtime is `reconnecting`, keep forms filled after a failed submit, and let users retry a failed write explicitly.
+The client retries what is safe; a person should decide about the rest.
+
+## Making the client injectable
+
+Application code that imports a client module directly is hard to test, because every test then talks to whatever that module created.
+Passing the client in, or reading it from a small container, keeps tests simple and makes the dependency visible.
+
+```typescript
+// orders/service.ts
+import type { PawabaseClient } from "@pawabase/client";
+import type { Database } from "../database";
+
+export function ordersService(pawabase: PawabaseClient<Database>) {
+  return {
+    open: () => pawabase.from("orders").eq("status", "open").order("created_at", "desc").perPage(50),
+    markPaid: (id: string) => pawabase.from("orders").update(id, { status: "paid" }),
+  };
+}
+```
+
+```typescript
+// app.ts
+import { pawabase } from "./lib/pawabase";
+import { ordersService } from "./orders/service";
+
+export const orders = ordersService(pawabase);
+```
+
+```typescript
+// orders/service.test.ts
+import { createClient } from "@pawabase/client";
+import { ordersService } from "./service";
+
+const fake = createClient({
+  url: "https://api.example.test",
+  apiKey: "pb_pk_test",
+  fetch: async () => new Response(JSON.stringify({ data: [], page: 1, per_page: 50, total: 0 }), { status: 200 }),
+});
+
+const orders = ordersService(fake);
+```
+
+The service receives a real client whose transport is fake.
+That tests your query building and result handling exactly as production runs them, without a server.
+
+## Coming from supabase-js options
+
+| supabase-js option | @pawabase/client option | Notes |
+| --- | --- | --- |
+| `createClient(url, key, options)` | `createClient({ url, apiKey, ...options })` | One options object. |
+| `auth.storage` | `auth.storage` | Same three methods. |
+| `auth.storageKey` | `auth.storageKey` | Different default format. |
+| `auth.persistSession` | `auth.persistSession` | Same meaning. |
+| `auth.autoRefreshToken` | `auth.autoRefreshToken` | Same meaning; plus `refreshMarginSeconds`. |
+| `auth.detectSessionInUrl` | `auth.detectSessionInUrl` | Reads a fragment, not a query code. |
+| `auth.flowType: "pkce"` | `auth.exchangeCode(code, verifier)` | PKCE is a method call, not a mode. |
+| `global.fetch` | `fetch` | Top-level. |
+| `global.headers` | `headers` | Top-level. |
+| `db.schema` | none | Resources are named directly; there are no schemas to choose. |
+| `realtime.params` | `realtime` | Different fields; see [Realtime options](#realtime-options). |
+| `accessToken` (third-party auth) | `accessToken` | Puts the client in stateless mode. |
+
+## Which configuration values are sensitive
+
+Not every configuration value is a secret, and treating them all alike leads to either leaks or needless friction.
+
+| Value | Sensitive? | Where it may appear |
+| --- | --- | --- |
+| Gateway URL | No | Anywhere, including browser bundles and logs |
+| Environment name | No | Anywhere |
+| Publishable key | No; it identifies the environment and is constrained by policies | Browser bundles, mobile binaries, logs |
+| Secret key | Yes; it bypasses every policy | Server environment variables and secret managers only |
+| A user's access token | Yes, for up to 15 minutes | Memory, secure storage, HTTP-only cookies |
+| A user's refresh token | Yes, until used or revoked | Secure storage, HTTP-only cookies |
+| Signed URLs | Yes, until they expire | Handed only to the intended recipient |
+
+The client is careful with the sensitive values it handles.
+`ConfigError` messages name the URL but never print the key.
+`onRequest` receives headers with `apikey` and `authorization` replaced by `***`.
+Social sign-in and public URLs refuse to put a secret key in a URL.
+What the client cannot protect is your own logging of option objects; avoid `console.log(options)` in configuration code.
+
+## Defaults and why they were chosen
+
+| Default | Value | Reason |
+| --- | --- | --- |
+| Timeout | 30 seconds per attempt | Long enough for slow uploads and flows, short enough that a hung connection is noticed. |
+| Retries | 2 extra attempts | Covers a brief deploy or a rate-limit window without hiding a real outage. |
+| First backoff ceiling | 300 ms | A quick second try for transient failures. |
+| Largest backoff | 8 seconds | Keeps a user-facing call from stalling much longer than the timeout. |
+| Longest `Retry-After` honored | 30 seconds | A server asking for longer is better surfaced as an error the UI can explain. |
+| Refresh margin | 60 seconds | Covers request latency and modest clock skew. |
+| Heartbeat | 25 seconds | Below the idle timeout of common proxies and load balancers. |
+| Realtime acknowledgement timeout | 10 seconds | Long enough for a busy server, short enough to report a stuck socket. |
+
+## A checklist for a new client
+
+| Question | If the answer is yes |
+| --- | --- |
+| Does this code run in a browser or an app binary? | Use a publishable key and the default session handling. |
+| Does it act for a user on a server? | Use a publishable key and `asUser(token)` per request. |
+| Does it act on its own behalf? | Use a secret key, and keep it in server configuration. |
+| Does it use social sign-in, realtime, `manage()` or `admin()`? | Pass `environment`. |
+| Does it run on Node 20 and use live channels? | Pass `realtime.webSocket`. |
+| Does it run where `localStorage` is unavailable but sessions must persist? | Pass `auth.storage`. |
+| Does it make long uploads or long-running calls? | Raise `timeoutMs` for those calls only. |
+| Will it run in production? | Add `hooks` that record failures with their `requestId`. |
+
+When every row is settled, the configuration is complete.
+Write the answers down next to the client module, in a short comment, so the next person knows why each option is there.
+Anything you add beyond it should answer a problem you have observed, such as a slow network or an unusual runtime, rather than one you expect.
+
+## Troubleshooting configuration
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Every request is `404` | The `url` contains a service path. | Use the origin only. |
+| Social sign-in throws `Social sign-in needs the environment` | `environment` was not passed and nobody is signed in. | Pass `environment` to `createClient`. |
+| `manage()` changes the wrong environment | `environment` was not passed, so `development` was used. | Pass `environment`, or name it in `manage(client, name)`. |
+| The session is lost on every reload | Storage is blocked, `persistSession` is `false`, or the storage key changed between builds. | Check the browser's privacy mode; keep the key and URL stable. |
+| Two tabs sign each other out | Two different storage keys for the same environment, or a client created per component. | Use one client per app. |
+| Requests hang for a long time before failing | A long timeout multiplied by retries. | Lower `timeoutMs` for interactive calls; use per-call timeouts for long work. |
+| A realtime channel is refused on the server | The server client is stateless, so its socket has no user token. | Use a client with a session for live channels, or publish over HTTP. |
+| Hooks never fire | They were passed under `auth` or `realtime` instead of at the top level. | Pass `hooks` at the top level of the options. |
+| `TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation` | A custom `fetch` was passed unbound, such as `window.fetch` stored in an object. | Pass `(input, init) => fetch(input, init)`. |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can I change the API key without creating a new client?">
+    No.
+    A client's options are fixed.
+    Create a new client and dispose the old one.
+    The session belongs to the old key's environment, so it does not carry over.
+  </Accordion>
+  <Accordion title="Does passing environment let a key reach another environment?">
+    No.
+    The key decides the environment for data, auth, storage and realtime.
+    The management modules address environments by name, and the platform checks that the key may manage the named environment.
+  </Accordion>
+  <Accordion title="Are hooks called for signed URL uploads?">
+    Yes.
+    Calls to absolute URLs go through the same transport and call the same hooks.
+    They send no API key, so there is nothing to mask.
+  </Accordion>
+  <Accordion title="Is the retry policy applied to realtime?">
+    No.
+    Realtime has its own reconnect policy, configured with `realtime.reconnect`.
+    The HTTP retry policy applies to realtime's HTTP methods: `realtime.publish`, `realtime.presence` and `realtime.history`.
+  </Accordion>
+  <Accordion title="What happens when two clients with the same storage key refresh at once?">
+    In a browser with Web Locks, refreshes for the same storage key are serialized across all clients and tabs.
+    The second one finds the new tokens already stored and uses them instead of refreshing again.
+  </Accordion>
+  <Accordion title="Should each tenant of my SaaS get its own key?">
+    Usually not.
+    Tenants are organizations inside one environment, separated by policies that test `$auth.org`.
+    Separate environments, and therefore separate keys, are for separate stages such as staging and production, or for tenants that need fully isolated data and users.
+  </Accordion>
+  <Accordion title="Can I read the configured environment back from a client?">
+    Yes.
+    `pawabase.options` holds the options the client was created with, including `environment`.
+    Treat it as read-only; changing it does not reconfigure the client.
+  </Accordion>
+  <Accordion title="Does the client cache responses?">
+    No.
+    Each call sends a request.
+    Server-side response caching is configured per resource in Pawabase; client-side caching belongs to your data layer.
+  </Accordion>
+  <Accordion title="Do I need to configure connection pooling?">
+    No.
+    The runtime's `fetch` manages connections.
+    On Node, the built-in `fetch` keeps connections alive and reuses them across requests to the same gateway.
+  </Accordion>
+  <Accordion title="What is the smallest configuration that works?">
+    A URL and a publishable key.
+    Add `environment` as soon as you use social sign-in, realtime or the management modules.
+  </Accordion>
+  <Accordion title="Why is my custom content-type replaced?">
+    It is not, as long as you set it on the call.
+    The client only adds `application/json` when you send an object and set no `content-type` yourself.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="TypeScript SDK" icon="js" href="/clients/javascript">The map of the package and the choice of key for each runtime.</Card>
+  <Card title="Errors and retries" icon="triangle-alert" href="/clients/typescript/errors-retries">Error classes, retry behavior in detail, cancellation and timeouts.</Card>
+  <Card title="Authentication" icon="key-round" href="/clients/typescript/authentication">What the session options change for sign-in and refresh.</Card>
+  <Card title="API keys" icon="key" href="/operate/api-keys">Creating, scoping, rotating and revoking keys.</Card>
+</CardGroup>

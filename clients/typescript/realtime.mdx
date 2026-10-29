@@ -1,0 +1,1668 @@
+---
+title: "Realtime"
+description: "How the TypeScript client uses Pawabase realtime: one connection shared by channels, channel rules, messages, presence, history, live resource changes, reconnection, token changes, limits and the failures each can produce."
+icon: "radio"
+---
+
+`pawabase.realtime` connects your application to the environment's realtime service.
+Through it, clients exchange messages on named channels, see who else is present, catch up on recent messages, and receive live changes to resources.
+
+This page explains the connection and the channel model, how channel rules decide what each person may do, every method of the client's realtime module, how the connection survives network drops and token changes, and the limits that apply.
+
+## The mental model
+
+Realtime has three layers, and each answers a different question.
+
+| Layer | What it is | Question it answers |
+| --- | --- | --- |
+| Connection | One WebSocket from a client to the gateway | Is this client connected, and as whom? |
+| Channel | A named topic, such as `chat:lobby` or `resource:orders` | Which messages does this client receive? |
+| Rule | A pattern with policies, configured per environment | Who may join, send and be present on which channels? |
+
+A client opens **one** connection and joins any number of channels over it.
+Channels are not created in advance: a channel exists while someone is on it.
+What a client may do on a channel is decided by the first rule whose pattern matches the channel's name, or by the environment's default policy when none matches.
+
+```text
+client ── one WebSocket ──▶ gateway ──▶ realtime service
+            │                                │
+            ├─ subscribe "chat:lobby"   ──▶  rule "chat:*": subscribe = authenticated ✓
+            ├─ subscribe "user:u_7"     ──▶  rule "user:{{ auth.user_id }}": only u_7 ✓
+            ├─ subscribe "resource:orders" ─▶ each change checked against orders' read policy
+            └─ publish "chat:lobby"     ──▶  rule "chat:*": publish = authenticated ✓
+```
+
+Realtime is for things connected clients should see now.
+It is not a queue: a client that is not connected does not receive messages sent meanwhile, except what it can fetch from a channel's recent history.
+Work that must happen whether or not anyone is connected belongs in events and flows.
+
+## Where realtime is configured
+
+Realtime is configured per environment in Studio under **Services → Realtime**.
+
+| Section | What it holds |
+| --- | --- |
+| Channel rules | Each rule's **Pattern**, **Kind**, **Subscribe** and **Publish** policies, **Presence** switch and **History** length |
+| Connections | The connections open now, with their user and channels |
+| Active channels | Channels with subscribers now, with **Subscribers**, **Present** and **Delivered** counts |
+
+A channel rule has these fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `pattern` | required | The channel names the rule governs: a fixed name, a `*` wildcard, or a template such as `user:{{ auth.user_id }}` |
+| `subscribe` | `authenticated` | The policy for joining a matching channel |
+| `publish` | `authenticated` | The policy for sending to a matching channel |
+| `presence` | on | Whether members can share presence on matching channels |
+| `history` | `50` | How many recent messages are kept per channel, up to 1000 |
+| `kind` | `public` | A label; `durable` also keeps messages across restarts, for a retention period |
+
+Rules are tried in order, and the first whose pattern matches wins.
+A channel no rule matches uses the environment's default policy, which is `authenticated` unless changed.
+
+Whether a resource publishes its changes is not a channel rule.
+It is the resource's own **realtime** setting, under **Data**.
+
+## Connecting
+
+You rarely connect yourself.
+The first `subscribe()` opens the connection, and the client keeps it open while channels need it.
+
+<CodeGroup>
+```typescript TypeScript
+const room = pawabase.realtime.channel("chat:lobby");
+await room.subscribe();
+```
+
+```python Python
+# Live channels need AsyncPawabase and pip install "pawabase[realtime]"
+room = apb.realtime.channel("chat:lobby")
+await room.subscribe()
+```
+
+```text WebSocket
+# A live channel is a WebSocket, for example with websocat:
+websocat "wss://api.example.com/realtime/v1/socket?apikey=$PAWABASE_KEY&token=$TOKEN&environment=production"
+{"type": "subscribe", "channel": "chat:lobby", "ref": "1"}
+# ← {"type": "ack", "ref": "1", "ok": true}
+```
+</CodeGroup>
+
+`connect()` opens it explicitly and resolves once the server has welcomed the connection.
+`disconnect()` closes it and stops reconnecting.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.realtime.connect();
+console.log(pawabase.realtime.connectionId);
+pawabase.realtime.disconnect();
+```
+
+```python Python
+await apb.realtime.connect()
+print(apb.realtime.connection_id)
+await apb.realtime.close()
+```
+
+```text WebSocket
+# A live channel is a WebSocket, for example with websocat:
+websocat "wss://api.example.com/realtime/v1/socket?apikey=$PAWABASE_KEY&token=$TOKEN&environment=production"
+# ← {"type": "welcome", "connection_id": "…"}
+```
+</CodeGroup>
+
+The connection is a WebSocket to `/realtime/v1/socket` on the gateway, with the API key, the person's access token when signed in, and the environment name in the URL.
+The gateway checks the key before the realtime service sees the connection.
+
+### The runtime's WebSocket
+
+Browsers, Deno, Bun and Node 22 and later have a global `WebSocket`, which the client uses.
+On Node 20, pass an implementation, such as the `ws` package:
+
+```typescript
+import WebSocket from "ws";
+import { createClient, type WebSocketConstructor } from "@pawabase/client";
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "production",
+  realtime: { webSocket: WebSocket as unknown as WebSocketConstructor },
+});
+```
+
+Without one, `connect()` and `subscribe()` throw `ConfigError` with a message saying so.
+
+### Connection status
+
+`realtime.status` is one of five values, and `onStatusChange` reports every change.
+
+| Status | Meaning |
+| --- | --- |
+| `idle` | No connection has been opened yet |
+| `connecting` | Opening for the first time |
+| `open` | Connected and welcomed; channels can be joined |
+| `reconnecting` | The connection dropped and the client is trying again |
+| `closed` | Closed by `disconnect()`, or by the server for a reason reconnecting would not fix |
+
+```typescript
+const stop = pawabase.realtime.onStatusChange((status) => {
+  banner.hidden = status === "open" || status === "idle";
+  banner.textContent = status === "reconnecting" ? "Reconnecting…" : "Offline";
+});
+```
+
+Show `reconnecting` in your interface.
+People forgive a short gap; they do not forgive a screen that silently stopped updating.
+
+## Channels
+
+`realtime.channel(name, options)` returns the channel object for a name.
+Asking for the same name again returns the same object, so every part of your app that listens to a channel shares one subscription.
+
+<CodeGroup>
+```typescript TypeScript
+const room = pawabase.realtime.channel<{ text: string }, { name: string }>("chat:lobby", {
+  presence: { name: "Ada" },
+  replay: 50,
+});
+```
+
+```python Python
+room = apb.realtime.channel("chat:lobby", presence={"name": "Ada"}, replay=50)
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `presence` | Your presence data, shown to others on the channel while you are subscribed |
+| `replay` | After a reconnect, fetch up to this many recent messages and deliver the ones you missed |
+
+The two type parameters describe the message payload and the presence data.
+They are promises to the compiler; the server does not check payload shapes.
+
+### Channel names
+
+Channel names are short strings of letters, digits and a few separators.
+The server accepts names that start with a letter or digit, followed by letters, digits and `: _ . @ = + -`, up to 200 characters.
+Event names allow letters, digits and `: _ . -`, up to 100 characters.
+
+| Name | Valid |
+| --- | --- |
+| `chat:lobby` | Yes |
+| `org:acme:announcements` | Yes |
+| `user:u_7` | Yes |
+| `doc=42.cursor` | Yes |
+| `chat/lobby` | No: `/` is not allowed |
+| `:lobby` | No: must start with a letter or digit |
+| `chat lobby` | No: spaces are not allowed |
+
+A colon is the conventional separator, and rules match on it naturally: `chat:*` governs every chat room.
+
+### Subscribing
+
+`subscribe()` joins the channel, connecting first if needed.
+It resolves with the channel once the server has accepted, and it is safe to call twice.
+
+<CodeGroup>
+```typescript TypeScript
+try {
+  await room.subscribe();
+} catch (error) {
+  if (error instanceof RealtimeError && error.code === "forbidden") showMessage("You cannot join this room.");
+  else throw error;
+}
+```
+
+```python Python
+from pawabase import RealtimeError
+
+try:
+    await room.subscribe()
+except RealtimeError as error:
+    if error.code == "forbidden":
+        show_message("You cannot join this room.")
+    else:
+        raise
+```
+
+```text WebSocket
+{"type": "subscribe", "channel": "chat:staff", "ref": "2"}
+# ← {"type": "ack", "ref": "2", "ok": false, "error": "forbidden", "reason": "…"}
+```
+</CodeGroup>
+
+The server checks the channel's subscribe policy against the connection's identity.
+A refusal rejects with `RealtimeError` whose `code` is `forbidden`, and the channel also emits an `error` event.
+
+`room.subscribed` is `true` while the channel is joined on an open connection.
+
+### Receiving messages
+
+`on(event, handler)` listens for one of five channel events, and returns a function that stops listening.
+
+| Event | Handler receives | When |
+| --- | --- | --- |
+| `message` | A `ChannelMessage` | A message arrived on the channel |
+| `presence` | `{ joins, leaves, members }` | Someone joined or left, or presence data changed |
+| `subscribed` | nothing | The channel was joined, including after a reconnect |
+| `closed` | `{ reason }` | The channel stopped receiving: unsubscribed, or the connection was lost |
+| `error` | A `RealtimeError` | The server refused a request on this channel |
+
+<CodeGroup>
+```typescript TypeScript
+const stopMessages = room.on("message", (message) => {
+  appendToChat(message.from, message.payload.text, message.sent_at);
+});
+
+const stopTyping = room.onEvent("typing", (message) => showTyping(message.from));
+```
+
+```python Python
+room.on(None, lambda message: append_to_chat(message["from"], message["payload"]["text"], message["sent_at"]))
+room.on("typing", lambda message: show_typing(message["from"]))
+# In Python, on(event, handler) filters by the message's event name; None receives every message.
+```
+</CodeGroup>
+
+`onEvent(name, handler)` is a shortcut that listens only for messages with one event name.
+
+A message has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The message's id, unique on the channel |
+| `channel` | The channel name |
+| `event` | The event name the sender chose, such as `message` or `typing` |
+| `payload` | The data the sender sent |
+| `from` | The sender's user id, `"server"` for messages published by the platform or with a secret key, or `null` for an anonymous sender |
+| `sent_at` | When the server accepted the message |
+| `seq` | A sequence number, present on messages read from history |
+
+Handlers that throw do not break delivery to other handlers.
+
+### Iterating messages
+
+A channel is also an async iterator, which suits code that processes messages in order:
+
+<CodeGroup>
+```typescript TypeScript
+for await (const message of room) {
+  await handle(message);
+}
+```
+
+```python Python
+async for message in room:      # subscribes on first use
+    await handle(message)
+```
+</CodeGroup>
+
+The loop ends when the channel is unsubscribed.
+Breaking out of the loop unsubscribes the channel.
+Messages that arrive while your loop is busy wait in a queue of up to 1000; beyond that, the oldest are dropped.
+
+### Sending messages
+
+`send(event, payload)` publishes a message on the channel over the socket.
+It resolves with the message id once the server has accepted it.
+
+<CodeGroup>
+```typescript TypeScript
+const { id } = await room.send("message", { text: "Hello" });
+```
+
+```python Python
+sent = await room.send("message", {"text": "Hello"})
+message_id = sent["id"]
+```
+
+```text WebSocket
+{"type": "publish", "channel": "chat:lobby", "event": "message", "payload": {"text": "Hello"}, "ref": "3"}
+# ← {"type": "ack", "ref": "3", "ok": true, "id": "…"}
+```
+</CodeGroup>
+
+The server checks the channel's publish policy.
+A refusal rejects with `RealtimeError` code `forbidden`.
+A payload larger than the limit, 64 KiB by default, rejects with `payload_too_large`.
+
+The sender receives its own message on the channel too, like every other subscriber.
+Use the returned id to recognize it, for example to replace an optimistic copy.
+
+An environment can turn off publishing from clients altogether, so that only servers publish.
+Then every client `send` is refused, and messages come from flows or servers instead.
+
+### Leaving
+
+`unsubscribe()` leaves the channel, clears its presence, ends any iterators, and forgets the channel object.
+
+```typescript
+await room.unsubscribe();
+```
+
+Unsubscribe when a screen that uses a channel unmounts.
+Channels that stay joined keep receiving and keep counting against the connection's limit.
+
+## Channel rules in practice
+
+Rules turn channel names into permissions.
+A few patterns cover most applications.
+
+| Pattern | Subscribe | Publish | Use |
+| --- | --- | --- | --- |
+| `announcements` | `public` | `{ "service": true }` | Messages from servers to everyone, including signed-out visitors |
+| `chat:*` | `authenticated` | `authenticated` | Rooms any signed-in person may join |
+| `user:{{ auth.user_id }}` | `authenticated` | `{ "service": true }` | A private channel per person, for notifications |
+| `org:{{ auth.org }}:*` | `authenticated` | `authenticated` | Channels shared within the caller's current organization |
+| `doc:*` | A named policy that checks membership | The same | Collaboration on records with their own sharing |
+
+Templates deserve a closer look.
+The pattern `user:{{ auth.user_id }}` governs every channel that starts with `user:`, but permits a caller only the one that matches their own id.
+A person who asks for `user:u_8` while signed in as `u_7` is refused by this rule, rather than falling through to a looser default.
+A signed-out caller is refused too, because the template cannot be filled.
+
+Policies on channels see the channel's name, its segments, the action, and for publishes the payload:
+
+| Variable | Meaning |
+| --- | --- |
+| `$channel.name` | The channel, such as `org:acme:general` |
+| `$channel.segments` | The name split on `:` and `/`, such as `["org", "acme", "general"]` |
+| `$channel.action` | `subscribe`, `publish` or `presence` |
+| `$input` | For a publish, the message payload |
+
+```json
+{
+  "all": [
+    { "truthy": "$auth.org" },
+    { "eq": ["$channel.segments.1", "$auth.org"] }
+  ]
+}
+```
+
+That condition admits a caller to `org:<slug>:…` channels only for the organization in their token.
+
+### Rules change while people are connected
+
+When an environment's rules change, the server re-checks every open subscription in that environment.
+A subscription the new rules no longer allow is closed by the server, which sends a `channel_closed` frame naming the channel and the reason.
+
+The TypeScript client does not yet handle `channel_closed` as a channel event.
+It reports the frame through the `onProtocolError` option, as `an unknown frame arrived: channel_closed`, and the channel object still believes it is subscribed.
+If your application changes rules while people are connected, pass `onProtocolError` and resubscribe or tear down the affected screens when it reports `channel_closed`.
+
+## Presence
+
+Presence lets members of a channel share a small piece of data about themselves, such as a name or a cursor position, and see who else is there.
+
+<CodeGroup>
+```typescript TypeScript
+const room = pawabase.realtime.channel<unknown, { name: string; typing: boolean }>("chat:lobby", {
+  presence: { name: "Ada", typing: false },
+});
+
+room.on("presence", ({ joins, leaves, members }) => {
+  renderMembers(members.map((member) => member.meta.name));
+  for (const left of leaves) showLeft(left.meta.name);
+});
+
+await room.subscribe();
+await room.track({ name: "Ada", typing: true });
+```
+
+```python Python
+room = apb.realtime.channel("chat:lobby", presence={"name": "Ada", "typing": False})
+
+def on_presence(joins, leaves):
+    render_members([member["meta"]["name"] for member in room.presence_state()])
+    for member in leaves:
+        show_left(member["meta"]["name"])
+
+room.on_presence(on_presence)
+await room.subscribe()
+await room.track({"name": "Ada", "typing": True})
+```
+
+```text WebSocket
+{"type": "presence", "channel": "chat:lobby", "meta": {"name": "Ada", "typing": true}, "ref": "4"}
+# ← {"type": "presence_diff", "channel": "chat:lobby", "joins": [...], "leaves": []}
+```
+</CodeGroup>
+
+| Method or event | Meaning |
+| --- | --- |
+| `presence` option | Your initial presence data, sent when you subscribe |
+| `track(meta)` | Change your presence data; subscribe first |
+| `presenceState()` | Everyone present, as last reported by the server |
+| `presence` event | `{ joins, leaves, members }` after every change |
+
+A presence member has these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `presence_ref` | Unique per connection and channel; one person with two tabs has two |
+| `user_id` | The person's id, or `null` for an anonymous member |
+| `meta` | The presence data they shared |
+| `online_at` | When they joined |
+
+Presence must be enabled by the channel's rule, which it is by default.
+Presence data is limited to 2 KiB per member.
+Count people by `user_id` rather than by members when the same person may have several tabs open.
+
+Presence is not durable.
+When a connection drops, its members leave after a short delay, and they join again when the connection returns.
+
+## History
+
+Each channel keeps its most recent messages, as many as its rule's `history` allows.
+A client can read them to show what happened before it joined.
+
+<CodeGroup>
+```typescript TypeScript
+const recent = await room.history(20);
+for (const message of recent) appendToChat(message.from, message.payload.text, message.sent_at);
+```
+
+```python Python
+recent = await room.history(20)            # over the socket
+recent = pb.realtime.history("chat:lobby", 20)   # over HTTP, on either client
+```
+
+```bash cURL
+curl "$PAWABASE_URL/realtime/v1/channels/chat:lobby/history?limit=20" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+`room.history(limit)` reads over the socket; `realtime.history(channel, limit)` reads over HTTP without joining.
+Both return messages oldest first, with a `seq` number on each.
+
+The number returned is the smaller of what you ask for and what the rule keeps.
+History is kept in memory unless the rule's kind is `durable`, in which case messages survive a restart for the rule's retention period, seven days by default.
+
+History for `resource:<name>` channels is filtered like live delivery: a change to a record you cannot read is not returned.
+
+### Catching up after a reconnect
+
+A channel created with `replay: n` fetches up to `n` recent messages after every reconnect and delivers those it has not delivered before.
+The client remembers the ids of the last 1000 messages per channel, so a message is never delivered twice.
+
+```typescript
+const feed = pawabase.realtime.channel("org:acme:activity", { replay: 100 });
+```
+
+Replay fills short gaps.
+After a long disconnection, more messages may have been sent than the channel keeps, and some are lost.
+Screens that must be exact, such as a list of orders, should reload their data after a reconnect instead of relying on replay.
+
+## Live resource changes
+
+A resource with realtime turned on publishes each create, update and delete on the channel `resource:<name>`.
+Each subscriber receives a change only if the resource's read policy allows them to read that record, checked against the record and the subscriber's identity.
+
+<CodeGroup>
+```typescript TypeScript
+const orders = pawabase.realtime.channel("resource:orders");
+
+orders.on("message", (message) => {
+  const change = message.payload as {
+    resource: string;
+    change: "created" | "updated" | "deleted";
+    record: Record<string, unknown>;
+    changed?: string[];
+    source?: "database";
+  };
+  if (change.change === "deleted") removeRow(change.record.id);
+  else upsertRow(change.record);
+});
+
+await orders.subscribe();
+```
+
+```python Python
+orders = apb.realtime.channel("resource:orders")
+
+def on_change(message):
+    change = message["payload"]
+    if change["change"] == "deleted":
+        remove_row(change["record"]["id"])
+    else:
+        upsert_row(change["record"])
+
+orders.on(None, on_change)
+await orders.subscribe()
+```
+
+```text WebSocket
+# A live channel is a WebSocket, for example with websocat:
+websocat "wss://api.example.com/realtime/v1/socket?apikey=$PAWABASE_KEY&token=$TOKEN&environment=production"
+{"type": "subscribe", "channel": "resource:orders", "ref": "1"}
+# ← {"type": "message", "channel": "resource:orders", "event": "updated", "payload": {"resource": "orders", "change": "updated", "record": {…}, "changed": ["status"]}}
+```
+</CodeGroup>
+
+| Payload field | Meaning |
+| --- | --- |
+| `resource` | The resource's name |
+| `change` | `created`, `updated` or `deleted`; also the message's `event` |
+| `record` | The record as an API read would show it: write-only fields and undeclared columns removed |
+| `changed` | For updates, the fields whose values changed |
+| `source` | `database` for a change captured from the database rather than made through the API |
+
+Changes made through the API, flows and Studio's records view are published.
+Statements run in the SQL console are not.
+
+Clients cannot publish to `resource:` channels; only the platform does.
+
+## When the connection drops
+
+Networks drop connections: a phone changes towers, a laptop sleeps, a proxy times out an idle socket, a server restarts.
+The client is built to recover without your code doing anything, and to tell you when it cannot.
+
+### What the client does
+
+```text
+open ──drop──▶ reconnecting ──backoff──▶ connecting ──welcome──▶ open
+                    ▲                                              │
+                    └──────────── another drop ◀───────────────────┘
+after "open": every channel that was joined is joined again,
+              presence is sent again, and channels with `replay` catch up
+```
+
+| Step | Behavior |
+| --- | --- |
+| Detecting a drop | The socket closes, or two heartbeat intervals pass with no traffic at all, which recycles a link that died silently |
+| Waiting | A random delay between zero and a ceiling that doubles each attempt, from 500 ms up to 15 s |
+| Reconnecting | A new socket with the current access token |
+| Rejoining | Every channel you subscribed to and did not unsubscribe is joined again, with its presence data |
+| Catching up | Channels with `replay` fetch recent history and deliver what they missed, without duplicates |
+
+Messages sent while the connection was down are not delivered live.
+Only `replay`, or reloading data, recovers them.
+
+### Close codes
+
+The server ends a connection with a close code that says why, and the client reacts to each differently.
+
+| Code | Meaning | Client reaction |
+| --- | --- | --- |
+| `4001` | No API key, or the key was refused | Stops; status `closed`. Fix the key. |
+| `4003` | The access token was refused | Refreshes the session once, then reconnects; if refresh fails, stops |
+| `4008` | The connection kept sending faster than allowed | Reconnects with backoff |
+| `4429` | Too many connections for the environment, or for this person | Reconnects with backoff |
+| `1012` | The server is restarting | Reconnects with backoff |
+| Anything else | The network or a proxy closed the socket | Reconnects with backoff |
+
+`4429` most often means a person has too many tabs or devices connected; the default ceiling is 20 connections per person.
+A reconnect succeeds as soon as another of their connections closes.
+
+### Tuning reconnection
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "production",
+  realtime: {
+    reconnect: { baseDelayMs: 1000, maxDelayMs: 30_000, maxAttempts: 50 },
+    heartbeatSeconds: 20,
+  },
+});
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `reconnect.baseDelayMs` | `500` | The first backoff ceiling |
+| `reconnect.maxDelayMs` | `15000` | The largest backoff |
+| `reconnect.maxAttempts` | unlimited | Give up and set status `closed` after this many attempts |
+| `reconnect: false` | | Never reconnect |
+| `heartbeatSeconds` | `25` | Ping interval; a connection silent for two intervals is recycled |
+| `connectTimeoutMs` | `10000` | How long to wait for a new connection to be welcomed |
+| `ackTimeoutMs` | `10000` | How long to wait for the server to acknowledge a subscribe, publish or presence change |
+
+After `maxAttempts`, the client stops.
+Call `connect()` again, for example when the browser reports it is back online, to start over.
+
+```typescript
+window.addEventListener("online", () => {
+  if (pawabase.realtime.status === "closed") void pawabase.realtime.connect();
+});
+```
+
+### Waiting for the connection
+
+`realtime.whenOpen(ms)` resolves when the socket is really open, connecting first if the client is idle.
+`send`, `track` and `history` use it internally, so a call made during a short reconnect waits instead of failing.
+If the connection does not open in time, they reject with `RealtimeError` code `not_connected`.
+
+## When the session changes
+
+The realtime connection carries the person's access token, and it follows the session as it changes.
+
+| Session change | What happens on the connection |
+| --- | --- |
+| The token is refreshed | The client sends the new token over the open socket; no reconnect |
+| The person signs in | The new token is sent; channels that need a signed-in person can now be joined |
+| The person signs out | The client sends an empty token; the connection continues as anonymous |
+| The token expires without a refresh | The server treats the connection as anonymous and sends `token_expired` |
+
+When a connection becomes anonymous, by sign-out or expiry, the server re-checks its subscriptions and closes the ones that required a person, sending `channel_closed` for each.
+
+The server also sends `token_expiring` shortly before a connection's token runs out.
+The client's own refresh timer normally refreshes earlier than that, so the warning passes unnoticed.
+
+The TypeScript client reports `token_expiring`, `token_expired`, `channel_closed` and `going_away` frames through `onProtocolError`, because it does not yet have events for them.
+Log them, and react to `channel_closed` and `token_expired` if your screens depend on channels that need a signed-in person:
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "production",
+  realtime: {
+    onProtocolError: (detail) => {
+      if (detail.includes("channel_closed") || detail.includes("token_expired")) refreshLiveScreens();
+      else console.debug("realtime:", detail);
+    },
+  },
+});
+
+declare function refreshLiveScreens(): void;
+```
+
+A stateless client, created with `accessToken` or `asUser`, opens its socket without a person's token.
+Server code that needs a person's live channels should adopt the session with `auth.setSession` on a normal client instead.
+
+## Realtime over HTTP
+
+Three operations work over plain HTTP, without a socket, from browsers and servers alike:
+
+| Method | Request | Returns |
+| --- | --- | --- |
+| `realtime.publish(channel, event, payload)` | `POST /realtime/v1/publish` | `{ id, channel, event }` |
+| `realtime.presence(channel)` | `GET /realtime/v1/channels/<channel>/presence` | The members present now |
+| `realtime.history(channel, limit)` | `GET /realtime/v1/channels/<channel>/history?limit=` | Recent messages, oldest first |
+
+The same rules apply as on the socket: publishing needs the publish policy, presence and history need the subscribe policy.
+
+Publishing over HTTP is how servers send realtime messages.
+With a secret key, the message's `from` is `"server"`, and the publish is allowed whatever the channel's rule says: service credentials bypass channel policies, the environment's switch for client publishing, and the restriction on `resource:` channels.
+That makes the secret key the right tool for server-sent notifications, and a key to keep on servers only.
+
+<CodeGroup>
+```typescript TypeScript
+const service = createClient({ url, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" });
+
+await service.realtime.publish(`user:${userId}`, "notification", {
+  title: "Your export is ready",
+  href: `/exports/${exportId}`,
+});
+```
+
+```python Python
+service = Pawabase(url, os.environ["PAWABASE_SECRET_KEY"], environment="production")
+
+service.realtime.publish(f"user:{user_id}", "notification", {"title": "Your export is ready", "href": f"/exports/{export_id}"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/realtime/v1/publish" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"channel": "user:u_7", "event": "notification", "payload": {"title": "Your export is ready"}}'
+```
+</CodeGroup>
+
+HTTP publishing uses the client's normal retry rules: `POST` is not repeated after a network failure, because the message may have been delivered.
+
+## Limits
+
+| Limit | Default | When exceeded |
+| --- | --- | --- |
+| Message size, including payload | 64 KiB | The send is refused with `payload_too_large` |
+| Presence data per member | 2 KiB | The presence update is refused with `payload_too_large` |
+| Channels per connection | 100 | The subscribe is refused |
+| Connections per person | 20 | The connection is closed with `4429` |
+| History per channel | The rule's `history`, at most 1000 | Older messages are discarded |
+| Messages per connection per second | An installation setting | Sends are refused with `rate_limited`; persistent flooding closes the connection with `4008` |
+| Messages and channels per project | The plan's limits | Refused with a quota message |
+
+Installations can change these defaults.
+The numbers above are what a default installation uses.
+
+## Errors
+
+Refusals and failures on the socket reach your code as `RealtimeError`, with a `code` naming what happened.
+
+| `code` | Meaning |
+| --- | --- |
+| `forbidden` | A rule refused the subscribe, publish or presence update; the message says why |
+| `payload_too_large` | The message or presence data is over its limit |
+| `rate_limited` | The connection is sending too fast |
+| `invalid_token` | A token sent over the socket was refused |
+| `capacity` | A connection or channel limit was reached |
+| `unavailable` | The server could not complete the request |
+| `ack_timeout` | No acknowledgement within `ackTimeoutMs` |
+| `not_connected` | The connection is not open and did not open in time |
+| `connect_timeout` | A new connection was not welcomed within `connectTimeoutMs` |
+| `closed`, `closed_<code>` | The connection closed while a request was pending, or before it opened |
+| `send_failed` | The socket refused to send |
+
+The HTTP methods raise the usual HTTP errors instead: `AuthenticationError`, `PermissionError`, `RateLimitError` and so on.
+
+## Delivery guarantees
+
+Knowing what realtime promises, and what it does not, prevents designs that fail under load.
+
+| Property | Guarantee |
+| --- | --- |
+| Live delivery | At most once, to subscribers connected at the time |
+| Order | Messages on one channel are delivered to a subscriber in the order the server accepted them |
+| Duplicates | The client removes duplicates by message id, including between replay and live delivery |
+| Missed messages | Not redelivered, except through history and `replay` within the channel's history length |
+| Durability | In memory, unless the rule's kind is `durable` |
+| Acknowledgement of a send | The server accepted the message; not that anyone received it |
+
+Use realtime for what benefits from immediacy and tolerates gaps: chat, presence, notifications, live dashboards.
+Keep the source of truth in records, and treat realtime as the fast path to the screen.
+
+### Refusal messages
+
+A `forbidden` refusal carries a message that says which check failed:
+
+| Message | Cause |
+| --- | --- |
+| `this channel belongs to someone else` | A templated rule, such as `user:{{ auth.user_id }}`, governs the channel, and its rendered name is not this caller's |
+| `resource change channels are server-published` | A client tried to publish to a `resource:` channel |
+| `clients may not publish in this environment` | The environment allows only servers to publish |
+| `presence is off for this channel` | The rule turns presence off |
+| `invalid channel name` or `invalid event name` | The name uses characters outside the allowed set |
+| A policy's own reason | The rule's subscribe or publish policy refused |
+
+## Patterns
+
+### A chat room
+
+A chat room combines history for context, live messages, presence for the member list, and a send with an optimistic copy.
+
+```typescript
+import { RealtimeError } from "@pawabase/client";
+
+interface ChatMessage { text: string }
+interface Member { name: string }
+
+export async function openRoom(roomId: string, me: Member, render: (state: RoomState) => void) {
+  const state: RoomState = { messages: [], members: [], pending: new Map() };
+  const room = pawabase.realtime.channel<ChatMessage, Member>(`chat:${roomId}`, { presence: me, replay: 50 });
+
+  room.on("message", (message) => {
+    state.pending.delete(message.id);
+    if (!state.messages.some((existing) => existing.id === message.id)) state.messages.push(message);
+    render(state);
+  });
+  room.on("presence", ({ members }) => {
+    state.members = members.map((member) => member.meta);
+    render(state);
+  });
+
+  await room.subscribe();
+  state.messages = await room.history(50);
+  render(state);
+
+  return {
+    async send(text: string) {
+      try {
+        const { id } = await room.send("message", { text });
+        state.pending.set(id, text);
+      } catch (error) {
+        if (error instanceof RealtimeError && error.code === "payload_too_large") throw new Error("That message is too long.");
+        throw error;
+      }
+    },
+    close: () => room.unsubscribe(),
+  };
+}
+
+interface RoomState {
+  messages: Array<import("@pawabase/client").ChannelMessage<ChatMessage>>;
+  members: Member[];
+  pending: Map<string, string>;
+}
+```
+
+The message list is keyed by id, so a message that arrives through both history and live delivery appears once.
+For chat that must be kept permanently, also store each message as a record, and use realtime for delivery only.
+
+### A typing indicator
+
+Typing indicators send often, so throttle them, and expire them on the receiving side.
+
+```typescript
+let lastSent = 0;
+
+export function onInput(room: import("@pawabase/client").RealtimeChannel) {
+  const now = Date.now();
+  if (now - lastSent < 2000) return;
+  lastSent = now;
+  void room.send("typing", {}).catch(() => undefined);
+}
+
+const typing = new Map<string, number>();
+room.onEvent("typing", (message) => {
+  if (message.from) typing.set(message.from, Date.now());
+});
+setInterval(() => {
+  for (const [user, at] of typing) if (Date.now() - at > 4000) typing.delete(user);
+  renderTyping([...typing.keys()]);
+}, 1000);
+
+declare const room: import("@pawabase/client").RealtimeChannel;
+declare function renderTyping(users: string[]): void;
+```
+
+Sending at most every two seconds keeps the connection well under its rate limit even with many people typing.
+
+### Personal notifications
+
+A rule with the pattern `user:{{ auth.user_id }}`, subscribe `authenticated` and publish restricted to services gives each person a private inbox that only servers write to.
+
+```typescript
+export async function listenForNotifications(onNotify: (note: { title: string; href: string }) => void) {
+  const user = await pawabase.auth.getCachedUser();
+  if (!user) return () => undefined;
+  const inbox = pawabase.realtime.channel<{ title: string; href: string }>(`user:${user.id}`, { replay: 20 });
+  const stop = inbox.onEvent("notification", (message) => onNotify(message.payload));
+  await inbox.subscribe();
+  return async () => {
+    stop();
+    await inbox.unsubscribe();
+  };
+}
+```
+
+Servers and flows publish to `user:<id>` with a secret key.
+Pair the live notification with a stored record, so a person who was offline still sees it in a notification list.
+
+### Live cursors
+
+Cursors change many times a second, which is too often to send each change.
+Send positions as presence data at a steady, modest rate, and let presence deliver them.
+
+```typescript
+let pending: { x: number; y: number } | null = null;
+
+document.addEventListener("pointermove", (event) => {
+  pending = { x: event.clientX / innerWidth, y: event.clientY / innerHeight };
+});
+
+setInterval(() => {
+  if (!pending) return;
+  void doc.track({ name: me.name, cursor: pending }).catch(() => undefined);
+  pending = null;
+}, 100);
+
+doc.on("presence", ({ members }) => renderCursors(members.filter((member) => member.user_id !== me.id)));
+
+declare const doc: import("@pawabase/client").RealtimeChannel<unknown, { name: string; cursor: { x: number; y: number } }>;
+declare const me: { id: string; name: string };
+declare function renderCursors(members: unknown[]): void;
+```
+
+Positions as fractions of the window make cursors meaningful across screen sizes.
+Ten updates a second is smooth enough for cursors and stays small next to the presence size limit.
+
+### A live dashboard
+
+A dashboard of orders combines an initial load, live changes, and a reload after reconnects.
+
+```typescript
+export async function liveOrders(render: (rows: Order[]) => void) {
+  let rows: Order[] = [];
+  const load = async () => {
+    rows = (await pawabase.from("orders").eq("status", "open").order("created_at", "desc").perPage(100)).data as Order[];
+    render(rows);
+  };
+
+  const changes = pawabase.realtime.channel("resource:orders");
+  changes.on("message", (message) => {
+    const { change, record } = message.payload as { change: string; record: Order };
+    rows = rows.filter((row) => row.id !== record.id);
+    if (change !== "deleted" && record.status === "open") rows = [record, ...rows];
+    render(rows);
+  });
+  changes.on("subscribed", () => void load());
+
+  await changes.subscribe();
+  return () => changes.unsubscribe();
+}
+
+interface Order { id: string; status: string; created_at: string }
+```
+
+Loading on every `subscribed` event covers the first join and each rejoin after a reconnect.
+The list is therefore correct even after a long disconnection, which replay alone cannot guarantee.
+
+### Broadcasting from a worker
+
+A background job that finishes work tells the people waiting for it, with a secret-key client and HTTP publishing:
+
+<CodeGroup>
+```typescript TypeScript
+export async function finishExport(exportId: string, ownerId: string, fileKey: string) {
+  await service.from("exports").update(exportId, { status: "done", file_key: fileKey });
+  await service.realtime.publish(`user:${ownerId}`, "export.done", { export_id: exportId });
+}
+
+declare const service: import("@pawabase/client").PawabaseClient;
+```
+
+```python Python
+def finish_export(export_id: str, owner_id: str, file_key: str) -> None:
+    service.from_("exports").update(export_id, {"status": "done", "file_key": file_key})
+    service.realtime.publish(f"user:{owner_id}", "export.done", {"export_id": export_id})
+```
+</CodeGroup>
+
+The record update is the source of truth; the message is a nudge so the screen updates at once.
+
+## Realtime in React
+
+A small hook subscribes when a component mounts and unsubscribes when it unmounts.
+Because channel objects are shared by name, several components can use the same channel safely.
+
+```tsx
+import { useEffect, useState } from "react";
+import type { ChannelMessage } from "@pawabase/client";
+
+export function useChannelMessages<T>(name: string, limit = 100) {
+  const [messages, setMessages] = useState<ChannelMessage<T>[]>([]);
+
+  useEffect(() => {
+    const channel = pawabase.realtime.channel<T>(name);
+    const stop = channel.on("message", (message) => {
+      setMessages((current) => [...current.slice(-(limit - 1)), message]);
+    });
+    void channel.subscribe().catch(() => undefined);
+    return () => {
+      stop();
+      void channel.unsubscribe();
+    };
+  }, [name, limit]);
+
+  return messages;
+}
+
+export function useRealtimeStatus() {
+  const [status, setStatus] = useState(pawabase.realtime.status);
+  useEffect(() => pawabase.realtime.onStatusChange(setStatus), []);
+  return status;
+}
+```
+
+Unsubscribing in the cleanup of one component unsubscribes the shared channel for every component using it.
+When several components share a channel, keep the subscription in one place, such as a provider, and let components only listen.
+
+## Testing realtime code
+
+The client accepts any WebSocket implementation, which makes realtime code testable with a small fake that plays the server's part.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient, type WebSocketLike } from "@pawabase/client";
+
+class FakeSocket implements WebSocketLike {
+  static last: FakeSocket;
+  readyState = 0;
+  sent: Array<Record<string, unknown>> = [];
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onclose: ((event: { code: number; reason?: string }) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+
+  constructor(readonly url: string) {
+    FakeSocket.last = this;
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.receive({ type: "welcome", connection_id: "c1" });
+    });
+  }
+  send(data: string) {
+    const frame = JSON.parse(data);
+    this.sent.push(frame);
+    if (frame.type === "subscribe") this.receive({ type: "ack", ref: frame.ref, ok: true });
+  }
+  close(code = 1000) {
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+  receive(frame: Record<string, unknown>) {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+
+test("delivers messages once, even when repeated", async () => {
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    environment: "test",
+    realtime: { webSocket: FakeSocket },
+  });
+  const room = pawabase.realtime.channel<{ text: string }>("chat:lobby");
+  const seen: string[] = [];
+  room.on("message", (message) => seen.push(message.payload.text));
+  await room.subscribe();
+
+  const message = { type: "message", id: "m1", channel: "chat:lobby", event: "message", payload: { text: "hi" }, from: "u1", sent_at: "2026-10-25T10:00:00Z" };
+  FakeSocket.last.receive(message);
+  FakeSocket.last.receive(message);
+
+  assert.deepEqual(seen, ["hi"]);
+  assert.match(FakeSocket.last.url, /\/realtime\/v1\/socket\?apikey=pb_pk_test/);
+  pawabase.dispose();
+});
+```
+
+The fake answers subscriptions with an acknowledgement and lets the test push frames.
+Extend it to answer `publish` and `history`, or to close with a chosen code to test reconnection.
+
+Rules cannot be tested this way; only the server evaluates them.
+Test rules against a development environment, with two signed-in test users checking that each can join their own channels and not the other's.
+
+## The frames on the wire
+
+For debugging, these are the frames the client exchanges with the server.
+Each request carries a `ref`, and the server's `ack` or `history` frame answers with the same `ref`.
+
+| Direction | `type` | Purpose |
+| --- | --- | --- |
+| Server to client | `welcome` | The connection is ready; carries `connection_id` |
+| Client to server | `subscribe` | Join a channel, with optional `presence` |
+| Client to server | `unsubscribe` | Leave a channel |
+| Client to server | `publish` | Send a message: `channel`, `event`, `payload` |
+| Client to server | `presence` | Change presence data: `channel`, `meta` |
+| Client to server | `history` | Ask for recent messages: `channel`, `limit` |
+| Client to server | `auth` | Replace the connection's token |
+| Client to server | `ping` | Keep the connection alive |
+| Server to client | `ack` | The answer to a request: `ok`, and `error` and `reason` when refused |
+| Server to client | `message` | A message on a channel |
+| Server to client | `history` | The answer to a history request |
+| Server to client | `presence_state`, `presence_diff` | Everyone present, then joins and leaves |
+| Server to client | `pong` | The answer to a ping |
+| Server to client | `channel_closed`, `token_expiring`, `token_expired`, `going_away` | Notices the TypeScript client reports through `onProtocolError` |
+
+The [protocol reference](/realtime/protocol) documents each frame's fields for clients written in other languages.
+
+## A collaborative document
+
+Several people editing one document need three things from realtime: who else is there, what they are changing, and a way to save the result.
+Realtime handles the first two; records handle the third.
+
+```typescript
+interface Edit { field: string; value: string; version: number }
+
+export async function openDocument(docId: string, me: { id: string; name: string }, apply: (edit: Edit, from: string | null) => void) {
+  const channel = pawabase.realtime.channel<Edit, { name: string; field?: string }>(`doc:${docId}`, { presence: { name: me.name } });
+
+  channel.onEvent("edit", (message) => {
+    if (message.from !== me.id) apply(message.payload, message.from);
+  });
+  await channel.subscribe();
+
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  return {
+    focus: (field: string) => channel.track({ name: me.name, field }),
+    edit: async (edit: Edit) => {
+      await channel.send("edit", edit);
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => void pawabase.from("documents").update(docId, { [edit.field]: edit.value }), 1500);
+    },
+    close: () => channel.unsubscribe(),
+  };
+}
+```
+
+Presence shows which field each person is in, so the interface can show "Grace is editing the title".
+Edits go out at once for the others to see, and the record is saved after a pause in typing.
+
+This last-writer-wins approach suits forms and short fields.
+Long text edited by several people at once needs a conflict-free merging library on top; realtime then carries that library's updates as payloads.
+
+## Progress for long work
+
+Long jobs can report progress to the person who started them through their private channel.
+
+<CodeGroup>
+```typescript TypeScript
+export async function runImport(importId: string, ownerId: string, rows: unknown[]) {
+  let lastReport = 0;
+  for (let index = 0; index < rows.length; index++) {
+    await importRow(rows[index]);
+    if (Date.now() - lastReport > 1000 || index === rows.length - 1) {
+      lastReport = Date.now();
+      await service.realtime.publish(`user:${ownerId}`, "import.progress", { import_id: importId, done: index + 1, total: rows.length });
+    }
+  }
+  await service.from("imports").update(importId, { status: "done" });
+}
+
+declare const service: import("@pawabase/client").PawabaseClient;
+declare function importRow(row: unknown): Promise<void>;
+```
+
+```python Python
+import time
+
+
+def run_import(import_id: str, owner_id: str, rows: list) -> None:
+    last_report = 0.0
+    for index, row in enumerate(rows):
+        import_row(row)
+        if time.monotonic() - last_report > 1 or index == len(rows) - 1:
+            last_report = time.monotonic()
+            service.realtime.publish(f"user:{owner_id}", "import.progress", {"import_id": import_id, "done": index + 1, "total": len(rows)})
+    service.from_("imports").update(import_id, {"status": "done"})
+```
+</CodeGroup>
+
+Reporting at most once a second keeps the messages useful without flooding the channel.
+The final status goes into the record, so a person who reconnects after the job finished still sees that it did.
+
+## Abuse and moderation
+
+Any channel people can publish to can be misused.
+The platform limits the damage; your rules and your application decide the rest.
+
+| Concern | What the platform does | What you can do |
+| --- | --- | --- |
+| Flooding | Refuses sends over the rate limit; closes persistent offenders with `4008` | Throttle your own sends; keep publish policies narrow |
+| Oversized messages | Refuses messages over 64 KiB and presence over 2 KiB | Validate before sending |
+| Unwanted members | Applies subscribe policies | Require a role or membership in the rule |
+| Abusive content | Nothing; it delivers payloads as sent | Send chat through a route that checks content, and publish from the server |
+| Removing a person from a channel | Re-checks subscriptions when rules change | Change their role or membership, so the rule refuses them |
+
+For public chat, publishing through a server is the strongest design: clients call a route, the flow checks and stores the message, and a secret-key publish delivers it.
+Clients then never publish directly, and the environment can turn client publishing off.
+
+## Realtime with a query cache
+
+Applications that use a query cache, such as TanStack Query, can let realtime tell the cache when data changed, instead of patching rows by hand.
+
+```typescript
+import { QueryClient } from "@tanstack/react-query";
+
+export function invalidateOnChanges(queryClient: QueryClient, resources: string[]) {
+  const stops = resources.map((resource) => {
+    const channel = pawabase.realtime.channel(`resource:${resource}`);
+    const stop = channel.on("message", () => void queryClient.invalidateQueries({ queryKey: [resource] }));
+    void channel.subscribe();
+    return () => {
+      stop();
+      void channel.unsubscribe();
+    };
+  });
+  return () => stops.forEach((stop) => stop());
+}
+```
+
+Invalidation refetches the affected queries, so every screen shows data that went through the same filters, sorting and policies as the first load.
+It costs a request per change, which is fine for data that changes a few times a minute and wasteful for data that changes many times a second.
+
+## Accessible live updates
+
+Content that changes without the person acting can be missed by people using screen readers.
+Announce important live changes in an `aria-live` region, and keep the announcements short.
+
+```tsx
+export function LiveAnnouncer({ message }: { message: string }) {
+  return (
+    <div aria-live="polite" aria-atomic="true" className="sr-only">
+      {message}
+    </div>
+  );
+}
+```
+
+Announce "3 new messages", not each message.
+Do not move keyboard focus when content arrives.
+
+## Moving from polling to realtime
+
+Many applications start by polling and move to realtime later.
+The move is safer in steps than all at once.
+
+| Step | Change |
+| --- | --- |
+| Keep the poll, lengthen its interval | The screen still works if realtime fails |
+| Subscribe to the resource's changes and update the screen from them | Changes appear immediately |
+| Reload on `subscribed` | Reconnects are covered |
+| Remove the poll once realtime has been reliable in production | Fewer requests |
+
+A slow poll kept as a safety net, such as once every few minutes, costs little and protects against bugs in change handling.
+
+## A notification bell
+
+A notification bell needs an accurate unread count on first load, and immediate updates afterwards.
+Records give the first; realtime gives the second.
+
+```typescript
+export async function startBell(userId: string, render: (unread: number) => void) {
+  const notifications = pawabase.from("notifications");
+  let unread = await notifications.eq("read", false).count();
+  render(unread);
+
+  const changes = pawabase.realtime.channel("resource:notifications");
+  changes.on("message", (message) => {
+    const { change, record } = message.payload as { change: string; record: { read: boolean } };
+    if (change === "created" && !record.read) unread += 1;
+    if (change === "updated" && record.read) unread = Math.max(0, unread - 1);
+    render(unread);
+  });
+  changes.on("subscribed", async () => {
+    unread = await notifications.eq("read", false).count();
+    render(unread);
+  });
+  await changes.subscribe();
+}
+```
+
+The `notifications` resource's read policy limits both the count and the changes to the person's own notifications, so the bell never counts someone else's.
+Recounting on `subscribed` corrects any drift after a reconnect.
+
+## Sending over the socket or over HTTP
+
+| | `channel.send` | `realtime.publish` |
+| --- | --- | --- |
+| Needs a joined channel | No; it needs an open connection | No |
+| Transport | The shared WebSocket | One HTTP request |
+| Typical caller | A browser or app on the channel | A server, a job, or a browser that is not subscribed |
+| Retried by the client | No | No, after a network failure; yes, after `429` |
+| Answer | `{ id }` when accepted | `{ id, channel, event }` when accepted |
+
+Browsers that are already on a channel should use `send`; it is faster and uses the open connection.
+Servers should use `publish`, which needs no socket.
+
+## How channels come and go
+
+A channel is not created or deleted by anyone.
+It exists while there are subscribers or recent messages to keep, and the server forgets it afterwards.
+
+| Moment | What exists |
+| --- | --- |
+| Nobody has joined `chat:42` yet | Nothing; a subscribe brings it into being |
+| People are subscribed | The channel, its subscribers, its presence and its recent history |
+| The last subscriber leaves | Recent history may still be kept, in memory or, for durable rules, in the database |
+| A durable channel's retention passes | Its stored messages are purged |
+
+You can therefore use as many channel names as your data has things, such as one per document, without managing them.
+Each project's plan may limit how many channels can be active at once.
+
+## The realtime module at a glance
+
+| Call | Purpose |
+| --- | --- |
+| `realtime.channel(name, { presence, replay })` | The shared channel object for a name |
+| `realtime.connect()` / `disconnect()` | Open or close the connection |
+| `realtime.status`, `onStatusChange(fn)` | The connection's state |
+| `realtime.whenOpen(ms)` | Wait for an open connection |
+| `realtime.connectionId` | The server's id for this connection |
+| `realtime.publish(channel, event, payload)` | Publish over HTTP |
+| `realtime.presence(channel)` | Members present, over HTTP |
+| `realtime.history(channel, limit)` | Recent messages, over HTTP |
+| `channel.subscribe()` / `unsubscribe()` | Join or leave |
+| `channel.on(event, fn)`, `onEvent(name, fn)` | Listen for messages, presence and channel state |
+| `channel.send(event, payload)` | Publish over the socket |
+| `channel.track(meta)` | Change your presence data |
+| `channel.presenceState()` | Members present, as last reported |
+| `channel.history(limit)` | Recent messages, over the socket |
+| `channel.subscribed` | Whether the channel is joined |
+| `for await (const m of channel)` | Iterate messages until unsubscribed |
+
+## Designing channel names
+
+Channel names are the vocabulary your rules speak.
+A consistent scheme makes rules short and mistakes visible.
+
+| Principle | Example | Why |
+| --- | --- | --- |
+| Start with the kind of channel | `chat:…`, `user:…`, `doc:…` | One rule per kind, matched with `kind:*` |
+| Put the access boundary next | `org:acme:…`, `user:u_7` | Templated rules and segment checks can compare it |
+| End with the specific thing | `org:acme:chat:general` | Many channels share one rule |
+| Use ids, not names | `doc:01JB9C2W`, not `doc:Q3 plan` | Names change and contain characters channels do not allow |
+| Keep resource changes on `resource:<name>` | `resource:orders` | The platform publishes there; do not reuse the prefix |
+
+### Rule order matters
+
+Rules are tried from the top, and the first match wins.
+A general rule placed above a specific one hides it.
+
+| Order | Channel `chat:staff` | Effect |
+| --- | --- | --- |
+| `chat:*` (authenticated), then `chat:staff` (role staff) | Matches `chat:*` first | Every signed-in person can join the staff room |
+| `chat:staff` (role staff), then `chat:*` (authenticated) | Matches `chat:staff` first | Only staff can join |
+
+Put specific patterns first and general ones after.
+After changing rules, test a channel of each kind as a person who should be refused, not only as one who should be admitted.
+
+## Presence in depth
+
+Presence answers "who is here now", and its details decide whether that answer is accurate.
+
+| Situation | What presence shows | What to do |
+| --- | --- | --- |
+| One person, two tabs | Two members with the same `user_id` | Group by `user_id` for "who is here" |
+| A tab is closed | The member leaves after the server notices the connection is gone | Expect a short delay |
+| A laptop sleeps | The member stays until the connection times out, then leaves | Do not treat presence as proof of attention |
+| A person updates their data | A `presence` event with the member in `joins` | Replace by `presence_ref` |
+| A person without a session | A member with `user_id: null` | Show "guest", or require sign-in by rule |
+
+Everything in presence data is visible to everyone on the channel.
+Do not put email addresses or other private details there unless every member may see them.
+
+`presenceState()` returns the client's view, rebuilt from the server's `presence_state` frame when you join and updated from each `presence_diff`.
+`realtime.presence(channel)` asks the server directly over HTTP, which is useful for a server that wants a count without joining.
+
+```typescript
+function uniquePeople(members: Array<{ user_id: string | null; meta: { name?: string } }>) {
+  const byUser = new Map<string, string>();
+  let guests = 0;
+  for (const member of members) {
+    if (member.user_id) byUser.set(member.user_id, member.meta.name ?? "Someone");
+    else guests += 1;
+  }
+  return { people: [...byUser.values()], guests };
+}
+```
+
+## Durable channels
+
+A rule whose kind is `durable` keeps its channels' messages in the database, not only in memory.
+History then survives a server restart, for the rule's retention period or the installation's default of seven days.
+
+| | Default kind | `durable` |
+| --- | --- | --- |
+| History after a restart | Lost | Kept for the retention period |
+| History length | The rule's `history` | The rule's `history` |
+| Cost per message | Memory | A database write |
+| Fits | Chat cursors, typing, transient updates | Activity feeds, announcements, anything people catch up on |
+
+The server can make a repeated publish to a durable channel harmless when the publish carries a client message id.
+The TypeScript client does not send one, so a send that is retried by your own code after a timeout can produce two messages.
+Retry sends to durable channels only after checking history for the first attempt, or accept the occasional duplicate.
+
+## Realtime on mobile
+
+Mobile operating systems suspend apps in the background and close their sockets.
+The client reconnects when the app runs again, but a few habits make the experience better.
+
+| Habit | Why |
+| --- | --- |
+| Disconnect when the app goes to the background, and connect when it returns | Avoids a stream of failed reconnects while suspended, and saves battery |
+| Reload screen data on `subscribed` after returning | Messages sent while suspended are not delivered live |
+| Keep `heartbeatSeconds` at the default or higher | Each ping wakes the radio |
+| Use `replay` on channels people read like a feed | Short absences are filled without reloading |
+
+```typescript
+import { AppState } from "react-native";
+
+AppState.addEventListener("change", (state) => {
+  if (state === "active") void pawabase.realtime.connect();
+  else pawabase.realtime.disconnect();
+});
+```
+
+Channels keep their listeners across `disconnect()` and are rejoined on the next `connect()`.
+
+## Realtime and server rendering
+
+A server rendering a page has no use for a live socket; the page is sent once.
+Open realtime connections in the browser only, after the page has hydrated.
+
+In React, subscribe inside `useEffect`, which does not run on the server.
+In other frameworks, use their client-only lifecycle hook.
+A server that creates a client per request and touches `realtime.channel(…).subscribe()` would open a socket per request and never use it.
+
+## Cost and scale
+
+Every message is delivered to every subscriber of its channel, so the work grows with both.
+
+| Factor | Effect | Lever |
+| --- | --- | --- |
+| Subscribers per channel | Each message is sent that many times | Split broad channels into narrower ones |
+| Message size | Bandwidth per delivery | Send ids and small diffs, not whole documents |
+| Message rate | Deliveries per second | Throttle typing, cursors and progress updates |
+| Resource change channels | One delivery per change per permitted subscriber, with a read check each | Turn on realtime only for resources that need it |
+
+The **Delivered** count in **Services → Realtime** shows which channels carry the most traffic.
+Projects also have plan limits on realtime messages and channels; refusals for those say which limit was reached.
+
+## Debugging realtime
+
+Realtime problems are easier to diagnose with the connection's own story in front of you.
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "development",
+  realtime: { onProtocolError: (detail) => console.debug("[realtime] notice", detail) },
+});
+
+pawabase.realtime.onStatusChange((status) => console.debug("[realtime] status", status));
+
+room.on("error", (error) => console.warn("[realtime] refused", error.code, error.message));
+room.on("closed", ({ reason }) => console.debug("[realtime] closed", reason));
+```
+
+The browser's developer tools show WebSocket frames: open the network panel, select the `socket` request, and read the messages in both directions.
+Each refused request appears as an `ack` frame with `ok: false`, an `error` and a `reason`.
+
+On the server side, **Services → Realtime** lists open connections with their user and channels, which answers "is this person actually connected, and to what".
+
+## Realtime, events and webhooks
+
+Three features move information when something happens, and they are easy to mix up.
+
+| Feature | Who receives | Delivery | Use for |
+| --- | --- | --- | --- |
+| Realtime | Connected clients | Immediate, at most once | Screens that update live |
+| Events and flows | Your server-side logic | Reliable, with retries and run history | Work that must happen |
+| Outbound webhooks | Other systems over HTTP | Reliable, with retries and delivery history | Telling partners |
+
+A single record change can feed all three: realtime updates screens, a flow sends the email, and a webhook tells the warehouse.
+Choose by who must know and how sure you need to be that they did.
+
+## Security checklist for realtime
+
+| Check | Why |
+| --- | --- |
+| Every channel kind has a rule; the default policy is not relied on | A missing rule falls back to the environment default, which may be broader than intended |
+| Specific rules come before general ones | The first match wins |
+| Per-person and per-organization channels use templates or segment checks | Guessable names must not be joinable by others |
+| Publishing is restricted where only servers should speak | Notifications and announcements must not be forgeable |
+| Presence data contains only what every member may see | Presence is broadcast to the channel |
+| Resources with realtime have read policies you have reviewed | Change delivery follows the read policy |
+| Secret keys never reach browsers | They bypass every channel rule |
+
+## Channels and organization switches
+
+Organization channels, such as `org:acme:activity`, are authorized against the organization in the person's token.
+After `auth.switchOrg`, the token names a different organization, and channels of the previous one should be left.
+
+```typescript
+let current: import("@pawabase/client").RealtimeChannel | null = null;
+
+pawabase.auth.onAuthStateChange(async (_event, session) => {
+  const org = session?.org ?? null;
+  const wanted = org ? `org:${org}:activity` : null;
+  if (current?.name === wanted) return;
+  await current?.unsubscribe();
+  current = wanted ? pawabase.realtime.channel(wanted, { replay: 50 }) : null;
+  await current?.subscribe();
+});
+```
+
+The new token reaches the open connection automatically, and the server re-checks existing subscriptions against it.
+Leaving the old channel yourself makes the change immediate and keeps the screen from showing another organization's activity.
+
+## Designing message payloads
+
+A message's `event` and `payload` are a small protocol between your senders and receivers.
+Designing them like an API keeps old and new clients working together.
+
+| Principle | Example |
+| --- | --- |
+| Name events by what happened | `order.shipped`, `member.joined` |
+| Send ids and the few fields the screen shows | `{ "order_id": "o1", "status": "shipped" }` |
+| Add fields; do not rename or remove them | Old clients ignore new fields |
+| Mark a breaking change with a new event name | `order.shipped.v2` alongside `order.shipped` |
+| Keep secrets and personal data out | Everyone on the channel sees the payload |
+
+Receivers should ignore events they do not recognize, so senders can add new ones without breaking anyone.
+
+## Common mistakes
+
+| Mistake | Consequence | Fix |
+| --- | --- | --- |
+| Treating realtime as the source of truth | Gaps after reconnects leave screens wrong | Load from records; use realtime to update |
+| One broad channel for everything | Every client receives everything | One channel per thing people watch |
+| Sending on every keystroke or pointer move | Rate limiting and wasted bandwidth | Throttle and use presence for high-frequency state |
+| Unsubscribing a shared channel from one component | Other components stop receiving | Subscribe in one place, listen in many |
+| Rules ordered general before specific | Restricted channels become open | Specific patterns first |
+| Ignoring `channel_closed` | Screens silently stop updating | Handle it through `onProtocolError` |
+| Secret keys in browser realtime clients | Every rule is bypassed | Publishable keys in browsers |
+
+## Realtime in end-to-end tests
+
+End-to-end tests that drive a browser can check live behavior with two browser contexts signed in as different people.
+One acts, the other watches, and the test waits for the watcher's screen to change.
+
+| Step in the test | What it proves |
+| --- | --- |
+| Watcher opens the screen and waits for the live indicator | The connection opens and the channel is joined |
+| Actor changes a record through the interface | The change is published |
+| Watcher's screen shows the change within a few seconds | Delivery and the read policy work for that person |
+| A third person who may not read the record sees nothing | The read policy filters delivery |
+
+Wait for the change with a timeout of a few seconds rather than a fixed sleep.
+Delivery is usually immediate, but test machines are slow in ways production is not.
+
+Give each test run its own channel or record ids, such as a suffix with the run's timestamp.
+Parallel runs then cannot see each other's messages, and a failure in one run does not leave the next run with stale presence or history.
+
+Run these tests against a development or preview environment with realtime turned on for the resources involved, and with the same channel rules as production.
+A rule that differs between environments is the most common reason a live screen works in testing and not after release.
+Promoting rules along with the rest of the definitions keeps the environments in step.
+
+## Before shipping a live screen
+
+| Check | Why |
+| --- | --- |
+| The screen loads its data from records first | Realtime only carries changes |
+| It reloads or catches up on `subscribed` | Reconnects leave gaps |
+| It shows `reconnecting` and `closed` states | People should know when the screen is not live |
+| It unsubscribes when the screen closes | Channels count against limits and keep receiving |
+| High-frequency updates are throttled | Rate limits and bandwidth |
+| The channel's rule has been tested as a person who should be refused | Access mistakes are silent otherwise |
+| `onProtocolError` is wired to logging | Server notices such as `channel_closed` are visible |
+
+## Words used on this page
+
+| Term | Meaning |
+| --- | --- |
+| Connection | One WebSocket between a client and the realtime service |
+| Channel | A named topic; exists while used |
+| Rule | A pattern with subscribe and publish policies, presence and history settings |
+| Presence | The set of members on a channel, each with a small piece of shared data |
+| History | The recent messages a channel keeps |
+| Replay | The client fetching recent history after a reconnect to fill gaps |
+| Durable | A rule kind whose messages are stored in the database for a retention period |
+| Resource channel | `resource:<name>`, where the platform publishes a resource's changes |
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Add or change a channel rule | **Services → Realtime**, the channel rules, with **Pattern**, **Kind**, **Subscribe**, **Publish**, **Presence** and **History** |
+| See who is connected | **Services → Realtime**, **Connections** |
+| See busy channels | **Services → Realtime**, **Active channels**, with **Subscribers**, **Present** and **Delivered** |
+| Publish a live record change stream | Turn on **realtime** on the resource under **Data** |
+| See refused subscriptions and drops | **Services → Realtime** statistics, and **Project → Activity** |
+
+## Coming from Supabase Realtime
+
+| Supabase | @pawabase/client | Note |
+| --- | --- | --- |
+| `supabase.channel("room")` | `pawabase.realtime.channel("room")` | Shared object per name |
+| `.on("broadcast", { event }, fn)` | `.onEvent(event, fn)` or `.on("message", fn)` | |
+| `.send({ type: "broadcast", event, payload })` | `.send(event, payload)` | Resolves when accepted |
+| `.on("presence", { event: "sync" }, fn)` | `.on("presence", fn)` | `{ joins, leaves, members }` |
+| `.track(meta)` | `.track(meta)` | Subscribe first |
+| `.on("postgres_changes", { table }, fn)` | `channel("resource:<name>").on("message", fn)` | Filtered by the resource's read policy |
+| Realtime Authorization with RLS on `realtime.messages` | Channel rules with subscribe and publish policies | Configured in Studio |
+| `supabase.removeChannel(ch)` | `ch.unsubscribe()` | |
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| `ConfigError: No WebSocket implementation found` | Node 20 without a WebSocket | Pass `realtime.webSocket` |
+| Status goes to `closed` immediately | Close code `4001`: the key was refused | Check the key and the gateway URL |
+| `RealtimeError` `forbidden` on subscribe | A rule refused | Read the message; check the channel's rule in Studio |
+| `this channel belongs to someone else` | A templated rule and another person's channel name | Use the caller's own id or organization in the name |
+| Messages stop arriving after a while, with no error | The server closed the channel after a rule change or token expiry | Handle `channel_closed` in `onProtocolError` |
+| Messages are missing after a reconnect | They were sent while disconnected | Use `replay`, or reload data on `subscribed` |
+| Every send is refused | Client publishing is off for the environment | Publish from a server or flow instead |
+| `payload_too_large` | Over 64 KiB, or presence over 2 KiB | Send ids and fetch details, or trim presence data |
+| Frequent reconnects with `4429` | Too many connections for this person | Close unused tabs or share one connection per tab |
+| Resource changes never arrive | Realtime is off for the resource, or the changes are made in the SQL console | Turn on realtime; make changes through the API |
+| The server's channels refuse a server-side client | The client is stateless and connects without a token | Publish over HTTP with a secret key, or adopt a session |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="How many channels should one screen use?">
+    As few as the screen needs, usually one or two.
+    A connection may join up to 100, and each joined channel costs a little on both sides.
+  </Accordion>
+  <Accordion title="Can a signed-out visitor use realtime?">
+    Yes, on channels whose rules admit anonymous callers, such as a rule with `public` subscribe.
+    The connection carries only the publishable key.
+  </Accordion>
+  <Accordion title="Do I need realtime to keep a list up to date?">
+    No; polling a query works and is simpler.
+    Realtime is worth it when updates must appear within a second, or when many people watch the same data.
+  </Accordion>
+  <Accordion title="Are messages encrypted?">
+    The connection to the gateway is encrypted with TLS when the gateway URL is `https:`.
+    Messages are visible to the server and to everyone the channel's rule admits.
+  </Accordion>
+  <Accordion title="Can I send binary data?">
+    No.
+    Frames are JSON text.
+    Upload files to storage and send their keys.
+  </Accordion>
+  <Accordion title="Does `send` guarantee delivery?">
+    It guarantees the server accepted the message.
+    Subscribers connected at that moment receive it; others can find it in history while the channel keeps it.
+  </Accordion>
+  <Accordion title="Can a server subscribe to channels?">
+    Yes, with a client that has a WebSocket and a session or key.
+    Most servers do not need to: they publish over HTTP, and react to data changes through events and flows, which are reliable where a socket is not.
+  </Accordion>
+  <Accordion title="What happens to my channels when I call `auth.signOut()`?">
+    The connection continues as anonymous.
+    Channels that require a signed-in person are closed by the server; public channels keep working.
+  </Accordion>
+  <Accordion title="Can I subscribe to changes of one record only?">
+    Subscribe to `resource:<name>` and filter by id in your handler.
+    Delivery is already limited to records the person may read.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Realtime overview" icon="radio" href="/realtime/overview">How the realtime service fits into Pawabase.</Card>
+  <Card title="Channel rules" icon="shield" href="/realtime/channel-rules">Patterns and policies for channels.</Card>
+  <Card title="Resource changes" icon="database" href="/realtime/resource-changes">Live record changes and their filtering.</Card>
+  <Card title="Presence" icon="users" href="/realtime/presence">Presence data and its lifecycle.</Card>
+  <Card title="Server publishing" icon="send" href="/realtime/server-publishing">Publishing from servers and flows.</Card>
+</CardGroup>

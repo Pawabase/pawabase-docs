@@ -1,286 +1,1524 @@
 ---
 title: "Email verification"
-description: "How to verify an email address after sign-up, including the verify endpoint, the complete handler, resend flow with rate limiting, and email templates."
+description: "Confirming that a user owns an address: the verify token, where the link lands, what redeeming it returns, and how the requirement is switched on per environment."
 icon: "mail-check"
 ---
 
-Email verification is the process of confirming that a user owns the email address they provided during sign-up. Pawabase sends a verification email containing a one-time link that the user clicks to verify their address. Once verified, the user can access all features that require email confirmation.
+Email verification answers one question: does this person control the inbox behind this address? Once answered, the account carries a timestamp — `email_verified_at` — and every later decision about that account can treat the address as trustworthy.
 
-Email verification is controlled by the `require_email_verification` configuration flag. When enabled, new sign-ups must complete verification before they can access the application. The verification flow consists of two endpoints: the verification request endpoint (`verify`) and the completion handler (`complete`).
+In Pawabase verification is not a separate service with its own rules. It is one **purpose** of the shared one-time token mechanism, and one environment flag that decides whether the question is asked at all. That is why almost every question about verification — how long the link lasts, where it goes, what happens if it is opened twice, whether it can be previewed — has the same answer as the corresponding question about magic links and password recovery. The mechanism is described once, in [One-time tokens](#the-one-time-token-behind-every-link), and reused.
 
 <CardGroup cols={3}>
-  <Card title="Verification is opt-in" icon="toggle">Controlled by the `require_email_verification` flag in the environment configuration.</Card>
-  <Card title="One-time codes" icon="code">A `OTP` record is created in the database with a single-use code that expires after a configurable time-to-live.</Card>
-  <Card title="Resend is rate-limited" icon="clock">Verification emails can be resent, but the resend endpoint is protected by per-IP and per-user rate limiting.</Card>
+  <Card title="Off by default" icon="toggle">`require_email_verification` is `false`. Verification is a switch you opt into per environment, not a stage every account passes through.</Card>
+  <Card title="A 24-hour token" icon="clock">The `verify` token carries a 24-hour lifetime, the longest of the emailed link types, because a confirmation mail may sit in an inbox overnight.</Card>
+  <Card title="Redeeming signs you in" icon="key">A successful confirmation does not return a bare "verified" flag. It starts a session and returns the full token payload.</Card>
 </CardGroup>
 
-## How email verification works
+## Where this sits in the layered model
 
-When a new user signs up (through `POST /auth/v1/token` with `grant_type: "password"` or `grant_type: "magic_link"`), Pawabase creates the `AuthUser` record and checks the `require_email_verification` flag:
+Verification touches all three layers, but only one of them owns anything.
+
+| Layer | What it does for verification |
+| --- | --- |
+| **Akountz** (identity) | Owns the `OneTimeToken` row, sends the message, consumes the token, stamps the user, starts a session. |
+| **The API** (project config) | Owns `require_email_verification`, `site_url`, the redirect allowlist, and the `verify` message override. Akountz reads them. |
+| **Gateway / `pawabase_core`** | Verifies the resulting access token like any other. It never sees the one-time token. |
+
+The tenancy rule applies without exception. A verification token is scoped to one `project` + `env` pair, so a link issued for `acme/staging` cannot be redeemed against `acme/production` even when the address is identical. The signature and the row lookup both carry the environment, which is what makes that true rather than merely likely.
+
+<Info>
+If the layered model and the per-environment tenancy rule are unfamiliar, read [Authentication](/auth/overview) first. Everything on this page is an instance of them.
+</Info>
+
+## Verification is optional, and that changes the flow
+
+The flag decides whether an account is *asked* to verify. It does not decide whether the account *can*.
+
+| Setting | Effect |
+| --- | --- |
+| `require_email_verification: false` | Sign-up returns a session immediately. No message is sent. The account is unverified and stays that way until someone verifies it. |
+| `require_email_verification: true` | Sign-up returns `session: null` and `verification_required: true`, and sends the message. Password sign-in is refused with `403 confirm your email address first` until the address is stamped. |
+
+The distinction that matters in practice: **an unverified account is a normal account.** Creating one without verification does not make it provisional. It cannot sign in with a password in an environment that requires verification, but it is fully present — it can hold data, appear in Studio's user list, be granted roles, and be given permissions.
+
+That has a consequence worth stating plainly, because it surprises people who expect the flag to be a gate rather than a rule. An unverified account in a verification-required environment is stuck, not restricted. It exists, it holds its roles, and there is no route by which it signs in until someone redeems a link or an operator stamps it. If your sign-up form creates accounts that people are expected to complete later, that is the state they sit in meanwhile.
+
+<Warning>
+Turning `require_email_verification` off does not un-verify anyone. It stops new accounts from being blocked and lets existing unverified accounts sign in again. The `email_verified_at` timestamps stay exactly as they were.
+</Warning>
+
+<Note>
+Editing the flag in Studio does not take effect instantly. Each environment's configuration is cached for the Akountz `config_ttl` setting, 10 seconds by default. A sign-in attempt in the first few seconds after the change can still be refused.
+</Note>
+
+## What sign-up returns under each setting
+
+The response shape differs, and a client that assumes one shape will break on the other. With verification required, sign-up is a `201` whose body contains no tokens at all:
+
+```json
+{
+  "user": {
+    "id": "01JQ7Z3M9K4YB2XQ8V0N5T6RJPD",
+    "email": "ada@example.com",
+    "username": "ada",
+    "name": "Ada Lovelace",
+    "avatar_url": null,
+    "email_verified": false,
+    "email_verified_at": null,
+    "user_metadata": {},
+    "app_metadata": {},
+    "roles": [],
+    "mfa_enabled": false,
+    "identities": [],
+    "created_at": "2026-03-04T09:12:31+00:00",
+    "last_sign_in_at": null
+  },
+  "session": null,
+  "verification_required": true
+}
+```
+
+Without it, sign-up returns the ordinary session payload with `verification_required: false`:
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1750000900,
+  "session_id": "6f1c9a84be2d47f0",
+  "org": null,
+  "org_role": null,
+  "user": { "...": "the same user object" },
+  "verification_required": false
+}
+```
+
+A client should branch on `session` being `null`, or on `verification_required`, and route the person to a "check your email" screen rather than into the application.
+
+## The three routes
+
+Verification is reached through exactly two schema routes, plus the hosted link page when no `site_url` is configured.
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/auth/v1/verify/request` | POST | Send, or re-send, the confirmation message. |
+| `/auth/v1/verify` | POST | Redeem the token: stamp the address and start a session. |
+| `/auth/v1/links/{project}/{env}/verify` | GET | The Akountz-hosted page. Only reachable when `site_url` is empty. |
+
+The request route is context-scoped and needs the normal environment context. The redemption route is too — it takes the token from the body rather than the URL, and the environment comes from the request context just as it does for sign-in.
+
+### Asking for the message
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/verify/request" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"email": "Ada@example.com"}'
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `email` | string | required | The address. Stripped and lowercased, then validated. |
+| `redirect_to` | string | `null` | Where the link should land afterwards. Must be allowlisted, or the request is refused with `400 redirect_to is not an allowed URL`. |
+
+The address is normalised before it is looked up, so case never matters. `Ada@example.com`, ` ada@example.com ` and `ADA@EXAMPLE.COM` are the same account. Normalisation also requires the shape `^[^@\s]+@[^@\s]+\.[^@\s]+$` and a length of at most 255; anything else is `422 a valid email address is required`.
+
+The response is identical whether or not anything was sent:
+
+```json
+{ "sent": true, "message": "If the address has an account, a message is on its way." }
+```
+
+A message actually goes out only when the address has an account in this environment and that account's `email_verified_at` is still `null`. An already-verified account gets nothing.
+
+<Warning>
+That fixed response is the design, not a shortcut. A request route that answered differently for registered and unregistered addresses would let anyone enumerate which addresses hold accounts in your environment. The same response is used by the recovery and magic-link routes.
+</Warning>
+
+Both the verification and recovery request routes are limited to **10 requests per 60 seconds** per caller, under the rate-limit key `akz:links`, backed by the Akountz `redis_url`. Sign-up and sign-in have a separate budget of 30 per 60 seconds under `akz:auth`. MFA endpoints carry their own 10 per 60 seconds under `akz:mfa`.
+
+### Redeeming the token
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/verify" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"token": "Im91Yi1ub3QtYS1yZWFsLXRva2VuIg.Xt3m9Q.hJ8k2vB7nQ4sT1xZ"}'
+```
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `token` | string | Between 10 and 2048 characters. The value from the link's `token` query parameter. |
+
+That length range is the only shape validation applied to the body. Everything else about the token is decided by the mechanism below.
+
+### Redeeming from a browser page
+
+If you host your own confirmation page, the shape of the work is small: read `token` from the query string, post it, store whatever comes back.
+
+```bash
+# On your page, /auth/callback?token=...&type=verify
+curl -X POST "https://api.example.com/auth/v1/verify" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d "{\"token\": \"$(python3 -c 'import sys,urllib.parse;print(urllib.parse.parse_qs(sys.argv[1]).get("token",[""])[0])' "$QUERY_STRING")\"}"
+```
+
+The TypeScript SDK exposes the verification exchange. Other clients can use the HTTP shape above;
+the Python SDK does not manage application-user auth. See [Calling Pawabase](/clients/overview).
+
+## The one-time token behind every link
+
+Verification, recovery, magic links, invitations, MFA challenges, email changes and OAuth identity linking all issue tokens from the same function in `app/links.py`. The token is a signed reference to a row; the row makes it single-use. Understanding it once removes the guesswork from every link-based flow in the system.
+
+### The row
+
+`OneTimeToken` lives in the `akz_one_time_tokens` table.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | A ULID. The only thing the signed token carries. |
+| `project` | The project the token belongs to. Part of every lookup. |
+| `env` | The environment name. Part of every lookup. |
+| `purpose` | What the token may be used for. A `verify` token cannot be redeemed as a `magic` token. |
+| `user` | The account it belongs to, or `null` for a token issued against an address that has no account yet. |
+| `email` | The address it was issued for. Defaults to the user's own address when a user is given. |
+| `data` | Purpose-specific extras. Verification uses none; magic links and MFA record the sign-in method here. |
+| `expires_at` | When the row stops being redeemable. |
+| `used_at` | Set the moment the token is redeemed. `null` until then. |
+
+The tenancy columns are what make a token environment-scoped. They are not decoration: the redemption query filters on `id`, `project`, `env` and `purpose` together, so a row from another environment is simply not found.
+
+### The signature
+
+The string in the email is a timed signature over `{"id": "<ulid>"}`, produced with a secret derived for that project and environment and a salt that includes the purpose. Two consequences follow, and both are worth internalising.
+
+The token cannot be forged, because a valid signature requires the environment's signing secret. And the token cannot be moved between purposes, because the salt differs — a signature made for `verify` will not verify against `recovery`, even for the same row.
+
+<Warning>
+The signature is derived from Akountz's `internal_secret` combined with the project and environment. Rotating that secret invalidates every outstanding one-time token in every environment at once. Do it during a maintenance window, and expect users mid-flow to see `400 the link is invalid or has expired`.
+</Warning>
+
+### Lifetimes are per purpose
+
+| Purpose | Lifetime | Used by |
+| --- | --- | --- |
+| `verify` | 24 hours | This page. |
+| `recovery` | 1 hour | [Password recovery](/auth/password-recovery). |
+| `magic` | 15 minutes | [Magic links](/auth/magic-links). |
+| `invite` | 7 days | Organization invitations. |
+| `mfa` | 5 minutes | The second-factor challenge issued before a session. |
+| `email_change` | 24 hours | Confirming a change of address. |
+| `link` | 10 minutes | Linking an OAuth provider to a signed-in account. |
+
+Verification and email-change tokens share the 24-hour figure because both answer a question a person may not look at until tomorrow: *is this address yours?* Magic links are the opposite case — the person is waiting at the browser when the mail arrives — and get 15 minutes.
+
+The lifetime is enforced twice: once by the signature's own max age, and once by comparing the row's `expires_at`. The row is what makes a token revocable and auditable; the signature is what makes it unforgeable.
+
+### Consuming a token
+
+Redemption is one operation with four checks, in order:
+
+| Check | On failure |
+| --- | --- |
+| The signature verifies within the purpose's lifetime. | `400 the link is invalid or has expired` |
+| A row exists with this id, in this project, env and purpose. | the same 400 |
+| The row's `used_at` is `null` and `expires_at` is in the future. | the same 400 |
+| The conditional update matched a row. | the same 400 |
+
+One error for all four, deliberately. A caller cannot distinguish an expired link from an already-used one from one that was never real, so the endpoint leaks nothing about which addresses have outstanding tokens.
+
+The fourth check is the interesting one. Marking a token used is a **conditional update**:
+
+```python
+updated = await OneTimeToken.filter(id=row.id, used_at=None).update(
+    used_at=datetime.now(UTC)
+)
+if not updated:
+    raise invalid
+```
+
+The filter says: update this row only if it is still unused. If two requests arrive with the same token at the same moment, both pass the earlier read, both attempt the update, and exactly one matches a row. The loser gets the same `400` the winner would have got for a used token. Single-use is a property of the write, not of a check that can race.
+
+<Note>
+The same conditional-update pattern appears twice more in the codebase, for the same reason: consuming an MFA recovery code, and accepting an organization invitation. Both are "this thing may only happen once" operations where a read-then-write would be wrong.
+</Note>
+
+### Peeking
+
+Consumption can be told not to consume. In peek mode the signature and the row are checked, the caller gets the row back, and `used_at` is left alone.
+
+That is what lets a form be rendered before anything is submitted. The hosted recovery page peeks to decide whether to show the password form at all; the submit consumes. MFA works the same way — the challenge is peeked, the code is checked, and the token is only consumed once the code is right, so a mistyped code does not burn the challenge.
+
+Verification never peeks. There is nothing to confirm before the confirmation.
+
+## Where the link lands
+
+This is the decision that surprises people most often, and it comes down to one setting: `site_url`.
+
+Every emailed link in Pawabase is built the same way. The builder takes the kind, the token and an optional redirect target, then chooses a destination.
+
+| Environment state | The link points at |
+| --- | --- |
+| `site_url` is set | `{site_url}/auth/callback?token=...&type=verify` |
+| `site_url` is empty | `{public_url}/auth/v1/links/{project}/{env}/verify?token=...` |
+
+Both carry the same token. What differs is **who completes the flow**.
+
+**With a `site_url`, your application does the work.** The link opens a page on your domain with the token in the query string. That page is yours: you read the token, post it to `/auth/v1/verify`, store the session, and decide what the person sees next. You control the page, the styling, and everything after.
+
+**Without one, Akountz hosts the page.** The link opens a page served by the identity service itself. It redeems the token server-side and shows a short confirmation — *"You're all set"* — or, if a `redirect_to` was supplied and is allowlisted, redirects to it with the tokens in the URL fragment.
+
+The second path works perfectly well for an internal tool. The difference is that you get no page of your own and no control over the post-verification experience.
+
+<Warning>
+The setting is shared with every other emailed link — recovery, magic, email change. Setting `site_url` so verification links point at your app changes where **all** of them point. That is usually what you want; it is worth knowing before you expect one flow to behave differently from another.
+</Warning>
+
+<Info>
+If `site_url` is empty and `public_url` is also empty, the hosted link is built from an empty base and will not resolve. Both unset is a misconfiguration, not a supported mode.
+</Info>
+
+### The redirect allowlist
+
+`redirect_to` is checked against the same allowlist used by OAuth: `site_url` plus every entry in `redirect_urls`, matched on exact equality or on a `/` or `?` boundary.
+
+| Candidate URL | `site_url` is `https://app.example.com` |
+| --- | --- |
+| `https://app.example.com` | allowed |
+| `https://app.example.com/welcome` | allowed |
+| `https://app.example.com/welcome?next=/x` | allowed |
+| `https://app.example.com.evil.test/` | refused |
+| `https://evil.test/?x=https://app.example.com` | refused |
+| `https://app.example.computer/` | refused |
+
+The boundary rule is what makes prefix matching safe. A naive `startswith` would accept `https://app.example.com.evil.test`, because the attacker chose a domain that begins with yours.
+
+An empty `redirect_to` is always allowed, and means "no redirect".
+
+### What the hosted page does with a successful redemption
+
+The hosted page reads `token` and `redirect_to` from the query string. After redeeming, it applies one further check: the redirect only happens if the result actually contains an `access_token`. If it does, four fields are carried in the **URL fragment**:
+
+```text
+https://app.example.com/welcome#access_token=eyJ...&refresh_token=eyJ...&expires_in=900&token_type=bearer
+```
+
+Fragments, not query parameters, because a fragment is not sent to servers and is not written to access logs on the redirect hop. A bearer token in a query string ends up in your server's logs, in proxy logs, and in browser history.
+
+If there is no usable redirect target, the page shows *"You're all set"* and the person closes the tab. **In that case they are not signed in anywhere** — the session was created and its tokens were discarded with the response. They will need to sign in on your application with their password.
+
+<Warning>
+This is the practical reason to set `site_url`. Without it, a person who verifies from the hosted page and then returns to your application still has to sign in, and the "you're all set" message gives them no reason to expect that.
+</Warning>
+
+If redemption fails, the hosted page renders the error text with the failing status code: *"This link cannot be used"*, followed by the error's detail.
+
+## What a successful redemption returns
+
+A confirmed address is also a session. This surprises people who expect `{"verified": true}`, and it is worth understanding why.
+
+The handler consumes the token and then, only if the user was not already verified, stamps `email_verified_at` with the current time and emits a `user.verified` event carrying the user id and address, with the user as the actor. It then starts a session with the method recorded as `email_verification`, and returns the standard payload.
+
+| Field | Meaning |
+| --- | --- |
+| `access_token` | A bearer token for this project and environment. |
+| `refresh_token` | The rotating half of the token family. |
+| `token_type` | Always `"bearer"`. |
+| `expires_in` | The environment's `access_ttl`, 900 seconds by default. |
+| `expires_at` | Absolute expiry as a Unix timestamp. |
+| `session_id` | The token family hex string. This is what `DELETE /auth/v1/sessions/{session_id}` takes. |
+| `org` | The organization slug the tokens were issued for, or `null`. |
+| `org_role` | The person's role in that organization, or `null`. |
+| `user` | The user object, now with `email_verified: true` and an `email_verified_at` timestamp. |
+
+The reasoning behind returning a session is that the person has just proved control of the address by clicking a link from inside that inbox. Making them type a password immediately afterwards adds friction without adding assurance — the link and the password would both have arrived at the same mailbox.
+
+<Note>
+If the account already had `email_verified_at` set — which happens when a magic link already stamped the address — the stamp and the event are skipped, but the session is still issued. Redeeming a `verify` token twice fails at the second attempt, because the first attempt consumed it.
+</Note>
+
+### The event
+
+```json
+{
+  "name": "user.verified",
+  "project": "acme",
+  "env": "production",
+  "payload": {
+    "user_id": "01JQ7Z3M9K4YB2XQ8V0N5T6RJPD",
+    "email": "ada@example.com"
+  },
+  "actor": "01JQ7Z3M9K4YB2XQ8V0N5T6RJPD"
+}
+```
+
+The actor is the user themselves. Subscribe to it if your application needs to run something the moment an address becomes trustworthy — provisioning a default workspace, sending a welcome sequence, unlocking a gated resource. See [Events](/events/overview).
+
+### What the access token carries
+
+The claims a downstream service sees are the same ones every sign-in produces, because verification reuses the standard session path. Only `aal` differs in origin: it is `aal1`, because verification did not involve a second factor.
+
+| Claim | Value here |
+| --- | --- |
+| `prj`, `env` | The environment that issued the token. A token from staging is refused in production. |
+| `aal` | `aal1`, unless the account has MFA and the flow asked for it — it does not. |
+| `email` | The address just verified. |
+| `roles`, `perms` | Read at issue time from the environment's groups and permissions. |
+| `org`, `org_role` | `null` unless the request named an organization. |
+
+That last row is worth a note. Verification never asks for an organization, so a session started this way is always org-less. See [Tokens and sessions](/auth/tokens-and-sessions) for the full claim list and [Organizations](/auth/organizations) for what the org claims are for.
+
+## The message
+
+There are exactly five kinds of message in Akountz, and verification is the `verify` one. Each kind has a default subject and body; an environment overrides either under `emails` in its auth settings.
+
+The defaults for verification are:
+
+| Part | Default |
+| --- | --- |
+| Subject | `Confirm your email for {project}` |
+| Body | `Welcome to {project}.` / `Confirm your email address by opening this link:` / `{link}` / `If you did not sign up, you can ignore this message.` |
+
+`{project}` resolves to `project_name` when the environment sets one, and to the project slug otherwise. That fallback is worth knowing: in an environment with no display name, the subject of every message is the bare slug.
+
+### Placeholders
+
+| Placeholder | Available in | Resolves to |
+| --- | --- | --- |
+| `{project}` | every kind | The environment's display name, or its slug. |
+| `{email}` | every kind | The address the message was sent to. |
+| `{link}` | every kind | The URL the message points at. |
+| `{organization}` | `invite` only | The organization's display name. |
+| `{role}` | `invite` only | The role the invitation grants. |
+
+An unknown placeholder is left **literal** rather than raising. A typo like `{lin}` appears in the delivered message as `{lin}`, and the message still sends. This is deliberate: a template mistake should be visible in the inbox rather than turning into an exception that silently stops delivery.
+
+<Warning>
+Because unknown placeholders survive, a template with a typo produces a message that looks almost right and contains literal braces. When testing template changes, actually read the delivered message. A successful send is not evidence that the template is valid.
+</Warning>
+
+### Overriding the template
+
+```json
+{
+  "auth": {
+    "emails": {
+      "verify": {
+        "subject": "Confirm your email for {project}",
+        "text": "Welcome aboard.\n\nConfirm {email} by opening this link:\n\n{link}\n\nThis link is good for 24 hours."
+      }
+    }
+  }
+}
+```
+
+The override is merged key by key over the defaults, so you can replace the subject alone and keep the default body.
+
+### Delivery, escaping and the HTML part
+
+Delivery goes through the API's mail service, which means it uses the **environment's own SMTP settings**. A staging environment with a different mail configuration sends through different infrastructure from production, and the message copy comes from that same environment's `emails` block.
+
+There is also an HTML alternative part. The plain text is HTML-escaped, newlines become `<br>`, and wherever `{link}` was substituted, the URL is wrapped in an anchor. The result is wrapped in a single paragraph. It is a reasonable rendering, not a designed one — if you want a branded message, send it through the mail tooling described in [Mail](/mail/overview) using a `user.verified` subscription, and keep the Akountz message as the transactional fallback.
+
+<Note>
+`{link}` is escaped twice in the HTML part: once for the visible text and once, with quoting enabled, for the `href`. That is what keeps an address containing `&` or `"` from breaking out of the attribute.
+</Note>
+
+### Sending your own message instead
+
+The verification token is issued whenever someone asks, and the request route answers identically whether or not it sends. So a common pattern is: let Akountz send, and additionally deliver your own branded message from a `user.created` or `user.verified` subscription.
+
+The catch is that your own message would need its own valid token, and there is no public route that hands one out. The `verify/request` route sends the default message every time. In practice this means the Akountz message is the one that works, and your subscription should treat it as a notification rather than a replacement.
+
+## Studio
+
+Everything on this page is reachable from one screen. Open the project, pick the environment, and go to **Users & auth**. The layout title is *"Users & auth"* and its description reads *"End users of this environment, managed by Akountz: accounts, sessions, MFA, roles and organizations."*
+
+The tabs, in order, are **Users**, **Roles**, **Organizations**, **Sign-in activity**, and **Configuration**. Verification touches three of them.
+
+### Turning the requirement on
+
+The switch lives under **Configuration**, in the card titled **Akountz configuration**, in the **Sign-up** section — *"Who can create an account, and whether their email must be confirmed first."*
+
+| Label | Hint shown beneath it |
+| --- | --- |
+| **Sign-up enabled** | *"Turn off to invite-only new accounts."* |
+| **Require email verification** | *"Unverified users can't sign in until they confirm."* |
+
+Turn on **Require email verification**, save, and remember the 10-second configuration cache before testing.
+
+<Tip>
+Leave **Sign-up enabled** on while you roll verification out. If you turn sign-up off at the same time, you cannot tell whether an account that failed to arrive was a verification problem or simply nobody being allowed to register.
+</Tip>
+
+### Resending by hand
+
+Under **Users**, find the person — the search box's placeholder is *"Search email or name"* — open them, and use **Verify email**.
+
+That action stamps `email_verified_at` directly. It does not consume a token and does not send a message. It is the operational escape hatch for the case where the mail never arrived, the address is a typo, or the person is on the phone.
+
+The same modal shows the state as **Marked verified** once the account has a timestamp, and carries the actions **Disable**, **Enable**, **MFA reset**, **Signed out everywhere**, **Session revoked**, **Password set**, **New role**, and a **Roles** field whose hint reads *"Comma-separated role names from the Roles tab."*
+
+### Reading the attempts
+
+The **Sign-in activity** tab shows what actually happened. It has a failures-only checkbox and columns **When**, **Event**, **Email**, **Result**, **IP**. The Result badge renders `ok` in green and the `reason` string in red.
+
+| Event | Success | Reason when it fails |
+| --- | --- | --- |
+| `sign_in` | `ok` | `unknown email`, `locked`, `wrong password`, `disabled` |
+| `recovery_requested` | `ok` | — |
+| `password_reset` | `ok` | — |
+
+A person repeatedly hitting `confirm your email address first` does not appear there, because that refusal happens after the password check and does not write a login event. The signal for "cannot get in because unverified" is the sign-up response, not the activity log.
+
+<Note>
+The `Sign-in activity` tab is backed by `akz_login_events`. Successes are hidden by default; untick the failures-only box to see the full history, including the sign-ins that worked. See [Managing users](/auth/managing-users) for the full screen.
+</Note>
+
+## Where the sign-in refusal sits
+
+The check lives on the password branch of the token endpoint, after the account is found, the password is verified, and the account is confirmed enabled:
+
+```text
+find the account by email
+  → refuse if it is locked
+  → refuse if the password is wrong
+  → refuse if it is disabled
+  → refuse if verification is required and the address is unverified
+  → issue an MFA challenge, or start a session
+```
+
+Its position in that sequence is what makes the error so unhelpful in isolation. Someone who typed the right password gets a `403` that mentions email rather than credentials, and concludes the address is broken.
+
+| Order consequence | What it means in practice |
+| --- | --- |
+| The lockout check comes first. | An unverified person can be locked out, and a reset will clear it. |
+| The password check comes second. | A wrong password on an unverified account reports the password, not the verification. |
+| The disabled check comes third. | A disabled account reports that, not the verification. |
+| The verification check comes last. | It only appears once everything else is correct. |
+
+<Note>
+Because it comes last, the verification refusal is the *most* accurate message a person can receive about their own sign-in. Every other state masks itself behind a less specific one.
+</Note>
+
+### Where else an address gets verified
+
+Five other flows can stamp `email_verified_at` without going through a `verify` token. Knowing which is which prevents a support conversation that goes in circles.
+
+| Flow | Does it verify the address? | Why |
+| --- | --- | --- |
+| Magic link redemption | Yes, if not already verified. | Receiving the mail is proof of control. |
+| Social sign-in creating an account | Yes, when the provider asserts `email_verified`. | The provider performed the check. |
+| Social sign-in matching an existing account | No. | The address is used for matching, not trusted. |
+| A change of address, confirmed | Yes, on the **new** address. | The old address's stamp does not carry over. |
+| Studio's **Verify email** | Yes. | An operator asserted it. |
+
+### Magic links
+
+A magic link arriving in the inbox proves the same thing a verification link does, so redemption stamps the address. There is one important ordering detail: the MFA check happens **after** the stamp.
+
+```text
+consume the magic token
+  → refuse a disabled account
+  → stamp email_verified_at if it is null
+  → if the account has MFA and the environment allows it, return an MFA challenge
+  → otherwise start the session
+```
+
+That ordering has a visible consequence. A person with MFA enabled who redeems a magic link in an environment requiring verification gets their address verified by the magic link itself, and then faces the second factor. They do not need to find the separate confirmation mail.
+
+### Social sign-in
+
+When a provider creates a new account, the account is created verified if and only if the provider's profile says the email is verified. When the provider's email is unverified and an account already exists with that address, sign-in is refused rather than merged — the person gets an error code in the URL fragment.
+
+When a provider email **is** verified and matches an existing account, that identity is attached to the existing account. This is the one place an external assertion of address ownership is trusted to bind two records together, and it is why the rule in the source is that only a *verified* provider email may do it.
+
+<Warning>
+If your provider does not return an `email_verified` flag, no account created through it will be pre-verified, and your `require_email_verification` setting will still apply to those people. Check your provider's profile mapping before assuming social sign-in bypasses verification.
+</Warning>
+
+### Changing an address
+
+A signed-in person who sends a new address in `PATCH /auth/v1/user` does not change it immediately. The route issues an `email_change` token and mails the **new** address; the account keeps the old one until that token is confirmed. Confirming stamps the new address as verified in the same write.
+
+```json
+{ "email": "ada@newdomain.test" }
+```
+
+```json
+{ "changed": true, "email": "ada@newdomain.test" }
+```
+
+If the new address already belongs to someone else, confirmation is refused with `409 that email is in use`.
+
+## Enforcing it in your application
+
+Verification produces a boolean on the user object and a claim on the access token. What it does **not** do is stop anyone from reading or writing your data.
+
+Nothing in the system refuses a request because the caller's address is unverified. If you need that, you write it as a policy.
+
+### Reading the state in a policy
+
+`$auth` carries the verified claims. For verification, the useful pair is `$auth.email` and the user record.
+
+| Path | What it holds |
+| --- | --- |
+| `$auth.authenticated` | `true` for any signed-in caller. |
+| `$auth.email` | The address the token was issued for. |
+| `$auth.roles`, `$auth.permissions` | Read at issue time. |
+| `$auth.aal` | `aal1` or `aal2`. |
+| `$record.owner_id` | The owner column on a resource, for an ownership check. |
+
+Because the token only carries the address and not the verification stamp, gating on verification is most naturally done against your own profile data:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "ne": ["$record.email_verified", true] }
+  ]
+}
+```
+
+Conditions are plain JSON. There is no expression language to learn and nothing to compile — see [Policy conditions](/policies/conditions) for the operator vocabulary and [Enforcement points](/policies/enforcement-points) for where a policy attaches.
+
+<Warning>
+The claim snapshot matters. `roles` and `perms` are read when the token is issued, so a change to someone's roles lands on their next refresh, not on their next request. If you gate on a role, expect up to one access-token lifetime of lag. See [Roles and permissions](/auth/roles-and-permissions).
+</Warning>
+
+### Keeping the client honest
+
+A useful client-side rule, once you have `/auth/v1/user` working:
+
+```text
+if the response has email_verified == false
+  → send the person to a "check your inbox" screen
+  → offer a resend that calls /auth/v1/verify/request
+  → do not let them into the application
+```
+
+Two things that client must not do: treat `email_verified` from a cached profile as authoritative for a request that matters, and treat a successful resend as proof that a message was delivered. The response says `sent`, not `delivered`, and it says it in every case.
+
+## What goes wrong
+
+Each of these is a real behaviour of the system, not a hypothetical.
+
+### The link says it is invalid and it was just sent
+
+Almost always the environment. A `verify` token is bound to the `project` and `env` it was issued in, and redemption looks the row up on both. If the page you opened is calling `/auth/v1/verify` with the context for a different environment, the row is not found and you get the same `400` as for a forged token.
+
+The second cause is a consumed token. If the page loaded once, redeemed, and then the person refreshed and clicked again, the second attempt fails. This is the single-use property working.
+
+The third is a rotated signing secret. If Akountz's `internal_secret` changed since the message was sent, every outstanding token fails at once.
+
+| Symptom | Most likely cause | Check |
+| --- | --- | --- |
+| `400 the link is invalid or has expired` immediately | Wrong environment on the redeeming request. | Compare `prj`/`env` in the context with the environment the mail came from. |
+| The same, on a second click | The token was already consumed. | Expected. Issue a new one. |
+| The same, for every link at once | The signing secret was rotated. | Check Akountz's recent configuration changes. |
+| The same, after 24 hours | The lifetime expired. | Expected. Issue a new one. |
+
+### Sign-up returns a session but nobody receives a message
+
+That is what `require_email_verification: false` does. It sends nothing at all. The account exists and is usable immediately.
+
+### Sign-up returns `session: null` and nobody receives a message
+
+Something failed after the account was created. The most common cause is the environment's mail configuration, which lives in the API rather than in Akountz — see [Mail](/mail/overview). Check that the environment can send, and check its logs.
+
+<Warning>
+An account is created before the message is sent. If delivery fails, the account still exists and is still unverified. Retrying sign-up with the same address returns `409 an account with this email already exists`. Use `/auth/v1/verify/request` to retry delivery — do not delete and recreate the account.
+</Warning>
+
+### The person verified but cannot sign in
+
+Verification succeeded and the sign-in failed for another reason. Check the **Sign-in activity** tab's Result column, which distinguishes them:
+
+| Result | Meaning |
+| --- | --- |
+| `wrong password` | The account was created by social sign-in or magic link and has no usable password. Set one through a recovery link. |
+| `locked` | Ten failures reached the threshold. It clears after 15 minutes or with **Enable** in Studio. |
+| `disabled` | An administrator disabled it. **Enable** reverses it. |
+| `unknown email` | The address has no account in *this* environment. They signed up somewhere else. |
+
+### Changing the setting appears to do nothing for ten seconds
+
+That is the configuration cache, not a bug. `config_ttl` defaults to 10 seconds and applies per environment, keyed as `authcfg:{project}:{env}`.
+
+### The link opens a page I do not recognise
+
+`site_url` is empty, so the link went to Akountz's hosted page. Set **Site URL** under **Configuration → URLs** — its placeholder is `https://app.example.com` — and the links will point at your application instead.
+
+### The full set of reasons a link flow fails
+
+One error covers every failure, which makes the diagnostic table above the practical tool. Across all purposes, the redemption path can only fail these ways:
+
+| Failure | Status | Detail |
+| --- | --- | --- |
+| Signature does not verify | 400 | `the link is invalid or has expired` |
+| Signature older than the purpose's lifetime | 400 | the same |
+| No row for this id in this environment | 400 | the same |
+| Row already has `used_at` | 400 | the same |
+| Row's `expires_at` has passed | 400 | the same |
+| A concurrent request consumed it first | 400 | the same |
+| Token missing or too short in the body | 422 | Schema validation on `token`. |
+
+The `422` is the only distinguishable one, and it means your client sent something malformed rather than something stale.
+
+<Info>
+Because every failure is the same 400, you cannot build a support tool that tells someone "this link expired at 14:32". If you need that, subscribe to the identity events and record issuance on your side.
+</Info>
+
+### Requesting a message for an address that does not exist
+
+The response says `sent: true`. Nothing is sent, nothing is created, and no event is emitted. This is correct and deliberate, but it does mean a typo in an email form produces a message to nobody and an interface that looks like it worked.
+
+The only honest fix on your side is to make the person confirm what they typed before you tell them anything.
+
+## How this interacts with the rest of the system
+
+### Sessions and tokens
+
+Verification issues a session through the normal path, so it participates in everything sessions do: rotation on refresh, `session_id` for targeted sign-out, theft detection across the token family, and the `Signed out everywhere` action in Studio. Nothing about a verified session is special.
+
+### Rate limits
+
+Three separate budgets apply to a verification attempt, and they are easy to confuse:
+
+| Budget | Limit | Key | Applies to |
+| --- | --- | --- | --- |
+| Sign-in and sign-up | 30 per 60s | `akz:auth` | `POST /auth/v1/signup`, `POST /auth/v1/token` |
+| Link requests | 10 per 60s | `akz:links` | `POST /auth/v1/verify/request`, `POST /auth/v1/recover`, `POST /auth/v1/magic-link` |
+| MFA | 10 per 60s | `akz:mfa` | the `/auth/v1/mfa/*` routes |
+
+Note that `POST /auth/v1/verify` — the redemption — carries no rate-limit middleware of its own. It is protected by the token being unforgeable and single-use, not by a counter.
+
+### Environments and promotion
+
+Verification state is per environment, because the accounts themselves are. Promoting a database from staging to production brings the users with it, and their verification state comes along. What does not come along is the configuration: `require_email_verification` lives in the environment's `auth` block, which you set per environment. See [Environments and promotion](/operate/environments-and-promotion).
+
+### Backups
+
+An environment's backup includes users with their verification timestamps, so a restore into a fresh environment produces accounts that are already verified. Restoring into an environment where those addresses already hold unverified accounts is a conflict worth checking before you restore. See [Backup and restore](/operate/backup-and-restore).
+
+### Events
+
+Verification can emit four events, and it is worth having the full list in one place because three of them come from shared code paths.
+
+| Event | Emitted when | Actor |
+| --- | --- | --- |
+| `user.created` | Sign-up created the account. | The new user. |
+| `user.verified` | An address was confirmed for the first time. | The user. |
+| `user.signed_in` | The session started. | The user. |
+| `session.reuse_detected` | A consumed refresh token was replayed. | The user. |
+
+### Audit
+
+Verification itself is not in the audit log; the identity activity that records it is `akz_login_events`. Sign-up is recorded as a `sign_in` with method `email_verification` when the session starts, and the `user.verified` event carries the timestamp for anyone consuming events. See [Audit log](/operate/audit-log) for what the two systems each record.
+
+## A worked example
+
+Sign-up is the flow that touches the most settings at once, so it is worth following end to end with an environment configured a particular way.
+
+Assume `acme/production` has:
+
+```json
+{
+  "auth": {
+    "signup_enabled": true,
+    "require_email_verification": true,
+    "password_policy": "strict",
+    "password_min_length": 12,
+    "access_ttl": 900,
+    "refresh_ttl": 2592000,
+    "site_url": "https://app.acme.test",
+    "default_roles": ["customer"]
+  }
+}
+```
+
+A person submits the sign-up form.
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/signup" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{
+    "email": "Grace@Example.com",
+    "password": "correct-horse-battery-8",
+    "name": "Grace Hopper",
+    "data": { "plan": "free" },
+    "redirect_to": "https://app.acme.test/welcome"
+  }'
+```
+
+What happens, in order:
+
+| Step | What the service does |
+| --- | --- |
+| 1 | Refuses if `redirect_to` is outside the allowlist. `https://app.acme.test/welcome` is under `site_url`, so it passes. |
+| 2 | Normalises the address to `grace@example.com` and checks it against this environment's accounts. |
+| 3 | Derives a username: the local part `grace`, stripped of anything outside `a-z0-9_.-`, truncated to 40. On collision it appends a random number. |
+| 4 | Runs the strict password validator. A failure is a `422` carrying a list of problems. |
+| 5 | Creates the account, unverified, with `user_metadata` set from `data`. |
+| 6 | Assigns every role in `default_roles` — here, `customer`. |
+| 7 | Emits `user.created`. |
+| 8 | Because the flag is on, issues a `verify` token, sends the message, and returns `session: null`. |
+| 9 | The link in the message is `https://app.acme.test/auth/callback?token=…&type=verify&redirect_to=https%3A%2F%2Fapp.acme.test%2Fwelcome`. |
+
+The account now exists with the `customer` role and no session. It is a real account with real permissions; it simply cannot sign in yet.
+
+### Following the link
+
+The person's browser opens that URL on your domain. Your page reads the query string and posts the token:
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1750000900,
+  "session_id": "6f1c9a84be2d47f0",
+  "org": null,
+  "org_role": null,
+  "user": {
+    "id": "01JQ7Z3M9K4YB2XQ8V0N5T6RJPD",
+    "email": "grace@example.com",
+    "username": "grace",
+    "name": "Grace Hopper",
+    "email_verified": true,
+    "email_verified_at": "2026-03-04T09:31:07+00:00",
+    "user_metadata": { "plan": "free" },
+    "app_metadata": {},
+    "roles": ["customer"],
+    "mfa_enabled": false,
+    "identities": [],
+    "created_at": "2026-03-04T09:30:58+00:00",
+    "last_sign_in_at": "2026-03-04T09:31:07+00:00"
+  }
+}
+```
+
+Note four things:
+
+`user_metadata` came from the sign-up `data` and is visible on the returned object. It is also carried in the token's `meta` claim, which policies must not trust, because the user can edit it through `PATCH /auth/v1/user`.
+
+`app_metadata` is empty and was never settable at sign-up. Only an administrator or a service key can write it, which is what makes the `app` claim safe to rely on.
+
+`roles` is `["customer"]`, assigned at creation, and read at issue time.
+
+`last_sign_in_at` moved, because starting a session calls the same success recording that password sign-in does.
+
+<Warning>
+The address in the response is `grace@example.com`, not what was typed. If your form shows a confirmation using the submitted string, capitalise or trim it yourself before comparing it to anything the API returns.
+</Warning>
+
+### Knowing what the environment offers
+
+`GET /auth/v1/settings` reports what this environment supports, including whether verification is required, whether sign-up is open, and which providers are usable. Read it at startup rather than hardcoding any of it in your frontend, because all of it is per environment and can change without a deploy.
+
+```json
+{
+  "signup_enabled": true,
+  "email_verification_required": true,
+  "magic_link_enabled": true,
+  "mfa_enabled": true,
+  "providers": ["github", "google"],
+  "password_policy": { "kind": "strict", "min_length": 12 }
+}
+```
+
+The `providers` array comes from filtering the environment's provider block down to those that are both enabled and carry a `client_id`. A provider you configured without a `client_id` is simply absent, and asking for it directly returns `404`. Use the list to decide which buttons to render, and treat the redirect flow behind them as a black box until you have read [Social login](/auth/social-login).
+
+`email_verification_required` is the field worth reading at startup, because it tells your sign-up screen whether to expect tokens or a "check your inbox" page. Everything else on that response is a convenience; this one changes what you build.
+
+### The same address, two environments
+
+This is the case that catches people out, and it is the tenancy rule doing exactly what it says.
+
+| | `acme/staging` | `acme/production` |
+| --- | --- | --- |
+| Account for `grace@example.com` | exists, unverified | exists, verified |
+| Password | `staging-pass-1` | `production-pass-9` |
+| Roles | `tester` | `customer` |
+| Sessions | separate | separate |
+| Verification message | staging's SMTP, staging's `emails` block | production's |
+
+A verification link from staging redeemed against production fails, because the token's row carries `env: "staging"` and production's redemption filters on `env: "production"`. The error is the same 400 as for an expired link.
+
+The corollary for testing: verify in the environment whose context header you are sending. If your staging page posts to the production context, the redemption fails and looks like a bug in the link.
+
+<Note>
+The same rule governs roles, and it is the one that produces "I gave them the role but nothing changed". A role granted in staging is a different group from the identically named role in production, and the permission in the token is only ever the one belonging to the environment that issued it. See [Roles and permissions](/auth/roles-and-permissions).
+</Note>
+
+## Studio, step by step
+
+The Configuration tab is the only place the flag lives, and it is worth walking through because the surrounding fields decide things verification depends on.
+
+Open **Users & auth → Configuration**. The card is titled **Akountz configuration** and describes itself as *"Settings live in the project's auth block — this screen edits them."* Each card has a **Description** button in its corner, which reveals a live view of the JSON behind the form. That view is the fastest way to confirm what was actually saved.
 
 <Steps>
-  <Step title="User signs up">
-    The user provides an email and password (or clicks a magic link). Pawabase creates the `AuthUser` record with `email_verified = False`. If `require_email_verification` is `true`, the user cannot access the application until they verify their email.
+  <Step title="Open the environment">
+    Pick the project, then the environment in the environment switcher. The flag is per environment, and the form shows only the selected one.
   </Step>
-  <Step title="Verification request">
-    The client calls `POST /auth/v1/verify` with the user's email. Pawabase creates a new `OTP` record with `kind: "verify"` and generates a one-time code.
+  <Step title="Find the sign-up card">
+    It is the first card, with the hint *"Who can create an account, and whether their email must be confirmed first."*
   </Step>
-  <Step title="Email is sent">
-    Pawabase sends an email to the user's address containing a verification link with the one-time code embedded. The email template uses `{{verify_url}}` which is replaced with the actual verification URL.
+  <Step title="Turn on Require email verification">
+    The hint under it reads *"Unverified users can't sign in until they confirm."* This is the switch. It does nothing to existing accounts.
   </Step>
-  <Step title="User clicks the link">
-    The user clicks the verification link in their email. The link directs them to the `complete` handler, which validates the one-time code.
+  <Step title="Set the site URL if you have a frontend">
+    In the URLs card, **Site URL** takes your application base. Its placeholder is `https://app.example.com`. Without it, confirmation links go to Akountz's hosted page.
   </Step>
-  <Step title="Verification is complete">
-    The `complete` handler validates the code against the `OTP` table, marks the user as `email_verified = True`, and deletes the used `OTP` record. The user can now access the application.
+  <Step title="Save and wait">
+    The environment's configuration is cached for 10 seconds. A sign-in or a redemption in that window uses the previous values.
+  </Step>
+  <Step title="Check the view">
+    Click **Description** on the card and confirm the JSON now contains `require_email_verification: true`.
   </Step>
 </Steps>
 
-### The `OTP` model
+### The other cards that matter here
 
-Verification codes are stored in the `OTP` table:
+| Card | Fields | Relevance to verification |
+| --- | --- | --- |
+| **Akountz configuration** | **Sign-up enabled**, **Require email verification**, **Password policy**, **Minimum password length** | The first two decide the flow. |
+| **Tokens** | **Access token lifetime**, **Refresh token lifetime** | Decide how long the session returned by redemption lasts. |
+| **URLs** | **Site URL**, **Redirect URLs** | Decide where the link goes and where it may send people afterwards. |
+| **Default roles** | A tag input, placeholder `customer`, hint *"Granted automatically at sign-up."* | Applied at account creation, before verification. |
+| **Email templates** | Subject and body per kind, with a placeholder hint | Controls the message text. |
 
-```python
-class OTP(BaseModel):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    email: str = Field(index=True)
-    kind: str  # "verify", "recovery", or "magic_link"
-    code: str  # The one-time code
-    code_hash: str  # Hashed version of the code for secure storage
-    ttl: datetime  # When the code expires
-    used: bool = False
-    created_at: datetime = Field(default_factory=datetime.now(UTC))
-    expires_at: datetime = Field(default_factory=datetime.now(UTC))
+<Note>
+**Default roles** are granted at account creation, which for a verification-required environment is the moment the person submits the form — not the moment they confirm. An unverified account already holds its roles.
+</Note>
+
+### The email template editor
+
+The Email templates card has one section per kind. The subject field's hint shows the default in guillemets, and the body field carries a hint listing the available placeholders.
+
+For the verification kind the hint is:
+
+```text
+Default: "Confirm your email for {project}". Placeholders: {project} {email} {link}
 ```
 
-The `OTP` model has the following fields:
-
-- **`email`**: The email address the verification code was sent to. Indexed for fast lookups.
-- **`kind`**: The type of OTP — `"verify"` for email verification, `"recovery"` for password recovery, or `"magic_link"` for magic link sign-in.
-- **`code`**: The raw one-time code (stored temporarily for verification).
-- **`code_hash`**: The hashed version of the code, stored securely in the database. The raw code is not stored persistently after verification.
-- **`ttl`**: The expiration timestamp. The code is only valid until this time.
-- **`used`**: `True` if the code has been used. Once used, the code cannot be verified again.
-- **`expires_at`**: The expiration timestamp. Codes that have expired are rejected automatically.
-
-## The `verify` endpoint
-
-The `verify` endpoint initiates the verification process. The client sends the user's email address, and Pawabase creates an `OTP` record and sends the verification email:
-
-```bash
-curl -X POST "$GW/auth/v1/verify" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "email": "user@example.com"
-  }'
-```
-
-The `verify` endpoint validates the email format, checks if the user exists, and if `require_email_verification` is enabled, creates an `OTP` record and sends the email. If the user does not exist, the endpoint returns `404 user not found`. If the email is already verified, it returns `400 email already verified`.
-
-### Rate limiting on the `verify` endpoint
-
-The `verify` endpoint is protected by rate limiting to prevent abuse:
-
-- **Per-IP rate limiting**: Each IP address is limited to a certain number of verification requests per time window (default: 30 requests per 60 seconds).
-- **Per-user rate limiting**: Each user is limited in how many verification emails they can request within a short period (default: 5 requests per hour).
-- **Per-email rate limiting**: Each email address has a cooldown period between verification requests (default: 60 seconds between requests for the same email).
-
-If any rate limit is exceeded, the endpoint returns `429 rate limit exceeded` with details on when the limit resets.
-
-### What happens if the user already has an `OTP` record
-
-If the user already has an unexpired, unused `OTP` record for verification, the `verify` endpoint either:
-
-1. Returns the existing `OTP` record (no new one is created), or
-2. Creates a new `OTP` record and invalidates the old one.
-
-This depends on the configuration. The default behavior is to create a new `OTP` record, which invalidates the old one by setting its `used` flag to `True`. This prevents an attacker from using an old verification code that they might have intercepted.
-
-## The `complete` handler
-
-The `complete` handler validates the verification code and marks the user as verified. The client receives the verification link from the email and passes the code to this handler:
-
-```bash
-curl -X POST "$GW/auth/v1/complete" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "code": "abcdef123456"
-  }'
-```
-
-The `complete` handler:
-
-1. Looks up the `OTP` record by the code. If the code is not found, returns `400 invalid verification code`.
-2. Checks if the code has expired. If the `ttl` has passed, returns `400 verification code expired`.
-3. Checks if the code has already been used (`used == True`). If so, returns `400 verification code already used`.
-4. Marks the `AuthUser` as `email_verified = True`.
-5. Marks the `OTP` record as `used = True`.
-6. Emits a `user.email_verified` event.
-7. Returns the access token and refresh token for the verified session.
-
-### After verification completes
-
-Once the user is verified, they can access all features that require email verification. If `require_email_verification` was blocking their access, the restriction is lifted immediately. The user's `Principal` will now have `email_verified = true` in their claims.
-
-## Resend verification email
-
-If the user doesn't receive the verification email, they can request a new one through the resend flow:
-
-```bash
-curl -X POST "$GW/auth/v1/verify/resend" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "email": "user@example.com"
-  }'
-```
-
-The resend endpoint:
-
-1. Validates the email format.
-2. Checks if the user exists.
-3. Checks if the user is already verified (if so, returns `400 email already verified`).
-4. Checks rate limits (per-IP and per-email cooldown).
-5. Invalidates any existing unexpired `OTP` record for the user.
-6. Creates a new `OTP` record.
-7. Sends a new verification email.
-
-### Rate limiting on resend
-
-The resend endpoint has stricter rate limiting than the initial `verify` endpoint:
-
-- **Per-IP**: Maximum 5 resend requests per 60 seconds.
-- **Per-email**: Minimum 60 seconds between consecutive requests for the same email.
-- **Per-user**: Maximum 10 resend requests per hour.
-
-These limits prevent email bombing and abuse of the verification system.
-
-## Email templates
-
-The verification email uses a template that includes a verification link. The template variable `{{verify_url}}` is replaced with the actual URL that includes the one-time code:
-
-```
-Verify your email address
-
-Click the link below to verify your email:
-{{verify_url}}
-
-This link expires in 15 minutes. If you didn't create an account, you can safely ignore this email.
-```
-
-The `{{verify_url}}` template variable is generated by Pawabase and includes the verification code as a query parameter. The URL format is:
-
-```
-https://yourapp.com/verify?code=abcdef123456
-```
-
-### Customizing email templates
-
-Email templates can be customized in the environment configuration. The default templates include:
-
-- **Verification email**: The template used for email verification. Contains `{{verify_url}}`.
-- **Recovery email**: The template used for password recovery. Contains `{{recovery_url}}`.
-- **Magic link email**: The template used for magic link sign-in. Contains `{{magic_link_url}}`.
-
-Each template can be configured with custom subject lines, HTML content, and plain-text alternatives.
-
-## Unverified user restrictions
-
-When `require_email_verification` is enabled, unverified users face several restrictions:
-
-1. **Cannot access protected routes**: Any route that requires authentication will reject unverified users with `403 email not verified`.
-2. **Cannot change password**: The password change endpoint requires email verification.
-3. **Cannot initiate recovery**: Password recovery endpoints require email verification.
-4. **Cannot sign out other sessions**: Session management endpoints require verification.
-5. **Cannot access admin API**: Admin API endpoints require verified email addresses.
-
-The restrictions are enforced by the `require_email_verification` gate in the authentication middleware. Every authenticated request checks the user's `email_verified` status before processing the request.
-
-### How the restriction is enforced
-
-The enforcement happens at the middleware level:
-
-```python
-async def verify_email_middleware(request: Request, call_next):
-    principal = get_principal(request)
-    if principal and require_email_verification:
-        if not principal.email_verified:
-            return Response(status_code=403, content="email not verified")
-    return await call_next(request)
-```
-
-This means the restriction applies to every route that requires authentication, including the token refresh endpoint. An unverified user cannot refresh their tokens — they must verify their email first.
-
-## Admin-initiated verification
-
-Administrators can force-verify a user's email through the admin API:
-
-```bash
-POST /projects/{project}/envs/{env}/users/{user_id}/verify-email
-```
-
-This endpoint sets `email_verified = True` for the specified user without sending a verification email. It is useful for:
-
-1. **Onboarding**: Administrators can pre-verify emails for known users during onboarding.
-2. **Recovery**: If a user loses access to their email, an admin can verify it on their behalf.
-3. **Testing**: Administrators can verify test users without sending actual emails.
-
-The admin-initiated verification emits the same `user.email_verified` event as the self-service flow, so audit logs are consistent.
-
-### Admin verification and session creation
-
-When an administrator verifies a user's email, a verification session is not automatically created. The user still needs to sign in to get access tokens. The verification is recorded in the user's profile (`email_verified = True`), but no tokens are issued until the user signs in.
-
-## Verification and social login
-
-When a user signs in with a social provider (Google, GitHub, etc.), the email verification behavior depends on the provider:
-
-1. **Providers that verify email**: Google and GitHub verify email addresses before providing them to Pawabase. When Pawabase receives an email from these providers, the email is considered verified (`email_verified = True`).
-2. **Providers that do not verify email**: Some providers may not guarantee email verification. In this case, Pawabase may still set `email_verified = False` and require verification through the standard flow.
-3. **`require_email_verification` still applies**: Even if the social provider verifies the email, if `require_email_verification` is enabled, Pawabase may still require the user to verify through the standard flow. This behavior is configurable.
+The invitation kind's hint appends `{organization} {role}`, because those two exist only for invitations.
 
 <Warning>
-Never trust the email verification status from a social provider without validating it. Always check the `email_verified` claim from the provider's token, and set `email_verified = True` only if the provider confirms it. Some providers may not include an `email_verified` claim at all.
+Studio writes the template into the environment's `auth.emails` block. There is no per-kind toggle and no "send me a test" button. To test a change, trigger a real flow against a real address and read the delivered message.
 </Warning>
 
-## Verification and organizations
+## Adding verification to a frontend
 
-Email verification interacts with organization membership in the following ways:
+The pieces you need, in the order you need them.
 
-1. **Organization invitations**: When a user is invited to an organization, the invitation email must be verified. The invitation is only accepted after the user verifies their email through the verification flow.
-2. **Organization creation**: A user must verify their email before they can create an organization. This prevents anonymous organization creation.
-3. **Organization membership**: Organization membership records are tied to the user's verified email. If a user changes their email, they must re-verify the new email address before it can be used for organization membership.
+### The "check your inbox" screen
 
-## Common mistakes
+After sign-up returns `session: null`, show something that says three things: we sent a message, it may take a minute, here is a button to send another. Then stop. Do not poll an endpoint hoping verification has happened — there is no such endpoint, and the honest answer is that verification is not observable except by asking `/auth/v1/user` with a session you do not yet have.
+
+### The resend button
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/verify/request" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"email": "grace@example.com"}'
+```
+
+Always render the same confirmation whether or not it sent. If you disable the button because the address is already verified, you have turned the uniform response into a membership oracle — one your own frontend now performs on your behalf.
+
+<Warning>
+Disable the button on a timer, not on the response. The rate limit is 10 per 60 seconds, and the correct client behaviour is to stop asking long before that rather than to let the server refuse.
+</Warning>
+
+### The confirmation page
+
+Your page needs three cases, and they are easy to get wrong in ways that strand people.
+
+| Case | What to show |
+| --- | --- |
+| `token` missing from the query string | An error saying the link is incomplete, with a link to request a new one. |
+| Redemption returned a session | Success, and send them into the application. |
+| Redemption returned `400` | The link is invalid or expired. Offer a resend. Do not say which of the two it was. |
+
+The third case is the one that needs thought. Because every failure looks identical, your page cannot tell someone "try again in ten minutes" when the truth might be "this link was already used". Phrase it as *"This link is no longer valid"* and give the resend. That is honest whatever the cause.
+
+### Reading verification state on an existing session
+
+A signed-in person can ask who they are, and the answer carries the boolean:
+
+```bash
+curl "$PAWABASE_URL/auth/v1/user" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+```json
+{
+  "id": "01JQ7Z3M9K4YB2XQ8V0N5T6RJPD",
+  "email": "grace@example.com",
+  "username": "grace",
+  "name": "Grace Hopper",
+  "avatar_url": null,
+  "email_verified": true,
+  "email_verified_at": "2026-03-04T09:31:07+00:00",
+  "user_metadata": { "plan": "free" },
+  "app_metadata": {},
+  "roles": ["customer"],
+  "mfa_enabled": false,
+  "identities": [],
+  "created_at": "2026-03-04T09:30:58+00:00",
+  "last_sign_in_at": "2026-03-04T09:31:07+00:00",
+  "aal": "aal1",
+  "session_id": "6f1c9a84be2d47f0"
+}
+```
+
+This is the endpoint your frontend should call at startup, because it answers "am I signed in, and am I verified" in one request. The `email_verified` field is a boolean derived from whether `email_verified_at` is null — it is not a separate column that can drift.
+
+Two fields on that object are worth reading alongside it. `aal` tells you whether the session passed a second factor, which decides whether a sensitive screen is available. `session_id` is the token family, and it is what `DELETE /auth/v1/sessions/{session_id}` takes when someone wants to end one device rather than all of them.
+
+<Note>
+This is the user-facing view. The admin view, used by Studio and service keys, adds `disabled`, `disabled_at`, `locked_until`, `last_sign_in_ip`, `has_password` and `permissions`. Do not build a client around the admin fields; they exist for operators.
+</Note>
+
+## Verification and the rest of the identity surface
+
+### Does verification gate anything by itself?
+
+No. This is the single most common misunderstanding. `require_email_verification` controls exactly two things: whether a message is sent at sign-up, and whether password sign-in refuses an unverified account.
+
+| Behaviour | Gated by the flag? |
+| --- | --- |
+| A message is sent at sign-up. | Yes. |
+| Password sign-in is refused. | Yes. |
+| Magic-link sign-in is refused. | No. It verifies the address as part of signing in. |
+| Social sign-in is refused. | No. |
+| A refresh-token grant is refused. | No. |
+| Reading or writing application data. | No. That is a policy. |
+| Holding roles and permissions. | No. |
+
+The third row is the one that surprises. If a person who cannot sign in with a password receives a magic link, they are in. The magic link proves the same thing the verification link would have.
+
+### Why that is coherent
+
+The design answer is that a magic link is not weaker than a password. It required control of the mailbox at the moment of use. Refusing it for an unverified account would mean refusing the very proof that would resolve the objection.
+
+<Warning>
+If your product requires that every account passes through an explicit confirmation screen — for compliance, or because a separate team approves accounts — you need to enforce that yourself. The system will not do it for you, and the flag's name suggests it might.
+</Warning>
+
+### Passwords are unaffected
+
+Verification does not change the password policy, the hashing, or the lockout counters. An account created through verification has a normal password, hashed by Sillo's user model with `passlib` — bcrypt by default, with a `pbkdf2_sha256` fallback. See [Passwords](/auth/passwords).
+
+### Lockout is unaffected, and separate
+
+Ten failures locks an account for fifteen minutes. Those are Akountz *installation* settings, not per-environment configuration, which means one instance's lockout policy applies across all of its environments while the failure counters live per environment.
+
+A person who cannot sign in because they are locked is a different support conversation from one who cannot sign in because they are unverified, and the **Sign-in activity** tab distinguishes them by the `reason` string.
+
+### Organizations are unaffected
+
+Verification state is not consulted when joining an organization, and organization membership is not consulted when verifying. The two features share the mailbox but not the rules. See [Organizations](/auth/organizations).
+
+<Note>
+The one interaction worth knowing is indirect: an invitation is mailed, and accepting an invitation requires a signed-in user. If that address has no account, the person must sign up first. Whether that sign-up requires verification depends on the flag.
+</Note>
+
+## Why the messages answer identically
+
+This deserves a section of its own, because the design decision is unusual enough that teams routinely "fix" it.
+
+Every route in Akountz that causes a message to be sent returns the same body:
+
+```json
+{ "sent": true, "message": "If the address has an account, a message is on its way." }
+```
+
+That covers `/auth/v1/verify/request`, `/auth/v1/recover` and `/auth/v1/magic-link`.
+
+### The threat it prevents
+
+Consider the alternative. If an unknown address returned `404 no such user`, then anyone could POST a list of addresses and learn which of your users have accounts. Addresses are not a secret — they appear in commits, in shared documents, in breach notifications — so a membership oracle here is a reconnaissance tool for everything else.
+
+The fixed response removes the oracle. A script can send a million requests and learn nothing, because the response is a constant function of nothing.
+
+### What it costs, honestly
+
+The cost is real and worth stating rather than hiding:
+
+| Cost | Mitigation |
+| --- | --- |
+| A person who typoed their address sees "check your email" and nothing arrives. | Make them retype the address to confirm before you promise delivery. |
+| Support cannot tell whether a message was sent. | Nobody can, by design. Check the mail logs instead. |
+| A client that wants to show "you already have an account" cannot. | Do not try to build that on this endpoint. |
+
+<Warning>
+The temptation to "improve" this — by returning 404 for unknown addresses, or by adding an `already_registered` field — is among the most damaging changes you can make to this part of the system. It is not an improvement, and the next audit will find it.
+</Warning>
+
+### What still varies
+
+The *body* is constant; the *work done* is not. A request for a registered, unverified address creates a token and sends a message. A request for an unregistered address, or for a verified account, does neither. That asymmetry is invisible from outside, which is the point.
+
+### The one thing that is not uniform
+
+The rate limit is applied before the lookup, so a flood of requests for addresses that do not exist is throttled exactly as a flood for addresses that do. That is another reason the timing of the response leaks nothing useful.
+
+## Frequently asked questions
 
 <AccordionGroup>
-  <Accordion title="Not configuring `require_email_verification`">
-    If you don't set `require_email_verification = true`, new users can access your application without verifying their email. This means anyone can sign up with a fake email and use your application. Always enable this for production applications.
+  <Accordion title="Does verification create the account if it does not exist?">
+    No. `verify/request` never creates an account. It only sends a message when one already exists. If you want an address to become an account by receiving a link, that is the magic-link flow with `create_user` set to true, not this one.
   </Accordion>
-  <Accordion title="Not rate-limiting the verify endpoint">
-    Without rate limiting, an attacker can send thousands of verification emails to a single address or domain, causing email bombing and potential blacklisting of your sending domain.
+  <Accordion title="Can I resend to an address whose account is already verified?">
+    You can call the route. Nothing is sent, and the response is the same one it always is. This is why the client must not infer delivery from the response.
   </Accordion>
-  <Accordion title="Storing the raw verification code">
-    The raw verification code should never be stored in the database. Only the hashed version (`code_hash`) should be persisted. Storing the raw code creates a security vulnerability — if the database is compromised, all verification codes are exposed.
+  <Accordion title="How many outstanding verify tokens can one account have?">
+    As many as you request. Each call creates a new row. They are independent, so an older link remains valid even after a newer one is sent — both will work, once each.
   </Accordion>
-  <Accordion title="Not handling expired codes">
-    If the `complete` handler doesn't check `expires_at`, expired verification codes could still be accepted. This creates a security vulnerability — an attacker who intercepts an old verification link could still verify the email after the intended expiration time.
+  <Accordion title="Does redeeming an old link after a new one work?">
+    Yes, if the old token has not been used and has not passed 24 hours. Sending a new message does not invalidate the previous token. If you want a resend to supersede an earlier message, there is no route for that; issue an email change or ask the person to be careful with which link they open.
   </Accordion>
-  <Accordion title="Ignoring the `used` flag">
-    If the `complete` handler doesn't check `used == True`, a verification code could be used multiple times. This means an attacker who intercepts the verification link could verify the email multiple times.
+  <Accordion title="Can an account be un-verified?">
+    Not through the API. `email_verified_at` is only ever set, never cleared, by any user-facing route. Studio's **Verify email** sets it. There is no un-verify action, and that is deliberate.
   </Accordion>
-  <Accordion title="Not sending the correct email template">
-    Using the wrong template variable (e.g., `{{recovery_url}}` instead of `{{verify_url}}`) breaks the verification flow. The template must use the correct variable for the specific verification type.
+  <Accordion title="Is the verification token a JWT?">
+    No. It is a signed reference to a row, using a timed serializer rather than the JWT machinery used for access tokens. The distinction matters: one-time tokens are not bearer credentials, they are lookups, and they carry no claims of their own.
+  </Accordion>
+  <Accordion title="Does the token leak information if someone reads the database?">
+    The token string is not stored. Only the row is, and the row's id is not the token — it is the token's payload. Someone with read access to `akz_one_time_tokens` still cannot reconstruct a redeemable token without the signing secret.
+  </Accordion>
+  <Accordion title="What happens if two people open the same link?">
+    One succeeds and gets a session. The other gets `400`. The conditional update is what guarantees this, and it is why the link behaves the way people expect when a mail client pre-fetches it.
   </Accordion>
 </AccordionGroup>
+
+## Mail delivery
+
+Verification depends on mail actually leaving the platform, and mail is the layer most likely to fail quietly. The important thing to know is where it lives.
+
+### The environment owns its SMTP
+
+Delivery goes through the API's mail service, not through Akountz's own transport. That means:
+
+| Property | Source |
+| --- | --- |
+| SMTP host and credentials | The environment's mail configuration, in the API. |
+| From address and reply-to | The same. |
+| The message subject and body | The environment's `emails` block, via Akountz. |
+| The link inside it | Akountz's `link()` builder. |
+| The signing secret for that link | Akountz's `internal_secret`, derived per environment. |
+
+So a message is a joint product: the API's transport, Akountz's template and signing. When one environment's mail works and another's does not, the difference is in the API configuration, not in Akountz.
+
+<Note>
+Because the transport is per environment, a staging environment can use a completely different mail provider from production without Akountz knowing. Staging verification links will still work; they just come from a different sender.
+</Note>
+
+### Delivery failures are silent to the person
+
+The `sent` response means the request was accepted and, where applicable, handed to the mail service. It does not mean the message was delivered, and there is no delivery callback in Akountz. If your provider offers one, wire it to your own subscription on `user.verified` and `user.created` events rather than expecting it from this path.
+
+For a transactional flow you control end to end, use the mail tooling described in [Mail](/mail/overview) and subscribe to identity events. That gives you delivery reporting; Akountz's own message does not.
+
+### The HTML alternative part
+
+The body is sent twice: as plain `text` and as a simple `html` part. The HTML is built from the same string with newlines converted to breaks, HTML-escaped, and the link substituted as an anchor.
+
+| Concern | How it is handled |
+| --- | --- |
+| A display name containing `<` | Escaped. |
+| A link containing `&` | Escaped in the visible text and in the `href`, with quoting enabled. |
+| Line breaks | Converted to `<br>`. |
+| Everything else | Wrapped in a single `<p>`. |
+
+<Warning>
+The generated HTML is functional, not branded. If your confirmation message is part of how your product is perceived, override the `text` and send a designed message yourself. The Akountz message is best treated as the functional fallback that always exists.
+</Warning>
+
+### Templates are per environment, and there are five kinds
+
+| Kind | Subject default | Unique placeholders |
+| --- | --- | --- |
+| `verify` | `Confirm your email for {project}` | — |
+| `recovery` | `Reset your {project} password` | — |
+| `magic` | `Your {project} sign-in link` | — |
+| `invite` | `You are invited to {organization} on {project}` | `{organization}`, `{role}` |
+| `email_change` | `Confirm your new email for {project}` | — |
+
+Two things about that table. There is no template for an MFA challenge, because an MFA challenge is handed to the client directly, never mailed. And `{organization}` and `{role}` exist only for `invite`; using them in a `verify` template leaves them literal in the delivered message, because unknown placeholders survive rather than raising.
+
+### A safe override
+
+```json
+{
+  "auth": {
+    "emails": {
+      "verify": {
+        "subject": "Confirm your email for {project}",
+        "text": "Hi,\n\nPlease confirm this address for your {project} account:\n\n{link}\n\nThe link works once, and is good for 24 hours. If you did not request an account, ignore this message."
+      }
+    }
+  }
+}
+```
+
+Including the lifetime and the single-use property in the message is worth doing for every kind. It sets an expectation that matches the system, and it means a person who clicks an old link understands what happened instead of assuming something broke.
+
+## Verifying the flow works
+
+A checklist you can actually run, with the thing to look for at each step. Every step uses the publishable key and a real user session, never a service key, because a service key bypasses the flows you are trying to test.
+
+### Before you start
+
+Confirm the environment's settings: **Sign-up enabled** on, **Require email verification** on, **Site URL** set to your application, and a redirect URL that covers where you want to land. Wait 10 seconds for the configuration cache.
+
+### The run
+
+<Steps>
+  <Step title="Create an account in the environment you are testing">
+    Use a real address you can read. Not an address you have used in another environment — the whole point is that the account must be new *here*.
+  </Step>
+  <Step title="Confirm the response has no tokens">
+    `session` must be `null` and `verification_required` must be `true`. If you got tokens, the flag did not apply — wait out the cache and try again with a new address.
+  </Step>
+  <Step title="Confirm the message arrived, and read it">
+    Check that `{link}` was substituted rather than appearing literally, that the destination is your `site_url`, and that `redirect_to` survived encoding.
+  </Step>
+  <Step title="Open the link">
+    It should land on your own page at `/auth/callback` with `token` and `type=verify` in the query string.
+  </Step>
+  <Step title="Redeem it">
+    `POST /auth/v1/verify` should return a full token payload, and `user.email_verified` should be `true` with a non-null `email_verified_at`.
+  </Step>
+  <Step title="Try the same link again">
+    Expect `400 the link is invalid or has expired`. This is not a failure; it is the property you are testing.
+  </Step>
+  <Step title="Sign in with the password">
+    It should now succeed. Before the redemption it would have returned `403 confirm your email address first`.
+  </Step>
+  <Step title="Check the event stream">
+    `user.verified` should have fired exactly once, with the user as the actor.
+  </Step>
+</Steps>
+
+### The negative cases
+
+Positive paths prove little on their own. These are the ones that catch real problems:
+
+| Test | How | Expected |
+| --- | --- | --- |
+| Requesting for an unregistered address | `POST /auth/v1/verify/request` with an address that has no account | The same `sent` body. No message. No error. |
+| Requesting for a verified account | Same address, now verified | The same `sent` body. No message. |
+| Redeeming in the wrong environment | Post a staging token with the production context | `400`. |
+| Redeeming after 24 hours | Wait, or use a token you have kept | `400`. |
+| A malformed token | Send `token: "short"` | `422` from schema validation, not `400`. |
+| A disallowed `redirect_to` | `POST /auth/v1/signup` with `redirect_to` on another domain | `400 redirect_to is not an allowed URL`. |
+| A lookalike domain | `redirect_to: https://app.acme.test.evil.example/` | `400`. Prefix matching must not accept it. |
+
+### Testing the hosted page
+
+If you have no `site_url`, the link goes to Akountz's own page. Test it by clearing the field temporarily.
+
+| Check | Expected |
+| --- | --- |
+| The page opens from the message. | A plain page titled *"You're all set"*, or a redirect if `redirect_to` was allowlisted. |
+| The token is consumed. | A second visit shows *"This link cannot be used"*. |
+| With a `redirect_to` inside the allowlist. | A `302` to your URL with four fields in the fragment. |
+| With no `redirect_to`. | The confirmation page, and no session on your side. |
+
+<Note>
+Check the redirect carries a fragment and not a query string. If you ever see `?access_token=…`, something is wrong — that value has been written into a server log somewhere.
+</Note>
+
+### What a service key will not tell you
+
+A service-key request bypasses the parts of the flow you are trying to exercise. Specifically, it does not prove that:
+
+- an unverified account would be refused a password grant,
+- a message would actually be sent,
+- a one-time token would be rejected after use,
+- the redirect allowlist would accept your target.
+
+Run all of the above with a publishable key and a real session. Use a service key only for the admin operations in [Managing users](/auth/managing-users).
+
+## Security properties
+
+What this design actually defends against, and what it does not.
+
+### Forgery
+
+A token is a signature over a row id. Producing one that verifies requires the secret derived for that project and environment from Akountz's `internal_secret`. There is no other way to make a valid token, and no field in a request that lets a caller influence the signature.
+
+### Replay
+
+The row's `used_at`, set by a conditional update, makes each token good for exactly one redemption. This is what protects against the common attacks:
+
+| Attack | Why it fails |
+| --- | --- |
+| An attacker reads the link from a forwarded message. | It works — once. The legitimate recipient then finds it invalid. |
+| A link preview in a mail client fetches the URL. | The GET consumes the token. The recipient then finds it invalid. This is the one real operational hazard. |
+| Two people click the same link. | One wins; the other gets `400`. |
+
+<Warning>
+Mail clients that fetch links to build previews will consume the token before the person sees it. This affects every link-based flow. If your audience uses such clients, tell people to copy the link rather than click it, or build your confirmation page so that a consumed token can be recovered from by issuing a new one immediately. There is no route that extends a token's life.
+</Warning>
+
+### Scope
+
+A token cannot be used for another purpose or another environment. The purpose is in the signing salt, and the environment is in both the derived secret and the row lookup. So a staging verification token presented to production fails, and a verification token presented to the recovery route fails, with the same undifferentiated error.
+
+### Disclosure
+
+The redemption endpoint's error is constant, the request endpoint's response is constant, and neither reveals whether an address is registered. Combined with the fact that tokens are only ever mailed to the address they concern, the flow gives an attacker no oracle to work from.
+
+<Note>
+The one thing an attacker with a mailbox can do is verify an address they control, which is exactly the point. Verification proves control, not goodness.
+</Note>
+
+### What verification is not
+
+It is not a second factor. It proves the address is reachable; it does not prove the person at the keyboard is the account holder. Use [MFA](/auth/mfa) for that, and gate on `aal` where the distinction matters:
+
+```json
+{ "aal": "aal2" }
+```
+
+### Sessions started by redemption
+
+A session issued this way is an ordinary session: `aal1`, a token family, a refresh lifetime from the environment's `refresh_ttl`. Nothing about it is marked as having come from a link, apart from the recorded method. Do not treat a link-derived session as more or less trustworthy than a password one — it is exactly as trustworthy as the mailbox.
+
+## Choosing a configuration
+
+Three setups, with the trade-off stated rather than implied.
+
+### Setup A: no verification, no frontend
+
+Leave `require_email_verification` false and `site_url` empty. Sign-up returns a session; magic links work; nothing is mailed.
+
+Best for: an internal tool, a proof of concept, or any environment where people are pre-provisioned by an administrator.
+
+The cost: an unverified account is indistinguishable from a verified one, so anything downstream that needs a trustworthy address has nothing to check. If your product sends password resets by mail, that is the number to weigh.
+
+### Setup B: verification, Akountz hosts the pages
+
+Set `require_email_verification` true and leave `site_url` empty.
+
+Best for: getting the guarantee without building any UI.
+
+People click a link, see *"You're all set"*, and then sign in on your application with a password. Every flow works, the pages are plain, and nothing is yours to maintain.
+
+The cost: the pages are not branded, and the sign-in step after verification is friction the message does not explain. People report this as "the link said it worked but I still couldn't log in", which is a real support burden.
+
+### Setup C: verification, your application completes every flow
+
+Set `require_email_verification` true and `site_url` to your application. Add `redirect_urls` for anything else you need to land on.
+
+Best for: a product with a frontend. This is the recommended setup.
+
+You build one page — `/auth/callback` — that reads `token` and `type` from the query string and dispatches on the type:
+
+| `type` | Route to post to |
+| --- | --- |
+| `verify` | `/auth/v1/verify` |
+| `magic` | `/auth/v1/magic-link/verify` |
+| `recovery` | `/auth/v1/recover/confirm` |
+| `email_change` | `/auth/v1/email/confirm` |
+
+The cost: you own that page, including its handling of the two failure modes. In exchange, verification ends with the person signed in, on your own screen, with your own design.
+
+<Tip>
+One page handling four `type` values is less work than four pages. The dispatch is a single conditional, and you get consistent error handling for free.
+</Tip>
+
+### Migrating between them
+
+Moving from setup B to setup C needs no data migration. Set `site_url`, and the next message sent goes to your application. Outstanding links built under the old setting still point at the hosted page and still work, because the token is the token.
+
+<Warning>
+The reverse is not true in one direction. Links already sent to your application's `/auth/callback` do not change, because they are absolute. After clearing `site_url`, any link you already sent is still pointing at your page — and that page must still exist, or those people see nothing at all. Leave the page in place for at least the longest token lifetime, 24 hours.
+</Warning>
+
+## Frequently asked questions, second pass
+
+<AccordionGroup>
+  <Accordion title="Does verification reset anything if the account was locked?">
+    No. Redemption stamps the address and starts a session; it does not clear `failed_logins` or `locked_until` the way a successful sign-in does. A locked account that redeems a verification link is still locked. Use a recovery link or Studio's **Enable** to clear it.
+  </Accordion>
+  <Accordion title="Can a disabled account be verified?">
+    The verification request will send, because that route does not check the disabled flag. Redemption consumes the token and then fails when it tries to start a session, so the address is stamped but no session is created. Expect a `401` on the redemption and a consumed token.
+  </Accordion>
+  <Accordion title="Why did the redemption return a session when I only wanted the boolean?">
+    Because that is what the route does, and it is deliberate. If you need a boolean without a session, read `GET /auth/v1/user` afterwards with the session you now hold, or subscribe to `user.verified`.
+  </Accordion>
+  <Accordion title="Can I use verification links for one-time passcodes instead?">
+    Not with the built-in routes. There is no route that sends a numeric code, and no route that accepts one. A password policy of "minimum length 8" plus a link is a different product decision from "six digits typed into a form". If you want codes, build them in your own application with the data tooling and your own mail.
+  </Accordion>
+  <Accordion title="How long are the old tokens kept?">
+    The row persists with `used_at` set or `expires_at` past. Nothing prunes them on a schedule in the code you should depend on. Treat the table as an audit trail rather than as a working set, and size it accordingly if you request messages at volume.
+  </Accordion>
+  <Accordion title="Does the sign-up event fire before or after verification?">
+    `user.created` fires when the account is created, which is before the message is sent and well before verification. `user.verified` fires at redemption. If you provision on creation, you are provisioning for people who may never confirm.
+  </Accordion>
+</AccordionGroup>
+
+## Inspecting the state
+
+When something is wrong and you need to look at the facts rather than infer them, three tables answer almost every question.
+
+### The token rows
+
+```sql
+SELECT id, purpose, email, created_at, expires_at, used_at
+FROM akz_one_time_tokens
+WHERE project = 'acme' AND env = 'production' AND purpose = 'verify'
+ORDER BY id DESC
+LIMIT 20;
+```
+
+| Column | Reading it |
+| --- | --- |
+| `purpose` | Which flow created it. If you expected `verify` and see `magic`, you are looking at the wrong table. |
+| `user_id` | Null for a token issued against an address with no account. |
+| `expires_at` | Compare with `used_at`. A row with `used_at` set is spent. |
+| `used_at` | Non-null means a redemption succeeded. Null on a row past its expiry means nobody arrived. |
+
+The row's `id` is the token's payload. You cannot reconstruct a redeemable token from it alone, which is exactly why you can safely paste it into a support ticket.
+
+<Warning>
+Do not write to this table to force a resend or to clear `used_at`. Clearing it makes a genuinely consumed link redeemable again, and nothing records that you did so. Issue a new token through the API instead.
+</Warning>
+
+### The accounts
+
+```sql
+SELECT id, email, username, email_verified_at, disabled_at, failed_logins, locked_until, mfa_enabled
+FROM akz_users
+WHERE project = 'acme' AND env = 'production'
+  AND (email_verified_at IS NULL OR locked_until IS NOT NULL)
+ORDER BY id DESC;
+```
+
+This finds the two populations that generate support: accounts waiting on a confirmation, and accounts currently locked out. Both are ordinary queries, and both answer questions faster than the UI can.
+
+### The sessions started by a verification
+
+```sql
+SELECT family, method, aal, created_at, last_refreshed_at, revoked_at
+FROM akz_sessions
+WHERE project = 'acme' AND env = 'production' AND method = 'email_verification'
+ORDER BY created_at DESC;
+```
+
+`method` is the field that distinguishes a session begun by a link from one begun by a password or a provider. It is set by the sign-in path, not by the client, so a client cannot forge it.
+
+<Note>
+Every one of these queries is scoped by `project` and `env`, because that is how every query in the identity layer is scoped. A query that omits them returns rows across environments, and it will eventually return somebody else's user.
+</Note>
+
+## Turning verification on without breaking anything
+
+The rollout that causes the fewest problems, and the two that cause the most.
+
+### A safe rollout
+
+| Order | Action | Why here |
+| --- | --- | --- |
+| 1 | Set `site_url`. | Links should already point at your application before anyone is required to use one. |
+| 2 | Add the `redirect_urls` your confirmation flow needs. | A disallowed target fails at the moment of redemption, which is the worst time to discover it. |
+| 3 | Build and deploy `/auth/callback`. | It needs to exist before the first message that points at it. |
+| 4 | Test the whole flow with **Sign-up enabled** and the flag off. | Messages are only sent when the flag is on, so you must turn it on to test it — but you can do that in staging first. |
+| 5 | Turn on `require_email_verification`. | Existing accounts are unaffected, so this is safe to do at any time. |
+| 6 | Watch the Sign-in activity tab for `403`s. | You will not see them there; watch your application's logs instead. |
+
+### The mistake that costs the most
+
+Turning on `require_email_verification` in production without a `site_url`.
+
+The result is that every new account gets a message pointing at Akountz's hosted page, confirms there, and is told *"You're all set"* — and then cannot sign in on your application until they type their password, which they did not expect. Worse, if your account creation flow had depended on the sign-up response containing a session, the integration may be treating `session: null` as an error rather than as a normal outcome.
+
+### The other mistake
+
+Testing with an address you already used in a different environment. You get `409 an account with this email already exists` from the wrong environment, or a link that fails to redeem for no visible reason. The tenancy rule is doing its job.
+
+## Reference summary
+
+Everything on one page, for the reader who wants the shape rather than the reasoning.
+
+### Routes
+
+| Method | Path | Purpose | Rate limited |
+| --- | --- | --- | --- |
+| POST | `/auth/v1/signup` | Create an account; sends the message when the flag is on. | 30/60s, `akz:auth` |
+| POST | `/auth/v1/verify/request` | Send or re-send the confirmation message. | 10/60s, `akz:links` |
+| POST | `/auth/v1/verify` | Redeem the token, stamp the address, start a session. | no |
+| POST | `/auth/v1/token` | Password sign-in; refuses unverified accounts when the flag is on. | 30/60s, `akz:auth` |
+| GET | `/auth/v1/links/{project}/{env}/verify` | The hosted page, when `site_url` is empty. | no |
+| GET | `/auth/v1/user` | The signed-in person, with `email_verified`. | no |
+| GET | `/auth/v1/settings` | Whether verification is required. | no |
+
+### Configuration
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `require_email_verification` | `false` | Refuses password sign-in for unverified accounts; sends the message at sign-up. |
+| `site_url` | `""` | Where the link goes, and the base of the redirect allowlist. |
+| `redirect_urls` | `[]` | Extra allowed redirect prefixes. |
+| `emails.verify.subject` | `Confirm your email for {project}` | Message subject. |
+| `emails.verify.text` | see above | Message body. |
+| `public_url` | `""` | Where Akountz is reachable, used when `site_url` is empty. |
+
+Configuration is JSON throughout. There is no TOML in auth settings, and an unset key falls back to its default rather than to "off". See [Environment settings](/reference/environment-settings) for where the block lives.
+
+### Model
+
+| Thing | Where it lives |
+| --- | --- |
+| The verification stamp | `AuthUser.email_verified_at`, table `akz_users`. |
+| The token | `OneTimeToken`, table `akz_one_time_tokens`, purpose `verify`. |
+| The session it starts | `SessionInfo`, table `akz_sessions`, method `email_verification`. |
+| The account | `AuthUser`, table `akz_users`, unique on `(project, env, email)`. |
+
+### Errors
+
+| Status | Detail | Cause |
+| --- | --- | --- |
+| 400 | `the link is invalid or has expired` | Any redemption failure. |
+| 400 | `redirect_to is not an allowed URL` | The target is outside `site_url` and `redirect_urls`. |
+| 403 | `sign-up is disabled` | `signup_enabled` is false. |
+| 403 | `confirm your email address first` | Password sign-in with an unverified account while the flag is on. |
+| 409 | `an account with this email already exists` | Sign-up with an address already in this environment. |
+| 422 | `a valid email address is required` | The address failed normalisation. |
+| 422 | Schema error on `token` | Fewer than 10 or more than 2048 characters. |
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Password recovery" icon="key" href="/auth/password-recovery">What to do when a password is forgotten.</Card>
-  <Card title="Magic links" icon="link" href="/auth/magic-links">Passwordless sign-in through email links.</Card>
-  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">Access and refresh token claims, rotation, theft detection, revocation.</Card>
-  <Card title="MFA" icon="shield-check" href="/auth/mfa">Adding a second factor for additional security.</Card>
+  <Card title="Password recovery" icon="key" href="/auth/password-recovery">The same mechanism with a one-hour lifetime, and what a reset revokes.</Card>
+  <Card title="Magic links" icon="wand-magic-sparkles" href="/auth/magic-links">Passwordless sign-in that also verifies the address.</Card>
+  <Card title="Managing users" icon="users" href="/auth/managing-users">Creating, disabling and unlocking accounts from Studio.</Card>
+  <Card title="Configuration" icon="sliders" href="/auth/configuration">Every key in the environment's `auth` block, with defaults.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">The claims the returned session carries.</Card>
+  <Card title="Security model" icon="lock" href="/auth/security-model">How the layers combine into a threat model.</Card>
 </CardGroup>
+
+<Info>
+If you are reading this to work out why a link in someone's inbox is not working, start at [What goes wrong](#what-goes-wrong) rather than at the mechanism.
+</Info>
+
+<Note>
+Every link-based flow in Pawabase shares the mechanism described under [The one-time token behind every link](#the-one-time-token-behind-every-link). Reading that section once will save you a return trip when the next page covers a different purpose on the same machinery.
+</Note>

@@ -18,7 +18,7 @@ Events make it possible to add new reactions to something that already happens, 
 
 The event bus is the transport layer behind every event in Pawabase. When any part of the platform — a resource write, an auth action, a flow's `event.emit` block, or a schedule — produces an event, it goes to the bus. The bus records the event, then fans it out asynchronously to every matching subscriber.
 
-The bus is **persistent** in production deployments (backed by Redis when configured), meaning an event published while a worker is temporarily down doesn't disappear — it waits until the worker is available. In development without Redis configured, the bus is in-process and events are delivered synchronously, which is convenient for local testing but not a model to design around in production.
+Every event is published as a job on the **`events` queue**, the same job queue that runs flows, functions and webhook deliveries. With Redis configured (production), that queue is persistent: an event published while every worker is down waits for one, and a worker that dies in the middle of an event does not lose it — the job is held with a visibility deadline and only removed when the worker finishes, so another worker takes it again. Processing that fails (the database briefly unreachable, a consumer that could not be queued) is retried with backoff, up to 8 attempts, and an event that still fails is a **failed job** you can see and replay in Studio. Without Redis (local development), the queue is in-process.
 
 **Delivery is at-least-once.** An event may be delivered more than once in unusual circumstances — a worker crash between receiving the event and committing the result, a network failure, an explicit retry. Design every event consumer to be idempotent: use the event's `id` to detect and skip a duplicate before acting on it.
 
@@ -91,15 +91,17 @@ Platform lifecycle events like `flow.started` and `flow.completed` are **not** e
 
 When an event is emitted, this is what happens:
 
-1. The event is written to the persistent event store (a Redis list in production).
-2. The event processor — a background worker — reads it and records an `EventLog` row with the full envelope and a list of every consumer the event will be dispatched to.
+1. The event is queued as a job on the `events` queue.
+2. A worker takes the job and records an `EventLog` row with the full envelope and a list of every consumer the event will be dispatched to.
 3. The event processor fans out to every matching subscription, dispatching each as an independent job:
    - **Flow subscriptions** are queued as background jobs on the `flows` queue.
    - **Function subscriptions** are queued on the `functions` queue.
    - **Outbound webhook subscriptions** are queued on the `webhooks` queue.
    - **Realtime subscriptions** publish a message to the configured channel immediately.
 4. Each consumer runs independently. A slow or failing consumer does not block or delay any other consumer.
-5. Delivery outcomes are recorded per consumer in the `EventLog.consumers` list, visible in Studio's event inspector.
+5. Delivery outcomes are recorded per consumer in the `EventLog.consumers` list, visible in Studio's event inspector. When every consumer has been handed its work, the log's `routed_at` is set.
+
+If routing stops part-way — one consumer could not be queued, or the worker died — the event job is retried, and the retry hands work only to the consumers that did not get it. A consumer already queued is not queued again. The one gap is a worker dying in the instant between queuing a consumer and recording it; then that consumer is queued twice. That is why delivery is at-least-once rather than exactly-once.
 
 The original action that emitted the event — the REST request that created the order, the flow that ran — never waits for any consumer to finish. Event delivery is fully asynchronous relative to the emitter.
 

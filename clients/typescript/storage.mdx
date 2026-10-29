@@ -1,0 +1,1690 @@
+---
+title: "Storage"
+description: "How the TypeScript client stores and serves files: buckets and their policies, uploads, downloads, listings, public and gateway URLs, image transformations, signed URLs for direct uploads, and the failures each step can produce."
+icon: "folder"
+---
+
+`pawabase.storage` uploads and downloads files in the environment's buckets.
+A bucket is a named container with its own rules: who may read, upload, replace, list and delete, which content types it accepts, and how large a file may be.
+
+This page explains how the client maps onto buckets and objects, what each method sends, which policy decides each operation, and how to serve files to browsers efficiently and safely.
+
+## The mental model
+
+Storage has two kinds of things.
+
+| Thing | What it is | Defined where |
+| --- | --- | --- |
+| Bucket | A named container with policies and limits | Studio, **Services → Storage** |
+| Object | One file in a bucket, addressed by a key | Created by uploads |
+
+A key is a path-like string, such as `u_7/avatars/me.png`.
+The slashes have no special meaning to storage itself; they are part of the name.
+Listings treat the text up to a slash as a "folder" for convenience, and policies can read the first segment, which is why putting the owner's id first is a common and useful convention.
+
+Every operation on an object is checked against one of the bucket's policies:
+
+| Operation | Client methods | Policy |
+| --- | --- | --- |
+| Read an object | `download*`, `getPublicUrl` URLs, gateway URLs | `read_policy` |
+| Upload to a new key | `upload`, signed upload URLs | `write_policy` |
+| Upload to an existing key | `upload` | `update_policy`, which follows `write_policy` when unset |
+| List keys | `list`, `listAll` | `list_policy`, which follows `read_policy` when unset |
+| Delete an object | `remove` | `delete_policy`, which follows `write_policy` when unset |
+
+The default read and write policy is `authenticated`.
+A new bucket therefore lets signed-in users read and write everything in it, and refuses anonymous callers, until you write tighter policies.
+
+Policies for buckets see the object's key as `$object.key`, its segments as `$object.segments`, and the action as `$object.action`.
+A policy that says "the first segment must be the caller's user id" gives every user a private folder in a shared bucket.
+
+```json
+{
+  "all": [
+    { "truthy": "$auth.user_id" },
+    { "eq": ["$object.segments.0", "$auth.user_id"] }
+  ]
+}
+```
+
+The `truthy` test is not decoration.
+It makes the condition fail for a signed-out caller explicitly, instead of relying on how an empty user id compares, which is the most common way a policy accidentally lets everyone in.
+
+See [Bucket access](/storage/access) for policy patterns and [Buckets](/storage/buckets) for every bucket setting.
+
+## Buckets in code
+
+`pawabase.storage.listBuckets()` returns the buckets this environment has.
+
+<CodeGroup>
+```typescript TypeScript
+const buckets = await pawabase.storage.listBuckets();
+for (const bucket of buckets) {
+  console.log(bucket.name, bucket.public, bucket.accepts, bucket.max_bytes);
+}
+```
+
+```python Python
+for bucket in pb.storage.list_buckets():
+    print(bucket["name"], bucket["public"], bucket["accepts"], bucket["max_bytes"])
+```
+
+```bash cURL
+curl "$PAWABASE_URL/storage/v1/buckets" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+| Field | Meaning |
+| --- | --- |
+| `name` | The bucket's name |
+| `public` | Whether objects can be read without credentials |
+| `accepts` | Accepted content types, such as `image/*`; empty means all |
+| `max_bytes` | The largest object, in bytes; `0` means the environment's limit |
+
+Use it to show limits in an upload form before the person picks a file, rather than after the server refuses it.
+
+`pawabase.storage.from(name)` returns a handle on one bucket.
+Like a resource client, it is cheap and stateless.
+
+```typescript
+const avatars = pawabase.storage.from("avatars");
+```
+
+Buckets are created and configured in Studio, or with the management module; the client's `storage` cannot create them.
+
+## Uploading
+
+`upload(key, body, options)` stores a file at a key, replacing what is there.
+
+<CodeGroup>
+```typescript TypeScript
+const avatars = pawabase.storage.from("avatars");
+const user = await pawabase.auth.getCachedUser();
+
+const stored = await avatars.upload(`${user!.id}/me.png`, file);
+console.log(stored.key, stored.size, stored.content_type, stored.etag);
+```
+
+```python Python
+from pathlib import Path
+
+avatars = pb.storage.from_("avatars")
+user = pb.auth.user
+
+stored = avatars.upload(f"{user['id']}/me.png", Path("me.png"))   # bytes, str, a file object or a Path
+print(stored["key"], stored["size"], stored["content_type"])
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/storage/v1/object/avatars/$USER_ID/me.png" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: image/png" --data-binary @me.png
+```
+</CodeGroup>
+
+The body can be any of these:
+
+| Body | Typical source | Retried on failure |
+| --- | --- | --- |
+| `File` or `Blob` | An `<input type="file">`, a drag and drop, a canvas export | Yes |
+| `ArrayBuffer` or a typed array | Bytes you produced | Yes |
+| `string` | Text you produced | Yes |
+| `FormData` | A form with a `file` field | Yes |
+| `ReadableStream` | A large file streamed from disk or another response | No; a stream can be read once |
+
+The content type comes from, in order: the `contentType` option, the `Blob`'s own type, `text/plain; charset=utf-8` for strings, or `application/octet-stream`.
+Set it explicitly when the source does not know it, such as bytes you generated:
+
+<CodeGroup>
+```typescript TypeScript
+await reports.upload("2026/09/summary.pdf", pdfBytes, { contentType: "application/pdf" });
+```
+
+```python Python
+reports.upload("2026/09/summary.pdf", pdf_bytes, content_type="application/pdf")
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/storage/v1/object/reports/2026/09/summary.pdf" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/pdf" --data-binary @summary.pdf
+```
+</CodeGroup>
+
+The content type matters twice.
+The bucket's `accepts` list is checked against it, after the server inspects the bytes, so a file renamed to look like an image is still refused.
+And it is the type browsers receive when they download the object, which decides whether they display it or save it.
+
+### What upload returns
+
+| Field | Meaning |
+| --- | --- |
+| `bucket` | The bucket name |
+| `key` | The stored key |
+| `size` | Bytes stored |
+| `content_type` | The stored content type |
+| `etag` | The object's version tag, when the driver provides one |
+
+### Replacing and retrying
+
+Uploading to a key that exists replaces the object, and that replacement is checked against the bucket's `update_policy` rather than its `write_policy`.
+This lets you allow people to add files without allowing them to overwrite other people's.
+
+Because replacing an object with the same bytes leaves the same result, the client marks uploads as safe to repeat.
+After a network failure or a gateway error, it uploads again.
+A stream body is the exception: it cannot be read twice, so it is not retried.
+
+### Upload failures
+
+| Answer | Client error | Cause |
+| --- | --- | --- |
+| `401` | `AuthenticationError` | Signed out, and the policy requires a user |
+| `403` | `PermissionError` | The write or update policy refused |
+| `400` | `ApiError` | The content type is not accepted, the size is over the bucket's limit, or the key is invalid; the message says which |
+| `413` | `PayloadTooLargeError` | The body is larger than the gateway or the signed URL allows |
+| `415` | `ApiError` | A signed upload URL was used with a different content type |
+| `404` | `NotFoundError` | The bucket does not exist |
+
+The refused file is never partly stored.
+A size or type refusal leaves the previous object, if any, untouched.
+
+### Large files and timeouts
+
+The client's default timeout is 30 seconds per attempt, which is too short for a large file on a slow connection.
+Give uploads their own timeout:
+
+```typescript
+await videos.upload("intro.mp4", file, { timeoutMs: 0 });
+```
+
+`0` disables the timeout.
+Combine it with an `AbortSignal` so the person can cancel:
+
+```typescript
+const controller = new AbortController();
+cancelButton.onclick = () => controller.abort();
+await videos.upload("intro.mp4", file, { timeoutMs: 0, signal: controller.signal });
+```
+
+The client does not report upload progress, because `fetch` does not expose it.
+For progress bars, upload through a signed upload URL with `XMLHttpRequest`, which does; see [Direct uploads with signed URLs](#direct-uploads-with-signed-urls).
+
+## Downloading
+
+A bucket handle has five download methods, for the five ways code wants a file.
+
+| Method | Returns | Use it for |
+| --- | --- | --- |
+| `download(key)` | `Blob` | Files you will display, save or pass on |
+| `downloadText(key)` | `string` | Text files: CSV, Markdown, logs |
+| `downloadJson<T>(key)` | `T` | JSON documents |
+| `downloadStream(key)` | `ReadableStream<Uint8Array>` | Large files you process as they arrive |
+| `downloadResponse(key)` | `Response` | When you need headers: `etag`, `content-type`, `content-length` |
+
+<CodeGroup>
+```typescript TypeScript
+const csv = await exports.downloadText("2026-09/orders.csv");
+const settings = await config.downloadJson<{ theme: string }>("defaults.json");
+```
+
+```python Python
+csv = exports.download_text("2026-09/orders.csv")
+settings = config.download_json("defaults.json")
+data = media.download("intro.mp4")   # bytes
+```
+
+```bash cURL
+curl "$PAWABASE_URL/storage/v1/object/exports/2026-09/orders.csv" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -o orders.csv
+```
+</CodeGroup>
+
+<CodeGroup>
+```typescript TypeScript
+const response = await media.downloadResponse("intro.mp4");
+console.log(response.headers.get("content-length"), response.headers.get("etag"));
+```
+
+```python Python
+response = media.download_response("intro.mp4")   # an httpx.Response
+print(response.headers.get("content-length"), response.headers.get("etag"))
+```
+
+```bash cURL
+curl -I "$PAWABASE_URL/storage/v1/object/media/intro.mp4" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+Downloads are reads, checked against `read_policy`.
+
+| Answer | Client error | Cause |
+| --- | --- | --- |
+| `401` | `AuthenticationError` | Signed out, and the policy requires a user |
+| `403` | `PermissionError` | Signed in, and the policy refused |
+| `404` | `NotFoundError` | No such object |
+
+Downloading through the client is right for files your code processes.
+For files a browser displays, such as images and videos, give the browser a URL instead, so it can cache and stream them itself.
+The next sections explain which URL.
+
+## Listing
+
+`list(options)` returns one page of objects below a prefix.
+
+<CodeGroup>
+```typescript TypeScript
+const page = await uploads.list({ prefix: `${userId}/`, limit: 100 });
+for (const file of page.files) console.log(file.key, file.size, file.modified);
+console.log("folders:", page.prefixes);
+if (page.cursor) {
+  const next = await uploads.list({ prefix: `${userId}/`, cursor: page.cursor, limit: 100 });
+}
+```
+
+```python Python
+page = uploads.list(prefix=f"{user_id}/", limit=100)
+for file in page["files"]:
+    print(file["key"], file["size"], file["modified"])
+print("folders:", page["prefixes"])
+if page["cursor"]:
+    next_page = uploads.list(prefix=f"{user_id}/", cursor=page["cursor"], limit=100)
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/storage/v1/list/uploads" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" --data-urlencode "prefix=$USER_ID/" --data-urlencode "limit=100"
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `prefix` | Only keys that start with this text |
+| `cursor` | Where the previous page ended |
+| `limit` | Keys per page |
+
+| Result | Meaning |
+| --- | --- |
+| `files` | Objects on this page: `key`, `size`, `content_type`, `modified` |
+| `prefixes` | The distinct "folders" directly below the prefix |
+| `cursor` | Pass it back for the next page; empty on the last page |
+
+`listAll(options)` walks every page for you and yields objects one at a time:
+
+<CodeGroup>
+```typescript TypeScript
+let total = 0;
+for await (const file of uploads.listAll({ prefix: `${userId}/` })) {
+  total += file.size;
+}
+```
+
+```python Python
+total = sum(file["size"] for file in uploads.list_all(prefix=f"{user_id}/"))
+
+# async client
+total = 0
+async for file in auploads.list_all(prefix=f"{user_id}/"):
+    total += file["size"]
+```
+</CodeGroup>
+
+Listing is checked against `list_policy`, which follows `read_policy` unless set.
+A refused listing answers `403`.
+
+A public bucket does not have to be listable.
+Setting `list_policy` to `authenticated` lets anyone render an object whose URL they hold while only signed-in users can enumerate the bucket.
+That is usually what a public bucket should do.
+
+## Deleting
+
+`remove(key)` deletes an object.
+
+<CodeGroup>
+```typescript TypeScript
+await avatars.remove(`${userId}/old.png`);
+```
+
+```python Python
+avatars.remove(f"{user_id}/old.png")
+```
+
+```bash cURL
+curl -X DELETE "$PAWABASE_URL/storage/v1/object/avatars/$USER_ID/old.png" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+| Answer | Client error | Cause |
+| --- | --- | --- |
+| `204` | none | Deleted |
+| `403` | `PermissionError` | The delete policy refused |
+| `404` | `NotFoundError` | No such object |
+
+Deleting is safe to repeat, so the client retries it after a network failure.
+A retry after a delete that already happened gets `404`; treat that as success when your goal is "the file is gone".
+
+Storage does not know which records refer to a file.
+When you delete a record that points at an object, delete the object too, in the same code or in a flow triggered by the record's delete event.
+
+## Serving files to browsers
+
+A browser displays images and plays media by URL.
+It cannot attach your API key or a bearer token to an `<img src>`, so the URL itself must carry whatever authority is needed.
+There are three kinds of URL, each for a different situation.
+
+| URL | Looks like | Needs | Use for |
+| --- | --- | --- | --- |
+| Gateway file URL | `/storage/v1/files/<env>/<bucket>/<key>` | Nothing, for a public bucket | Public images, downloads, and transformations |
+| Object URL with a key | `/storage/v1/object/<bucket>/<key>?apikey=pb_pk_…` | A publishable key in the URL | Public buckets, from `getPublicUrl` |
+| Signed URL | Returned by `createSignedUrl` | Nothing; the URL is the credential | Private files, for a limited time |
+
+### Public buckets
+
+A bucket marked public serves its objects to anyone.
+`getPublicUrl(key)` builds an object URL with the client's publishable key in it:
+
+<CodeGroup>
+```typescript TypeScript
+const url = avatars.getPublicUrl(`${userId}/me.png`);
+image.src = url;
+```
+
+```python Python
+# The Python client builds the keyless gateway file URL:
+url = avatars.public_url(f"{user_id}/me.png")
+# https://api.example.com/storage/v1/files/production/avatars/u_7/me.png
+```
+
+```bash cURL
+# Object URL with the publishable key (TypeScript's getPublicUrl):
+curl "$PAWABASE_URL/storage/v1/object/avatars/u_7/me.png?apikey=$PAWABASE_KEY" -o me.png
+# Keyless gateway file URL (Python's public_url), public buckets only:
+curl "$PAWABASE_URL/storage/v1/files/production/avatars/u_7/me.png" -o me.png
+```
+</CodeGroup>
+
+It builds the URL locally, without a request.
+It refuses to run with a secret key, because the key would be visible in the URL.
+
+The gateway also serves public objects at a keyless file URL, which is shorter, cache-friendly, and supports image transformations:
+
+```text
+https://api.example.com/storage/v1/files/production/avatars/u_7/me.png
+```
+
+The client does not have a helper for this form; build it from the gateway URL, the environment, the bucket and the key, encoding each key segment:
+
+<CodeGroup>
+```typescript TypeScript
+function fileUrl(environment: string, bucket: string, key: string) {
+  const path = key.split("/").map(encodeURIComponent).join("/");
+  return `${gatewayUrl}/storage/v1/files/${encodeURIComponent(environment)}/${encodeURIComponent(bucket)}/${path}`;
+}
+```
+
+```python Python
+# Built in: uses the client's environment
+url = pb.storage.from_(bucket).public_url(key)
+```
+</CodeGroup>
+
+A private bucket answers `404` at this URL for a caller with no credentials.
+For private files, use a signed URL.
+
+### Image transformations
+
+Gateway file URLs accept query parameters that resize and re-encode images on the fly, when the bucket allows transformations.
+
+```text
+/storage/v1/files/production/avatars/u_7/me.png?width=200&height=200&fit=cover&format=webp
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `width`, `height` | The target size in pixels |
+| `fit` | `cover`, `contain`, `fill`, `inside` or `outside` |
+| `format` | `webp`, `avif`, `jpeg` or `png` |
+| `quality` | Compression quality for lossy formats |
+
+Transformed images are cached, so asking for the same variant twice does not resize twice.
+Use transformations to serve thumbnails and responsive images from one stored original.
+
+<CodeGroup>
+```typescript TypeScript
+const avatarSrc = `${fileUrl("production", "avatars", key)}?width=96&height=96&fit=cover&format=webp`;
+const avatarSrc2x = `${fileUrl("production", "avatars", key)}?width=192&height=192&fit=cover&format=webp`;
+```
+
+```python Python
+avatar_src = avatars.transform_url(key, width=96, height=96, fit="cover", format="webp")
+avatar_src_2x = avatars.transform_url(key, width=192, height=192, fit="cover", format="webp")
+```
+
+```bash cURL
+curl "$PAWABASE_URL/storage/v1/files/production/avatars/u_7/me.png?width=96&height=96&fit=cover&format=webp" -o avatar.webp
+```
+</CodeGroup>
+
+Studio's object sheet has a **Transform** tab where you can try parameters and copy the resulting URL.
+See [Transformations](/storage/transformations).
+
+### Signed URLs for private files
+
+`createSignedUrl(key, { expiresIn })` asks the server for a URL that lets anyone holding it read one object until it expires.
+
+<CodeGroup>
+```typescript TypeScript
+const { url, expires_at } = await invoices.createSignedUrl(`${orgId}/2026-09.pdf`, { expiresIn: 300 });
+window.open(url);
+```
+
+```python Python
+signed = invoices.create_signed_url(f"{org_id}/2026-09.pdf", expires_in=300)
+url, expires_at = signed["url"], signed["expires_at"]
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/storage/v1/sign/invoices/$ORG_ID/2026-09.pdf" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"method": "GET", "expires_in": 300}'
+# → {"url": "…", "expires_at": 1761400000, "method": "GET"}
+```
+</CodeGroup>
+
+| Option | Default | Range |
+| --- | --- | --- |
+| `expiresIn` | `300` seconds | 1 second to 7 days |
+
+The server checks that you may read the object yourself before signing.
+You cannot sign access you do not have: a signer without read access gets `403 you may not grant access you do not have`.
+
+A bucket can also refuse to issue signed URLs at all; then signing answers `403 this bucket does not issue signed URLs for that`.
+
+Keep expiries short.
+A signed URL in an email, a log or a browser history grants access to whoever finds it until it expires, and it cannot be revoked early.
+For links meant for people without accounts that you may need to revoke, use share links, which the management module creates; see [Share links](/storage/share-links).
+
+## Signed URLs compared with share links
+
+Both give access to one object without an account, and they are easy to confuse.
+
+| | Signed URL | Share link |
+| --- | --- | --- |
+| Created by | Anyone who may read (or write) the object, with `createSignedUrl` | An operator or a secret-key server, with the management module or Studio |
+| Lifetime | 1 second to 7 days | Chosen when created |
+| Revocable before expiry | No | Yes |
+| Permissions | Read, or one upload | View, download, or both |
+| Good for | Showing a private file in your own app | Sending a file to someone outside the app |
+
+A signed URL cannot be withdrawn once issued, so choose a share link whenever you might need to take access back, such as a document sent to a client who later leaves the project.
+In Studio, the **New temporary link** form on an object's **Sharing** tab creates share links.
+
+## Direct uploads with signed URLs
+
+A signed upload URL lets a browser or device upload one object straight to storage, without holding any key that could do anything else.
+It is the right design in two situations:
+
+| Situation | Why a signed upload URL helps |
+| --- | --- |
+| Your server decides what may be uploaded, and where | The server signs a URL for one key, one content type and one size limit |
+| You need upload progress in a browser | The browser can upload with `XMLHttpRequest`, which reports progress |
+
+The server side creates the URL:
+
+<CodeGroup>
+```typescript TypeScript
+const slot = await documents.createSignedUploadUrl(`${orgId}/contracts/${contractId}.pdf`, {
+  expiresIn: 600,
+  contentType: "application/pdf",
+  maxBytes: 20 * 1024 * 1024,
+});
+return { uploadUrl: slot.url, expiresAt: slot.expires_at };
+```
+
+```python Python
+slot = documents.create_signed_upload_url(
+    f"{org_id}/contracts/{contract_id}.pdf",
+    expires_in=600,
+    content_type="application/pdf",
+    max_bytes=20 * 1024 * 1024,
+)
+return {"upload_url": slot["url"], "expires_at": slot["expires_at"]}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/storage/v1/sign/documents/$ORG_ID/contracts/c1.pdf" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"method": "PUT", "expires_in": 600, "content_type": "application/pdf", "max_bytes": 20971520}'
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `expiresIn` | Seconds the URL is valid; 300 by default |
+| `contentType` | The only content type the upload may have |
+| `maxBytes` | The largest upload the URL accepts |
+
+The signer must be allowed to write the key itself, under the bucket's write policy.
+
+The uploading side sends the file with `uploadToSignedUrl`, which sends no API key and no token:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.storage.from("documents").uploadToSignedUrl(uploadUrl, file, { contentType: "application/pdf" });
+```
+
+```python Python
+pb.storage.from_("documents").upload_to_signed_url(upload_url, Path("contract.pdf"), content_type="application/pdf")
+```
+
+```bash cURL
+# No key and no token: the URL is the credential.
+curl -X PUT "$UPLOAD_URL" -H "content-type: application/pdf" --data-binary @contract.pdf
+```
+</CodeGroup>
+
+Or with `XMLHttpRequest`, for progress:
+
+```typescript
+function uploadWithProgress(url: string, file: File, onProgress: (fraction: number) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
+    xhr.upload.onprogress = (event) => event.lengthComputable && onProgress(event.loaded / event.total);
+    xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(`upload failed: ${xhr.status} ${xhr.responseText}`)));
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.send(file);
+  });
+}
+```
+
+| Answer | Cause |
+| --- | --- |
+| `413` | The file is larger than `maxBytes` |
+| `415` | The content type differs from the one the URL was signed for |
+| `404` | The URL expired, was altered, or is for another environment |
+
+An upload through a signed URL is retried by the client like any upload, because it is safe to repeat while the URL is valid.
+
+## Designing keys
+
+A key is more than a file name.
+It is what policies inspect, what listings group by, what appears in URLs and logs, and what decides whether two uploads collide.
+A little design up front saves migrations later.
+
+### Put the boundary first
+
+Policies can read each segment of a key.
+Putting the access boundary in the first segment makes the policy one comparison.
+
+| Who may access | Key shape | Policy condition |
+| --- | --- | --- |
+| One user | `<user id>/…` | `$auth.user_id` is set and `$object.segments.0` equals it |
+| One organization | `<org slug>/…` | `$auth.org` is set and `$object.segments.0` equals it |
+| Anyone signed in, writes by owner only | `<user id>/…` with a read policy of `authenticated` | Write: the first segment equals the user id |
+
+```typescript
+const key = `${user.id}/receipts/${receiptId}.pdf`;
+```
+
+When the boundary is not in the key, the policy has nothing to compare, and the bucket must fall back to "everyone signed in", which is rarely right for private files.
+
+### Decide between overwriting and versioning
+
+Two strategies, each with a clear trade-off:
+
+| Strategy | Key | When the file changes | Good for |
+| --- | --- | --- | --- |
+| Stable key | `u_7/avatar.png` | Upload to the same key | Files with one current version, small storage |
+| Versioned key | `u_7/avatar-01JB9C2W.png` | Upload a new key, update the record, delete the old | Files that browsers and CDNs cache aggressively |
+
+A stable key is simpler, but every cache that holds the old bytes keeps serving them until it expires.
+A versioned key never has that problem, because a new version is a new URL.
+For avatars, logos and anything served with long cache lifetimes, versioned keys avoid "I changed my picture but it still shows the old one".
+
+### Keep personal data out of keys
+
+Keys appear in URLs, logs, browser history and listing results.
+Use ids, not names or email addresses:
+
+| Avoid | Prefer |
+| --- | --- |
+| `ada.lovelace@example.com/passport.jpg` | `u_7/identity/01JB9C2W.jpg` |
+| `invoices/Acme Ltd - September.pdf` | `org_acme/invoices/2026-09.pdf` |
+
+The original file name can live in a record field, where policies protect it, and be used as the download name.
+
+### Characters
+
+Keys can contain any characters, and the client encodes each segment when it builds a path.
+Leading slashes are removed, and an empty key is refused with `ConfigError` before any request.
+Spaces, `#`, `?` and non-ASCII characters work, but they make URLs harder to read and copy.
+Lowercase letters, digits, hyphens, underscores, dots and slashes are the safe set.
+
+## Bucket designs
+
+The same client calls serve very different buckets.
+What changes is the bucket's policies and limits.
+The designs below cover most applications; each shows the bucket settings in the form the **JSON** view of a bucket uses.
+
+### Public avatars, written by their owners
+
+```json
+{
+  "name": "avatars",
+  "public": true,
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "max_bytes": 2097152,
+  "read_policy": "public",
+  "list_policy": "authenticated",
+  "write_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] }
+}
+```
+
+Anyone can render an avatar from its URL.
+Only signed-in users can list the bucket.
+Each person can write only below their own id.
+
+### Private documents per user
+
+```json
+{
+  "name": "documents",
+  "public": false,
+  "max_bytes": 26214400,
+  "read_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] },
+  "write_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] }
+}
+```
+
+Nobody sees anyone else's files, not even by guessing keys.
+Browsers display these files through signed URLs created on demand.
+
+### Files shared within an organization
+
+```json
+{
+  "name": "team-files",
+  "read_policy": { "all": [{ "truthy": "$auth.org" }, { "eq": ["$object.segments.0", "$auth.org"] }] },
+  "write_policy": { "all": [{ "truthy": "$auth.org" }, { "eq": ["$object.segments.0", "$auth.org"] }] },
+  "delete_policy": { "in": ["$auth.org_role", ["owner", "admin"]] }
+}
+```
+
+Members of an organization read and add files under its slug.
+Only admins and owners delete.
+The token must be issued for the organization, which `auth.switchOrg` arranges.
+
+### Write once, never overwrite
+
+```json
+{
+  "name": "evidence",
+  "write_policy": "authenticated",
+  "update_policy": { "service": true },
+  "delete_policy": { "service": true }
+}
+```
+
+People can add files but cannot replace or remove them; only a secret key can.
+Use this for audit material, signed contracts and anything whose history must not change.
+
+### An inbox that only servers read
+
+```json
+{
+  "name": "inbox",
+  "write_policy": "authenticated",
+  "read_policy": { "service": true },
+  "list_policy": { "service": true }
+}
+```
+
+People upload; a server job with a secret key processes and moves the files.
+Uploaders cannot read back what others sent.
+
+See [Bucket access](/storage/access) for the policy language, including the `service` shorthand.
+
+## Linking files to records
+
+Most files belong to a record: an avatar to a profile, an attachment to a message, a receipt to an expense.
+Storage does not know about records, so your application keeps the link, usually as a key stored in a record field.
+
+The safest order is: upload first, then write the record.
+
+```typescript
+export async function attachReceipt(expenseId: string, file: File) {
+  const user = await pawabase.auth.getCachedUser();
+  const key = `${user!.id}/receipts/${expenseId}-${Date.now()}.${extensionOf(file)}`;
+  await pawabase.storage.from("receipts").upload(key, file);
+  try {
+    return await pawabase.from("expenses").update(expenseId, { receipt_key: key, receipt_name: file.name });
+  } catch (error) {
+    await pawabase.storage.from("receipts").remove(key).catch(() => undefined);
+    throw error;
+  }
+}
+
+function extensionOf(file: File) {
+  return file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "bin";
+}
+```
+
+If the record update fails, the upload is removed, so no file is left without a record.
+If the cleanup itself fails, an orphan remains, which is harmless and can be collected later.
+
+The reverse order, record first, risks a record that points at a file that never arrived.
+That shows up as a broken image or a failed download in front of a user, which is worse than an unreferenced file nobody sees.
+
+Deleting works the other way round: delete the record, then the file.
+A flow subscribed to the record's `deleted` event can delete the file on the server, which also catches deletions made from Studio or other clients.
+
+### Finding orphans
+
+A periodic job with a secret key can compare a bucket's keys with the keys records refer to:
+
+```typescript
+async function findOrphans() {
+  const referenced = new Set<string>();
+  for await (const expense of service.from("expenses").isNot("receipt_key", null).select("id", "receipt_key")) {
+    referenced.add(expense.receipt_key as string);
+  }
+  const orphans: string[] = [];
+  for await (const file of service.storage.from("receipts").listAll()) {
+    if (!referenced.has(file.key)) orphans.push(file.key);
+  }
+  return orphans;
+}
+```
+
+Leave a grace period before deleting orphans, such as only those older than a day by `modified`, so an upload whose record is still being written is not removed.
+
+## Patterns for common screens
+
+### An avatar picker
+
+An avatar picker checks the file before uploading, shows a preview at once, uploads under a versioned key, and then points the profile at the new key.
+
+```typescript
+const AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp"];
+const AVATAR_MAX = 2 * 1024 * 1024;
+
+export async function changeAvatar(file: File, preview: (url: string) => void) {
+  if (!AVATAR_TYPES.includes(file.type)) return { error: "Choose a PNG, JPEG or WebP image." };
+  if (file.size > AVATAR_MAX) return { error: "Choose an image smaller than 2 MB." };
+
+  const local = URL.createObjectURL(file);
+  preview(local);
+
+  const user = await pawabase.auth.getCachedUser();
+  const key = `${user!.id}/avatar-${Date.now()}.${file.type.split("/")[1]}`;
+  try {
+    await pawabase.storage.from("avatars").upload(key, file);
+    const previous = await pawabase.from("profiles").first();
+    await pawabase.from("profiles").update(previous!.id, { avatar_key: key });
+    if (previous?.avatar_key) await pawabase.storage.from("avatars").remove(previous.avatar_key as string).catch(() => undefined);
+    return { key };
+  } finally {
+    URL.revokeObjectURL(local);
+  }
+}
+```
+
+The client-side checks mirror the bucket's `accepts` and `max_bytes`.
+They exist to give a fast, friendly message; the server enforces the same limits regardless.
+Reading the limits from `listBuckets()` instead of hard-coding them keeps the two in step.
+
+### Uploading many files
+
+A drop zone that accepts many files should upload a few at a time and report each file's outcome, rather than failing the whole batch on one bad file.
+
+```typescript
+export async function uploadAll(files: File[], folder: string, onEach: (name: string, ok: boolean, message?: string) => void) {
+  const bucket = pawabase.storage.from("team-files");
+  const queue = [...files];
+  const workers = Array.from({ length: 3 }, async () => {
+    for (let file = queue.shift(); file; file = queue.shift()) {
+      try {
+        await bucket.upload(`${folder}/${file.name}`, file, { timeoutMs: 0 });
+        onEach(file.name, true);
+      } catch (error) {
+        onEach(file.name, false, error instanceof Error ? error.message : String(error));
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+```
+
+Three parallel uploads saturate most connections.
+More rarely helps and makes rate limits more likely.
+
+### A file browser with folders
+
+Listings return `prefixes` alongside `files`, which is enough to render folders and breadcrumbs.
+
+```typescript
+export async function openFolder(path: string) {
+  const prefix = path ? `${path.replace(/\/+$/, "")}/` : "";
+  const page = await pawabase.storage.from("team-files").list({ prefix, limit: 200 });
+  const folders = page.prefixes.map((full) => ({ name: full.slice(prefix.length).replace(/\/$/, ""), path: full.replace(/\/$/, "") }));
+  const files = page.files.map((file) => ({ name: file.key.slice(prefix.length), key: file.key, size: file.size }));
+  const crumbs = path.split("/").filter(Boolean).map((part, index, all) => ({ name: part, path: all.slice(0, index + 1).join("/") }));
+  return { folders, files, crumbs, more: page.cursor };
+}
+```
+
+Folders are not real objects.
+A folder exists while at least one key starts with its prefix, and disappears when the last such object is deleted.
+To show an empty folder, store a placeholder object, such as `.keep`, and hide it in the listing.
+
+### A download button for a private file
+
+Create the signed URL when the person clicks, not when the page renders.
+A URL created at render time may expire before it is clicked, and it is visible in the page source the whole time.
+
+```typescript
+export async function downloadPrivate(bucket: string, key: string, fileName: string) {
+  const { url } = await pawabase.storage.from(bucket).createSignedUrl(key, { expiresIn: 60 });
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+}
+```
+
+Sixty seconds is plenty for a browser to start a download.
+The `download` attribute suggests a file name; whether the browser uses it for a cross-origin URL depends on the browser.
+
+### Showing private images
+
+Private images in a list, such as attachment thumbnails, need a signed URL each.
+Sign them in parallel when the list loads, with an expiry longer than people stay on the page:
+
+```typescript
+export async function withImageUrls<T extends { image_key: string | null }>(rows: T[]) {
+  const bucket = pawabase.storage.from("attachments");
+  return Promise.all(
+    rows.map(async (row) => ({
+      ...row,
+      image_url: row.image_key ? (await bucket.createSignedUrl(row.image_key, { expiresIn: 3600 })).url : null,
+    })),
+  );
+}
+```
+
+Each signature is a request.
+For screens with hundreds of private images, consider whether those images really need to be private, or serve them from a server route that checks access once and streams many.
+
+### A gallery with responsive images
+
+For public images, transformations give each screen size the right file from one original.
+
+```tsx
+export function Photo({ base, alt }: { base: string; alt: string }) {
+  const at = (width: number) => `${base}?width=${width}&format=webp&quality=80`;
+  return (
+    <img
+      src={at(640)}
+      srcSet={`${at(320)} 320w, ${at(640)} 640w, ${at(1280)} 1280w`}
+      sizes="(max-width: 700px) 100vw, 640px"
+      alt={alt}
+      loading="lazy"
+    />
+  );
+}
+```
+
+`base` is the gateway file URL of the original.
+The browser picks a width; the gateway produces and caches it.
+
+### Importing a CSV someone uploaded
+
+Files that your code processes are read with the download methods, not URLs.
+
+```typescript
+export async function previewCsv(key: string) {
+  const text = await pawabase.storage.from("imports").downloadText(key);
+  const [header, ...lines] = text.split(/\r?\n/).filter(Boolean);
+  const columns = header.split(",");
+  return { columns, rows: lines.slice(0, 20).map((line) => line.split(",")) };
+}
+```
+
+Splitting on commas is enough for a preview.
+For the real import, use a CSV parser that handles quoted fields, and send rows to the management module's `importRecords` from a server.
+
+## Caching and changed files
+
+Browsers and CDNs cache files they download.
+How long depends on the response's cache headers, which a bucket's cache settings control for gateway file URLs.
+
+| Situation | What people see | What to do |
+| --- | --- | --- |
+| A file is replaced at the same key | The old version, until caches expire | Use versioned keys, or add `?v=<etag>` to the URL |
+| A file is deleted | The cached copy, until caches expire | Expect it; delete is not instant for cached readers |
+| A signed URL expires | A `404` for new requests; cached copies may still display | Keep expiries short for sensitive files |
+| A transformed variant of a replaced image | The old variant, until caches expire | Versioned keys again |
+
+The `etag` returned by `upload` changes whenever the bytes change.
+Appending it to a stable key's URL is a cheap way to make browsers fetch the new version:
+
+```typescript
+const stored = await logos.upload("org_acme/logo.png", file);
+const url = `${fileUrl("production", "logos", stored.key)}?v=${encodeURIComponent(stored.etag ?? Date.now().toString())}`;
+```
+
+## Storage from servers
+
+On a server with a secret key, storage policies are bypassed, and the client can move files that no person could.
+Typical jobs: generating reports, moving files out of an inbox bucket, importing from another system, and cleaning up.
+
+Node's file streams convert to the web streams the client accepts:
+
+```typescript
+import { createReadStream, statSync } from "node:fs";
+import { Readable } from "node:stream";
+
+export async function uploadFromDisk(bucket: string, key: string, path: string, contentType: string) {
+  const stream = Readable.toWeb(createReadStream(path)) as ReadableStream<Uint8Array>;
+  const size = statSync(path).size;
+  return service.storage.from(bucket).upload(key, stream, { contentType, timeoutMs: 0 });
+}
+```
+
+A stream upload is not retried, because the stream cannot be replayed.
+Wrap the call in your own retry that opens a fresh stream on each attempt when the job must survive a network blip.
+
+Reading a large object without holding it in memory:
+
+```typescript
+import { createWriteStream } from "node:fs";
+import { Writable } from "node:stream";
+
+export async function downloadToDisk(bucket: string, key: string, path: string) {
+  const stream = await service.storage.from(bucket).downloadStream(key);
+  await stream.pipeTo(Writable.toWeb(createWriteStream(path)));
+}
+```
+
+A report job commonly ends by signing a URL and sending it to the person who asked:
+
+<CodeGroup>
+```typescript TypeScript
+const key = `${orgId}/reports/${month}.pdf`;
+await service.storage.from("reports").upload(key, pdf, { contentType: "application/pdf" });
+const { url } = await service.storage.from("reports").createSignedUrl(key, { expiresIn: 24 * 3600 });
+await sendEmail(requester, `Your report is ready: ${url}`);
+```
+
+```python Python
+key = f"{org_id}/reports/{month}.pdf"
+service.storage.from_("reports").upload(key, pdf, content_type="application/pdf")
+url = service.storage.from_("reports").create_signed_url(key, expires_in=24 * 3600)["url"]
+send_email(requester, f"Your report is ready: {url}")
+```
+</CodeGroup>
+
+## Uploaded files and the safety of your site
+
+Files people upload can be harmful when served back, even if they are never "executed" on your server.
+Three rules keep uploads safe.
+
+| Rule | Why |
+| --- | --- |
+| Restrict `accepts` to the types the feature needs | An HTML or SVG file served from a domain your app trusts can run script in a visitor's browser |
+| Serve user uploads from the gateway's domain, not your application's | A malicious file then runs, at worst, on a domain that holds none of your app's cookies or storage |
+| Prefer signed URLs and short expiries for private files | Links leak through sharing, history and logs |
+
+The server inspects uploaded bytes before checking `accepts`, so renaming `page.html` to `page.png` does not get it past an image-only bucket.
+SVG deserves special mention: it is an image format that can contain script.
+Accept it only from trusted uploaders, or convert it to a raster format before serving it to others.
+
+## Testing storage code
+
+Upload and download code can be tested with a fake `fetch` that stores bodies in a map.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient } from "@pawabase/client";
+
+test("upload then download round-trips the bytes", async () => {
+  const store = new Map<string, { body: ArrayBuffer; type: string }>();
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    fetch: async (input, init) => {
+      const path = new URL(input).pathname;
+      if (init?.method === "PUT") {
+        const body = await new Response(init.body as BodyInit).arrayBuffer();
+        const type = new Headers(init.headers).get("content-type") ?? "";
+        store.set(path, { body, type });
+        return Response.json({ bucket: "b", key: path.split("/").slice(5).join("/"), size: body.byteLength, content_type: type });
+      }
+      const hit = store.get(path);
+      return hit ? new Response(hit.body, { headers: { "content-type": hit.type } }) : new Response("Not found", { status: 404 });
+    },
+  });
+
+  const bucket = pawabase.storage.from("b");
+  await bucket.upload("u1/note.txt", "hello");
+  assert.equal(await bucket.downloadText("u1/note.txt"), "hello");
+  await assert.rejects(bucket.downloadText("u1/missing.txt"), { name: "NotFoundError" });
+  pawabase.dispose();
+});
+```
+
+Policies cannot be tested this way, because only the server evaluates them.
+Test bucket policies against a development environment with two signed-in test users, checking that each can reach their own files and not the other's.
+
+## Choosing an upload path
+
+There are four ways to get a file into storage, and each fits a different situation.
+
+| Path | Who sends the bytes | Who decides the key and limits | Use when |
+| --- | --- | --- | --- |
+| `upload` from the browser | The browser, with the person's session | Bucket policies | The person may upload into their own area, and policies can say where |
+| Signed upload URL | The browser, with no credentials | Your server, when it signs | The server must choose the key, the type or the size per upload |
+| Your own server route | Your server, as the person | Your server code, plus policies | The server must inspect or transform the bytes |
+| A secret-key job | Your server | Your code alone | Imports, migrations and processing pipelines |
+
+Start with the first.
+Move to a signed URL when a rule cannot be expressed as a policy on the key, and to a server route only when the server has to see the file.
+
+## The life of an upload
+
+Following one upload end to end shows where each rule on this page applies.
+
+```text
+browser: avatars.upload("u_7/avatar-1730.png", file)
+  │  PUT /storage/v1/object/avatars/u_7/avatar-1730.png
+  │  apikey, authorization, content-type: image/png
+  ▼
+gateway
+  │  key valid, origin allowed, rate limit, firewall
+  ▼
+storage service
+  │  bucket "avatars" exists?                       no  → 404
+  │  key exists already?  yes → update_policy, no → write_policy
+  │  policy allows this caller and key?             no  → 401 signed out / 403 signed in
+  │  bytes sniffed; type in accepts?                no  → 400
+  │  size within max_bytes and limits?              no  → 400 or 413
+  ▼
+storage driver (local disk or S3-compatible)
+  │  bytes written
+  ▼
+200 { bucket, key, size, content_type, etag }
+```
+
+Two details in that path are easy to miss.
+The policy is chosen by whether the key already exists, so the same call can be allowed for a new file and refused for a replacement.
+And the content type check uses the bytes, not only the header, so an accurate `contentType` helps but cannot sneak a wrong file in.
+
+## What each method sends
+
+| Method | HTTP request |
+| --- | --- |
+| `listBuckets()` | `GET /storage/v1/buckets` |
+| `upload(key, body)` | `PUT /storage/v1/object/<bucket>/<key>` with the body |
+| `download*(key)` | `GET /storage/v1/object/<bucket>/<key>` |
+| `remove(key)` | `DELETE /storage/v1/object/<bucket>/<key>` |
+| `list({ prefix, cursor, limit })` | `GET /storage/v1/list/<bucket>?prefix=…&cursor=…&limit=…` |
+| `createSignedUrl(key)` | `POST /storage/v1/sign/<bucket>/<key>` with `{ method: "GET", expires_in }` |
+| `createSignedUploadUrl(key)` | `POST /storage/v1/sign/<bucket>/<key>` with `{ method: "PUT", expires_in, content_type, max_bytes }` |
+| `uploadToSignedUrl(url, body)` | `PUT <url>` with no key and no token |
+| `getPublicUrl(key)` | No request; builds `/storage/v1/object/<bucket>/<key>?apikey=…` |
+
+Each key segment is percent-encoded and the slashes are kept, so `u_7/My File.png` travels as `u_7/My%20File.png`.
+
+## Uploading from an HTML form
+
+A plain HTML form can send a file as multipart form data.
+The storage service accepts a form whose file is in a field named `file`, and takes the content type from that part.
+
+```typescript
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const data = new FormData(form);
+  const file = data.get("file") as File;
+  await pawabase.storage.from("uploads").upload(`${userId}/${file.name}`, data);
+});
+```
+
+When the body is `FormData`, the client does not set a content type itself, because the runtime must add the multipart boundary.
+Sending the `File` directly is simpler and equally correct; `FormData` is useful when the form already exists.
+
+## Uploading from React Native
+
+On React Native, a picked image is a local URI, not a `File`.
+Fetch the URI to get a `Blob`, then upload it.
+
+```typescript
+import * as ImagePicker from "expo-image-picker";
+
+export async function pickAndUploadPhoto(userId: string) {
+  const picked = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], quality: 0.8 });
+  if (picked.canceled) return null;
+  const asset = picked.assets[0];
+  const blob = await (await fetch(asset.uri)).blob();
+  const type = asset.mimeType ?? "image/jpeg";
+  return pawabase.storage.from("photos").upload(`${userId}/${Date.now()}.${type.split("/")[1]}`, blob, { contentType: type, timeoutMs: 0 });
+}
+```
+
+Setting `contentType` from the picker matters here, because a blob fetched from a local URI may have no type.
+
+## Resizing images before upload
+
+Phones take photos of several megabytes.
+Resizing in the browser before uploading saves the person's data plan and your storage, and it often brings the file under the bucket's limit.
+
+```typescript
+export async function downscale(file: File, maxSide = 1600, quality = 0.85): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const canvas = new OffscreenCanvas(Math.round(bitmap.width * scale), Math.round(bitmap.height * scale));
+  canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  return canvas.convertToBlob({ type: "image/webp", quality });
+}
+
+const smaller = await downscale(file);
+await pawabase.storage.from("photos").upload(`${userId}/${Date.now()}.webp`, smaller);
+```
+
+Re-encoding through a canvas also removes embedded metadata, including the location a phone may have recorded, which is a privacy improvement for photos shared with others.
+
+Keep originals only when you need them.
+Server-side transformations can then produce every display size from a reasonably sized original.
+
+## Media and range requests
+
+Video and audio players request byte ranges, so they can start playing and seek without downloading the whole file.
+Gateway file URLs and signed URLs support ranges and conditional requests, so a `<video src>` pointing at one works as people expect.
+
+```tsx
+<video src={signedUrl} controls preload="metadata" />
+```
+
+From code, a range is a header on a raw request:
+
+<CodeGroup>
+```typescript TypeScript
+const response = await pawabase.http.request<Response>({
+  path: "/storage/v1/object/media/intro.mp4",
+  headers: { range: "bytes=0-1048575", accept: "*/*" },
+  parse: "response",
+});
+console.log(response.status, response.headers.get("content-range"));
+```
+
+```python Python
+with pb.stream("GET", "/storage/v1/object/media/intro.mp4", headers={"range": "bytes=0-1048575"}) as response:
+    first_megabyte = response.read()
+    print(response.status_code, response.headers.get("content-range"))
+```
+
+```bash cURL
+curl "$PAWABASE_URL/storage/v1/object/media/intro.mp4" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "range: bytes=0-1048575" -o first-megabyte
+```
+</CodeGroup>
+
+Use ranges when you need part of a large file, such as the header of a media file or the tail of a log.
+
+## Quotas and usage
+
+Stored bytes count against the project's plan.
+When an upload would exceed the plan, the server refuses it with `403` and the code `quota_exceeded`, with details naming the limit, what is allowed and what is used.
+
+```typescript
+import { PermissionError } from "@pawabase/client";
+
+try {
+  await bucket.upload(key, file);
+} catch (error) {
+  if (error instanceof PermissionError && error.code === "quota_exceeded") {
+    showMessage("Storage is full for this workspace. Remove files or upgrade the plan.");
+  } else throw error;
+}
+```
+
+**Project → Usage & plan** in Studio shows storage use against the limit.
+
+## A file or a field?
+
+Some data could live either in a record field or in a file.
+The choice affects querying, policies, size and cost.
+
+| Data | Better as | Why |
+| --- | --- | --- |
+| A short text or a small JSON document you filter or sort on | A record field | Filters and sorting work on fields, not on files |
+| Rich text under a few hundred kilobytes | A `text` field | One request reads it with the record |
+| Images, PDFs, audio, video | A file | Browsers fetch them by URL; transformations and ranges apply |
+| Large JSON exports or logs | A file | Keeps rows small and lists fast |
+| Anything a browser displays directly | A file | URLs, caching and content types |
+
+A useful rule: if the screen shows it inside a list, it belongs in a field; if the screen links to it or renders it as media, it belongs in a file.
+
+## Layouts for multi-tenant applications
+
+A multi-tenant application can keep each tenant's files under a prefix in shared buckets, or give each tenant its own buckets.
+
+| Layout | How | Strengths | Weaknesses |
+| --- | --- | --- | --- |
+| Shared buckets, tenant prefix | `team-files/<org>/…`, policies compare the first segment with `$auth.org` | One set of buckets and policies; easy to add tenants | A policy mistake affects every tenant |
+| A bucket per tenant | `files-<org>` | Hard separation; per-tenant limits | Buckets must be created per tenant; more configuration |
+
+Shared buckets with prefix policies suit most applications.
+Per-tenant buckets suit tenants with contractual separation or very different limits, and they are created with the management module from your onboarding code.
+
+## Copying files between environments
+
+Promoting an environment copies its definitions, including bucket settings, but not the objects in them.
+To copy objects, for example to give a staging environment realistic files, use two secret-key clients:
+
+```typescript
+export async function copyBucket(from: PawabaseClient, to: PawabaseClient, bucket: string, prefix = "") {
+  let copied = 0;
+  for await (const file of from.storage.from(bucket).listAll({ prefix })) {
+    const blob = await from.storage.from(bucket).download(file.key);
+    await to.storage.from(bucket).upload(file.key, blob, { contentType: file.content_type, timeoutMs: 0 });
+    copied += 1;
+  }
+  return copied;
+}
+```
+
+Copy only what you need, and never copy personal files from production into a less protected environment.
+
+## Storage drivers
+
+An installation stores objects with one driver: the local disk or an S3-compatible service.
+The client behaves the same with either, with two differences you may notice.
+
+| Detail | Local driver | S3-compatible driver |
+| --- | --- | --- |
+| `etag` on upload | Present | Present when the service returns one |
+| `modified` in listings | The file's modification time | The service's last-modified time |
+
+See [Storage drivers](/storage/drivers) for configuration.
+
+## Error messages people understand
+
+Upload errors are shown to people who did nothing wrong except pick a file.
+Translate them.
+
+| Error | Message |
+| --- | --- |
+| Content type refused | "This kind of file is not accepted here. Choose a PNG, JPEG or WebP image." |
+| Size refused | "This file is too large. The limit is 2 MB." |
+| `PermissionError` | "You cannot upload files here." |
+| `AuthenticationError` | "Sign in to upload files." |
+| `NetworkError` or `TimeoutError` | "The upload did not finish. Check your connection and try again." |
+| `quota_exceeded` | "Storage is full for this workspace." |
+
+Name the limit in the message.
+"Too large" without a number sends people guessing.
+
+## Receiving uploads in your own server route
+
+Sometimes a file must pass through your server, for example to validate its contents, strip metadata or attach it to several records in one step.
+The server receives the file, then uploads it as the signed-in person so the bucket's policies still apply.
+
+```typescript
+// app/api/upload/route.ts (Next.js)
+import { pawabaseForRequest } from "@/lib/pawabase/server";
+
+export async function POST(request: Request) {
+  const pawabase = await pawabaseForRequest();
+  const user = await pawabase.auth.getUser().catch(() => null);
+  if (!user) return new Response("Sign in first", { status: 401 });
+
+  const form = await request.formData();
+  const file = form.get("file");
+  if (!(file instanceof File)) return new Response("No file", { status: 400 });
+  if (file.size > 10 * 1024 * 1024) return new Response("Too large", { status: 413 });
+
+  const key = `${user.id}/uploads/${crypto.randomUUID()}-${file.name.replace(/[^\w.-]+/g, "_")}`;
+  const stored = await pawabase.storage.from("documents").upload(key, file, { timeoutMs: 0 });
+  return Response.json({ key: stored.key, size: stored.size });
+}
+```
+
+Passing files through a server costs bandwidth twice and holds a server process for the length of the upload.
+Use it when the server must see the bytes; otherwise prefer direct uploads, with signed upload URLs when the server must decide where the file goes.
+
+## Processing uploads in the background
+
+Files that need work before they are usable, such as scanning, converting or extracting text, fit the inbox pattern: people upload to a bucket they cannot read, and a job with a secret key processes and moves each file.
+
+```typescript
+export async function processInbox() {
+  const inbox = service.storage.from("inbox");
+  const ready = service.storage.from("documents");
+  for await (const file of inbox.listAll()) {
+    const blob = await inbox.download(file.key);
+    const verdict = await scan(blob);
+    if (verdict.clean) {
+      await ready.upload(file.key, blob, { contentType: file.content_type, timeoutMs: 0 });
+      await service.from("documents").create({ key: file.key, owner_id: file.key.split("/")[0], status: "ready" });
+    } else {
+      await service.from("documents").create({ key: file.key, owner_id: file.key.split("/")[0], status: "rejected" });
+    }
+    await inbox.remove(file.key);
+  }
+}
+
+declare function scan(blob: Blob): Promise<{ clean: boolean }>;
+```
+
+Run the job on a schedule, or have your upload code call a custom route that runs it for one key.
+Because the record is created after the file is processed, screens that list documents never show a file that is not ready.
+
+## Expiring old files
+
+Files that are only useful for a while, such as exports, temporary previews and abandoned uploads, should be removed on a schedule.
+Listings report each object's `modified` time, which is enough to decide.
+
+```typescript
+export async function removeOlderThan(bucket: string, days: number, prefix = "") {
+  const cutoff = Date.now() - days * 24 * 3600 * 1000;
+  const store = service.storage.from(bucket);
+  let removed = 0;
+  for await (const file of store.listAll({ prefix })) {
+    const modified = typeof file.modified === "number" ? file.modified * 1000 : Date.parse(String(file.modified));
+    if (Number.isFinite(modified) && modified < cutoff) {
+      await store.remove(file.key);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+```
+
+`modified` may arrive as an ISO string or as Unix seconds, depending on the storage driver, so the example accepts both.
+
+## Downloading several files at once
+
+Storage serves one object per request; there is no endpoint that returns a zip of a folder.
+For a "download all" button over a handful of files, build the archive in the browser:
+
+```typescript
+import JSZip from "jszip";
+
+export async function downloadFolderAsZip(bucket: string, prefix: string) {
+  const store = pawabase.storage.from(bucket);
+  const zip = new JSZip();
+  for await (const file of store.listAll({ prefix })) {
+    zip.file(file.key.slice(prefix.length), await store.download(file.key));
+  }
+  const blob = await zip.generateAsync({ type: "blob" });
+  const link = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: "files.zip" });
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+```
+
+For large folders, build the archive in a server job instead, upload it as one object, and give the person a signed URL to it.
+
+## Files from the clipboard and drag and drop
+
+People paste screenshots and drop files onto pages.
+Both give you `File` objects, which upload like any other.
+
+```typescript
+document.addEventListener("paste", async (event) => {
+  const file = [...(event.clipboardData?.files ?? [])].find((item) => item.type.startsWith("image/"));
+  if (!file) return;
+  await pawabase.storage.from("attachments").upload(`${userId}/pasted-${Date.now()}.${file.type.split("/")[1]}`, file);
+});
+
+dropZone.addEventListener("drop", async (event) => {
+  event.preventDefault();
+  const files = [...(event.dataTransfer?.files ?? [])];
+  await uploadAll(files, `${userId}/drops`, (name, ok) => markResult(name, ok));
+});
+
+declare function markResult(name: string, ok: boolean): void;
+```
+
+Pasted screenshots have generic names such as `image.png`, which is why the example builds the key from a timestamp instead of the file name.
+
+## Tracking an upload in the interface
+
+An upload has more states than "uploading" and "done", and showing them correctly prevents double submissions and lost files.
+
+| State | Shown as | Allowed actions |
+| --- | --- | --- |
+| Checking | The file's name and a brief spinner | Cancel |
+| Uploading | A progress bar (with signed URLs) or a spinner | Cancel |
+| Saving | "Saving…" while the record is written | None |
+| Done | The file, with its preview | Remove |
+| Failed | The message from the table above | Retry, remove |
+
+Keep the `File` object until the state is Done.
+A retry then needs no new selection from the person.
+
+## Knowing who uploaded what
+
+Storage records which key exists, not who put it there.
+When you need that history, keep it where history belongs:
+
+| Need | Where to keep it |
+| --- | --- |
+| The uploader of each file | In the key's first segment, and in the record that refers to the file |
+| When each file was uploaded | The record's `created_at`, or the object's `modified` |
+| A full audit trail of uploads and deletions | Records written by your upload code, or by a flow, in an audit resource |
+
+Requests themselves, including uploads, appear under **Project → Activity** with their request ids, which helps investigate a single incident but is not meant as a permanent record.
+
+## Public or private
+
+Every bucket is either public, serving objects to anyone who has the URL, or private, serving them only through credentials or signed URLs.
+Decide per bucket by asking what happens if a URL leaks.
+
+| Content | Public or private | Reason |
+| --- | --- | --- |
+| Product photos, logos, marketing images | Public | Meant to be seen; URLs leak by design |
+| Profile pictures | Public, usually | Shown next to names; a leak reveals little |
+| User documents, invoices, contracts | Private | A leaked URL would expose personal or financial data |
+| Exports and reports | Private, with short signed URLs | Often contain many people's data |
+| Files attached to private messages | Private | Visibility should follow the message |
+
+When in doubt, make it private.
+Changing a private bucket to public later is a setting; recovering from a public leak is not.
+
+## Uploads that survive a lost connection
+
+On unreliable networks, an upload can fail halfway, and the person may close the app before retrying.
+Keeping pending uploads in IndexedDB and retrying when the device comes back online turns "failed" into "sent later".
+
+```typescript
+import { get, set, del, keys } from "idb-keyval";
+
+export async function queueUpload(bucket: string, key: string, file: Blob) {
+  await set(`upload:${bucket}:${key}`, file);
+  return flushUploads();
+}
+
+export async function flushUploads() {
+  if (!navigator.onLine) return;
+  for (const id of await keys()) {
+    if (typeof id !== "string" || !id.startsWith("upload:")) continue;
+    const [, bucket, ...rest] = id.split(":");
+    const file = await get(id);
+    try {
+      await pawabase.storage.from(bucket).upload(rest.join(":"), file, { timeoutMs: 0 });
+      await del(id);
+    } catch {
+      return;
+    }
+  }
+}
+
+window.addEventListener("online", () => void flushUploads());
+```
+
+Because uploads to the same key are safe to repeat, retrying a file that actually arrived the first time does no harm.
+
+## Naming downloaded files
+
+When a browser saves a file, it picks a name from the URL or from the response.
+Keys built from ids make poor file names, so give the browser a better one.
+
+For a file you download through the client, the name is yours to choose:
+
+```typescript
+const blob = await pawabase.storage.from("documents").download(record.key);
+const link = Object.assign(document.createElement("a"), { href: URL.createObjectURL(blob), download: record.original_name });
+link.click();
+URL.revokeObjectURL(link.href);
+```
+
+For a URL the browser opens directly, the `download` attribute suggests a name for same-origin URLs; for cross-origin URLs, browsers may ignore it and use the last path segment instead.
+When the name matters, download through the client as above.
+
+## Checking bucket settings in CI
+
+Bucket settings are part of your application's correctness: a missing `accepts` list or a public flag in the wrong place is a bug.
+A test that reads the buckets and asserts their settings catches configuration drift.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+test("buckets are configured as the app expects", async () => {
+  const buckets = await pawabase.storage.listBuckets();
+  const byName = Object.fromEntries(buckets.map((bucket) => [bucket.name, bucket]));
+
+  assert.equal(byName.avatars?.public, true);
+  assert.deepEqual(byName.avatars?.accepts, ["image/png", "image/jpeg", "image/webp"]);
+  assert.equal(byName.documents?.public, false);
+  assert.ok((byName.documents?.max_bytes ?? 0) <= 25 * 1024 * 1024);
+});
+```
+
+Run it against each environment after promotion, with a key that can see the buckets.
+
+## Testing against a real bucket
+
+Policy behavior needs a real environment.
+Give each test run its own prefix, so runs do not collide and cleanup is a single walk.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+const runPrefix = `${testUserId}/test-run-${Date.now()}`;
+
+after(async () => {
+  for await (const file of pawabase.storage.from("documents").listAll({ prefix: runPrefix })) {
+    await pawabase.storage.from("documents").remove(file.key);
+  }
+});
+
+test("a user cannot read another user's document", async () => {
+  await alice.storage.from("documents").upload(`${aliceId}/${runPrefix}/a.txt`, "secret");
+  await assert.rejects(bob.storage.from("documents").downloadText(`${aliceId}/${runPrefix}/a.txt`), { name: "PermissionError" });
+});
+
+declare const pawabase: import("@pawabase/client").PawabaseClient;
+declare const alice: import("@pawabase/client").PawabaseClient;
+declare const bob: import("@pawabase/client").PawabaseClient;
+declare const aliceId: string;
+declare const testUserId: string;
+declare function after(fn: () => Promise<void>): void;
+```
+
+`alice` and `bob` are clients signed in as two test users.
+The assertion checks the exact refusal: a signed-in caller who may not read gets `PermissionError`, not `NotFoundError`.
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Create a bucket and set its policies and limits | **Services → Storage**, then the bucket's settings |
+| Browse objects and upload by hand | **Services → Storage**, open a bucket |
+| See an object's type, size, key and gateway URL | The object's sheet, **Overview** tab, including **Gateway URL** under **Address** |
+| Create a temporary link for one object | The object's sheet, **Sharing** tab, **New temporary link** |
+| Try image transformations and copy the URL | The object's sheet, **Transform** tab |
+| See stored metadata | The object's sheet, **Metadata** tab |
+| See storage use against the plan | **Project → Usage & plan** |
+
+Uploading a file by hand in Studio is a quick way to check a bucket's `accepts` and size limits before writing upload code.
+
+## Coming from supabase-js storage
+
+| supabase-js | @pawabase/client | Note |
+| --- | --- | --- |
+| `storage.listBuckets()` | `storage.listBuckets()` | Returns the list directly |
+| `storage.from(b).upload(path, file)` | `storage.from(b).upload(key, file)` | Always replaces; no `upsert` flag |
+| `.download(path)` | `.download(key)` | Also `downloadText`, `downloadJson`, `downloadStream` |
+| `.list(folder, { limit, offset })` | `.list({ prefix, limit, cursor })` | Cursor paging, with `prefixes` for folders |
+| `.remove([paths])` | `.remove(key)` | One key per call |
+| `.getPublicUrl(path)` | `.getPublicUrl(key)` | Contains the publishable key |
+| `.createSignedUrl(path, seconds)` | `.createSignedUrl(key, { expiresIn })` | Returns `{ url, expires_at, method }` |
+| `.createSignedUploadUrl(path)` | `.createSignedUploadUrl(key, { contentType, maxBytes })` | Can pin type and size |
+| `.uploadToSignedUrl(path, token, file)` | `.uploadToSignedUrl(url, file)` | The URL is the credential |
+| `getPublicUrl(path, { transform })` | Query parameters on the gateway file URL | `width`, `height`, `fit`, `format`, `quality` |
+| Storage RLS on `storage.objects` | Bucket policies per action | Read, write, update, list and delete |
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| `AuthenticationError` on upload | Signed out, and the write policy needs a user | Sign in first, or relax the policy if intended |
+| `PermissionError` on upload of an existing key | The update policy refuses replacements | Upload to a new key, or change `update_policy` |
+| `ApiError` 400 mentioning the type | The content type is not in `accepts` | Check the file, or the `contentType` option |
+| `ApiError` 400 mentioning the size | Larger than the bucket's `max_bytes` | Compress, or raise the limit |
+| `PayloadTooLargeError` | Larger than the gateway or the signed URL allows | Use a signed upload URL with a larger `maxBytes`, or split the file |
+| An `<img>` from `getPublicUrl` does not load | The bucket is not public | Use a signed URL, or make the bucket public |
+| The gateway file URL answers `404` | The bucket is private, or the environment name in the URL is wrong | Check both |
+| A replaced image still shows the old picture | Caching | Versioned keys, or `?v=<etag>` |
+| `TimeoutError` on large uploads | The 30-second default timeout | `timeoutMs: 0` for uploads |
+| `ConfigError: A storage key cannot be empty` | A key built from an empty variable | Check the variable before uploading |
+| A listing shows fewer files than expected | Another page follows | Use `cursor`, or `listAll` |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Is there a size limit for uploads?">
+    Each bucket has `max_bytes`, and the environment and gateway have their own limits.
+    The smallest applies.
+    `listBuckets()` reports the bucket's limit.
+  </Accordion>
+  <Accordion title="Can I rename or move an object?">
+    Not with the client's storage module.
+    Download and upload under the new key, then remove the old one; or, on a server, use the management module's `buckets.moveObject`.
+  </Accordion>
+  <Accordion title="Can I attach metadata to an object?">
+    The client stores the content type.
+    Keep other metadata, such as the original file name or a caption, in a record that holds the key.
+  </Accordion>
+  <Accordion title="Does deleting a bucket's files happen when I delete the bucket?">
+    Buckets are managed in Studio or with the management module, and what happens to their objects is decided there.
+    The client's storage module never deletes buckets.
+  </Accordion>
+  <Accordion title="Can anonymous visitors upload?">
+    Only if the bucket's write policy admits them, such as `public`.
+    That is rarely wise; prefer signed upload URLs issued by a server that checks what is being uploaded.
+  </Accordion>
+  <Accordion title="Can I limit how many files one person uploads?">
+    Not with bucket settings alone.
+    Count a person's files with `list` or keep a counter in a record, and refuse in a custom route or signed-upload issuer when the limit is reached.
+  </Accordion>
+  <Accordion title="Are uploads encrypted?">
+    Traffic to the gateway is encrypted with TLS.
+    Encryption at rest depends on the storage driver: the disk or the S3-compatible service the installation uses.
+  </Accordion>
+  <Accordion title="Can two people upload to the same key at the same time?">
+    Yes; the last upload to finish wins.
+    Use keys that include something unique, such as an id or a timestamp, when collisions would lose data.
+  </Accordion>
+  <Accordion title="Why does my signed URL work in the browser but not in my server code?">
+    Calling a signed URL must send no API key or token.
+    Use `uploadToSignedUrl`, or a plain `fetch` with no extra headers, rather than `pawabase.request`.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Buckets" icon="folder" href="/storage/buckets">Every bucket setting.</Card>
+  <Card title="Bucket access" icon="shield" href="/storage/access">Per-action policies and patterns.</Card>
+  <Card title="Downloads" icon="download" href="/storage/downloads">Gateway file URLs, ranges and caching.</Card>
+  <Card title="Transformations" icon="image" href="/storage/transformations">Resizing and re-encoding images.</Card>
+  <Card title="Share links" icon="link" href="/storage/share-links">Revocable links for people without accounts.</Card>
+  <Card title="Environment management" icon="settings" href="/clients/typescript/management">Bucket administration with a secret key.</Card>
+</CardGroup>

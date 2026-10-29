@@ -1,0 +1,1876 @@
+---
+title: "Authentication"
+description: "How the TypeScript client signs people in and keeps them signed in: the session and its refresh rules, every sign-in method, MFA, emailed links, the user's profile, sessions, devices, personal keys and organizations."
+icon: "key-round"
+---
+
+`pawabase.auth` is everything about the person using your application.
+It signs them up and in, keeps their session alive, and lets them manage their own account: profile, password, second factors, devices, sessions, personal API keys and the organizations they belong to.
+
+This page starts with the session, because every other auth feature either creates one, changes one or depends on one.
+Then it covers each way of signing in, the account features, organizations, and the patterns that tie them into screens.
+
+## The mental model
+
+A **session** is three things the auth service gives a person when they sign in:
+
+| Part | What it is | Lifetime |
+| --- | --- | --- |
+| Access token | A signed token sent as `Authorization: Bearer …` on every request | 15 minutes by default |
+| Refresh token | A single-use token exchanged for a new session | Until used, revoked, or the session ends |
+| User | The person's record: id, email, roles, metadata | A copy, refreshed when you ask |
+
+The client is the session's owner.
+It stores the session, attaches the access token to requests, exchanges the refresh token before the access token expires, and tells your code when any of this changes.
+Your code mostly reacts to those changes; it rarely handles tokens directly.
+
+Every session belongs to one environment.
+A person who signs up in `development` does not exist in `production`; they are different users in different databases.
+
+```text
+signed out ──sign in──▶ signed in ──refresh──▶ signed in (new tokens) ──sign out──▶ signed out
+                            │                                                ▲
+                            └── refresh token refused (revoked, reused) ─────┘
+```
+
+The client is in one of three states at any moment from your code's point of view:
+
+| State | How you know | What to render |
+| --- | --- | --- |
+| Unknown | No `INITIAL_SESSION` event yet | A neutral loading state |
+| Signed out | The session is `null` | Public pages and sign-in |
+| Signed in | The session has a user | The app |
+
+The unknown state exists because reading the stored session is asynchronous.
+Treating it as "signed out" bounces signed-in people to the sign-in page on every reload.
+
+## Where authentication is configured
+
+Authentication is configured per environment in Studio under **Access → Users & auth**.
+The page has five tabs: **Users**, **Roles**, **Organizations**, **Sign-in activity** and **Configuration**.
+
+The **Configuration** tab decides which methods the client can use:
+
+| Setting | Effect on the client |
+| --- | --- |
+| Sign-up enabled | `signUp` works, or answers `403 sign-up is disabled` |
+| Email verification required | `signUp` returns no session, and password sign-in refuses unverified accounts with `403` |
+| Magic links | `signInWithMagicLink` sends an email, or is refused |
+| Social providers | Which names `signInWithOAuth` accepts |
+| MFA | Whether second factors can be enrolled, and whether they are required |
+| Password policy | The minimum length and rules `signUp`, `resetPassword` and `updateUser` enforce |
+| Site URL and allowed redirect URLs | Where emailed links point, and which `redirectTo` values are accepted |
+
+`pawabase.auth.settings()` reads the public part of this configuration, without a session.
+Use it to decide what your sign-in screen shows, instead of hard-coding it:
+
+<CodeGroup>
+```typescript TypeScript
+const settings = await pawabase.auth.settings();
+
+const showSignUp = settings.signup_enabled;
+const showMagicLink = settings.magic_link_enabled;
+const providers = settings.providers;            // ["github", "google"]
+const minPassword = settings.password_policy.min_length;
+```
+
+```python Python
+settings = pb.auth.settings()
+
+show_sign_up = settings["signup_enabled"]
+show_magic_link = settings["magic_link_enabled"]
+providers = settings["providers"]
+min_password = settings["password_policy"]["min_length"]
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/settings" -H "apikey: $PAWABASE_KEY"
+```
+</CodeGroup>
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `signup_enabled` | `boolean` | New accounts may be created |
+| `email_verification_required` | `boolean` | Accounts must confirm their email before password sign-in |
+| `magic_link_enabled` | `boolean` | One-time email links are offered |
+| `mfa_enabled` | `boolean` | Second factors are available |
+| `providers` | `string[]` | Social providers configured for this environment |
+| `password_policy` | `{ kind, min_length }` | The rules a new password must satisfy |
+
+## The session in code
+
+### Listening for changes
+
+`onAuthStateChange(listener)` is the one subscription most apps need.
+The listener receives an event name and the current session.
+
+<CodeGroup>
+```typescript TypeScript
+const { unsubscribe } = pawabase.auth.onAuthStateChange((event, session) => {
+  console.log(event, session?.user.email ?? "signed out");
+});
+```
+
+```python Python
+unsubscribe = pb.auth.on_auth_state_change(
+    lambda event, session: print(event, session.user["email"] if session else "signed out")
+)
+# Python listeners receive SIGNED_IN, SIGNED_OUT, TOKEN_REFRESHED and USER_UPDATED; there is no INITIAL_SESSION.
+```
+</CodeGroup>
+
+| Event | When |
+| --- | --- |
+| `INITIAL_SESSION` | Once, shortly after you subscribe, when the stored session has been read |
+| `SIGNED_IN` | A sign-in, a sign-up that created a session, an adopted session, or another tab signing in |
+| `TOKEN_REFRESHED` | New tokens, from a refresh here or in another tab |
+| `USER_UPDATED` | After `updateUser` |
+| `SIGNED_OUT` | `signOut`, a refused refresh token, or another tab signing out |
+
+A listener that throws, or returns a rejected promise, is ignored.
+Auth state changes are never interrupted by a bug in a listener.
+
+Every listener gets `INITIAL_SESSION`, even one added long after startup.
+That makes listeners safe to add from components that mount late.
+
+### Reading the session
+
+| Method | Network | Returns |
+| --- | --- | --- |
+| `getSession()` | Only to refresh an expiring token | The current session, or `null` |
+| `getAccessToken()` | Only to refresh | The access token, or `null` |
+| `getCachedUser()` | None | The user as of the last sign-in, refresh or `getUser()`, or `null` |
+| `getUser()` | One request | The user, fresh from the server |
+| `initialized()` | None | Resolves when the stored session has been read |
+
+`getSession()` refreshes before returning when the token is within the refresh margin of expiring.
+If that refresh fails because the network is down and the token has not actually expired yet, it returns the existing session; if the token has expired and the refresh fails for a reason that may pass, it throws.
+If the server refused the refresh token, the session is cleared and it returns `null`.
+
+`getCachedUser()` is the right call for rendering a name or an avatar.
+`getUser()` is the right call when something about the user may have changed elsewhere, such as roles assigned by an administrator.
+
+### How refresh works
+
+Pawabase rotates refresh tokens.
+Each refresh consumes the refresh token and issues a new pair.
+If a consumed refresh token is presented again, the auth service treats it as stolen and revokes the whole session.
+
+That rule protects users, and it means two refreshes of the same session must never race.
+The client guarantees this at three levels:
+
+| Level | Mechanism |
+| --- | --- |
+| Within one client | Concurrent callers share one in-flight refresh |
+| Across tabs | The Web Locks API serializes refreshes for the same storage key; the second tab finds the new tokens already stored and uses them |
+| Across reloads | The session is written to storage before the refresh promise resolves |
+
+When does the client refresh?
+
+| Trigger | Behavior |
+| --- | --- |
+| A timer, `refreshMarginSeconds` (60) before expiry | Refreshes in the background |
+| A request finds the token expiring | Refreshes before sending |
+| A request gets `401` | Refreshes once and repeats the request |
+| A hidden tab becomes visible with an expiring token | Refreshes |
+| The realtime socket's token is refused | Refreshes once and reconnects |
+
+When a refresh fails:
+
+| Failure | Result |
+| --- | --- |
+| The server refuses the refresh token (`400`, `401`, `403`) | The session is cleared; listeners get `SIGNED_OUT` |
+| The network is down, or the server errors | The session is kept; the timer tries again 10 seconds later |
+
+The Web Locks behavior across tabs has been verified with a simulated browser, not a real one.
+Browsers without Web Locks still avoid most races, because each tab adopts tokens another tab stored, but two tabs refreshing in the same few milliseconds could collide.
+
+### Adopting a session from elsewhere
+
+`setSession({ access_token, refresh_token })` makes the client use tokens you obtained another way: from a server-rendered page, a mobile deep link, or another process.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.setSession({ access_token, refresh_token });
+```
+
+```python Python
+pb.auth.set_session(access_token, refresh_token)
+```
+
+```bash cURL
+# Adopting tokens is client-side; the client confirms them by reading the user:
+curl "$PAWABASE_URL/auth/v1/user" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+</CodeGroup>
+
+The client reads the expiry from the access token, fetches the user with it, stores the session and emits `SIGNED_IN`.
+Both tokens are required; a session without a refresh token cannot be kept alive.
+
+## Signing up
+
+`signUp(input)` creates an account.
+
+<CodeGroup>
+```typescript TypeScript
+const result = await pawabase.auth.signUp({
+  email: "ada@example.com",
+  password: "correct horse battery staple",
+  name: "Ada Lovelace",
+  data: { plan: "free", referral: "newsletter" },
+  redirectTo: "https://app.example.com/welcome",
+});
+
+if (result.verificationRequired) {
+  showMessage(`We sent a confirmation link to ${result.user.email}.`);
+} else {
+  navigate("/app");
+}
+```
+
+```python Python
+result = pb.auth.sign_up(
+    email="ada@example.com",
+    password="correct horse battery staple",
+    name="Ada Lovelace",
+    data={"plan": "free", "referral": "newsletter"},
+    redirect_to="https://app.example.com/welcome",
+)
+
+if result.verification_required:
+    show_message(f"We sent a confirmation link to {result.user['email']}.")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/signup" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{
+  "email": "ada@example.com", "password": "correct horse battery staple", "name": "Ada Lovelace",
+  "data": {"plan": "free"}, "redirect_to": "https://app.example.com/welcome"
+}'
+# → a session, or {"verification_required": true, "user": {…}}
+```
+</CodeGroup>
+
+| Input | Required | Meaning |
+| --- | --- | --- |
+| `email` | Yes | The account's address |
+| `password` | Yes | Checked against the environment's password policy |
+| `username` | No | A username, if the environment uses them |
+| `name` | No | The display name |
+| `data` | No | The initial `user_metadata`, which the user can edit later |
+| `redirectTo` | No | Where the confirmation link sends the user; must be an allowed redirect URL |
+
+| Result field | Meaning |
+| --- | --- |
+| `user` | The new user |
+| `session` | The session, or `null` when the address must be confirmed first |
+| `verificationRequired` | `true` when a confirmation email was sent and no session was created |
+
+When verification is not required, the user is signed in immediately and listeners get `SIGNED_IN`.
+
+`data` becomes `user_metadata`, which the user can change at any time.
+Never put anything in it that grants access.
+A plan, a role or a tenant that controls what the user may do belongs in `app_metadata` or roles, set by an administrator or a server; see [User administration](/clients/typescript/user-administration).
+
+| Error | Cause |
+| --- | --- |
+| `PermissionError`, `sign-up is disabled` | The environment does not allow sign-up |
+| `ValidationError` | The email is malformed or the password does not meet the policy |
+| `RateLimitError` | Too many sign-ups from this address in a short time |
+
+## Signing in with a password
+
+`signInWithPassword({ email, password, org? })` returns one of two results.
+
+<CodeGroup>
+```typescript TypeScript
+const result = await pawabase.auth.signInWithPassword({ email, password });
+
+if (result.status === "signed_in") {
+  navigate("/app");
+} else {
+  // result.status === "mfa_required"
+  showMfaPrompt(result.factors, (code) => result.verify(code));
+}
+```
+
+```python Python
+result = pb.auth.sign_in_with_password(email=email, password=password)
+
+if result.status == "signed_in":
+    go_to_app()
+else:  # "mfa_required"
+    show_mfa_prompt(result.factors, result.verify)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"grant_type": "password", "email": "ada@example.com", "password": "…"}'
+```
+</CodeGroup>
+
+| `status` | Fields | Meaning |
+| --- | --- | --- |
+| `signed_in` | `session` | The user is signed in; listeners got `SIGNED_IN` |
+| `mfa_required` | `mfaToken`, `factors`, `verify(code)` | The password was right; a second factor is needed |
+
+`org` asks for tokens issued for one of the user's organizations from the start, so policies that test `$auth.org` work on the first request.
+
+The answers that are not a success are worth handling one by one, because each needs a different message:
+
+| Server answer | Client error | What to tell the person |
+| --- | --- | --- |
+| `401` | `AuthenticationError` | The email or password is wrong |
+| `403 this account is disabled` | `PermissionError` | The account is not available; offer support |
+| `403 confirm your email address first` | `PermissionError` | Check your email, with a resend button |
+| `429 too many failed attempts` | `RateLimitError` | The account is temporarily locked; try again later |
+
+A locked account answers `429` even when the password is right.
+The lock is a counter of failed attempts on the account, shared by passwords and second-factor codes, and it expires on its own after a period the installation sets.
+The client treats `429` as retryable, so it repeats the request up to twice before throwing; while the account is locked, every attempt is refused the same way, and nothing worse happens.
+
+### Finishing a sign-in that needs MFA
+
+When `status` is `mfa_required`, the password was correct and the auth service is waiting for a second factor.
+`factors` lists what the account has, such as `["totp"]` or `["email"]`.
+
+`verify(code)` finishes the sign-in with a code from an authenticator app, a code from the email factor, or one of the account's recovery codes.
+
+<CodeGroup>
+```typescript TypeScript
+const session = await result.verify("492817");
+```
+
+```python Python
+session = result.verify("492817")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"grant_type": "mfa", "mfa_token": "…", "code": "492817"}'
+```
+</CodeGroup>
+
+For the email factor, the code must be sent first:
+
+<CodeGroup>
+```typescript TypeScript
+if (result.factors.includes("email")) {
+  await pawabase.auth.mfa.challenge(result.mfaToken);
+}
+```
+
+```python Python
+if "email" in result.factors:
+    pb.auth.mfa.challenge(result.mfa_token)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/mfa/challenge" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"mfa_token": "…"}'
+```
+</CodeGroup>
+
+`verifyMfa({ mfaToken, code, org? })` is the same as `verify`, for code that kept the token rather than the result object.
+
+The MFA token authorizes nothing on its own.
+It cannot be sent as a bearer token; it only finishes this sign-in.
+
+### When the environment requires MFA
+
+An environment can require a second factor for everyone.
+A person who has none yet then signs in with a password and is held until they set one up.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.mfa.startSetup({ mfaToken: result.mfaToken, method: "totp" });
+// show the QR code from the response, ask for the first code
+const done = await pawabase.auth.mfa.completeSetup({ mfaToken: result.mfaToken, code });
+```
+
+```python Python
+pb.auth.mfa.start_setup(mfa_token=result.mfa_token, method="totp")
+# show the QR code from the response, ask for the first code
+done = pb.auth.mfa.complete_setup(mfa_token=result.mfa_token, code=code)
+# The Python client stores the new session itself when the answer carries tokens.
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/mfa/setup/start" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"mfa_token": "…", "method": "totp"}'
+curl -X POST "$PAWABASE_URL/auth/v1/mfa/setup/complete" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"mfa_token": "…", "code": "123456"}'
+```
+</CodeGroup>
+
+`startSetup` begins enrolment for `totp` or `email` and returns what the user needs to enroll.
+`completeSetup` confirms the first code and returns the new tokens and the one-time recovery codes.
+
+`completeSetup` returns the tokens but does not store them.
+Adopt them with `setSession` so the client keeps the new session:
+
+```typescript
+const done = (await pawabase.auth.mfa.completeSetup({ mfaToken, code })) as {
+  access_token?: string;
+  refresh_token?: string;
+  recovery_codes?: string[];
+};
+if (done.access_token && done.refresh_token) {
+  await pawabase.auth.setSession({ access_token: done.access_token, refresh_token: done.refresh_token });
+}
+showRecoveryCodesOnce(done.recovery_codes ?? []);
+```
+
+## Signing in with an emailed link
+
+A magic link is a one-time sign-in link sent by email.
+It suits applications where people sign in rarely and forget passwords.
+
+`signInWithMagicLink({ email, redirectTo?, createUser? })` sends the email.
+It resolves the same way whether or not an account exists, so it cannot be used to discover which addresses are registered.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.signInWithMagicLink({ email, redirectTo: "https://app.example.com/app" });
+showMessage("Check your email for a sign-in link.");
+```
+
+```python Python
+pb.auth.sign_in_with_magic_link(email=email, redirect_to="https://app.example.com/app")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/magic-link" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"email": "ada@example.com", "redirect_to": "https://app.example.com/app"}'
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `redirectTo` | Where the person should end up after signing in; must be an allowed redirect URL |
+| `createUser` | Whether an unknown address creates an account; the environment's sign-up setting still applies |
+
+The link in the email points to your site, at `{site_url}/auth/callback?token=…&type=magic`.
+Your callback page reads the token and exchanges it:
+
+<CodeGroup>
+```typescript TypeScript
+const params = new URLSearchParams(location.search);
+if (params.get("type") === "magic") {
+  const result = await pawabase.auth.verifyMagicLink(params.get("token")!);
+  if (result.status === "mfa_required") showMfaPrompt(result.factors, result.verify);
+}
+```
+
+```python Python
+# token from {site_url}/auth/callback?token=…&type=magic
+result = pb.auth.verify_magic_link(token)
+if result.status == "mfa_required":
+    show_mfa_prompt(result.factors, result.verify)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/magic-link/verify" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"token": "…"}'
+```
+</CodeGroup>
+
+`verifyMagicLink` returns the same result as a password sign-in, because an account with MFA still needs its second factor.
+
+When the environment has no site URL, the link points to the auth service's own hosted page instead.
+The same callback page can handle verification and recovery links too, by switching on `type`; see [One callback page for every emailed link](#one-callback-page-for-every-emailed-link).
+
+## Signing in with a social provider
+
+Social sign-in sends the browser to a provider such as GitHub or Google, then back to your app with a session.
+
+```typescript
+const pawabase = createClient({ url, apiKey: publishableKey, environment: "production" });
+
+pawabase.auth.signInWithOAuth("github", { redirectTo: `${location.origin}/app` });
+```
+
+`signInWithOAuth` redirects the current page.
+`signInWithOAuthUrl` returns the URL instead, for code that opens it differently, such as a popup or a system browser on mobile.
+
+<CodeGroup>
+```typescript TypeScript
+const url = pawabase.auth.signInWithOAuthUrl("google", { redirectTo: "myapp://auth" });
+```
+
+```python Python
+url = pb.auth.oauth_url("google", redirect_to="myapp://auth")   # uses the client's environment
+```
+
+```bash cURL
+# The URL the browser visits:
+# $PAWABASE_URL/auth/v1/authorize/production/google?redirect_to=myapp%3A%2F%2Fauth&apikey=pb_pk_…
+```
+</CodeGroup>
+
+Two requirements are checked before any redirect:
+
+| Requirement | Why | Error when missing |
+| --- | --- | --- |
+| `environment` in the client options, or a signed-in session | The authorization URL is `/auth/v1/authorize/<environment>/<provider>` | `ConfigError` |
+| A publishable key | The key travels in the URL | `ConfigError` for a secret key |
+
+After the provider, the auth service redirects to `redirectTo` with the result in the URL fragment.
+In browsers, the client reads it automatically on startup.
+In apps, or when `detectSessionInUrl` is off, call `getSessionFromUrl(url)`:
+
+```typescript
+const result = await pawabase.auth.getSessionFromUrl(incomingUrl);
+```
+
+| `status` | Fragment | Meaning |
+| --- | --- | --- |
+| `signed_in` | `#access_token=…&refresh_token=…` | The session is stored |
+| `mfa_required` | `#mfa_required=1&mfa_token=…` | Call `result.verify(code)` |
+| `linked` | `#linked=<provider>` | A provider was linked to the signed-in account |
+| `error` | `#error=…` | The provider or the auth service refused; show `result.error` |
+| `none` | no fragment | Nothing to do |
+
+When reading from the current page, the client removes the fragment from the address bar, so tokens do not linger in history or get copied with the URL.
+
+### Exchanging a code
+
+Some sign-in flows return a short-lived code instead of tokens, so that tokens never appear in a URL.
+`exchangeCode(code, codeVerifier?)` trades the code for a session.
+When the flow began with a PKCE `code_challenge`, pass the matching verifier.
+
+<CodeGroup>
+```typescript TypeScript
+const session = await pawabase.auth.exchangeCode(code, verifier);
+```
+
+```python Python
+session = pb.auth.exchange_code(code, code_verifier=verifier)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token/exchange" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"code": "…", "code_verifier": "…"}'
+```
+</CodeGroup>
+
+## Confirming an email address
+
+When the environment requires verification, a new account receives a confirmation email.
+Its link is `{site_url}/auth/callback?token=…&type=verify`.
+
+<CodeGroup>
+```typescript TypeScript
+if (params.get("type") === "verify") {
+  await pawabase.auth.verifyEmail(params.get("token")!);
+  navigate("/app");
+}
+```
+
+```python Python
+pb.auth.verify_email(token)   # confirms the address and signs the person in
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/verify" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"token": "…"}'
+```
+</CodeGroup>
+
+`verifyEmail` confirms the address and signs the person in.
+
+`resendVerification({ email, redirectTo? })` sends the email again.
+It resolves the same way whether or not the address exists.
+
+## Recovering a password
+
+`requestPasswordReset({ email, redirectTo? })` sends a reset email.
+Like the other email methods, it resolves the same way for unknown addresses.
+
+The link is `{site_url}/auth/callback?token=…&type=recovery`.
+Your page asks for a new password and calls `resetPassword`:
+
+<CodeGroup>
+```typescript TypeScript
+const session = await pawabase.auth.resetPassword({ token, password: newPassword });
+```
+
+```python Python
+pb.auth.request_password_reset(email="ada@example.com", redirect_to="https://app.example.com/reset")
+session = pb.auth.reset_password(token=token, password=new_password)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/recover" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"email": "ada@example.com"}'
+curl -X POST "$PAWABASE_URL/auth/v1/recover/confirm" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"token": "…", "password": "…"}'
+```
+</CodeGroup>
+
+`resetPassword` sets the new password, ends every other session of the account, and signs this one in.
+Ending other sessions matters: if someone else had access to the account, the reset removes it.
+
+## The signed-in user
+
+### Reading the user
+
+<CodeGroup>
+```typescript TypeScript
+const user = await pawabase.auth.getUser();
+console.log(user.email, user.roles, user.mfa_enabled, user.aal);
+```
+
+```python Python
+user = pb.auth.get_user()
+print(user["email"], user["roles"], user["mfa_enabled"], user.get("aal"))
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/user" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+`getUser()` also refreshes the cached copy in the session, so `getCachedUser()` returns the new values afterwards.
+
+The two metadata fields deserve a clear rule:
+
+| Field | Who can change it | Use it for | Never use it for |
+| --- | --- | --- | --- |
+| `user_metadata` | The user, with `updateUser` | Preferences, profile details, display settings | Access decisions |
+| `app_metadata` | Administrators and servers with a secret key | Plan, account flags, external ids | Data the user should edit |
+
+Policies can read `app_metadata` through `$auth.claims.app.*` and can trust it.
+They can also read `user_metadata` through `$auth.claims.meta.*`, and must not trust it.
+
+### Updating the user
+
+`updateUser(input)` changes the profile, the password or the email.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.updateUser({ name: "Ada King", data: { theme: "dark" } });
+```
+
+```python Python
+pb.auth.update_user(name="Ada King", data={"theme": "dark"})
+```
+
+```bash cURL
+curl -X PATCH "$PAWABASE_URL/auth/v1/user" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"name": "Ada King", "data": {"theme": "dark"}}'
+```
+</CodeGroup>
+
+| Input | Meaning |
+| --- | --- |
+| `name`, `avatar_url` | Profile fields |
+| `data` | Merged into `user_metadata` |
+| `password` | A new password |
+| `current_password` | Required with `password` when the account already has a password |
+| `email` | Starts an email change; a confirmation goes to the new address |
+
+After the update, the client fetches the user again, emits `USER_UPDATED`, and returns the fresh user.
+
+Changing the email does not change it immediately.
+The new address receives a link, and `confirmEmailChange(token)` completes the change when the person follows it.
+
+## Linked sign-in methods
+
+A person can link several providers to one account, so they can sign in with any of them.
+
+<CodeGroup>
+```typescript TypeScript
+const url = await pawabase.auth.linkIdentityUrl("github", { redirectTo: `${location.origin}/settings/security` });
+location.assign(url);
+```
+
+```python Python
+url = pb.auth.link_identity_url("github", redirect_to="https://app.example.com/settings/security")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/identities/link?provider=github&redirect_to=https%3A%2F%2Fapp.example.com%2Fsettings" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+After the provider, the browser returns with `#linked=github`, which `getSessionFromUrl` reports as `{ status: "linked", provider: "github" }`.
+
+<CodeGroup>
+```typescript TypeScript
+const identities = await pawabase.auth.identities();
+await pawabase.auth.unlinkIdentity(identities[0].id);
+```
+
+```python Python
+identities = pb.auth.identities()
+pb.auth.unlink_identity(identities[0]["id"])
+```
+
+```bash cURL
+curl -X DELETE "$PAWABASE_URL/auth/v1/identities/$IDENTITY_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+`identities()` lists the linked providers with their email and last sign-in.
+`unlinkIdentity(id)` removes one.
+
+## Second factors
+
+`pawabase.auth.mfa` manages the signed-in person's second factors.
+
+| Method | Purpose |
+| --- | --- |
+| `status()` | `{ enabled, aal, recovery_codes_remaining }` |
+| `enroll()` | Start enrolling an authenticator app: `{ factor_id, secret, otpauth_uri }` |
+| `verifyEnrollment(code)` | Confirm with a first code; returns one-time `recovery_codes` |
+| `enrollEmail()` | Start using emailed codes as a factor |
+| `challenge(mfaToken)` | Send the emailed code during a sign-in |
+| `disable(code)` | Turn MFA off, with a current code |
+| `regenerateRecoveryCodes(code)` | Replace the recovery codes, with a current code |
+
+Enrolling an authenticator is two calls with a QR code in between:
+
+<CodeGroup>
+```typescript TypeScript
+const enrollment = await pawabase.auth.mfa.enroll();
+renderQrCode(enrollment.otpauth_uri);
+showSecretForManualEntry(enrollment.secret);
+
+const { recovery_codes } = await pawabase.auth.mfa.verifyEnrollment(codeFromApp);
+showRecoveryCodesOnce(recovery_codes);
+```
+
+```python Python
+enrollment = pb.auth.mfa.enroll()
+render_qr_code(enrollment["otpauth_uri"])
+
+codes = pb.auth.mfa.verify_enrollment(code_from_app)["recovery_codes"]
+show_recovery_codes_once(codes)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/mfa/totp/enroll" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl -X POST "$PAWABASE_URL/auth/v1/mfa/totp/verify" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"code": "123456"}'
+```
+</CodeGroup>
+
+After `verifyEnrollment`, the client refreshes the session so it carries `aal2`, the assurance level of a session that has passed a second factor.
+Policies that require `aal2` then admit the session without a new sign-in.
+
+Recovery codes are shown once, at enrolment and when regenerated.
+They are stored hashed and cannot be displayed again.
+Make the person save them before leaving the screen.
+
+## Sessions and sign-in history
+
+`pawabase.auth.sessions` lets a person see and end their own sessions on other devices.
+
+<CodeGroup>
+```typescript TypeScript
+const sessions = await pawabase.auth.sessions.list();
+for (const s of sessions) {
+  console.log(s.current ? "this device" : s.user_agent, s.ip, s.last_refreshed_at);
+}
+
+await pawabase.auth.sessions.revoke(lostPhoneSessionId);
+const history = await pawabase.auth.sessions.history();
+```
+
+```python Python
+for s in pb.auth.sessions.list():
+    print("this device" if s["current"] else s["user_agent"], s["ip"], s["last_refreshed_at"])
+
+pb.auth.sessions.revoke(lost_phone_session_id)
+history = pb.auth.sessions.history()
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/sessions" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl -X DELETE "$PAWABASE_URL/auth/v1/sessions/$SESSION_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl "$PAWABASE_URL/auth/v1/history" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+| Field of a session | Meaning |
+| --- | --- |
+| `id` | The session's id |
+| `method` | How it was started: password, magic link, a provider |
+| `aal` | Its assurance level |
+| `ip`, `user_agent` | Where it was started |
+| `created_at`, `last_refreshed_at` | When it started and last refreshed |
+| `current` | Whether it is the session making the request |
+
+`history()` lists recent sign-in events with their outcome, method and reason, which is the data behind a "recent activity" screen.
+
+### Signing out
+
+`signOut({ scope })` ends sessions.
+
+| `scope` | Ends | This client's session |
+| --- | --- | --- |
+| `local` (default) | This session | Cleared |
+| `others` | Every other session of the account | Kept |
+| `global` | Every session of the account | Cleared |
+
+The local session is cleared even if the server cannot be reached, so "sign out" always works from the person's point of view.
+A network failure is still thrown after clearing, so you can tell the person that other devices may still be signed in.
+
+## Devices
+
+`pawabase.auth.devices` lists browsers and apps the person has signed in from, and forgets one.
+
+<CodeGroup>
+```typescript TypeScript
+const devices = await pawabase.auth.devices.list();
+await pawabase.auth.devices.forget(deviceId);
+```
+
+```python Python
+devices = pb.auth.devices.list()
+pb.auth.devices.forget(device_id)
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/user/devices" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl -X DELETE "$PAWABASE_URL/auth/v1/user/devices/$DEVICE_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+## Personal API keys
+
+A person can create API keys that act as themselves, for scripts and integrations.
+These are different from the environment's project keys: they carry the person's identity, so the person's policies apply.
+
+<CodeGroup>
+```typescript TypeScript
+const key = await pawabase.auth.apiKeys.create({
+  name: "Spreadsheet sync",
+  scopes: ["resource:read"],
+  expiresInDays: 90,
+});
+showSecretOnce(key.secret);
+```
+
+```python Python
+key = pb.auth.api_keys.create(name="Spreadsheet sync", scopes=["resource:read"], expires_in_days=90)
+show_secret_once(key["secret"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/user/api-keys" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"name": "Spreadsheet sync", "scopes": ["resource:read"], "expires_in_days": 90}'
+```
+</CodeGroup>
+
+| Input | Meaning |
+| --- | --- |
+| `name` | A label the person recognizes |
+| `scopes` | What the key may do; empty means everything the person may do |
+| `expiresInDays` | When it stops working |
+| `org` | The organization the key acts in |
+
+The secret is in the response once and never again.
+`apiKeys.list()` shows the person's keys without secrets, and `apiKeys.revoke(id)` ends one.
+
+## Organizations
+
+Organizations let one person belong to several groups, such as companies, teams or households, with a role in each.
+They are how multi-tenant applications are usually built on Pawabase: records carry an organization, and policies compare it with the organization in the caller's token.
+
+`pawabase.auth.orgs` is the signed-in person's view of their organizations.
+What they may do in each depends on their role there.
+
+| Role | Typical rights |
+| --- | --- |
+| `viewer` | Read the organization |
+| `member` | Read, and take part in what the application allows members to do |
+| `admin` | Manage members and invitations |
+| `owner` | Everything, including deleting the organization |
+
+### Listing and creating
+
+<CodeGroup>
+```typescript TypeScript
+const orgs = await pawabase.auth.orgs.list();
+for (const org of orgs) console.log(org.slug, org.name, org.role);
+
+const acme = await pawabase.auth.orgs.create({ slug: "acme", name: "Acme Ltd" });
+```
+
+```python Python
+for org in pb.auth.orgs.list():
+    print(org["slug"], org["name"], org["role"])
+
+acme = pb.auth.orgs.create(slug="acme", name="Acme Ltd")
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/orgs" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl -X POST "$PAWABASE_URL/auth/v1/orgs" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"slug": "acme", "name": "Acme Ltd"}'
+```
+</CodeGroup>
+
+The person who creates an organization becomes its owner.
+`get(slug)`, `update(slug, { name, metadata })` and `delete(slug)` read, change and remove one, subject to the caller's role.
+
+### Members
+
+<CodeGroup>
+```typescript TypeScript
+const members = await pawabase.auth.orgs.members("acme");
+await pawabase.auth.orgs.setMemberRole("acme", userId, "admin");
+await pawabase.auth.orgs.removeMember("acme", userId);
+```
+
+```python Python
+members = pb.auth.orgs.members("acme")
+pb.auth.orgs.set_member_role("acme", user_id, "admin")
+pb.auth.orgs.remove_member("acme", user_id)
+```
+
+```bash cURL
+curl "$PAWABASE_URL/auth/v1/orgs/acme/members" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+curl -X PUT "$PAWABASE_URL/auth/v1/orgs/acme/members/$USER_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"role": "admin"}'
+curl -X DELETE "$PAWABASE_URL/auth/v1/orgs/acme/members/$USER_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+Each member has `user_id`, `email`, `name` and `role`.
+
+### Invitations
+
+An admin invites someone by email.
+The invitation email carries a token; the invited person signs in, or signs up, and accepts it.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.orgs.invite("acme", { email: "grace@example.com", role: "member", redirectTo: "https://app.example.com/join" });
+
+const pending = await pawabase.auth.orgs.invitations("acme");
+await pawabase.auth.orgs.revokeInvitation("acme", pending[0].id);
+```
+
+```python Python
+pb.auth.orgs.invite("acme", email="grace@example.com", role="member", redirect_to="https://app.example.com/join")
+
+pending = pb.auth.orgs.invitations("acme")
+pb.auth.orgs.revoke_invitation("acme", pending[0]["id"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/orgs/acme/invitations" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "grace@example.com", "role": "member"}'
+```
+</CodeGroup>
+
+<CodeGroup>
+```typescript TypeScript
+// On the page the invitation link opens, after the person is signed in:
+await pawabase.auth.orgs.acceptInvitation(tokenFromLink);
+await pawabase.auth.switchOrg("acme");
+```
+
+```python Python
+pb.auth.orgs.accept_invitation(token_from_link)
+pb.auth.switch_org("acme")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/invitations/accept" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"token": "…"}'
+```
+</CodeGroup>
+
+Accepting requires a signed-in person.
+If they arrive signed out, keep the token, take them through sign-in or sign-up, then accept.
+`redirectTo` must be one of the environment's allowed redirect URLs.
+
+### Teams
+
+Teams are groups inside an organization, for permissions finer than the organization role.
+
+<CodeGroup>
+```typescript TypeScript
+const teams = await pawabase.auth.orgs.teams("acme");
+await pawabase.auth.orgs.createTeam("acme", { slug: "finance", name: "Finance" });
+await pawabase.auth.orgs.addTeamMember("acme", "finance", userId);
+await pawabase.auth.orgs.removeTeamMember("acme", "finance", userId);
+```
+
+```python Python
+teams = pb.auth.orgs.teams("acme")
+pb.auth.orgs.create_team("acme", team_slug="finance", name="Finance")
+pb.auth.orgs.add_team_member("acme", "finance", user_id)
+pb.auth.orgs.remove_team_member("acme", "finance", user_id)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/orgs/acme/teams" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"slug": "finance", "name": "Finance"}'
+curl -X PUT "$PAWABASE_URL/auth/v1/orgs/acme/teams/finance/members/$USER_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+### The organization in the token
+
+An access token is issued for at most one organization at a time.
+The session's `org` and `org_role` fields say which, and policies see them as `$auth.org` and `$auth.org_role`.
+
+`switchOrg(slug)` asks for new tokens for another organization the person belongs to, or for none with `null`.
+It is a refresh with an extra parameter, so it rotates the refresh token like any refresh and emits `TOKEN_REFRESHED`.
+
+<CodeGroup>
+```typescript TypeScript
+const session = await pawabase.auth.switchOrg("acme");
+console.log(session.org, session.org_role); // "acme", "admin"
+```
+
+```python Python
+session = pb.auth.switch_org("acme")
+print(session.org, session.org_role)   # "acme", "admin"
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"grant_type": "refresh_token", "refresh_token": "…", "org": "acme"}'
+```
+</CodeGroup>
+
+You can also choose the organization at sign-in, with the `org` option of `signInWithPassword`, so the first token already carries it.
+
+An application with an organization switcher typically:
+
+| Moment | Call |
+| --- | --- |
+| After sign-in | `orgs.list()` to fill the switcher |
+| The person picks an organization | `switchOrg(slug)`, then reload the screen's data |
+| The page loads | Read `session.org` to know which organization is active |
+
+Data loaded before a switch belongs to the previous organization.
+Clear it, or key your data cache by organization, so one tenant's records never appear under another's name.
+
+## Sessions on a server
+
+Server-rendered applications often keep the session in HTTP-only cookies, so that no script in the browser can read the tokens.
+The server then performs sign-in, stores the tokens in cookies, refreshes them, and acts for the person with `asUser`.
+
+The client supports this with a short-lived, memory-only client per sign-in request.
+
+```typescript
+import { createClient, MemoryStorage, AuthenticationError } from "@pawabase/client";
+
+function authClient() {
+  return createClient({
+    url: process.env.PAWABASE_URL!,
+    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+    environment: process.env.PAWABASE_ENV,
+    auth: { storage: new MemoryStorage(), persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+}
+
+export async function signInHandler(email: string, password: string) {
+  const client = authClient();
+  try {
+    const result = await client.auth.signInWithPassword({ email, password });
+    if (result.status === "mfa_required") return { mfaToken: result.mfaToken, factors: result.factors };
+    return { cookies: sessionCookies(result.session.access_token, result.session.refresh_token, result.session.expires_at) };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { error: "Wrong email or password." };
+    throw error;
+  } finally {
+    client.dispose();
+  }
+}
+
+function sessionCookies(access: string, refresh: string, expiresAt: number) {
+  const secure = "Path=/; HttpOnly; Secure; SameSite=Lax";
+  return [
+    `pb-access=${access}; ${secure}; Expires=${new Date(expiresAt * 1000).toUTCString()}`,
+    `pb-refresh=${refresh}; ${secure}; Max-Age=${60 * 60 * 24 * 30}`,
+  ];
+}
+```
+
+Refreshing on the server uses the same short-lived client, seeded with the stored tokens:
+
+```typescript
+export async function refreshHandler(accessToken: string, refreshToken: string) {
+  const client = authClient();
+  try {
+    await client.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
+    const session = await client.auth.refreshSession();
+    return { cookies: sessionCookies(session.access_token, session.refresh_token, session.expires_at) };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { signedOut: true };
+    throw error;
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+`setSession` needs a valid access token, because it fetches the user with it.
+If the stored access token has already expired, call the token endpoint directly with the refresh token:
+
+<CodeGroup>
+```typescript TypeScript
+const fresh = await client.request<{ access_token: string; refresh_token: string; expires_in: number }>(
+  "POST",
+  "/auth/v1/token",
+  { body: { grant_type: "refresh_token", refresh_token: refreshToken } },
+);
+```
+
+```python Python
+fresh = client.request("POST", "/auth/v1/token", json={"grant_type": "refresh_token", "refresh_token": refresh_token})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"grant_type": "refresh_token", "refresh_token": "…"}'
+```
+</CodeGroup>
+
+The rotation rule applies on servers too.
+Two concurrent requests that both refresh the same cookie will end the session.
+Refresh in one place, such as middleware that runs before handlers, and make concurrent requests wait for it, or refresh only when a request actually receives `401`.
+
+The [servers and testing page](/clients/typescript/server-runtimes-testing) shows complete framework integrations.
+
+## Patterns for auth screens
+
+### A sign-in form that handles every answer
+
+A sign-in form has more outcomes than success and failure.
+Handling each one with its own message is the difference between a form people trust and one that sends them to support.
+
+```typescript
+import { AuthenticationError, PermissionError, RateLimitError, ValidationError } from "@pawabase/client";
+
+type SignInOutcome =
+  | { kind: "done" }
+  | { kind: "mfa"; factors: string[]; verify: (code: string) => Promise<unknown>; mfaToken: string }
+  | { kind: "error"; message: string; action?: "resend-verification" };
+
+export async function submitSignIn(email: string, password: string): Promise<SignInOutcome> {
+  try {
+    const result = await pawabase.auth.signInWithPassword({ email, password });
+    if (result.status === "signed_in") return { kind: "done" };
+    if (result.factors.includes("email") && !result.factors.includes("totp")) {
+      await pawabase.auth.mfa.challenge(result.mfaToken);
+    }
+    return { kind: "mfa", factors: result.factors, verify: result.verify, mfaToken: result.mfaToken };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { kind: "error", message: "The email or password is wrong." };
+    if (error instanceof RateLimitError) return { kind: "error", message: "Too many attempts. Wait a few minutes and try again." };
+    if (error instanceof PermissionError && /confirm your email/i.test(error.message)) {
+      return { kind: "error", message: "Confirm your email address first.", action: "resend-verification" };
+    }
+    if (error instanceof PermissionError) return { kind: "error", message: "This account is not available. Contact support." };
+    if (error instanceof ValidationError) return { kind: "error", message: "Enter a valid email address." };
+    throw error;
+  }
+}
+```
+
+Keep the wrong-credentials message the same for an unknown email and a wrong password.
+Different messages tell an attacker which addresses have accounts.
+
+### A second-factor prompt
+
+The prompt accepts a six-digit code or a recovery code, and offers to send an emailed code when the account has the email factor.
+
+```typescript
+export async function submitCode(outcome: Extract<SignInOutcome, { kind: "mfa" }>, code: string) {
+  const cleaned = code.replace(/\s+/g, "");
+  try {
+    await outcome.verify(cleaned);
+    return { ok: true as const };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { ok: false as const, message: "That code did not work. Try again." };
+    if (error instanceof RateLimitError) return { ok: false as const, message: "Too many attempts. The account is locked for a while." };
+    throw error;
+  }
+}
+
+export function resendEmailCode(outcome: Extract<SignInOutcome, { kind: "mfa" }>) {
+  return pawabase.auth.mfa.challenge(outcome.mfaToken);
+}
+```
+
+Failed codes count toward the same lockout as failed passwords.
+Say so near the input, so people reach for a recovery code before they lock themselves out.
+
+### One callback page for every emailed link
+
+Magic links, email confirmations and password resets all arrive at `{site_url}/auth/callback` with a `token` and a `type`.
+One page can handle all three.
+
+```typescript
+export async function handleAuthCallback(search: string) {
+  const params = new URLSearchParams(search);
+  const token = params.get("token");
+  const type = params.get("type");
+  const next = params.get("redirect_to") ?? "/app";
+  if (!token) return { route: "/sign-in" };
+
+  switch (type) {
+    case "magic": {
+      const result = await pawabase.auth.verifyMagicLink(token);
+      return result.status === "signed_in" ? { route: next } : { route: "/sign-in/mfa", pending: result };
+    }
+    case "verify":
+      await pawabase.auth.verifyEmail(token);
+      return { route: next };
+    case "recovery":
+      return { route: `/reset-password?token=${encodeURIComponent(token)}` };
+    default:
+      return { route: "/sign-in" };
+  }
+}
+```
+
+Only follow `redirect_to` values you recognize.
+The auth service checks it against the allowed redirect URLs when it sends the email, but the query string of the callback page can be edited by anyone.
+
+Tokens in emailed links are single-use and expire.
+A second visit to the same link fails; show "this link has already been used or has expired" with a way to request a new one.
+
+### A social sign-in return page
+
+When `detectSessionInUrl` is on, the client reads the fragment by itself.
+The return page only needs to wait for the result and react to the cases that are not a plain sign-in.
+
+```typescript
+const { unsubscribe } = pawabase.auth.onAuthStateChange((event, session) => {
+  if (event === "SIGNED_IN" && session) navigate("/app");
+});
+
+const hash = new URLSearchParams(location.hash.slice(1));
+if (hash.get("error")) showError(`Sign-in failed: ${hash.get("error")}`);
+if (hash.get("mfa_required")) navigate(`/sign-in/mfa?token=${encodeURIComponent(hash.get("mfa_token") ?? "")}`);
+```
+
+Read the fragment before the client cleans it if you need the error text, or call `getSessionFromUrl()` yourself with `detectSessionInUrl: false` to get the full result object.
+
+### An account security screen
+
+A security screen shows the factors, the sessions and the recent activity, and lets the person act on each.
+
+```typescript
+export async function loadSecurityScreen() {
+  const [user, mfa, sessions, history, keys] = await Promise.all([
+    pawabase.auth.getUser(),
+    pawabase.auth.mfa.status(),
+    pawabase.auth.sessions.list(),
+    pawabase.auth.sessions.history(),
+    pawabase.auth.apiKeys.list(),
+  ]);
+  return {
+    email: user.email,
+    identities: user.identities,
+    mfa,
+    sessions: sessions.sort((a, b) => Number(b.current) - Number(a.current)),
+    recentFailures: history.filter((event) => !event.success).slice(0, 10),
+    keys,
+  };
+}
+
+export const signOutEverywhereElse = () => pawabase.auth.signOut({ scope: "others" });
+```
+
+Recent failed sign-ins are worth showing.
+A person who sees attempts they did not make is the earliest warning you can get that an account is targeted.
+
+### Role-aware navigation
+
+Roles come with the user, and the session carries its assurance level.
+Use them to decide what to show, while policies decide what is allowed.
+
+```typescript
+export function navigationFor(user: { roles: string[] }, session: { org_role: string | null }, aal: string | null) {
+  return {
+    showAdmin: user.roles.includes("admin"),
+    showBilling: session.org_role === "owner" || session.org_role === "admin",
+    showPayouts: aal === "aal2",
+  };
+}
+```
+
+A hidden button is a courtesy, not protection.
+Every action behind it must still be refused by a policy for people who should not perform it.
+
+### An invitation landing page
+
+An invitation link may be opened by someone who is signed in, signed out, or signed in as somebody else.
+The landing page keeps the token across sign-in and only accepts once the right person is present.
+
+```typescript
+const PENDING = "pending-invitation";
+
+export async function onInvitationLink(token: string) {
+  sessionStorage.setItem(PENDING, token);
+  const user = await pawabase.auth.getCachedUser();
+  if (!user) return navigate("/sign-in?next=/join");
+  return acceptPendingInvitation();
+}
+
+export async function acceptPendingInvitation() {
+  const token = sessionStorage.getItem(PENDING);
+  if (!token) return navigate("/app");
+  try {
+    const accepted = (await pawabase.auth.orgs.acceptInvitation(token)) as { org?: string; slug?: string };
+    sessionStorage.removeItem(PENDING);
+    const slug = accepted.slug ?? accepted.org;
+    if (slug) await pawabase.auth.switchOrg(slug);
+    navigate("/app");
+  } catch (error) {
+    sessionStorage.removeItem(PENDING);
+    showError("This invitation is no longer valid, or it was sent to a different email address.");
+  }
+}
+
+declare function navigate(path: string): void;
+declare function showError(message: string): void;
+```
+
+Call `acceptPendingInvitation()` after every sign-in, so a person who had to sign in or sign up first still joins.
+The shape of the accept response is read defensively here because it is not part of the client's types.
+
+### A required second-factor setup screen
+
+When the environment requires MFA and the person has no factor, the sign-in result holds an MFA token and the person must enroll before receiving a session.
+
+```typescript
+export async function beginRequiredSetup(mfaToken: string) {
+  const setup = (await pawabase.auth.mfa.startSetup({ mfaToken, method: "totp" })) as { otpauth_uri?: string; secret?: string };
+  return { qr: setup.otpauth_uri, secret: setup.secret };
+}
+
+export async function finishRequiredSetup(mfaToken: string, code: string) {
+  const done = (await pawabase.auth.mfa.completeSetup({ mfaToken, code })) as {
+    access_token?: string;
+    refresh_token?: string;
+    recovery_codes?: string[];
+  };
+  if (done.access_token && done.refresh_token) {
+    await pawabase.auth.setSession({ access_token: done.access_token, refresh_token: done.refresh_token });
+  }
+  return done.recovery_codes ?? [];
+}
+```
+
+Show the recovery codes before navigating into the app, and require an explicit "I have saved them" action.
+This is the only moment those codes can be shown without regenerating them.
+If the person loses them anyway, `mfa.regenerateRecoveryCodes(code)` issues a new set and invalidates the old one, which needs a working authenticator.
+Without one, an administrator must reset the person's second factors.
+
+## Where the tokens live, and what that means
+
+In a browser, the default store is `localStorage`.
+Any script running on your origin can read it, including a script injected through a cross-site scripting bug.
+That is the trade-off of keeping a session in the browser, and it is the same for every browser-based client.
+
+| Option | Script on the page can read tokens | Survives reload | Effort |
+| --- | --- | --- | --- |
+| `localStorage` (default) | Yes | Yes | None |
+| `sessionStorage` | Yes | Per tab | An adapter |
+| Memory only (`persistSession: false`) | Yes, while the page is open | No | One option |
+| HTTP-only cookies managed by your server | No | Yes | A server and the cookie handlers above |
+
+For most applications, the default plus a strict Content Security Policy is a sound choice.
+For applications that hold sensitive data, keep tokens in HTTP-only cookies and let the server act with `asUser`.
+
+Two habits reduce the damage of a leaked access token whichever store you use.
+Keep access tokens short-lived, which the default 15 minutes does.
+And require `aal2` in policies for the most sensitive operations, so a stolen first-factor session cannot perform them.
+
+## Testing auth code
+
+Auth flows can be tested without a server by answering the auth endpoints from a fake `fetch`.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient, MemoryStorage } from "@pawabase/client";
+
+function fakeAuthServer(routes: Record<string, (body: any) => { status: number; body: unknown }>) {
+  return async (input: string, init?: RequestInit) => {
+    const path = new URL(input).pathname;
+    const handler = routes[`${init?.method ?? "GET"} ${path}`];
+    const { status, body } = handler ? handler(init?.body ? JSON.parse(String(init.body)) : undefined) : { status: 404, body: "not found" };
+    return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  };
+}
+
+const user = { id: "u1", email: "ada@example.com", roles: [], identities: [], user_metadata: {}, app_metadata: {} };
+
+test("a password sign-in that needs MFA", async () => {
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    auth: { storage: new MemoryStorage() },
+    fetch: fakeAuthServer({
+      "POST /auth/v1/token": (body) =>
+        body.grant_type === "password"
+          ? { status: 200, body: { mfa_required: true, mfa_token: "m1", factors: ["totp"] } }
+          : { status: 200, body: { access_token: "a.b.c", refresh_token: "r1", expires_in: 900, token_type: "bearer", user } },
+    }),
+  });
+
+  const result = await pawabase.auth.signInWithPassword({ email: "ada@example.com", password: "x" });
+  assert.equal(result.status, "mfa_required");
+  if (result.status === "mfa_required") {
+    const session = await result.verify("123456");
+    assert.equal(session.user.email, "ada@example.com");
+  }
+  assert.equal((await pawabase.auth.getCachedUser())?.id, "u1");
+  pawabase.dispose();
+});
+```
+
+Test the paths users actually take: wrong password, locked account, unverified email, MFA with a recovery code, and a refresh that the server refuses.
+Each is one route in the fake server.
+
+## Choosing sign-in methods
+
+Each method suits a different kind of application and person.
+Most applications offer two: a primary method and a fallback.
+
+| Method | Good for | Watch out for |
+| --- | --- | --- |
+| Email and password | Applications used daily, where people expect it | Password resets, lockouts, password managers |
+| Magic link | Applications used occasionally, consumer sign-ups | Email delivery delays; links opened on another device |
+| Social provider | Consumer applications, developer tools (GitHub) | Accounts tied to a provider the person may leave |
+| Password plus MFA | Business and financial data | Recovery when a phone is lost; keep recovery codes prominent |
+| Personal API keys | Scripts and integrations a person runs for themselves | Keys that outlive their purpose; use expiry |
+
+Whatever you choose, link identities rather than creating separate accounts.
+A person who signed up with a password and later clicks "Sign in with Google" should find the same account, which `linkIdentityUrl` makes possible from their settings.
+
+## What is inside an access token
+
+The client decodes the access token's payload for three purposes: its expiry, its organization, and its environment.
+It never verifies the signature; the server does that on every request.
+
+Your code rarely needs the token's contents, because the session and the user object carry the same information.
+When you inspect one while debugging, these are the claims you will see:
+
+| Claim | Meaning |
+| --- | --- |
+| `sub` | The user's id |
+| `email` | The user's email |
+| `roles`, `perms` | The user's roles and permissions in the environment |
+| `org`, `org_role` | The organization the token was issued for, and the user's role in it |
+| `aal` | `aal1` or `aal2` |
+| `sid` | The session's id |
+| `prj`, `env` | The project and environment |
+| `app` | Administrator-controlled claims, from `app_metadata` |
+| `meta` | User-editable claims, from `user_metadata` |
+| `exp`, `iat`, `jti` | Expiry, issue time and token id |
+
+A token is a snapshot.
+Roles granted after it was issued appear only in the next token, at the next refresh or after `switchOrg`.
+When an administrator changes someone's roles and the change must apply at once, the person's app can call `refreshSession()`.
+
+## Auth in a React application
+
+Most React applications want the session in context, a hook to read it, and a component that waits for the first event before rendering protected routes.
+
+```tsx
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import type { Session, User } from "@pawabase/client";
+import { pawabase } from "./lib/pawabase";
+
+interface AuthValue {
+  ready: boolean;
+  session: Session | null;
+  user: User | null;
+}
+
+const AuthContext = createContext<AuthValue>({ ready: false, session: null, user: null });
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [value, setValue] = useState<AuthValue>({ ready: false, session: null, user: null });
+
+  useEffect(() => {
+    const { unsubscribe } = pawabase.auth.onAuthStateChange((_event, session) => {
+      setValue({ ready: true, session, user: session?.user ?? null });
+    });
+    return unsubscribe;
+  }, []);
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+export function useAuth() {
+  return useContext(AuthContext);
+}
+
+export function RequireAuth({ children, fallback }: { children: ReactNode; fallback: ReactNode }) {
+  const { ready, session } = useAuth();
+  const content = useMemo(() => {
+    if (!ready) return null;
+    return session ? children : fallback;
+  }, [ready, session, children, fallback]);
+  return <>{content}</>;
+}
+```
+
+The provider subscribes once and holds the latest session.
+Components read it through `useAuth()` and re-render when someone signs in, out, or refreshes.
+
+Do not call `getSession()` in render.
+It is asynchronous and may refresh; the listener already gives you the session at the right times.
+
+When data fetched for one user is cached by a library such as TanStack Query, clear the cache on `SIGNED_OUT` and on organization switches.
+Otherwise the next person to sign in on the same device can briefly see the previous person's data.
+
+## Behavior across browser tabs
+
+A web application is often open in several tabs.
+With the default `localStorage` store, the tabs share one session, and the client keeps them consistent.
+
+| In one tab | The other tabs |
+| --- | --- |
+| Signs in | Receive the stored session and emit `SIGNED_IN` |
+| Refreshes the token | Adopt the new tokens and emit `TOKEN_REFRESHED` |
+| Signs out | Clear their session and emit `SIGNED_OUT` |
+| Is hidden for an hour, then shown | Refreshes on becoming visible if the token is expiring |
+
+This works through the browser's `storage` event, which fires in every other tab of the same origin when the stored value changes.
+Your listeners therefore see sign-outs that happened elsewhere, and a guard built on `onAuthStateChange` redirects every tab together.
+
+With `persistSession: false` or `sessionStorage`, each tab has its own session and none of this applies.
+
+## Sign-in on mobile with deep links
+
+On mobile, a social sign-in or a magic link must return to the app, not to a web page.
+The app registers a URL scheme or universal link, and the return lands in a deep-link handler.
+
+```typescript
+import * as WebBrowser from "expo-web-browser";
+import * as Linking from "expo-linking";
+import { pawabase } from "./pawabase";
+
+export async function signInWithGitHub() {
+  const returnUrl = Linking.createURL("auth");
+  const url = pawabase.auth.signInWithOAuthUrl("github", { redirectTo: returnUrl });
+  const result = await WebBrowser.openAuthSessionAsync(url, returnUrl);
+  if (result.type !== "success") return { cancelled: true };
+  const outcome = await pawabase.auth.getSessionFromUrl(result.url);
+  return { outcome };
+}
+
+Linking.addEventListener("url", async ({ url }) => {
+  const parsed = new URL(url);
+  const token = parsed.searchParams.get("token");
+  if (parsed.searchParams.get("type") === "magic" && token) {
+    await pawabase.auth.verifyMagicLink(token);
+  }
+});
+```
+
+The return URL must be one of the environment's allowed redirect URLs, including its custom scheme, such as `myapp://auth`.
+The client for a mobile app is created with `detectSessionInUrl: false`, because there is no page URL to read.
+
+## How auth changes affect realtime
+
+The realtime connection is opened with the access token, and it follows the session.
+
+| Auth change | Realtime effect |
+| --- | --- |
+| Sign-in | The next connection carries the token; channels that need a user can be joined |
+| Token refreshed | The new token is sent over the open socket without reconnecting |
+| Sign-out | The socket is told the token is gone; channels that need a user stop receiving |
+| Token refused by the socket | The client refreshes once and reconnects |
+
+Channels a signed-out person joined, such as a public lobby, keep working across sign-in and sign-out.
+Channels whose rules require a user are refused or dropped when the user goes away.
+
+## Signing out cleanly
+
+`signOut()` ends the session, but an application holds more than a session.
+A clean sign-out also clears what was loaded for the person:
+
+```typescript
+export async function signOutEverywhereInThisApp(queryClient: { clear(): void }) {
+  try {
+    await pawabase.auth.signOut();
+  } finally {
+    queryClient.clear();
+    pawabase.realtime.disconnect();
+    sessionStorage.clear();
+    navigate("/");
+  }
+}
+
+declare function navigate(path: string): void;
+```
+
+The `finally` block runs even when the server could not be reached.
+The person asked to leave; the device should forget them regardless.
+
+## Creating a profile on first sign-in
+
+Many applications keep per-user data in a resource, such as `profiles`, keyed by the user's id.
+The simplest way to make sure a profile exists is to check after sign-in and create it when missing.
+
+```typescript
+pawabase.auth.onAuthStateChange(async (event, session) => {
+  if (event !== "SIGNED_IN" || !session) return;
+  const profiles = pawabase.from("profiles");
+  const existing = await profiles.first();
+  if (!existing) {
+    await profiles.create({ display_name: session.user.name || session.user.email.split("@")[0] });
+  }
+});
+```
+
+This assumes `profiles` uses the owner field, so `first()` returns the person's own profile and `create` sets the owner.
+A unique owner field turns a race between two tabs into a harmless `409` for the second one.
+
+For profiles that must exist even if the person never opens the app again, such as accounts created by an administrator, create them on the server instead, in the same code that creates the user.
+
+## Before launching authentication
+
+| Check | Why |
+| --- | --- |
+| The site URL and allowed redirect URLs list production addresses only | Links and redirects cannot point to a development host |
+| Email templates read correctly and come from your domain | People decide whether to trust a link by how the email looks |
+| The sign-in form handles `401`, `403` and `429` separately | Each needs a different message |
+| Recovery codes are shown once with a clear instruction to save them | They are the way back when a phone is lost |
+| Sign-out clears caches and realtime | The next person on the device must see nothing |
+| Policies that need a signed-in user use `authenticated` or stricter | Anonymous access is opt-in |
+| Sensitive operations require `aal2` where appropriate | A stolen password alone should not be enough |
+| Somebody knows how to clear a lockout | Support requests will come |
+
+## Changing a password
+
+A signed-in person changes their password with `updateUser`.
+When the account already has a password, the current one is required, so that someone who finds an unlocked device cannot lock the owner out.
+
+```typescript
+import { AuthenticationError, ValidationError } from "@pawabase/client";
+
+export async function changePassword(current: string, next: string) {
+  try {
+    await pawabase.auth.updateUser({ password: next, current_password: current });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof ValidationError) return { ok: false, message: error.fieldError("password") ?? "Choose a stronger password." };
+    if (error instanceof AuthenticationError) return { ok: false, message: "Your current password is wrong." };
+    throw error;
+  }
+}
+```
+
+An account created through a social provider or a magic link has no password.
+It can set one without `current_password`, which gives the person a second way to sign in.
+
+After a password change, consider offering "sign out of other devices", which is `signOut({ scope: "others" })`.
+A person who changes a password because they suspect someone else knows it wants exactly that.
+
+## Changing an email address
+
+An email change is confirmed by the new address, so a typo cannot lock someone out of their account.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.updateUser({ email: "ada.king@example.com" });
+showMessage("We sent a confirmation link to your new address.");
+```
+
+```python Python
+pb.auth.update_user(email="ada.king@example.com")
+```
+
+```bash cURL
+curl -X PATCH "$PAWABASE_URL/auth/v1/user" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "ada.king@example.com"}'
+```
+</CodeGroup>
+
+Until the link is followed, the account keeps its old address, and the person signs in with it.
+The confirmation link carries a token; the page it opens calls `confirmEmailChange(token)`, which completes the change and refreshes the cached user when a session exists.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.auth.confirmEmailChange(token);
+```
+
+```python Python
+pb.auth.confirm_email_change(token)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/email/confirm" -H "apikey: $PAWABASE_KEY" -H "content-type: application/json" -d '{"token": "…"}'
+```
+</CodeGroup>
+
+If your application stores the email elsewhere, such as in a `profiles` resource or a billing system, update it after the confirmation, not after the request.
+
+## Form fields that work with password managers
+
+Sign-in forms that browsers and password managers understand are faster to use and less error-prone.
+The `autocomplete` attribute tells them what each field is.
+
+| Field | `autocomplete` value |
+| --- | --- |
+| Email on sign-in and sign-up | `email` (or `username` when people sign in with usernames) |
+| Password on sign-in | `current-password` |
+| Password on sign-up and reset | `new-password` |
+| Current password on a change-password form | `current-password` |
+| A six-digit authenticator or email code | `one-time-code` |
+
+```tsx
+<form onSubmit={onSubmit}>
+  <input name="email" type="email" autoComplete="email" required />
+  <input name="password" type="password" autoComplete="current-password" required minLength={8} />
+  <button type="submit">Sign in</button>
+</form>
+```
+
+`one-time-code` lets phones offer a code that arrived by SMS or email directly above the keyboard.
+Use `inputMode="numeric"` on code fields so phones show a number pad, and accept pasted codes with spaces by removing them before calling `verify`.
+
+## Rate limits on auth endpoints
+
+Auth endpoints are rate limited separately from data endpoints, because they are what attackers target.
+
+| Endpoint family | What limits it | What the client sees |
+| --- | --- | --- |
+| Password and MFA attempts | A per-account counter of failures, then a lockout | `429` for the duration of the lockout |
+| MFA endpoints | A per-caller limit of ten requests per minute | `429` with a short `Retry-After` |
+| Email-sending endpoints (magic link, verification, recovery) | Per-address and per-caller limits | `429`, or a silent success that sends nothing |
+| The environment as a whole | The gateway's rate limit | `429 rate_limit_exceeded` |
+
+The client waits for `Retry-After` and repeats when the wait is short.
+A lockout usually lasts longer than the client will wait, so it surfaces as `RateLimitError` with the account's lockout message.
+Show the message and a time to try again, not a generic failure.
+
+## Staff and internal tools
+
+An internal tool used by your own staff needs authentication too.
+There are two common arrangements, and the choice affects how the tool uses the client.
+
+| Arrangement | How it works | Good when |
+| --- | --- | --- |
+| Staff are users with a role in the same environment | Staff sign in with `auth`; policies grant the `staff` role more access | The tool works on the same data under rules you can express as policies |
+| The tool's server holds a secret key, and staff sign in to your own server | The server checks staff identity and uses the secret key for privileged work | The tool needs operations no policy should grant to any user |
+
+The first arrangement keeps every action attributable and policy-checked, and it is the better default.
+The second is right for operations such as refunds, account merges or data repairs, where the server should decide in code and record what it did.
+
+## Auth calls with a secret key
+
+Most auth methods are for people and belong with a publishable key.
+A server holding a secret key uses the user-administration module for accounts, not `auth`.
+
+| Call with a secret key | Behavior |
+| --- | --- |
+| `auth.settings()` | Works; useful for a server that renders sign-in pages |
+| `auth.signInWithPassword()` | Works, but the session's requests still carry the secret key, which bypasses policies; use a publishable key |
+| `auth.signInWithOAuthUrl()` | Refused with `ConfigError`; the key would be in a URL |
+| `auth.getUser()` with `asUser(token)` | Works; the token decides who the user is |
+| Creating, disabling or deleting other users | Not part of `auth`; use `admin(client).users` |
+
+The rule of thumb is simple.
+A client that acts for a person uses a publishable key.
+A client that acts for the system uses a secret key and never pretends to be a person.
+
+## Errors from auth calls
+
+| Call | Status | Client error | Meaning |
+| --- | --- | --- | --- |
+| `signUp` | `403` | `PermissionError` | Sign-up is disabled |
+| `signUp`, `updateUser`, `resetPassword` | `422` | `ValidationError` | The password does not meet the policy, or a field is invalid |
+| `signInWithPassword` | `401` | `AuthenticationError` | Wrong email or password |
+| `signInWithPassword` | `403` | `PermissionError` | Disabled account, or email not confirmed |
+| `signInWithPassword`, `verify`, `verifyMfa` | `429` | `RateLimitError` | The account is locked after failed attempts |
+| `verify`, `verifyMfa` | `401` | `AuthenticationError` | Wrong code, or an expired MFA token |
+| `verifyMagicLink`, `verifyEmail`, `resetPassword` | `400` or `401` | `ApiError` or `AuthenticationError` | The token is invalid, used or expired |
+| `refreshSession`, `switchOrg` | `401` | `AuthenticationError` | The refresh token is no longer valid; the session is cleared |
+| `switchOrg` | `403` | `PermissionError` | The person is not a member of that organization |
+| `signInWithOAuth`, `signInWithOAuthUrl` | none | `ConfigError` | No environment, or a secret key |
+| `orgs.*` | `403` | `PermissionError` | The person's role in the organization does not allow it |
+| `apiKeys.create`, `mfa.*` | `401` | `AuthenticationError` | Nobody is signed in |
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Turn sign-up, verification, magic links or MFA on or off | **Access → Users & auth → Configuration** |
+| Add a social provider | **Access → Users & auth → Configuration** |
+| Set the site URL and allowed redirect URLs | **Access → Users & auth → Configuration** |
+| Find a user and see their sessions, factors and organizations | **Access → Users & auth → Users**, then the user's **Security**, **Access** and **Organizations** tabs |
+| See why a sign-in failed | **Access → Users & auth → Sign-in activity** |
+| Clear a lockout | The user's page in **Users**, or `admin().users.update(id, { unlock: true })` |
+| Define roles and their permissions | **Access → Users & auth → Roles** |
+| See organizations and members | **Access → Users & auth → Organizations** |
+| Edit the emails sent for links | **Services → Mail** |
+
+**Sign-in activity** is the first place to look when someone says they cannot sign in.
+It records each attempt with its method, outcome and reason, such as `wrong password`, `locked` or `unknown email`.
+
+## Coming from supabase-js auth
+
+| supabase-js | @pawabase/client | Note |
+| --- | --- | --- |
+| `auth.signUp({ email, password, options: { data } })` | `auth.signUp({ email, password, data })` | `verificationRequired` instead of a null session check |
+| `auth.signInWithPassword` | `auth.signInWithPassword` | Returns `{ status }`; may be `mfa_required` |
+| `auth.signInWithOtp({ email })` | `auth.signInWithMagicLink({ email })` | Link only |
+| `auth.verifyOtp({ token_hash, type })` | `verifyMagicLink`, `verifyEmail`, `resetPassword` | One method per purpose |
+| `auth.signInWithOAuth({ provider })` | `auth.signInWithOAuth(provider)` | Needs `environment` |
+| `auth.exchangeCodeForSession(code)` | `auth.exchangeCode(code, verifier)` | |
+| `auth.getSession()` | `auth.getSession()` | Refreshes if expiring |
+| `auth.getUser()` | `auth.getUser()` | Throws instead of returning an error |
+| `auth.updateUser({ password })` | `auth.updateUser({ password, current_password })` | Current password required |
+| `auth.resetPasswordForEmail(email)` | `auth.requestPasswordReset({ email })` | |
+| `auth.mfa.enroll({ factorType: "totp" })` | `auth.mfa.enroll()` | Recovery codes come at verification |
+| `auth.mfa.challengeAndVerify` | `result.verify(code)` | Part of the sign-in result |
+| `auth.signOut({ scope })` | `auth.signOut({ scope })` | Same three scopes |
+| `auth.onAuthStateChange` | `auth.onAuthStateChange` | Same event names, plus `INITIAL_SESSION` for late listeners |
+| `auth.admin.*` | `admin(client).users.*` | A separate, server-only module |
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| Signed-in users see the sign-in page after a reload | The app renders before `INITIAL_SESSION` | Show a loading state until the first event |
+| Users are signed out a few minutes after signing in | Two parts of the app refresh the same session, or two clients share a storage key | Use one client; on servers, refresh in one place |
+| `ConfigError` on social sign-in | No `environment` in the client options | Pass `environment` |
+| Social sign-in returns to the app but nobody is signed in | `detectSessionInUrl` is off, or the router removed the fragment before the client read it | Call `getSessionFromUrl` early, before routing |
+| Emailed links point to the wrong site | The site URL is not set, or set for another environment | Set it under **Configuration** |
+| `redirectTo` is ignored | The URL is not in the allowed list | Add it under **Configuration** |
+| Sign-in fails with `403` in production but works locally | Production requires email verification | Confirm the address, or resend the email |
+| Sign-in fails with `429` and the right password | The account is locked | Wait, or clear the lockout as an administrator |
+| Policies requiring `aal2` refuse after enrolling MFA | The session was not refreshed | `verifyEnrollment` refreshes for you; after setup through the API, refresh manually |
+| Data from another organization appears after switching | Cached data was not cleared | Key caches by `session.org` |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can a user be signed in to two environments at once?">
+    Yes, with two clients.
+    Each environment has its own users and keys, and each client stores its own session under its own storage key.
+  </Accordion>
+  <Accordion title="How long does a session last?">
+    The access token lasts 15 minutes by default and is refreshed automatically.
+    The session itself lasts until it is signed out, revoked, or its refresh token is refused.
+  </Accordion>
+  <Accordion title="Can I sign a user in from my server without their password?">
+    Not through the public auth API.
+    A server with a secret key can create users and manage them with the user-administration module, but signing in is something a person does with a credential.
+  </Accordion>
+  <Accordion title="Why does signInWithMagicLink succeed for an address that has no account?">
+    So that the endpoint cannot be used to find out which addresses are registered.
+    Whether an email is sent depends on the account and on `createUser`.
+  </Accordion>
+  <Accordion title="Does signOut work offline?">
+    Yes, for this device.
+    The local session is always cleared.
+    The server is told when it can be reached; until then, the refresh token stays valid on the server.
+  </Accordion>
+  <Accordion title="Can I add my own fields to the user?">
+    Put user-editable fields in `user_metadata` with `updateUser({ data })`.
+    Put fields the user must not change in `app_metadata`, set by a server.
+    For anything larger or relational, create a `profiles` resource keyed by the user id.
+  </Accordion>
+  <Accordion title="How do I require a second factor for one screen only?">
+    Write the policy of that screen's resources to require `aal: aal2`.
+    People with MFA enrolled already have `aal2` sessions after signing in; people without it are refused until they enroll.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Tokens and sessions" icon="clock" href="/auth/tokens-and-sessions">Token contents, lifetimes and rotation, from the server side.</Card>
+  <Card title="MFA" icon="smartphone" href="/auth/mfa">Factors, recovery codes and assurance levels.</Card>
+  <Card title="Organizations" icon="building" href="/auth/organizations">Roles, invitations and teams in depth.</Card>
+  <Card title="Auth in policies" icon="shield" href="/auth/auth-in-policies">Using the caller's identity in policy conditions.</Card>
+  <Card title="User administration" icon="users" href="/clients/typescript/user-administration">Managing other people's accounts with a secret key.</Card>
+  <Card title="Servers and testing" icon="server" href="/clients/typescript/server-runtimes-testing">Cookie sessions and per-request clients in frameworks.</Card>
+</CardGroup>

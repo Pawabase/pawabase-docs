@@ -1,274 +1,1552 @@
 ---
 title: "Tokens and sessions"
-description: "Use access tokens, rotate refresh tokens, manage devices, and understand when session changes take effect."
+description: "The access and refresh token pair, token families, single-use rotation, theft detection, SessionInfo, and the three grant types on POST /auth/v1/token."
 icon: "key-round"
 ---
 
-A session lets a user make authenticated requests after sign-in. Pawabase returns a short-lived access token and a rotating refresh token.
+Before anything else, the thing that makes Pawabase tokens comprehensible is that
+they are issued for **one `project` + `env` pair and nothing else**. Akountz owns
+users, and a user belongs to exactly one environment. An email address can hold
+an account in `acme/production` and an entirely separate account in
+`acme/staging`, with different passwords, different roles and separate sessions.
+Every token carries that pair, and every other Pawabase service refuses a token
+whose pair does not match the request it is attached to.
 
-The access token authorizes application API requests. The refresh token obtains a replacement pair. Keep the two roles separate: a refresh token is not a bearer credential for resource requests.
+That single rule explains most of what people find surprising:
 
-## Configure lifetimes in Studio
+- A token minted for staging cannot be used against production, even though the
+  signature algorithm is identical. The signing key is derived per environment,
+  and the claims are checked again after the signature verifies.
+- Refreshing a session never changes which environment you are in. There is no
+  cross-environment token exchange.
+- Signing out "everywhere" revokes every session **for that user in that
+  environment**, not across the installation.
 
-Open **Users & auth → Configuration → Passwords** for the selected environment.
+The second thing worth internalising is that Pawabase has **four distinct kinds
+of signed token**, and only one of them belongs to this page:
 
-| Setting | Default | Meaning |
+| Token | Signed by | Purpose |
 | --- | --- | --- |
-| Access token lifetime | 900 seconds | How long a newly issued access token remains valid |
-| Refresh token lifetime | 2,592,000 seconds | Lifetime configured for issuing refresh credentials |
+| **User access token** | Akountz, with a key derived per environment | Proves which project user is calling. Lives 15 minutes by default. |
+| **Refresh token** | Akountz, with a *different* derived key | Obtains the next pair. Lives 30 days by default. Never accepted as a bearer credential for resource requests. |
+| **Context token** | The gateway | Tells an internal service which project, environment and credential a request carries. Travels in `X-Pawabase-Context`. |
+| **Service token** | The platform | One Pawabase service calling another, addressed to one audience. Lives about 60 seconds. |
 
-Changing a lifetime affects subsequent token issuance. It does not rewrite expiration timestamps inside existing tokens.
+If you are debugging a `401`, knowing which of the four is in your header solves
+most of the problem before you read another line.
 
-A shorter access lifetime reduces the time that stale permissions can remain in a previously issued token. It requires a reliable refresh implementation.
+<CardGroup cols={3}>
+  <Card title="Rotation is single-use" icon="rotate">Every refresh consumes the old token and mints a new one. Presenting a consumed token revokes the whole family.</Card>
+  <Card title="jti ties the layers" icon="link">The `jti` in the token is the same id that exists as a row in `jwt_tokens`. Rotation looks the row up by it.</Card>
+  <Card title="Sessions are token families" icon="users">`session_id` in the response is not a synthetic identifier. It is the family hex string.</Card>
+</CardGroup>
 
-## Session response
+## The token pair
 
-Password sign-in, successful email-link verification, MFA completion, and refresh return session information. OAuth redirects deliver a subset in a fragment.
+Signing in produces two tokens, minted together under one **family**. The family
+is 32 bytes of random hex — `secrets.token_hex(32)` — generated when the pair is
+issued and **kept for the life of the session**. Refresh rotates the pair *inside
+the same family*; it never starts a new one.
 
-A JSON session response has this shape:
+Each token gets its own `jti` of `secrets.token_hex(16)`. Both ids are written to
+`jwt_tokens` as rows, one `token_type="access"` and one `token_type="refresh"`,
+sharing a `token_family`. That table is the authoritative record of rotation and
+revocation state.
 
-~~~json
+```
+        sign in
+           │
+           ▼
+   ┌───────────────────────────┐
+   │ family: <64 hex chars>    │   ← stable for the whole session
+   ├───────────────────────────┤
+   │ access  jti A1  ttl 15m   │   ← discarded on every refresh
+   │ refresh jti R1  ttl 30d   │   ← consumed, then discarded
+   └───────────────────────────┘
+           │ refresh with R1
+           ▼
+   ┌───────────────────────────┐
+   │ family: unchanged         │
+   ├───────────────────────────┤
+   │ access  jti A2            │
+   │ refresh jti R2            │
+   └───────────────────────────┘
+           │ refresh with R1 again
+           ▼
+   family revoked — possible token theft
+```
+
+Two rows are created per refresh, not one, and they are created in the same
+family. The old access row is left in place with its own expiry; the old refresh
+row is marked consumed. Revoking a family acts on the family, so it takes out
+every token ever issued under it, current and historical.
+
+### Why the `jti` has to travel inside the token
+
+This is the detail that makes the whole rotation mechanism possible, and it is
+worth stating plainly: the `jti` is embedded in the signed payload, and the server
+looks the `jwt_tokens` row up **by that value**.
+
+There is no server-side "current session" pointer to consult. On every refresh,
+the server:
+
+1. Decodes the presented refresh token without checking expiry, to read `jti` and
+   `sub`.
+2. Finds the `jwt_tokens` row whose `token_jti` equals that `jti`.
+3. Checks that row's `revoked` and `consumed_at` flags.
+4. Marks it consumed, then writes two fresh rows in the same family.
+
+Because step 2 is keyed on a value inside the signed payload, an attacker cannot
+point the lookup at someone else's row without invalidating the signature.
+
+<Info>
+The unverified peek in step 1 exists only to learn who to load. The actual
+verification of the signature happens inside the refresh rotation itself, against
+the environment's refresh secret, and a failure there raises a different error.
+</Info>
+
+## What a refresh actually returns
+
+`POST /auth/v1/token` with `grant_type=refresh_token` returns the same shape as
+sign-in. It is stable across password sign-in, refresh, magic-link completion and
+MFA completion, so a client only implements one parse:
+
+```json
 {
-  "access_token": "<access-token>",
-  "refresh_token": "<refresh-token>",
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "token_type": "bearer",
   "expires_in": 900,
-  "expires_at": 1790850000,
-  "session_id": "<session-id>",
+  "expires_at": 1750000000,
+  "session_id": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6",
   "org": null,
   "org_role": null,
-  "user": {
-    "id": "482",
-    "email": "amina@example.com"
-  }
+  "user": { }
 }
-~~~
+```
 
-The user object above is abbreviated. `expires_at` is an illustrative Unix timestamp in seconds.
+Field by field, with the source of each value:
 
-| Field | Application use |
+<ResponseField name="access_token">A newly minted JWT carrying the claims below. Signed with the environment's **access** key.</ResponseField>
+<ResponseField name="refresh_token">The new refresh token. This is the one to persist; the old one is dead on arrival.</ResponseField>
+<ResponseField name="token_type">Always the literal `"bearer"`.</ResponseField>
+<ResponseField name="expires_in">`config.access_ttl` in seconds — 900 by default. This is the *configured* value, and it matches the token's own `exp`.</ResponseField>
+<ResponseField name="expires_at">An absolute Unix timestamp: now plus `access_ttl`. Convenient for a client that would rather not do arithmetic.</ResponseField>
+<ResponseField name="session_id">The **token family hex string**. This is what you pass to revoke one session, and it is what appears as `sid` in the token claims.</ResponseField>
+<ResponseField name="org">The organization slug the tokens are scoped to, or `null`. See [the three-way org semantics](#the-three-way-org-semantics) — `null` here does not always mean what it looks like.</ResponseField>
+<ResponseField name="org_role">The user's role in `org`, or `null`. Read **at issue time**, so a membership change lands on the next refresh.</ResponseField>
+<ResponseField name="user">The full user view, same as `GET /auth/v1/user` minus the `aal` and `session_id` additions.</ResponseField>
+
+<Warning>
+`session_id` is the family string, not a surrogate key. There is no
+`auth_sessions` table with an integer or UUID id, and nothing that generates a
+fresh identifier for a session. If you store it, store it as a string of hex.
+</Warning>
+
+### `expires_at` is the only absolute time in the response
+
+`expires_at` is computed server-side as `int(now) + access_ttl`. The token's own
+`exp` claim is minted from the same `access_ttl` a moment later, so they agree to
+within a second or so. Nothing else in the response carries a deadline: the
+refresh token's expiry is inside its own `exp` claim only, and the session itself
+has no wall-clock expiry independent of its tokens.
+
+That is deliberate. A session ends when its tokens stop working, not when a
+timer fires.
+
+### The access token is re-minted, not passed through
+
+An easy thing to assume wrongly is that the `access_token` in the response is the
+one the underlying token-pair code produced. It is not.
+
+The pair is minted first and its access token's `jti` is read back out. Then
+Akountz **signs a second access token** using that same `jti` and `sid`, adding
+the claims Sillo's tokens do not carry: the project, environment, roles,
+permissions, organization and assurance level. The token returned to you is the
+Pawabase one.
+
+The `jti` is deliberately reused rather than regenerated, so the Pawabase access
+token and the tracked row still line up. That shared `jti` is what lets
+revocation and rotation work across both layers.
+
+## The access token claims
+
+The access token is the credential your backend services verify. It is signed
+with a key derived from the platform's JWT master secret and the exact project and
+environment, so a service can verify it without calling Akountz.
+
+| Claim | Source | Notes |
+| --- | --- | --- |
+| `sub` | The user's ULID | The account's identity, stringified. |
+| `aud` | Literal `"authenticated"` | Verified on every check. A token with any other audience is rejected. |
+| `iss` | `pawabase:akountz:{project}` | Names the issuing project. |
+| `prj` | Project slug | Checked against the request's context. |
+| `env` | Environment name | Checked against the request's context. |
+| `sid` | Token family | The session this token belongs to. |
+| `jti` | `secrets.token_hex(16)` | Matches a `jwt_tokens` row. Reused from the underlying token so the two layers line up. |
+| `iat` / `exp` | Issue time, and issue time plus `access_ttl` | |
+| `typ` | Literal `"access"` | A service token or context token presented as a user token is rejected. |
+| `aal` | `"aal1"` or `"aal2"` | `"aal2"` after MFA. |
+| `email` | The user's address | |
+| `roles` | Role names | Unprefixed. Empty list if none. |
+| `perms` | Permission names | Direct **and** via-group, deduped and sorted. |
+| `org` | Organization slug or `null` | |
+| `org_role` | `owner`, `admin`, `member`, `viewer`, or `null` | |
+| `meta` | `user_metadata` | Present only if non-empty. **User-editable — policies must not trust it.** |
+| `app` | `app_metadata` | Present only if non-empty. **Admin-only — policies may rely on it.** |
+
+The `meta` / `app` split is the one line of this table that changes what you can
+build. A user can edit their own `user_metadata` through `PATCH /auth/v1/user`.
+Only a service key or Studio can change `app_metadata`. If a policy decides "is
+this user an employee" from a claim, that claim has to come from `app`, or the
+user could grant it to themselves.
+
+<Accordion title="Why perms carries group permissions too">
+`perms` is the union of directly granted permissions and every permission
+inherited through the user's roles, with the environment prefix stripped and the
+result sorted and deduplicated. A policy that checks `perms` therefore sees the
+effective set, not just the explicit grants. Roles and direct grants are managed
+in Studio's **Roles** tab and on the admin user routes — see
+[/auth/roles-and-permissions](/auth/roles-and-permissions).
+</Accordion>
+
+### The signing key is derived, not shared
+
+Both user token kinds are signed with a key derived by HMAC-SHA256 over the
+string `pawabase:user-token:{project}:{env}`, keyed by the master secret.
+
+Two consequences follow, and both matter:
+
+- **Verification needs no network call.** Every service derives the same key from
+  the same master and verifies locally. Akountz is not a hot path.
+- **Environments are independent.** Compromising one derived key exposes one
+  environment's tokens and nothing else.
+
+The refresh token is signed with a *different* derived key: the same function
+called with `{env}:refresh` as the environment component. Access and refresh
+tokens are therefore not interchangeable even within one environment — presenting
+a refresh token to a service as a bearer credential fails on the signature,
+before any claim is examined.
+
+## Rotation is single-use, and that is not configurable
+
+There is no `refresh_token_rotation` setting. Rotation is the only behaviour, and
+a refresh token is consumed the first time it is presented.
+
+### What rotation does, in order
+
+When a refresh token is presented and it verifies:
+
+1. The row for its `jti` is located and confirmed to be `token_type="refresh"`.
+2. The row's `consumed_at` is set to now.
+3. Two new rows are created in the **same** family — a new access `jti` and a new
+   refresh `jti`, each with a fresh expiry computed from the configured TTLs.
+4. A new pair is signed and returned.
+
+Note that the access token from the *previous* round is not invalidated by the
+refresh. It simply expires on its own clock. Refreshing early therefore leaves
+briefly overlapping access tokens, which is normal and harmless.
+
+## Theft detection
+
+Rotation only helps if a reused token is treated as a serious event. In Pawabase
+it is: presenting an already-consumed refresh token **revokes the entire token
+family**, not just that token.
+
+The reasoning is worth internalising, because it explains a behaviour that
+otherwise looks punitive. When a refresh token comes back a second time, the
+server cannot tell which of the two holders is the legitimate client. Both may be
+holding it, or the token may genuinely have been stolen and replayed. Rather than
+guess, Pawabase assumes theft and kills the whole family. The user must sign in
+again; the attacker's copy dies alongside the legitimate one.
+
+There are three failure modes inside rotation, and each has a specific message:
+
+| Condition | What happens | Message |
+| --- | --- | --- |
+| The row for the `jti` does not exist, or is not a refresh token | No family to revoke | `"Unknown refresh token"` |
+| The row is already `revoked` | **Revoke the whole family** | `"Token family has been revoked — possible token theft"` |
+| The row already has `consumed_at` set | **Revoke the whole family** | `"Refresh token already consumed — possible token theft"` |
+| The signature does not verify at all | Nothing is looked up | `"Invalid refresh token"` |
+
+Only the last is reported to the client as a plain `401 invalid refresh token`.
+The theft cases are deliberately collapsed into the same generic error at the HTTP
+boundary, so an attacker probing for "was this token consumed?" learns nothing from
+the status code or body.
+
+<Info>
+The distinction that leaks are the *internal* reason strings above, which land in
+`akz_login_events` with `kind="refresh"` and `method="refresh_token"`. They are
+what the Studio **Sign-in activity** tab shows in its **Result** column.
+</Info>
+
+### The reuse event
+
+When the theft branch fires, two things happen beyond the revocation:
+
+- The `SessionInfo` row for the family is stamped with `revoked_at`. The session
+  disappears from the active-sessions list immediately.
+- A `session.reuse_detected` event is emitted for the environment.
+
+The `SessionInfo` stamp matters because the family revocation acts on the token
+rows, while the session list is built from `SessionInfo`. Revoking only the tokens
+would leave a session row that looks active but cannot refresh.
+
+<Accordion title="Why both tables have to agree">
+Rotation state lives in `jwt_tokens` — that is where `consumed_at` and `revoked`
+live. Session metadata lives in `SessionInfo` — that is where the device, IP and
+assurance level live. They are joined by the family string. Any operation that
+revokes a session must touch both, or the two views drift apart. This is the
+reason behind the paired writes throughout this page.
+</Accordion>
+
+### What reuse detection does not do
+
+Two things it deliberately does not do, both of which surprise people:
+
+## The three-way org semantics
+
+The optional `org` field on `POST /auth/v1/token` is genuinely subtle, and it is
+the kind of thing that produces an intermittent bug that only shows up for users
+who belong to more than one organization.
+
+It has **three** distinct behaviours, not two:
+
+| What you send | Effect on the session |
 | --- | --- |
-| `access_token` | Authorization header on protected API requests |
-| `refresh_token` | Next refresh request; replace after every successful refresh |
-| `token_type` | Bearer-token scheme |
-| `expires_in` | Access lifetime in seconds |
-| `expires_at` | Absolute access expiration |
-| `session_id` | Identifies this session across token rotations |
-| `org` / `org_role` | Active application organization and membership role |
-| `user` | Profile information for the signed-in person |
+| **Omit `org` entirely** | The session **keeps** whatever organization it already has. |
+| Send `"org": null` explicitly | The session **leaves every organization**. |
+| Send `"org": "acme"` | The session **switches** to `acme`. If you are not a member, this is a `403`. |
 
-An MFA challenge or verification-pending sign-up response is not a session. Check the response shape before saving credentials.
+The distinction between the first two rows is invisible in most client code,
+because in most languages "field absent" and "field set to null" are handled by
+different code paths — or, worse, the same one. It is enforced server-side by a
+module-level sentinel.
 
-## Use the access token
+### The `KEEP` sentinel
 
-~~~bash
-curl "$PAWABASE_URL/auth/v1/user" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
-~~~
+Inside the session module there is a single module-level object whose only job is
+to be distinguishable from both a real slug and `None`:
 
-Use the same pair of headers for protected resource requests. The API key and token must belong to the same environment.
+```python
+#: ``refresh_session(org=KEEP)`` keeps the session's organization.
+KEEP: Any = object()
+```
 
-Do not send tokens in ordinary query strings. URLs commonly appear in history, logs, analytics, and copied links.
+The token route decides which of the three behaviours to invoke by asking whether
+the field was **set at all**, not what it was set to:
 
-## Claims on the access token
+```python
+org=body.org if "org" in body.model_fields_set else KEEP
+```
 
-Claims describe the authenticated user at the time the token was issued.
+That single line is the whole mechanism. The set of fields actually sent is
+recorded, so:
 
-| Claim | Meaning |
+- Key absent → `KEEP` → keep the current organization.
+- Key present with `null` → `None` → clear the organization.
+- Key present with a slug → validate membership and switch.
+
+Then the check inside the refresh is an identity test against the sentinel:
+
+```python
+if org is not KEEP:
+    active = await require_membership(config, user, org or None)
+```
+
+An empty string takes the same path as `None` — `org or None` normalises it — so
+sending `"org": ""` clears the organization rather than erroring.
+
+<Warning>
+If your client serialises absent fields as `null` — which most JSON encoders do
+when you build the body from an object with a `null` value — you will
+**silently strip the organization from the session on every refresh**, and the
+user will drop out of their org context without any error. If your app is
+org-scoped, be deliberate about whether the field is present.
+</Warning>
+
+### Why `null` is also what comes back
+
+The response normalises the other direction. After the org is resolved, the server
+re-reads the user's role in that organization, and if there is none, it collapses
+the org to `null`:
+
+```python
+org_role = await membership_role(config, user, org)
+if org_role is None:
+    org = None
+```
+
+So both "no organization" and "an organization you are not a member of" come back
+as `org: null, org_role: null` in the response. The response never contains an org
+slug without a role.
+
+The one exception is the **error** path. If you name an organization on the
+request and you are not a member of it, membership is validated first and you get
+a `403` rather than a silent `null`:
+
+| Situation | Result |
 | --- | --- |
-| `sub` | User identity |
-| `project`, `env` | Project and environment scope |
-| `roles` | Environment role names |
-| `perms` | Effective permission names |
-| `org`, `org_role` | Active application organization and membership role |
-| `aal` | Authentication assurance level |
-| `sid` | Session ID |
-| `jti` | Individual token ID |
-| `iat`, `exp` | Issuance and expiration timestamps |
-| `meta` | User metadata, when present |
-| `app` | Application-managed metadata, when present |
+| Named a slug you are **not** a member of | `403` — `you are not a member of that organization` |
+## `POST /auth/v1/token` — one endpoint, three grants
 
-Decoding a token for display is not verification. Let Pawabase verify it when making API requests. Do not authorize a backend action using unverified decoded claims.
+There is one token endpoint. There is no `/oauth/token`, and there is no
+`grant_type=authorization_code`. The entire grant surface is this endpoint, and
+`grant_type` is a literal with exactly three accepted values.
 
-Policies expose these values through [the authentication context](/auth/auth-in-policies), including `$auth.roles`, `$auth.permissions`, and `$auth.org`.
+| `grant_type` | Required fields | Optional |
+| --- | --- | --- |
+| `password` | `email`, `password` | `org` |
+| `refresh_token` | `refresh_token` | `org` |
+| `mfa` | `mfa_token`, `code` | `org` |
 
-## Refresh a session
+The default is `password`, so a body with just an email and password works without
+naming a grant. `grant_type` may also be passed as a **query parameter**, which
+takes precedence over the body when both are present — a detail that matters if
+you build URLs by string concatenation.
 
-~~~bash
-curl -X POST "$PAWABASE_URL/auth/v1/token" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "grant_type": "refresh_token",
-    "refresh_token": "<current-refresh-token>"
-  }'
-~~~
+`org` on the `password` grant names the organization the new session should be
+scoped to, and is validated immediately: a non-member gets a `403` before any
+token is issued. On the `refresh_token` grant it follows the three-way semantics
+above. On the `mfa` grant it is a fallback — the organization named when the
+challenge was issued wins.
 
-A successful response contains a new access token and a new refresh token. Replace the entire stored pair together.
+### The password grant
 
-Do not keep using the previous refresh token. It has been consumed.
+The straightest path, but note the order the checks run in, because it determines
+which error you get:
 
-### Serialize refresh requests
+| Check | Failure |
+| --- | --- |
+| `email` and `password` both present | `400` — `email and password are required` |
+| Email normalises and parses | `422` — `a valid email address is required` |
+| Account exists in **this** environment | `400` — `invalid email or password`, event `unknown email` |
+| Not locked out | `429` — `too many failed attempts; try again later`, event `locked` |
+| Password matches | `400` — `invalid email or password`, event `wrong password` |
+| Account not disabled | `403` — `this account is disabled`, event `disabled` |
+| Email verified, if required | `403` — `confirm your email address first` |
+| MFA enabled for this user and environment | Returns a challenge, see below |
+| Otherwise | A token pair |
 
-Several requests may discover an expired access token simultaneously. Coordinate them through one refresh operation.
+Two of those deserve attention. The "unknown email" and "wrong password" cases
+deliberately return the **same** message, so the endpoint is not an account
+enumeration oracle. The verification check is the only one that returns nothing at
+all in the login-event table, because it is checked before an event is written.
 
-~~~javascript
-let session = null;
-let refreshInFlight = null;
+Also note the lockout check runs **before** the password check. A locked account
+returns `429` even with the correct password.
 
-function setSession(next) {
-  session = next;
-}
+### The MFA branch, inside the password grant
 
-async function refreshSession() {
-  if (refreshInFlight) return refreshInFlight;
-  if (!session?.refresh_token) throw new Error("Sign in again");
+When the user has MFA on and the environment allows it, the password grant does
+not return tokens. It returns a challenge:
 
-  const refreshToken = session.refresh_token;
-  refreshInFlight = (async () => {
-    const response = await fetch(PAWABASE_URL + "/auth/v1/token", {
-      method: "POST",
-      headers: {
-        apikey: PAWABASE_PUBLISHABLE_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-      }),
-    });
-    const result = await response.json();
-    if (!response.ok) {
-      session = null;
-      throw new Error("Your session could not be renewed");
-    }
-    session = result;
-    return result;
-  })();
-
-  try {
-    return await refreshInFlight;
-  } finally {
-    refreshInFlight = null;
-  }
-}
-~~~
-
-This example coordinates refreshes within one JavaScript runtime. Multiple tabs need shared coordination, and a server handling concurrent requests needs a lock or equivalent session-store operation.
-
-If the server accepted a refresh but the response was lost, blindly retrying the old refresh token can trigger reuse detection. End the local session and ask for a fresh sign-in when you cannot safely recover the replacement.
-
-### Reuse detection
-
-Reusing an already-consumed refresh token can revoke the session's refresh chain. This protects against reuse of a copied credential, but a buggy client with parallel refreshes can cause the same result.
-
-Investigate repeated sign-outs by checking for duplicate refresh calls, stale browser tabs, and retries after network failures. Never log the token values while doing so.
-
-## Change the active organization
-
-Use the refresh endpoint with `org`:
-
-~~~json
+```json
 {
-  "grant_type": "refresh_token",
-  "refresh_token": "<current-refresh-token>",
-  "org": "northstar"
+  "mfa_required": true,
+  "mfa_token": "Im9uZS5tb3Jl.djNBeUxSbldER0E",
+  "factors": ["totp", "recovery_code"]
 }
-~~~
+```
 
-The user must belong to the requested organization.
+No session exists yet. The `mfa_token` is a signed single-use token carrying the
+user, not a JWT, and it expires in **300 seconds** — much shorter than a session.
 
-| Request | Result |
+The org named on the password request is validated at this point, before the
+challenge is issued, so a non-member fails here rather than after completing MFA.
+
+<Warning>
+A `200` from the password grant does not mean you are signed in. Check for
+`mfa_required` before you look for `access_token`. A client that assumes a token is
+present will read `undefined` and fail somewhere less obvious.
+</Warning>
+
+### The MFA grant
+
+Completes the challenge and returns the full token response:
+
+```bash
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"mfa","mfa_token":"Im9uZS5tb3Jl.djNBeUxSbldER0E","code":"482913"}'
+```
+
+The session it creates is `aal2`, and its `method` is recorded as whatever created
+the challenge — `password` or `oauth:{provider}` — so a social sign-in that hits
+MFA shows up as social in the session list.
+
+Failure is a `400` with `the code is not valid`, and it **counts toward lockout**
+on the same counter as password failures. `mfa_token` and `code` are both
+required; omitting either is a `400`.
+
+There is a subtlety about when the challenge is consumed. The server peeks the
+token first to find the user, verifies the code, and only then marks the challenge
+used. So an incorrect code does not burn the challenge — you get the full five
+minutes to try again, bounded instead by the lockout counter and the MFA rate
+limit.
+
+A challenge whose user has since been disabled is refused with `the challenge is
+no longer valid`. That is worth knowing because it is a different message from a
+wrong code, and it is the one you will see if an administrator disables an account
+mid-sign-in.
+
+### The refresh grant
+
+The simplest of the three, and the one most clients get wrong. It needs
+`refresh_token`, optionally `org`, and returns the standard response. A missing
+`refresh_token` is a `400`, not a `401`.
+
+The authentication order matters here too. The server unverified-peeks the token
+to read `sub`, loads that user **scoped to the current project and environment**,
+and rejects immediately if there is no such user or the account is disabled. That
+is why a staging refresh token presented against production fails with `401
+invalid refresh token` even before the signature is checked — there is no staging
+user in the production query.
+
+<Accordion title="The full refresh decision tree">
+1. Peek the token for `sub`. If it is not a ULID, there is no user to load.
+2. Load the user by ULID **with `project` and `env` matching the request**. Missing,
+   deleted or disabled → `401`.
+3. Verify the signature against the environment's refresh secret. Bad signature →
+   `401`.
+4. Look up the row by `jti`. Missing, or not a refresh token → theft path, family
+   revoked, `401`.
+5. Row already revoked → theft path, `401`.
+6. Row already consumed → theft path, `401`.
+7. Mark consumed, mint a new pair in the same family.
+8. Load the `SessionInfo` row. Already revoked → `401` — **after** rotation, which
+   is worth knowing.
+9. Resolve `org` per the three-way semantics.
+10. Update `last_refreshed_at` and `org`, return the response.
+</Accordion>
+
+Point 8 is a real quirk. The session-revoked check happens after the rotation has
+already happened, so a refresh against an administratively revoked session mints a
+new pair and then throws it away with a `401 the session was revoked`. The tokens
+are orphaned but the family is already dead, so nothing leaks — but if you are
+chasing an unexplained token, this is where it comes from.
+
+## SessionInfo: what Pawabase knows about a session
+
+The token rows know about rotation. They do not know what device the session
+belongs to, or whether the user passed MFA. That information lives in a separate
+row, one per family, in `akz_sessions`.
+
+`SessionInfo` is keyed by the **family string as its primary key**. There is no
+surrogate id column — the primary key *is* the token family, which is why
+`session_id` in the token response can simply be that string.
+
+| Column | Purpose |
 | --- | --- |
-| Omit `org` | Retain the current organization if membership remains valid |
-| Set an organization slug | Switch to that organization after membership validation |
-| Set `org: null` | Clear the active organization |
+| `family` | Primary key. The token family hex string, identical to `session_id` and to `sid` in the claims. |
+| `user` | The account this session belongs to. |
+| `project` / `env` | The environment, for scoping queries. |
+| `method` | How the session started — `password`, or `oauth:{provider}`. |
+| `aal` | `"aal1"` by default, raised to `"aal2"` once MFA passes. |
+| `org` | The organization slug this session is scoped to, or `null`. |
+| `ip` | Client IP at sign-in. Taken from `X-Forwarded-For` when present, falling back to the socket peer. |
+| `user_agent` | The `User-Agent` header, truncated to 500 characters. |
+| `last_refreshed_at` | Updated on every successful refresh. |
+| `revoked_at` | Set when the session is revoked, so it drops out of the active list. |
 
-A switch also rotates the token pair. Replace it and clear cached data or subscriptions for the previous organization.
+Two of these are easier to get wrong than they look.
 
-## List active sessions
+**`ip` is taken from `X-Forwarded-For` when that header is present.** The first
+entry in the comma-separated list is used. If you are not behind a proxy that sets
+that header — or if clients can set it themselves — the recorded IP is whatever
+the header claims. It is a record for you to eyeball, not a trust boundary.
 
-~~~bash
-curl "$PAWABASE_URL/auth/v1/sessions" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
-~~~
+**`user_agent` is truncated at 500 characters**, and that is also the column's
+length. A pathological user-agent string is cut rather than rejected.
 
-The response contains a `data` array. Each entry includes `id`, `method`, `aal`, `ip`, `user_agent`, `created_at`, `last_refreshed_at`, and `current`.
+### `method` is how the session started, not how it is continuing
 
-Use `current` to label “This session.” Browser and IP information help a person recognize activity, but are not proof of device ownership.
+A session created by a Google sign-in has `method="oauth:google"` for its entire
+life, including across every refresh. It is not a record of which grant refreshed
+it. The refresh event is recorded separately in the login-event table with
+`method="refresh_token"`.
 
-Only sessions with an active refresh credential appear. An expired session should not be presented as still resumable.
+This is why the Studio session list can show a device that has never seen a
+password prompt, and why it cannot tell you which refreshes came from which
+device — because for a given session, that distinction does not exist.
 
-Operators can inspect user sessions in **Users & auth → Users**, then open a user.
+### Assurance level
 
-## Sign out
+`aal` starts at `"aal1"` for every session except one completed through MFA,
+which is created directly as `"aal2"`.
 
-~~~bash
-curl -X POST "$PAWABASE_URL/auth/v1/logout" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"scope":"local"}'
-~~~
+It can also be **raised** on an existing session: confirming an MFA enrolment
+while signed in stamps the current session to `aal2`. That means a user who adds
+an authenticator app mid-session keeps their current token family, but their
+*next* refresh picks up the elevated level.
 
-| Scope | Effect |
+The `aal` you get back is the one baked into the token. Changing a user's MFA
+settings does not rewrite tokens already issued.
+
+<Warning>
+There is no `require_aal` directive and no way to demand a minimum assurance level
+in policy. If your application needs to require MFA for an operation, check the
+`aal` claim yourself in a policy condition. `/auth/auth-in-policies` covers the
+claim syntax.
+</Warning>
+## Listing sessions, and why the list is short
+
+`GET /auth/v1/sessions` returns the user's active sessions. Each entry looks like
+this:
+
+```json
+{
+  "id": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6",
+  "method": "password",
+  "aal": "aal1",
+  "ip": "203.0.113.42",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+  "created_at": "2026-09-14T08:21:03+00:00",
+  "last_refreshed_at": "2026-09-14T08:36:47+00:00",
+  "current": true
+}
+```
+
+`id` is the family string. `current` is computed by comparing against the `sid` in
+the caller's own token, so the calling session is flagged for you.
+
+<Warning>
+The list is built by intersecting two tables, and the result is narrower than
+people expect. A session appears only if **both** of these hold:
+
+- It has a `SessionInfo` row with `revoked_at` unset, **and**
+- Its family has a refresh token row that is unrevoked, unconsumed and unexpired.
+
+A session whose refresh tokens have all expired — because nobody refreshed for 30
+days, but the access tokens were also dead — does not appear. The list shows
+*resumable* sessions, not every session that ever existed.
+</Warning>
+
+That intersection is why the list is not a reliable forensic record. For that,
+read the login-event history instead.
+
+### Listing a user's history
+
+`GET /auth/v1/history` returns the last 50 events for the signed-in user, newest
+first, each with `kind`, `method`, `success`, `reason`, `ip`, `user_agent` and
+`at`. It is scoped to the caller, so it cannot be used to inspect anyone else.
+
+The kinds you will see include `sign_in`, `refresh`, `sign_out`, `mfa_challenge`,
+`mfa_verify`, `mfa_enrolled` and `recovery_requested`. The `reason` field is where
+the internal detail lives — the theft messages, `wrong password`, `unknown email`,
+`locked`, `disabled`, `wrong code` — and this is the user-facing surface for their
+own account.
+
+## Revoking sessions
+
+There are three scopes, and they are expressed as one field on the sign-out body.
+
+`POST /auth/v1/logout` takes a `scope`:
+
+| `scope` | Effect |
 | --- | --- |
-| `local` | Revoke the current session |
-| `global` | Revoke all sessions for the user |
-| `others` | Revoke the user's other sessions and retain this one |
+| `local` (default) | Revokes only the calling session's family. |
+| `others` | Revokes every session **except** the current one. |
+| `global` | Revokes every session for the user in this environment. |
 
-The response contains `signed_out: true` and the selected scope.
+The response is `{"signed_out": true, "scope": "..."}`, and a `session.revoked`
+event is emitted with the scope in its payload.
 
-For local or global logout, remove local credentials, user-specific caches, and subscriptions. If the network request fails, clearing local state still signs the person out of that browser, but does not prove remote revocation succeeded.
+`others` is implemented by listing sessions and revoking each that is not the
+current one, so it is bounded by the same intersection described above — a session
+that dropped out of the list will not be revoked by `others`, though `global`
+catches it.
 
-### Revoke a selected session
+To end one specific session from another device's UI, `DELETE
+/auth/v1/sessions/{session_id}` revokes that family and returns no content. An
+unknown or already-revoked session is a `404`.
 
-~~~bash
-curl -X DELETE "$PAWABASE_URL/auth/v1/sessions/$SESSION_ID" \
-  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
-  -H "Authorization: Bearer $ACCESS_TOKEN"
-~~~
+<Info>
+Signing out does not change anything about the account: it does not disable it,
+clear lockout, or reset MFA. Those are administrative actions on the admin routes,
+covered in [/auth/managing-users](/auth/managing-users).
+</Info>
 
-A successful deletion returns 204 with no response body. Use session IDs returned for the signed-in user; do not build an interface that accepts arbitrary IDs.
+## Configuring lifetimes
 
-## What revocation does and doesn't do immediately
+Both lifetimes come from the environment's `auth` block, and both are editable in
+Studio under **Users & auth → Configuration → Passwords**, in the section
+described as *"Password strength and how long sessions last."*
 
-Revocation prevents further refresh. An already-issued access token can remain usable until its expiry on services that validate the token without checking live session state.
+| Setting | Studio label | Field | Default |
+| --- | --- | --- | --- |
+| Access token lifetime | **Access token lifetime** | `access_ttl` | `900` seconds |
+| Refresh token lifetime | **Refresh token lifetime** | `refresh_ttl` | `2592000` seconds (30 days) |
 
-Do not promise instant invalidation of every API request after logout or a role change. Access-token lifetime is part of that boundary.
+The Studio hints are precise about the intent: the access field is *"Seconds. How
+long a bearer token works before it needs refreshing."* and the refresh field is
+*"Seconds. How long a signed-out-of-band session stays resumable."*
 
-Current-user endpoints may additionally check live account availability. That does not mean every resource request performs the same account lookup.
+Changing a lifetime affects tokens minted **after** the change. It does not
+rewrite the `exp` inside a token you already hold, and it does not extend the life
+of an existing session's remaining refresh window. A user mid-session keeps the
+TTL their next token was issued under.
 
-## Roles, membership, and MFA changes
+<Warning>
+Auth configuration is cached for **10 seconds** by default. Editing a lifetime in
+Studio can take up to ten seconds to take effect. If you changed it and the next
+token still has the old `expires_in`, that is the cache, not a failure.
+</Warning>
 
-Roles and permissions are refreshed when new access tokens are issued. Organization membership is also reconsidered during issuance.
+Shortening the access lifetime reduces the window in which a leaked token is
+useful, and lengthening it reduces how often your clients have to refresh. It is
+the main tuning knob for that trade-off, and it is bounded below by how often your
+client actually refreshes: a client that only refreshes on a `401` will see a
+faster churn of tokens than one that refreshes on a timer.
 
-After enrollment confirmation elevates an existing session to `aal2`, refresh to obtain an access token reflecting the new assurance level. A token already stored in memory does not change itself.
+### The platform environment is different
 
-Use [MFA](/auth/mfa) for enrollment and challenge handling.
+Studio's own operators — the reserved `_platform` environment — do not use your
+project's auth block. That configuration is hardcoded, not editable, and it is
+stricter: sign-up is off, the password policy is strict with a minimum length of
+10, access tokens live an hour, and refresh tokens live seven days.
 
-## Store credentials according to your application
+If you are debugging why a Studio operator's session behaves differently from your
+application users', this is why. There is no configuration key that changes it.
 
-A browser-only client can keep a session in memory, accepting that a reload loses it unless another persistence strategy is added. JavaScript-readable persistent storage increases exposure to injected scripts.
+## Refreshing from a client
 
-A backend-for-frontend can hold Pawabase tokens on the server and use its own Secure, HttpOnly session cookie. The backend must implement its cookie, CSRF protection, session store, and refresh coordination; Pawabase's JSON token response does not set up that architecture automatically.
+The TypeScript SDK manages this refresh loop. If you use the REST API directly — including from the
+server-oriented Python SDK, which has no user-session client — the refresh logic is yours to write.
+The wire behavior below is also the reference for debugging SDK-managed sessions.
 
-Native applications should use the platform's protected credential storage.
+The loop you need is: send the request with the access token; on a `401`, refresh
+once; retry once; if that also fails, sign the user out.
 
-Never put refresh tokens in application logs, error reporting payloads, or analytics properties.
+```bash
+# 1. Sign in
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"password","email":"ada@example.com","password":"correct horse"}'
 
-## Troubleshooting
+# 2. Call something with the access token
+curl https://api.example.com/data/restaurants \
+  -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiIs...'
 
-| Symptom | Check |
+# 3. On 401, refresh — once — and retry
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"refresh_token","refresh_token":"eyJhbGciOiJIUzI1NiIs..."}'
+```
+
+Three rules make this work:
+
+- **Refresh at most once per failed request.** Refreshing twice on one `401` means
+  the second call presents an already-consumed token, which triggers theft
+  detection and kills the session.
+- **Never retry a failed refresh with the same token.** A network timeout on the
+  refresh is ambiguous — the server may have rotated successfully. Presenting that
+  token again looks like theft. Treat any refresh failure as "sign in again".
+- **Refresh before the token expires if you can.** Using `expires_at` from the
+  response avoids the `401` entirely, and avoids the retry logic above.
+
+<Warning>
+Concurrent refreshes are a real hazard. If six requests all get a `401` at the
+same moment and each independently refreshes, the first succeeds and the other
+five present a consumed token — theft detection fires and the session is revoked.
+Serialise your refreshes behind a single in-flight promise. This is the most
+common cause of "users randomly get signed out".
+</Warning>
+
+### Where to keep the refresh token
+
+The refresh token is the long-lived credential and the thing worth stealing. Its
+defence is rotation and theft detection, not secrecy.
+
+Storing it in `localStorage` puts it within reach of any script that runs on your
+page, and a single XSS becomes a full account compromise that rotation cannot
+recover from. A `httpOnly` cookie keeps it out of reach of JavaScript entirely, at
+the cost of having to handle CSRF — and note that cookies do not work for a native
+mobile client at all.
+
+For a native client the platform keychain or keystore is the equivalent. For a
+backend service, an environment variable or secret manager. `/clients/overview`
+covers the broader client guidance.
+
+### The context header
+
+A user token is not sufficient on its own. Requests also carry
+`X-Pawabase-Context`, a gateway-signed token naming the project, environment,
+credential role, key id and scopes. Services read it to know which environment a
+request belongs to, and drop it silently if it does not verify — so a missing or
+invalid header degrades to an anonymous request rather than a hard failure, and
+public routes keep working.
+
+If your backend calls a Pawabase service directly rather than through the gateway,
+you need the API key in the `apikey` header. `/concepts/request-lifecycle` walks
+the whole path.
+
+## What goes wrong, and why
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| `401 invalid refresh token` on a token you believe is valid | It was already consumed by a previous refresh | Persist the **new** refresh token before discarding the old one |
+| Session dies after several successful refreshes | Concurrent refreshes tripped theft detection | Serialise refreshes behind one in-flight request |
+| `401` on every request, refresh seems fine | Two servers each hold a stale refresh token | Both instances must share refresh-token state, or use one |
+| `401` on a staging token sent to production | Environment mismatch in `prj`/`env` | Not fixable client-side; get a token for the right environment |
+| `401` immediately after a Studio edit | Config cache, up to 10 seconds | Wait and retry |
+| `org` unexpectedly `null` after a refresh | Client serialised an absent field as `null` | Omit the key entirely to preserve the session's org |
+| `org` and `org_role` both `null` despite membership | Role was changed after the token was minted | Refresh, or read the org routes for the authoritative value |
+| `403 you are not a member of that organization` | Named a slug you are not in, or a slug that does not exist | Same message either way; check the slug |
+| `403 the account is not available` on a valid token | An administrator disabled the account | Re-enable, or sign in as someone who can |
+| `401` on an already-revoked session's refresh | Rotation ran before the revoked check | Harmless; the orphan tokens belong to a dead family |
+| No active sessions in Studio for a signed-in user | No unexpired, unconsumed refresh token remains | Expected once the refresh window lapses |
+| Revoked session still works for a few minutes | Access tokens verify locally, with no live check | Wait out `access_ttl`, or shorten it |
+| `400 the code is not valid` repeatedly, then `429` | MFA failures share the lockout counter | The account is now locked; unlock from the admin route |
+
+<Accordion title="Diagnosing from the Sign-in activity tab">
+The **Users & auth → Sign-in activity** tab is the fastest way to explain a failed
+sign-in to a user, because the Result column carries the internal reason string
+rather than the generic message the API returned.
+
+The **failures only** checkbox filters to `success=False` rows. Columns are
+**When**, **Event**, **Email**, **Result** and **IP**. The Event column is the
+`kind`, and the method is folded into it for social sign-ins.
+
+| Event you see | What it means |
 | --- | --- |
-| Immediate 401 after sign-in | Matching gateway, API key, environment, and bearer header |
-| Intermittent refresh failures | Concurrent refresh calls or reused stored tokens |
-| Permissions stay unchanged | Whether the client actually installed the newest token pair |
-| Session disappears from the device list | Refresh expiry or revocation |
-| Logout completed but a copied access token still works | Its remaining access lifetime |
-| Organization switch is denied | Membership and exact organization slug |
-| MFA enrollment succeeded but policy still denies | Refresh and inspect the newly issued assurance level |
+| `sign_in` with `unknown email` | No account for that address **in this environment** |
+| `sign_in` with `wrong password` | The account exists; the password was wrong |
+| `sign_in` with `locked` | Lockout threshold reached; the password may well have been right |
+| `sign_in` with `disabled` | An administrator disabled the account |
+| `refresh` with a theft message | A consumed or revoked refresh token came back |
+| `refresh` with `Invalid refresh token` | The signature did not verify |
+| `mfa_challenge` | A challenge was issued, meaning the password was correct |
+| `mfa_verify` with `wrong code` | The TOTP or recovery code was wrong |
+| `sign_out` | The method is the scope — `local`, `others` or `global` |
 
-Continue with [Client integration](/auth/client-integration) and [Security model](/auth/security-model).
+The distinction between `unknown email` and `wrong password` is visible here even
+though the API deliberately returns the same message to the caller. This tab is
+for you, not for end users.
+</Accordion>
+
+<Accordion title="Why revoked tokens keep working until they expire">
+Access tokens are verified locally by each service using a key derived from the
+master secret. That is what makes verification fast and keeps Akountz off the hot
+path, but it means there is no per-request callback to ask "was this revoked?".
+
+The consequences are worth being explicit about:
+
+- Revoking a family does not un-issue access tokens already minted from it.
+- Disabling an account does not un-issue its tokens.
+- Deleting an account does not un-issue its tokens.
+- Only the **refresh** path consults the database, which is why a revoked session
+  is definitively dead — it simply cannot get a new token.
+
+So the access token lifetime is your real revocation latency. Everything else is
+immediate for new sessions and bounded by `access_ttl` for existing ones.
+</Accordion>
+
+## Studio: seeing and ending sessions
+
+Studio's **Users & auth** page has a per-user **Sessions** table. You get there
+from the **Users** tab: click a row, and the user's detail modal opens.
+
+The table has four columns — **Session**, **Device**, **IP**, **Last active** —
+plus a per-row **Revoke** button. **Session** shows only the first eight
+characters of the family, which is enough to recognise it and not enough to use
+it. **Device** is the raw user-agent string, which is long and rarely pretty.
+
+The empty state reads *"No active sessions."* If you see it for a user who is
+definitely signed in somewhere, that is usually the intersection rule above rather
+than a bug.
+
+The same modal carries a **History** table — **When**, **Event**, **OK**, **IP** —
+driven by that user's own history endpoint. The **OK** badge is green `ok` for
+success and red with the reason string otherwise, which makes it the fastest way
+to see *why* sign-ins are failing for one account.
+
+### Ending a session from Studio
+
+**Revoke** calls the same admin route a service key would, and toasts
+**Session revoked**. The user detail refreshes afterwards, so the row disappears.
+
+To end every session for a user at once, use **Sign out everywhere** in the same
+modal. That calls the revoke-all route and toasts **Signed out everywhere**.
+
+<Note>
+Session revocation takes effect on the **next request**. An access token that was
+already issued keeps working until it expires, because services verify the
+signature locally and do not call Akountz to check whether the family was revoked.
+With the default 900-second lifetime, that is the window you are buying when you
+shorten `access_ttl`.
+</Note>
+
+## A worked session, end to end
+
+The composite case is worth walking through once, because it exercises the family,
+the assurance level and the org field together — and it is the shape of almost
+every real sign-in for an org-scoped application with MFA enabled.
+
+**The password attempt** names the organization and hits an account with MFA on:
+
+```bash
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"password","email":"ada@acme.com","password":"correct horse","org":"research"}'
+```
+
+Membership in `research` is validated here, before anything is issued. Because
+the account has MFA, no tokens come back:
+
+```json
+{
+  "mfa_required": true,
+  "mfa_token": "Im9uZS5tb3Jl.cHVuSGpWSm5IeHhL",
+  "factors": ["totp", "recovery_code"]
+}
+```
+
+**The MFA completion** exchanges the challenge for a session:
+
+```bash
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"mfa","mfa_token":"Im9uZS5tb3Jl.cHVuSGpWSm5IeHhL","code":"482913"}'
+```
+
+Three things are true of the result that are not true of a password-only sign-in:
+
+- `aal` is `aal2` on the session row and in the token claims.
+- `method` is `password` — carried from the challenge, not from this grant.
+- `org` is `research` and `org_role` is populated, both read at issue time.
+
+Note the `org` was **not** sent on the MFA request. It came from the challenge's
+own data, which is why the org survives the two-step flow without the client
+having to repeat it.
+
+**A refresh** keeps everything. The client omits `org` entirely:
+
+```bash
+curl -X POST https://api.example.com/auth/v1/token \
+  -H 'Content-Type: application/json' \
+  -d '{"grant_type":"refresh_token","refresh_token":"eyJhbGciOiJIUzI1NiIs..."}'
+```
+
+Same family, new `jti`s, `last_refreshed_at` updated, `org` and `org_role`
+preserved, `aal` still `aal2` because it is read from the session row rather than
+re-derived.
+
+**A refresh after the user's role changed** shows the staleness clearly. Promote
+the user from `member` to `admin` in the `research` org, then refresh: the
+response still shows `org_role: "member"`, because the role is read from the
+membership row at issue time — but the *next* refresh shows `admin`. Any code
+that cached `org_role` from the first response is acting on a stale value.
+
+<Warning>
+In that example, a refresh that sends `"org": "research"` also works, and a refresh
+that sends `"org": null` silently drops the session out of `research` — producing
+`org: null, org_role: null` while the membership is untouched. Omit the field and
+you cannot accidentally do this.
+</Warning>
+
+### What a duplicate refresh looks like on the server
+
+If the client above sends the refresh request twice with the same token — because
+of a retry, a double-tap, or two tabs racing — the second call finds the row's
+`consumed_at` already set. That is the theft path: the family is revoked, the
+session row is stamped, `session.reuse_detected` is emitted, and the response is
+`401 invalid refresh token`.
+
+## The single-use tokens you will meet alongside JWTs
+
+Sessions are not the only tokens in the system, and mixing up the two families of
+token is a common source of confusion. The one-time tokens used for email
+verification, recovery, magic links and MFA challenges are **not JWTs at all**.
+
+They are a signed reference to a database row:
+
+```
+   email ──▶ OneTimeToken row { id, purpose, expires_at, used_at }
+                    │
+                    └── signed with a per-purpose secret
+                         │
+                         ▼
+              ?token=<signature>&type=verify
+```
+
+The signature makes the token unforgeable and time-limited. The **row** makes it
+single-use — and the row is what expires, not the signature alone. Lifetimes are
+per purpose:
+
+| Purpose | Lifetime | Carries |
+| --- | --- | --- |
+| `verify` | 24 hours | The new account awaiting email confirmation |
+| `recovery` | 1 hour | A password reset |
+| `magic` | 15 minutes | A passwordless sign-in |
+| `mfa` | 5 minutes | An in-flight MFA challenge |
+| `invite` | 7 days | An organization invitation |
+| `email_change` | 24 hours | A pending address change |
+| `link` | 10 minutes | Linking an external identity to an account |
+
+Two properties make these different from your access and refresh tokens:
+
+**Consumption is a conditional update.** The server updates the row with a
+condition that it is still unused, and if the update matches zero rows, someone
+else got there first and the token is treated as spent. That closes the race
+between two concurrent uses of the same emailed link — one wins, one fails,
+neither double-spends.
+
+**Every failure is the same error.** A token that is unknown, already used,
+expired, or signed with the wrong purpose all produce one identical response.
+There is deliberately no way to distinguish "this link was already clicked" from
+"this link never existed", because that distinction would tell an attacker whether
+an address has an account.
+
+<Warning>
+An MFA challenge is a five-minute token, not a JWT. It cannot be used as a bearer
+credential, it does not appear in `GET /auth/v1/sessions`, and revoking the
+session does not affect it. If a user abandons a sign-in halfway, the challenge
+expires on its own within five minutes.
+</Warning>
+
+### Consumption can be deferred
+
+One flow uses a peek rather than a consume: the MFA completion path needs to know
+*who* the challenge belongs to before it can verify a code, so it reads the token
+without using it up and consumes only after the code is correct.
+
+That is why an incorrect MFA code does not burn your challenge — you keep the full
+five minutes to try again. The practical bound on repeated attempts is the lockout
+counter and the MFA rate limit instead.
+
+## Rate limits on the auth surface
+
+Three limit buckets cover the endpoints, and they are per-IP against the
+installation's Redis.
+
+| Bucket | Limit | Window | Covers |
+| --- | --- | --- | --- |
+| `akz:auth` | 30 | 60 seconds | `/signup` and `/token` — sign-in, refresh and MFA completion alike |
+| `akz:mfa` | 10 | 60 seconds | MFA verification, disabling and recovery-code replacement |
+| `akz:links` | 10 | 60 seconds | The emailed one-time link flows |
+
+Note that `/token` is a single bucket for all three grants. A client stuck in a
+refresh loop can exhaust the same 30-per-minute allowance that sign-in uses, which
+presents as a `429` on a request you would not otherwise expect to be limited.
+
+<Info>
+The MFA bucket is 10 per 60 seconds, and failed MFA codes also increment the
+account's `failed_logins` counter toward lockout. Two independent mechanisms bound
+a TOTP guessing attempt, and they operate on different axes — one per IP, one per
+account.
+</Info>
+
+### Account lockout, and where it is *not* configured
+
+Failed sign-ins increment `failed_logins`. When the counter reaches
+`lockout_threshold`, `locked_until` is set to now plus `lockout_minutes` and the
+counter resets to zero.
+
+This is worth dwelling on because it is a common misconfiguration to hunt for: the
+two lockout values are **installation settings, not per-environment auth config**.
+They are global across every environment on that Akountz instance, while the
+counters they act on live per user, per environment.
+
+So you cannot give staging a stricter lockout than production. You change it for
+both at once, through the installation's settings rather than through an
+environment's `auth` block.
+
+| Behaviour | Detail |
+| --- | --- |
+## Where sessions and the rest of auth intersect
+
+**Sign-up can return a session too.** If email verification is not required,
+`POST /auth/v1/signup` starts a session immediately and returns
+`{verification_required: false}`. With verification required it returns
+`{"user": {...}, "session": null, "verification_required": true}` and no tokens —
+a client that assumes `access_token` is present on a `201` from sign-up will read
+`undefined` on the verification-required path.
+
+**Magic-link completion returns the same response shape**, so the refresh loop you
+write against `/token` works unchanged after a user clicks a link.
+
+**OAuth redirects carry a subset, in the fragment.** The social callback returns
+only `access_token`, `refresh_token`, `expires_in` and `token_type` — no
+`session_id`, no `user`. If your SPA needs the session id or the user object after
+a social sign-in, it must follow up with `GET /auth/v1/user`, or accept that the
+fragment gives it a bare pair. The fragment is used because fragments are not sent
+to servers or written to access logs on the redirect hop.
+
+**Sign-out emits an event regardless of scope.** `session.revoked` carries the
+scope in its payload, so a downstream system can distinguish a user closing one
+tab from a user signing out everywhere. `/events/overview` covers subscribing.
+
+## How a token is verified on a resource request
+
+Akountz is not involved in verifying a request to, say, your storage service. This
+is the part of the design that keeps auth off the hot path, and it is worth
+understanding because it explains several behaviours described above.
+
+The sequence for a request carrying a user token:
+
+1. A backend service receives the request with `Authorization: Bearer <token>` and
+   an `X-Pawabase-Context` header.
+2. The context header is verified and exposed to the request. **If it fails
+   verification it is dropped, not rejected** — the request continues as anonymous
+   so public routes keep working.
+3. The user backend runs. It reads `project` and `env` from the context, derives
+   the signing key for that pair, and verifies the token.
+4. Verification checks the signature, the audience, and that `typ` is `access`.
+5. It then checks `prj` and `env` in the claims match the context's pair. A
+   mismatch is rejected even though the signature was valid.
+6. On success the verified claims become the caller's identity, available to
+   policies without another round trip.
+
+The drop-in-step-2 behaviour has a consequence worth knowing: **a missing or
+invalid context header does not produce a `401`**. It produces an anonymous
+request, which on a protected route then fails as "not signed in" rather than as a
+context error. If you are debugging an authentication failure and the error
+mentions no token at all, suspect the context header.
+
+<Accordion title="Which failures are which">
+| Check | Failure looks like |
+| --- | --- |
+| Context header missing or invalid | Silently dropped; request proceeds anonymously |
+| No `Authorization` header | Not authenticated |
+| Header present but not `Bearer` | Not authenticated |
+| Signature invalid, expired, or wrong key | Not authenticated |
+| `typ` is not `access` — a service or context token was presented | Not authenticated |
+| `prj`/`env` mismatch with the context | Rejected as belonging to another environment |
+| Valid token, disabled or deleted account | Accepted at the service; rejected by Akountz on the next token operation |
+
+The last row is the honest boundary. A service verifying a signature does not know
+the account was disabled thirty seconds ago. Enforcement lands on the next sign-in
+or refresh.
+</Accordion>
+
+### The identity that reaches your code
+
+A verified user token becomes an object with the claims already attached. Nothing
+is fetched to build it — the identity *is* the claims. That is the payoff of
+putting roles and permissions in the token, and also its cost: there is no way to
+ask "is this user still a member?" through the identity alone.
+
+For a user token the identity is the user's id; for a service acting for a Studio
+operator it is the operator's; for a service with no operator behind it, the
+service itself, with admin rights by default. A service token minted for one
+service cannot be replayed against another, because it is addressed to one
+audience and the audience is verified.
+| Lock condition | `locked_until` is set and in the future |
+| Default threshold | 10 failed attempts |
+## Events emitted around sessions
+
+Sessions emit a small, specific set of events. Knowing the exact names matters
+because subscribing to an event that does not exist is a silent no-op.
+
+| Event | When | Payload highlights |
+| --- | --- | --- |
+| `user.signed_in` | A session starts | `user_id`, `method` |
+| `session.revoked` | A session, or all sessions, are revoked | `user_id`, `scope` or `session_id` |
+| `session.reuse_detected` | A consumed or revoked refresh token was presented | `user_id` |
+| `user.password_changed` | A password was changed | `user_id` |
+| `user.updated` | A self-service profile update | `user_id`, `changed` — the list of what moved |
+
+Two things to notice. **There is no `token.issued` or `token.refreshed` event** —
+a successful refresh emits nothing at all, which is correct: a refresh is routine
+and emitting on every one would flood your event stream. If you need refresh
+telemetry, use the login-event history rather than the event bus.
+
+And **reuse detection emits before it responds**, so a subscriber sees it even
+though the client only ever receives a generic `401`.
+
+The `changed` list on `user.updated` is worth reading if you are auditing: it
+contains human-readable entries like `email (pending confirmation)`, which tells
+you the address change has been requested but not yet confirmed.
+
+## The routes involved
+
+Every route on this page, in one place.
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/auth/v1/token` | POST | Sign in, refresh, complete MFA |
+| `/auth/v1/signup` | POST | Create an account; may start a session |
+| `/auth/v1/user` | GET | The signed-in user, plus `aal` and `session_id` |
+| `/auth/v1/user` | PATCH | Update the signed-in user |
+| `/auth/v1/logout` | POST | Sign out `local`, `others` or `global` |
+| `/auth/v1/sessions` | GET | Active sessions for the caller |
+| `/auth/v1/sessions/{session_id}` | DELETE | End one session |
+| `/auth/v1/history` | GET | The caller's last 50 events |
+| `/auth/v1/settings` | GET | What this environment offers for sign-in |
+| `/auth/v1/mfa` | GET | MFA status and remaining recovery codes |
+| `/auth/v1/mfa/totp/enroll` | POST | Begin TOTP enrolment |
+| `/auth/v1/mfa/totp/verify` | POST | Confirm enrolment, returns recovery codes |
+| `/auth/v1/mfa/disable` | POST | Turn MFA off, needs a current code |
+
+`GET /auth/v1/settings` is the one worth reading before you build a sign-in screen,
+because it tells the client what this environment actually offers — whether
+sign-up is on, whether verification is required, whether magic links exist, whether
+MFA is available, which password policy applies, and **which providers are
+enabled**. Hard-coding those in your frontend means it breaks the moment someone
+changes the environment.
+
+<Note>
+A provider with no `client_id` is **invisible** in the settings response and
+`404`s if you try to use it, even if it looks enabled in your config. The filter
+requires both a non-falsey `enabled` and a `client_id`. `/auth/social-login` covers
+the provider set in detail.
+</Note>
+
+### Two routes about keeping sessions honest
+
+`POST /auth/v1/mfa/disable` requires a **current** code to turn MFA off. It is
+deliberately not a free action for anyone holding a session — a stolen session
+cannot quietly remove the second factor. It deletes both the factors and the
+recovery codes, clears the flag, and emits `user.mfa_disabled`.
+
+`POST /auth/v1/mfa/recovery-codes` replaces the recovery codes, and requires a
+current authenticator code — specifically a TOTP code, not a recovery code.
+Replacing your codes with a recovery code would let anyone holding a single
+exhausted code bootstrap unlimited new ones.
+
+<Warning>
+MFA state and session state are independent. Removing a user's MFA does not revoke
+their sessions, and revoking their sessions does not remove MFA. If you disable an
+account *and* want MFA gone, that is two separate administrative actions.
+</Warning>
+## Practical guidance
+
+A short set of conclusions that follow from everything above, in the order they
+tend to matter:
+
+**Store the refresh token where a script cannot reach it, and treat a refresh
+failure as terminal.** Never retry a refresh with the same token; sign in again.
+These two rules together prevent the self-inflicted session death that dominates
+support tickets.
+
+**Serialise refreshes.** One in-flight refresh per client, with everything else
+waiting on it. Concurrent refreshes are indistinguishable from theft.
+
+**Set `access_ttl` from how much staleness you can tolerate.** It is the only knob
+that affects revocation latency, because verification is local. Fifteen minutes is
+a reasonable default; an hour means a disabled account keeps working for an hour
+against services.
+
+**Send `org` deliberately or not at all.** Never serialise it as `null` from an
+absent value, or you will silently drop org-scoped sessions on every refresh.
+
+**Read `org_role` from the org routes when correctness matters.** The claim is
+correct as of the last token you were handed, which may be up to fifteen minutes
+old.
+
+**Check `GET /auth/v1/settings` before hard-coding a sign-in screen.** It is the
+only thing that stays true when someone edits the environment.
+
+**Watch the Sign-in activity tab for theft messages.** They are the fingerprint of
+a client that is racing itself, and they are invisible in the API responses.
+
+## Reference: the models behind a session
+
+Four pieces of persisted state back everything on this page. They are named here
+because they appear in the data model, in Studio, and in the backup format, and
+knowing which is which resolves most "which table is that?" questions.
+
+| Model | Table | Holds | Keyed by |
+| --- | --- | --- | --- |
+| `AuthUser` | `akz_users` | The account | A ULID, unique per `project` + `env` + `email` |
+| `JWTToken` | `jwt_tokens` | Rotation and revocation state per token | Its own id; looked up by `jti` |
+| `SessionInfo` | `akz_sessions` | Device, IP, method, assurance level, org | The family string, as primary key |
+| `LoginEvent` | `akz_login_events` | Sign-in history, successes and failures | A ULID, newest first |
+
+A user can have many `SessionInfo` rows and many `LoginEvent` rows, but each
+`SessionInfo` row corresponds to exactly one token family, which corresponds to
+one `JWTToken` access row and one refresh row **per rotation**.
+
+Note that the user's own id is a ULID — a lexicographically sortable identifier,
+not a UUID and not an integer. `AuthUser` overrides the identity handling so that
+Sillo's methods, which would otherwise parse an identity as an integer, work with
+it. This is also why user ids are always uppercased when compared: the lookup
+accepts either case.
+
+### What is deliberately *not* stored
+
+Worth stating, because all three are things other systems usually keep:
+
+**No IP-to-session binding.** The `ip` and `user_agent` on a session are a record
+for you to inspect, not an enforcement mechanism. A session is not invalidated when
+the IP changes, and there is no device fingerprint that will refuse a legitimate
+token.
+
+**No `theft_detected` flag on the session.** Reuse detection is not recorded as a
+boolean you can query. It revokes the family, stamps `revoked_at`, and emits an
+event. To answer "was this session compromised?", read the login events for a
+theft message — which is exactly what the Studio History table does.
+
+**No per-session absolute expiry.** A session has no `expires_at` of its own. It
+ends when its refresh tokens expire and stop being refreshable, or when something
+revokes it. If you need a maximum session age, you have to enforce it yourself
+from `created_at` in the session list.
+
+<Info>
+Those three absences are the same design decision as local token verification: the
+system prefers fast, self-contained checks over a live lookup at every request. The
+trade-off is that revocations take up to `access_ttl` to bite, and that session
+history lives in the event table rather than in a convenient flag.
+</Info>
+
+### The backup view
+
+A backup exports roles, users — **including password hashes** — and organizations.
+That last point matters when you decide where backups may live and who may hold
+them: an identities backup is a credential archive, not a data archive.
+
+Restoring is gated on a format check and supports a dry run that reports counts
+before writing anything, plus a `replace` flag for a full overwrite rather than a
+merge. Roles and organizations are restored alongside users, because a user
+without their roles is not the same account. The routes are `GET {base}/backup` and
+`POST {base}/restore` on the admin base.
+
+## How this fits the rest of the system
+
+A few connections worth holding onto:
+
+**Tokens carry enough for policies, but not always the freshest truth.** Roles and
+permissions are in the token for exactly this reason — no network call per
+request. Organization role and membership are the exception to watch, because
+those change on a schedule the token cannot see. `/policies/context` covers what
+is available to a policy.
+
+**Akountz owns sessions; the API owns configuration.** The lifetimes and feature
+flags that govern sessions live in each environment's `auth` block, which belongs
+to the API. Akountz reads it and caches it. Changing the API's config is what
+changes session behaviour, and it takes up to ten seconds.
+
+**Session state survives across services.** Every service sees the same `sid`,
+`org` and `aal`, because they come from the one token. A request that reaches
+storage and one that reaches functions present the same identity.
+
+**Sign-out is not deletion.** Revoking sessions is cheap and immediate. Deleting an
+account is a soft delete that releases the email address for re-use — see
+[/auth/managing-users](/auth/managing-users).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Managing users" icon="users" href="/auth/managing-users">The Studio Users tab and every admin route: create, update, disable, unlock, delete, MFA reset, sign-out everywhere.</Card>
+  <Card title="Security model" icon="shield-check" href="/auth/security-model">How the properties on this page fit the wider threat model, and the checklist before going to production.</Card>
+  <Card title="MFA" icon="shield" href="/auth/mfa">Enrolment, the single-use TOTP step, recovery codes, and how a session reaches aal2.</Card>
+  <Card title="Organizations" icon="building-2" href="/auth/organizations">Membership, roles, invitations and teams — the source of truth behind org claims.</Card>
+  <Card title="Client integration" icon="code" href="/auth/client-integration">Calling auth endpoints from a frontend or backend, including refresh handling.</Card>
+  <Card title="Auth in policies" icon="file-code" href="/auth/auth-in-policies">Using the claims above in policy conditions.</Card>
+</CardGroup>
+## Every auth route, with its shape
+
+The complete session-and-token surface in one table. "Public" means no bearer token
+required; "User" means a valid user access token.
+
+| Route | Method | Auth | Body | Returns |
+| --- | --- | --- | --- | --- |
+| `/auth/v1/settings` | GET | Public | — | What the environment offers |
+| `/auth/v1/signup` | POST | Public | `email`, `password`, `username?`, `name?`, `data?`, `redirect_to?` | User plus a session, or `session: null` |
+| `/auth/v1/token` | POST | Public | `grant_type`, `email?`, `password?`, `refresh_token?`, `mfa_token?`, `code?`, `org?` | Token response, or an MFA challenge |
+| `/auth/v1/user` | GET | User | — | User view plus `aal` and `session_id` |
+| `/auth/v1/user` | PATCH | User | `name?`, `avatar_url?`, `data?`, `password?`, `current_password?`, `email?` | User view plus `changed` |
+| `/auth/v1/logout` | POST | User | `scope` | `signed_out`, `scope` |
+| `/auth/v1/sessions` | GET | User | — | Array of active sessions |
+| `/auth/v1/sessions/{id}` | DELETE | User | — | No content, or `404` |
+| `/auth/v1/history` | GET | User | — | Last 50 events for the caller |
+| `/auth/v1/mfa` | GET | User | — | `enabled`, `aal`, `recovery_codes_remaining` |
+| `/auth/v1/mfa/totp/enroll` | POST | User | — | `factor_id`, `secret`, `otpauth_uri` |
+| `/auth/v1/mfa/totp/verify` | POST | User | `code` | Recovery codes |
+| `/auth/v1/mfa/disable` | POST | User | `code` | `enabled: false` |
+| `/auth/v1/mfa/recovery-codes` | POST | User | `code` | Fresh recovery codes |
+
+Two rows deserve comment. `/auth/v1/token` is public because that is where a
+caller obtains a token in the first place — its protection is the password or the
+refresh token in the body, plus rate limiting.
+
+`/auth/v1/sessions/{id}` accepts **any** session id belonging to the caller and
+revokes it, including the current one. There is no special case preventing a user
+from signing themselves out through it.
+
+### The link flows, for completeness
+
+These complete sessions, so they belong in the same mental model even though they
+are not token routes.
+
+| Route | Method | Body | Effect |
+| --- | --- | --- | --- |
+| `/auth/v1/verify/request` | POST | `email`, `redirect_to?` | Sends a verification link |
+| `/auth/v1/verify` | POST | `token` | Marks verified, starts a session |
+| `/auth/v1/recover` | POST | `email`, `redirect_to?` | Sends a reset link |
+| `/auth/v1/recover/confirm` | POST | `token`, `password` | Sets the password, revokes all sessions |
+| `/auth/v1/magic-link` | POST | `email`, `redirect_to?`, `create_user?` | Emails a sign-in link |
+| `/auth/v1/magic-link/verify` | POST | `token` | Starts a session |
+| `/auth/v1/email/confirm` | POST | `token` | Applies a pending address change |
+
+The three request routes always return the same body whether or not the address has
+an account:
+
+```json
+{
+  "sent": true,
+  "message": "If the address has an account, a message is on its way."
+}
+```
+
+That uniform answer is the enumeration defence, stated in the response rather than
+implied by it.
+
+## Every error this surface can return
+
+A consolidated table, because the same status code means different things on
+different routes and that is a frequent source of confusion.
+
+| Status | Detail | Route | Cause |
+| --- | --- | --- | --- |
+| `400` | `email and password are required` | `/token` | Password grant without both fields |
+| `400` | `invalid email or password` | `/token` | Unknown email **or** wrong password |
+| `400` | `refresh_token is required` | `/token` | Refresh grant without a token |
+| `400` | `mfa_token and code are required` | `/token` | MFA grant missing a field |
+| `400` | `the code is not valid` | `/token` | Wrong TOTP or recovery code |
+| `400` | `the challenge is no longer valid` | `/token` | The user behind the challenge is gone or disabled |
+| `400` | `redirect_to is not an allowed URL` | Several | Target outside the allowlist |
+| `400` | `current_password is wrong` | `/user` PATCH | Self-service password change |
+| `400` | `the link is invalid or has expired` | Link flows | Unknown, used, expired or wrong-purpose token |
+| `401` | `invalid refresh token` | `/token` | Any refresh failure, including theft |
+| `401` | `the session was revoked` | `/token` | Refreshed a revoked session, after rotating |
+| `401` | `sign in first` | Authenticated routes | No user token |
+| `401` | `the account is not available` | Authenticated routes | Disabled or deleted account |
+| `403` | `confirm your email address first` | `/token` | Verification required and absent |
+| `403` | `this account is disabled` | `/token` | Disabled at password grant |
+| `403` | `you are not a member of that organization` | `/token` | Named an org you are not in, or that does not exist |
+| `403` | `sign-up is disabled` | `/signup` | `signup_enabled` is false |
+| `403` | `magic links are disabled` | `/magic-link` | `magic_link_enabled` is false |
+| `403` | `MFA is disabled for this project` | `/mfa/totp/enroll` | `mfa_enabled` is false |
+| `404` | `no such session` | Session routes | Unknown or already-revoked session id |
+| `409` | `that email is in use` | `/user` PATCH | Address already taken |
+| `422` | `a valid email address is required` | Several | Failed normalisation |
+| `422` | `{"message", "problems": [...]}` | Several | Password policy failure |
+| `429` | `too many failed attempts; try again later` | `/token` | Account lockout |
+| `429` | `{"error": "rate_limit_exceeded", ...}` | Several | Rate limit bucket exhausted |
+
+<Warning>
+`400 invalid email or password` and `401 invalid refresh token` each cover several
+genuinely different causes. The HTTP layer collapses them deliberately. When you
+are debugging, the login-event history is the only place the distinction survives.
+</Warning>
+
+### The rate-limit body is not a string
+
+Rate limiting is the one place on this surface with a structured error body rather
+than a `detail` string:
+
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Slow down and retry later.",
+  "retry_after": 43
+}
+```
+
+It arrives with `Retry-After`, `X-RateLimit-Limit` and `X-RateLimit-Remaining`
+headers. A client that only reads `detail` will find it missing on a `429` and may
+conclude the rate limit is not the cause.
+
+<Note>
+`retry_after` is a number of seconds and is always at least 1, even when the true
+figure rounds to zero. Treat it as a floor rather than an exact wait.
+</Note>
+
+## How a session reaches everything else
+
+The token is the only thing every service shares, so once it is issued, the same
+claims are what every other subsystem reasons about. This is where the design pays
+off — and where the snapshot semantics of authorization start to matter.
+
+### Policies read the claims directly
+
+A policy is evaluated per request with the verified token in scope, so the claims
+travel into condition expressions unchanged. `$auth` is the namespace for it.
+
+| Token claim | Policy path | Notes |
+| --- | --- | --- |
+| `sub` | `$auth.user_id` | The same value under both names |
+| `email` | `$auth.email` | Empty for a signed-out caller |
+| `roles` | `$auth.roles` | A **list**, so `$auth.roles.0` indexes it |
+| `perms` | `$auth.permissions` | Renamed from `perms` to `permissions` |
+| `org` | `$auth.org` | The slug, not an id |
+| `org_role` | `$auth.org_role` | `owner`, `admin`, `member` or `viewer` |
+| `aal` | `$auth.aal` | `aal1` or `aal2` |
+| `sid` | `$auth.session_id` | The family |
+| `app_metadata` | `$auth.claims.app.*` | Administrator-controlled |
+| `user_metadata` | `$auth.claims.meta.*` | User-editable |
+
+<Warning>
+Two renames bite. The token says `perms` but the policy path is
+`$auth.permissions`, and the token says `sid` but the path is `$auth.session_id`.
+There is also no `$auth.id` — the key is `user_id`. A path that does not exist is
+empty rather than an error, and two empty values compare equal, so a wrong name
+produces a policy that quietly admits everyone. `/policies/context` documents this.
+</Warning>
+
+The emptiness rule has a practical consequence worth stating: for a signed-out
+caller every `$auth` key exists with an empty value. A condition comparing
+`$auth.org_role` to something therefore **passes** for anonymous callers unless you
+also assert that the caller is authenticated. Always gate on `$auth.authenticated`
+before comparing other keys.
+
+### Storage scopes objects by the same claims
+
+Bucket read and write policies get `$object` in addition to `$auth`, which makes
+per-user and per-tenant prefixes straightforward:
+
+- **Per user** — with keys shaped `<user_id>/<filename>`, compare
+  `$object.segments.0` to `$auth.user_id`, so a signed-in user can only write
+  inside their own prefix.
+- **Per organization** — with keys shaped `<org>/<filename>`, compare
+  `$object.segments.0` to `$auth.org`, so one tenant's objects are invisible to
+  another.
+
+Both need a `truthy` check on the claim first, for the reason above: without it, an
+anonymous caller with an empty `$auth.org` matches an empty prefix.
+
+<Note>
+This is the practical payoff of putting `org` in the token. Storage enforces
+tenant isolation from the claim with no database lookup at all.
+</Note>
+
+### Realtime inherits the identity
+
+A realtime connection carries the same token, so channel rules are written against
+the same `$auth` values. Channel membership is therefore evaluated with the caller's
+claims, and a token whose `org` has been switched decides channel access at the
+moment of connection rather than at the moment of subscription.
+
+Because the claim is a snapshot, a channel rule based on `org_role` reflects the role
+as of the token's issue. `/realtime/channel-rules` covers the rule language.
+
+### Flows can react to authentication events
+
+Because authentication emits events on the same bus as everything else, a flow can
+trigger on them. The events that make useful triggers:
+
+| Event | A flow might use it to |
+| --- | --- |
+| `user.created` | Send a welcome sequence |
+| `user.verified` | Provision default records for a confirmed user |
+| `session.reuse_detected` | Alert on a suspected token theft |
+| `user.disabled` | Suspend a subscription or a scheduled job |
+| `user.deleted` | Clean up application-side data |
+
+`/flows/triggers` covers how a subscription is configured, and `/events/overview`
+covers routing. Note that a **successful refresh emits nothing**, so a flow cannot
+trigger on refresh activity — reach for the login-event history instead.
+
+### What does not carry the token
+
+Two systems that people expect to inherit the session and do not:
+
+**Jobs and schedules run without a user.** A scheduled job has no user token, so it
+runs with service authority. Work that must be attributed to a specific user has to
+read the user's data rather than act as them.
+
+**Webhooks are outbound.** A webhook leaving the platform carries a signature rather
+than a user token, and an inbound webhook is authenticated as its own thing — not
+as a user. `/webhooks/signatures` covers both directions.

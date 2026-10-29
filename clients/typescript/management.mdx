@@ -1,0 +1,1777 @@
+---
+title: "Environment management"
+description: "The manage() module of the TypeScript client: what the management plane is, how a secret key reaches it, and every service it offers for definitions, data, automation, files, access, observation and the lifecycle of environments."
+icon: "settings"
+---
+
+`manage(client)` gives server code the management plane of an environment: everything Studio does, as typed calls.
+Scripts and CI use it to change definitions, set secrets, rotate keys, inspect jobs and webhooks, take backups, promote definitions and create preview environments.
+
+This page explains what the management plane is and how the module reaches it, then walks through every service it offers, grouped by what you would use them for, with the decisions and pitfalls that matter for each.
+
+## The mental model
+
+Pawabase has two planes.
+
+| Plane | Paths | What it does | Who calls it |
+| --- | --- | --- | --- |
+| Data plane | `/rest/v1`, `/auth/v1`, `/storage/v1`, `/realtime/v1`, `/flows/v1` | Serves your application's records, people, files and messages | Your application, with publishable or secret keys |
+| Management plane | `/platform/v1/envs/<environment>/…` and `/platform/v1/…` | Defines and operates the environment: resources, policies, flows, keys, secrets, backups | Studio, and servers or CI with a secret key |
+
+The client's main object talks to the data plane.
+`manage()` talks to the management plane, with the same transport, the same retries and the same error classes.
+
+<CodeGroup>
+```typescript TypeScript
+import { createClient } from "@pawabase/client";
+import { manage } from "@pawabase/client/manage";
+
+const service = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  environment: "production",
+});
+
+const m = manage(service);
+await m.secrets.set("PAYSTACK_SECRET", process.env.PAYSTACK_SECRET!);
+```
+
+```python Python
+import os
+
+from pawabase import Pawabase
+
+service = Pawabase(os.environ["PAWABASE_URL"], os.environ["PAWABASE_SECRET_KEY"], environment="production")
+service.manage.secrets.set("PAYSTACK_SECRET", os.environ["PAYSTACK_SECRET"])
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/platform/v1/envs/production/secrets/PAYSTACK_SECRET" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"value": "sk_live_…", "description": ""}'
+```
+</CodeGroup>
+
+Three rules govern the module:
+
+| Rule | Consequence |
+| --- | --- |
+| It needs a secret key | `manage()` throws `ConfigError` for a publishable key |
+| It is bound to one environment | The client's `environment`, or the name you pass as the second argument |
+| It returns JSON documents | Results are typed as plain objects; lists are `{ data: [...] }` |
+
+Because it can change everything about an environment, the module is a separate import, `@pawabase/client/manage`, which browser bundles never include unless something imports it.
+Import it only from server-only code.
+
+## Choosing the environment
+
+`manage(client, environment?)` uses, in order: the environment you pass, the client's `environment` option, or `development`.
+The fallback to `development` is easy to trip over: a production script that forgets `environment` quietly changes development instead.
+Always pass it.
+
+<CodeGroup>
+```typescript TypeScript
+const production = manage(service, "production");
+const staging = production.withEnvironment("staging");
+```
+
+```python Python
+production = service.manage                        # bound to the client's environment
+staging = service.manage.environment("staging")    # the same services for another environment
+```
+
+```bash cURL
+# The environment is a path segment:
+curl "$PAWABASE_URL/platform/v1/envs/staging/flows" -H "apikey: $PAWABASE_SECRET_KEY"
+```
+</CodeGroup>
+
+`withEnvironment(name)` returns the same services for another environment.
+Whether a key may manage another environment is decided by the platform; a key that may not gets `PermissionError` or `NotFoundError`.
+
+## A first script
+
+A first management script should read before it writes.
+This one prints an environment's resources, flows and keys, which confirms the key, the environment and the module are set up correctly.
+
+```typescript
+import { createClient } from "@pawabase/client";
+import { manage } from "@pawabase/client/manage";
+
+const environment = process.env.PAWABASE_ENV ?? "staging";
+const service = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_SECRET_KEY!, environment });
+const m = manage(service, environment);
+
+const [resources, flows, keys] = await Promise.all([m.resources.list(), m.flows.list(), m.keys.list()]);
+console.log(`environment: ${environment}`);
+console.log("resources:", (resources.data ?? []).map((r: { name: string }) => r.name));
+console.log("flows:", (flows.data ?? []).map((f: { name: string }) => f.name));
+console.log("keys:", (keys.data ?? []).map((k: { name: string; role: string }) => `${k.name} (${k.role})`));
+service.dispose();
+```
+
+If it prints what Studio shows for that environment, everything else on this page will work with the same setup.
+
+| If it fails with | Check |
+| --- | --- |
+| `ConfigError` | The key starts with `pb_sk_` |
+| `AuthenticationError` | The key belongs to this installation and is not revoked |
+| `NotFoundError` or `PermissionError` | The environment name, and that the key belongs to it |
+
+## The services at a glance
+
+| Group | Services |
+| --- | --- |
+| Data | `resources`, `schema`, `policies`, `schemas`, `transformers`, `routes`, `database`, `runtime` |
+| Automation | `flows`, `schedules`, `subscriptions`, `events`, `webhooks`, `inboundHooks`, `jobs` |
+| Files and mail | `buckets`, `cache`, `mail`, `mailTemplates` |
+| Access | `keys`, `secrets`, `domains`, `firewall` |
+| Observation | `observability`, `alarms`, `statusPage`, `health` |
+| Lifecycle | `environments`, `releases`, `backups` |
+
+The module also has a `functions` service.
+Custom functions were removed from the platform, so its endpoints no longer exist; it is not documented here.
+
+### Definitions share five verbs
+
+Many services manage a kind of definition: resources, policies, schemas, transformers, routes, flows, schedules, subscriptions, webhooks, inbound hooks, buckets and mail templates.
+They share five methods.
+
+| Method | Request | Returns |
+| --- | --- | --- |
+| `list({ branch? })` | `GET …/<kind>` | `{ data: [...] }` |
+| `getOne(name, { branch? })` | `GET …/<kind>/<name>` | The definition |
+| `create(body, { branch? })` | `POST …/<kind>` | The created definition |
+| `replace(name, body, { branch? })` | `PUT …/<kind>/<name>` | The replaced definition |
+| `remove(name, { branch? })` | `DELETE …/<kind>/<name>` | A confirmation |
+
+A definition is addressed by its name; inbound hooks by their slug.
+`branch` works on a feature branch's draft of the definitions instead of the live environment, which is how changes are prepared for review; see [Releases](#releases-branches-and-api-versions).
+
+The body of a definition is the same JSON the **JSON** tab of its editor in Studio shows.
+Reading one with `getOne` and changing it is the reliable way to learn its shape.
+
+## Data
+
+### Resources
+
+`m.resources` manages resource definitions, their records as an operator, their tables, and their migrations.
+
+<CodeGroup>
+```typescript TypeScript
+await m.resources.create({
+  name: "tickets",
+  fields: [
+    { name: "subject", type: "string", required: true, max_length: 200 },
+    { name: "status", type: "string", enum: ["open", "pending", "closed"], default: "open" },
+  ],
+  operations: {
+    list: { enabled: true, policy: "owner:user_id" },
+    get: { enabled: true, policy: "owner:user_id" },
+    create: { enabled: true, policy: "authenticated" },
+    update: { enabled: true, policy: "owner:user_id" },
+    delete: { enabled: false },
+  },
+  owner_field: "user_id",
+  timestamps: true,
+});
+
+const applied = await m.resources.migrate("tickets");
+console.log(applied); // includes the statements that were run
+```
+
+```python Python
+m = service.manage
+m.resources.create({
+    "name": "tickets",
+    "fields": [
+        {"name": "subject", "type": "string", "required": True, "max_length": 200},
+        {"name": "status", "type": "string", "enum": ["open", "pending", "closed"], "default": "open"},
+    ],
+    "operations": {
+        "list": {"enabled": True, "policy": "owner:user_id"},
+        "get": {"enabled": True, "policy": "owner:user_id"},
+        "create": {"enabled": True, "policy": "authenticated"},
+        "update": {"enabled": True, "policy": "owner:user_id"},
+        "delete": {"enabled": False},
+    },
+    "owner_field": "user_id",
+    "timestamps": True,
+})
+print(m.resources.migrate("tickets"))
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/resources" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d @tickets.json
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/resources/tickets/migrate" -H "apikey: $PAWABASE_SECRET_KEY"
+```
+</CodeGroup>
+
+Creating a definition does not create its table.
+`migrate(name)` creates the table, or adds the columns the definition gained, and returns the statements it ran.
+It never drops or retypes columns; those changes go through the schema planning methods below, where a person reviews them.
+
+| Method | Purpose |
+| --- | --- |
+| `records(name, { limit, offset, filters })` | Browse records as an operator; policies do not apply |
+| `insert(name, values)` | Add a record as an operator |
+| `updateRecord(name, id, values)` | Change a record as an operator |
+| `deleteRecord(name, id)` | Delete a record as an operator |
+| `export(name, { format })` | Every record, for a download |
+| `importRecords(name, rows, { key, mode, dryRun })` | Add or update many records: `{ created, updated, failed, errors }` |
+| `openapi(name)` | The resource's compiled routes |
+| `migrate(name)` | Create the table or add new columns |
+| `schemaPlan(name)` | What applying the definition would change in the table |
+| `schemaApply(name, body)` | Apply the plan |
+| `schemaAcknowledge(name, body)` | Accept the table as it is and update the definition to match |
+| `schemaPurge(name, body)` | Remove what migrations kept for a rollback |
+| `migrations(name)` | The resource's migration history |
+| `rollbackMigration(name, id)` | Undo a migration |
+| `indexes(name)` | The table's indexes: declared, per-field, hand-made and system |
+| `dropIndex(name, index, body)` | Drop an index made outside Pawabase |
+
+Operator writes through `insert`, `updateRecord` and `deleteRecord` bypass policies, like a secret key on the data plane.
+Use them for repairs and administration, and the data plane for application behavior.
+
+`importRecords` is the right tool for loading data in bulk.
+With `key`, rows whose key value already exists are updated instead of duplicated, which makes an import safe to run again.
+`dryRun` reports what would happen without changing anything.
+
+<CodeGroup>
+```typescript TypeScript
+const result = await m.resources.importRecords("plans", rows, { key: "code", dryRun: true });
+console.log(result.created, result.updated, result.failed, result.errors);
+```
+
+```python Python
+result = m.resources.import_records("plans", rows, key="code", dry_run=True)
+print(result)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/resources/plans/import" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"rows": [{"code": "pro", "name": "Pro"}], "key": "code", "dry_run": true}'
+```
+</CodeGroup>
+
+### Schema
+
+`m.schema` looks at the whole database against the definitions.
+
+| Method | Returns |
+| --- | --- |
+| `overview()` | Every resource's table compared with its definition |
+| `unmappedTables()` | Tables in the database that no resource describes |
+
+After connecting an existing database, `unmappedTables()` shows what could become resources.
+Before a release, `overview()` shows tables that drifted from their definitions.
+
+### Policies, schemas, transformers and routes
+
+These are plain definition services with the five shared verbs.
+
+| Service | Definitions |
+| --- | --- |
+| `m.policies` | Named policies that resources, buckets, channels and routes refer to |
+| `m.schemas` | Reusable data shapes that fields refer to with `ref` |
+| `m.transformers` | Reshaping of a resource's output: hide, mask, rename, compute |
+| `m.routes` | Custom HTTP routes under `/rest/v1`, each handled by a flow |
+
+<CodeGroup>
+```typescript TypeScript
+await m.policies.create({
+  name: "same_org",
+  description: "The record belongs to the caller's current organization",
+  condition: { all: [{ truthy: "$auth.org" }, { eq: ["$record.org", "$auth.org"] }] },
+});
+```
+
+```python Python
+m.policies.create({
+    "name": "same_org",
+    "description": "The record belongs to the caller's current organization",
+    "condition": {"all": [{"truthy": "$auth.org"}, {"eq": ["$record.org", "$auth.org"]}]},
+})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/policies" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"name": "same_org", "condition": {"all": [{"truthy": "$auth.org"}, {"eq": ["$record.org", "$auth.org"]}]}}'
+```
+</CodeGroup>
+
+Changing a policy changes the behavior of everything that refers to it, at once.
+Prefer creating a new policy and moving references over editing a widely used one in place.
+
+### Database
+
+`m.database` reads the environment's database directly and runs SQL.
+
+| Method | Purpose |
+| --- | --- |
+| `info()` | The database: engine, version, size |
+| `table(name)` | A table's columns, indexes and foreign keys |
+| `rows(name, { limit, offset, sort, filters })` | A table's rows |
+| `query(sql, params, { allowWrite })` | Run one statement |
+
+<CodeGroup>
+```typescript TypeScript
+const result = await m.database.query("select status, count(*) from orders group by status", []);
+```
+
+```python Python
+result = m.database.query("select status, count(*) from orders group by status", [])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/database/query" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"sql": "select status, count(*) from orders group by status", "params": [], "allow_write": false}'
+```
+</CodeGroup>
+
+Statements are read-only unless `allowWrite` is `true`.
+A write is audited, clears the environment's caches, and does not publish resource events or realtime changes, because it bypasses the data plane.
+Use the data plane or a flow for changes that other parts of the system must hear about.
+
+### Runtime
+
+`m.runtime` exposes the runtime capabilities flows use, for tools that emulate them.
+Most scripts never need it.
+
+| Method | Purpose |
+| --- | --- |
+| `call(method, args, kwargs, { asUser, branch })` | Call a runtime capability by name |
+| `sql(op, fields)` | Database operations used by the runtime, optionally inside a transaction |
+| `identify(token)` | Who an access token belongs to |
+
+`identify(token)` is occasionally useful in its own right: a server that receives a token can ask whom it belongs to.
+
+## Automation
+
+### Flows
+
+`m.flows` manages flow definitions and runs flows as an operator.
+
+| Method | Purpose |
+| --- | --- |
+| The five verbs | Flow definitions |
+| `run(name, input, { asUser, entry })` | Run now: `{ status, run_id, result, response, trace }` |
+| `validate(definition)` | Check a graph without saving it: problems node by node |
+| `blocks()` | The catalogue of blocks, with their configuration fields |
+| `runs({ flow, status, limit, after })` | Recent runs |
+| `runDetail(runId)` | One run with its per-block trace |
+
+`run` ignores the flow's HTTP trigger policy: it is an operator action.
+`asUser` sets the identity the flow sees, which makes it the tool for reproducing what happened to a particular person:
+
+<CodeGroup>
+```typescript TypeScript
+const run = await m.flows.run("apply-coupon", { cart_id: "c9", code: "WELCOME10" }, { asUser: { user_id: "u_7" } });
+if (run.status !== "succeeded") console.error(JSON.stringify(run.trace, null, 2));
+```
+
+```python Python
+run = m.flows.run("apply-coupon", {"cart_id": "c9", "code": "WELCOME10"}, as_user={"user_id": "u_7"})
+if run["status"] != "succeeded":
+    print(run["trace"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/flows/apply-coupon/run" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"input": {"cart_id": "c9", "code": "WELCOME10"}, "as_user": {"user_id": "u_7"}, "entry": null}'
+```
+</CodeGroup>
+
+`entry` chooses which trigger node starts the run, for flows with several.
+
+`validate` belongs in CI for teams that keep flow definitions in their repository:
+
+```typescript
+const report = await m.flows.validate(definitionFromRepo);
+console.log(JSON.stringify(report, null, 2)); // the problems, node by node; fail the build when there are any
+```
+
+Print the whole report the first time, to see its shape for your flows, then fail the build on the fields that list problems.
+
+### Schedules
+
+`m.schedules` manages cron and interval schedules that run a flow or emit an event.
+Besides the five verbs, `run(name)` fires a schedule now, exactly as the scheduler would, which is how you test one without waiting.
+
+### Subscriptions
+
+`m.subscriptions` manages event subscriptions: which events run which flow, or reach which realtime channel.
+It has the five verbs.
+
+### Events
+
+`m.events` emits events and shows what happened to them.
+
+| Method | Purpose |
+| --- | --- |
+| `emit(name, payload)` | Publish an event; every subscription, flow and webhook listening runs |
+| `list({ name, limit, after })` | Recent events |
+| `detail(eventId)` | One event with every consumer it reached and the outcome |
+| `graph()` | Which event names exist and who consumes each |
+
+<CodeGroup>
+```typescript TypeScript
+await m.events.emit("billing.invoice_overdue", { invoice_id: "inv_42", days: 7 });
+```
+
+```python Python
+m.events.emit("billing.invoice_overdue", {"invoice_id": "inv_42", "days": 7})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/events" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"name": "billing.invoice_overdue", "payload": {"invoice_id": "inv_42", "days": 7}}'
+```
+</CodeGroup>
+
+Emitting from a server is how code outside Pawabase triggers flows without calling them directly.
+`detail` answers "did the email flow run for this event?" with one call.
+
+### Webhooks
+
+`m.webhooks` manages outbound webhook endpoints and their deliveries.
+
+| Method | Purpose |
+| --- | --- |
+| The five verbs | Endpoint definitions |
+| `test(name)` | Send one test event; one attempt, not retried |
+| `deliveries({ status, endpoint, limit })` | Delivery history: `pending`, `retrying`, `delivered`, `failed` |
+| `redeliver(deliveryId)` | Send one delivery again |
+| `redeliverMany({ ids, status, endpoint, event, sinceMinutes, limit, dryRun })` | Send many again; `dryRun` only counts |
+
+After a partner's outage, `redeliverMany` sends everything that failed in a window:
+
+<CodeGroup>
+```typescript TypeScript
+const preview = await m.webhooks.redeliverMany({ endpoint: "warehouse", sinceMinutes: 180, dryRun: true });
+console.log(preview); // how many deliveries would be sent again
+await m.webhooks.redeliverMany({ endpoint: "warehouse", sinceMinutes: 180 });
+```
+
+```python Python
+preview = m.webhooks.redeliver_many(endpoint="warehouse", since_minutes=180, dry_run=True)
+print(preview)
+m.webhooks.redeliver_many(endpoint="warehouse", since_minutes=180)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/webhook-deliveries/redeliver" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"status": "failed", "endpoint": "warehouse", "since_minutes": 180, "limit": 100, "dry_run": true}'
+```
+</CodeGroup>
+
+Always dry-run first: a redelivery reaches a partner's system, which may not ignore duplicates.
+
+### Inbound hooks
+
+`m.inboundHooks` manages the URLs other services call, each checking a signature and starting a flow.
+Besides the five verbs, `url(slug)` returns the public URL to give the sender.
+
+### Jobs
+
+`m.jobs` shows and controls background work: jobs, failures, replays, queues and workers.
+
+| Method | Purpose |
+| --- | --- |
+| `list({ status, queue, limit })` | Jobs: `queued`, `active`, `retrying`, `succeeded`, `failed` |
+| `detail(jobId)` | One job |
+| `retry(jobId)` | Retry one job |
+| `replay({ ids, status, queue, job, sinceMinutes, limit, dryRun })` | Queue recorded jobs again; failed ones by default |
+| `failed()` | Jobs that gave up after their retries |
+| `dismissFailed(jobId)` | Remove a failed job from the list |
+| `queues()` | Queues with depth and counts |
+| `workers()` | The processes taking jobs |
+| `retryPolicies()` | How each kind of work is retried |
+
+<CodeGroup>
+```typescript TypeScript
+await m.jobs.replay({ job: "send_mail", sinceMinutes: 60, dryRun: true });
+```
+
+```python Python
+m.jobs.replay(job="send_mail", since_minutes=60, dry_run=True)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/jobs/replay" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"ids": [], "status": "failed", "job": "send_mail", "since_minutes": 60, "limit": 200, "dry_run": true}'
+```
+</CodeGroup>
+
+A replay runs work again, with its side effects.
+Use `dryRun` to see the count, and replay only what is safe to run twice.
+
+## Files and mail
+
+### Buckets
+
+`m.buckets` manages bucket definitions and works with objects as an operator, regardless of bucket policies.
+
+| Method | Purpose |
+| --- | --- |
+| The five verbs | Bucket definitions: policies, accepted types, size limits, transformations |
+| `objects(bucket, { prefix, cursor, limit })` | One page of objects: `{ files, prefixes, cursor }` |
+| `object(bucket, key)` | One object's details and a way to read it |
+| `putObject(bucket, key, content, contentType)` | Upload as an operator |
+| `deleteObject(bucket, key)` | Delete as an operator |
+| `moveObject(bucket, source, target)` | Rename or move inside the bucket |
+| `sign(bucket, key, { method, expiresIn, contentType, maxBytes })` | A signed URL for reading or one upload |
+| `shares(bucket)` | Share links for the bucket's objects |
+| `createShare(bucket, key, { expiresIn, permissions, label })` | A revocable link for people without accounts |
+| `revokeShare(bucket, shareId)` | End a share link |
+
+Share links differ from signed URLs in one important way: they can be revoked.
+Use them for anything sent outside your application, such as a contract emailed to a client.
+
+<CodeGroup>
+```typescript TypeScript
+const share = await m.buckets.createShare("contracts", "acme/2026/msa.pdf", { expiresIn: 7 * 24 * 3600, permissions: "view", label: "Acme MSA" });
+console.log(share.url);
+```
+
+```python Python
+share = m.buckets.create_share("contracts", "acme/2026/msa.pdf", expires_in=7 * 24 * 3600, permissions="view", label="Acme MSA")
+print(share["url"])
+
+# or from a bucket handle, with a secret-key client:
+share = service.storage.from_("contracts").create_share_link("acme/2026/msa.pdf", permissions="view")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/buckets/contracts/shares" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"key": "acme/2026/msa.pdf", "expires_in": 604800, "permissions": "view", "label": "Acme MSA"}'
+```
+</CodeGroup>
+
+`permissions` is `view`, `download` or `both`.
+The URL is in the answer.
+
+### Cache
+
+`m.cache` controls the environment's response cache.
+
+| Method | Purpose |
+| --- | --- |
+| `stats()` | Hit rates and sizes |
+| `invalidate({ tags, resources })` | Drop cached answers by tag, such as `resource:posts`, or for whole resources |
+
+Invalidate after changes the cache cannot see, such as SQL writes through `m.database.query`, or when an expanded relation changed and its parent's cached answers are stale.
+
+### Mail and mail templates
+
+| Service | Method | Purpose |
+| --- | --- | --- |
+| `m.mail` | `config()` | The delivery settings in effect, without the password, and whether mail is being delivered |
+| `m.mail` | `log({ status, limit })` | Messages sent, failed or suppressed |
+| `m.mail` | `sendTest(to)` | Send a test message |
+| `m.mailTemplates` | The five verbs | Templates with subject, HTML and text, used by flows and sign-in emails |
+
+`log` is the first place to look when someone did not receive an email: it shows whether the message was sent, failed, or suppressed.
+
+## Access
+
+### Keys
+
+`m.keys` manages the environment's API keys.
+
+| Method | Purpose |
+| --- | --- |
+| `list()` | Keys with their prefixes, never their secrets |
+| `create(name, { role, scopes, expiresAt, allowedIps, allowedRoutes })` | A new key; the secret is in the answer once |
+| `revoke(keyId)` | End a key now |
+| `rotate(keyId, { graceHours })` | Issue a replacement; the old key keeps working for the grace period, 24 hours by default |
+
+<CodeGroup>
+```typescript TypeScript
+const key = await m.keys.create("reporting-service", {
+  role: "secret",
+  scopes: ["resource:read"],
+  allowedIps: ["203.0.113.0/24"],
+  expiresAt: new Date(Date.now() + 90 * 24 * 3600 * 1000),
+});
+await storeInSecretManager("PAWABASE_REPORTING_KEY", key.key);
+```
+
+```python Python
+from datetime import datetime, timedelta, timezone
+
+key = m.keys.create(
+    "reporting-service",
+    role="secret",
+    scopes=["resource:read"],
+    allowed_ips=["203.0.113.0/24"],
+    expires_at=datetime.now(timezone.utc) + timedelta(days=90),
+)
+store_in_secret_manager("PAWABASE_REPORTING_KEY", key["key"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/keys" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"name": "reporting-service", "role": "secret", "scopes": ["resource:read"], "allowed_ips": ["203.0.113.0/24"], "allowed_routes": []}'
+```
+</CodeGroup>
+
+A key with only `resource:read` cannot change data even through bugs, and an IP restriction makes a leaked key useless elsewhere.
+Build keys for services this way, with the least they need.
+
+Rotation with a grace period lets deployed services switch to the new key without downtime.
+Rotate, deploy with the new key, and let the old one expire.
+
+### Secrets
+
+`m.secrets` manages the secrets flows read.
+Values are written but never returned.
+
+| Method | Purpose |
+| --- | --- |
+| `list()` | Names, descriptions and rotation reminders |
+| `set(name, value, { description, rotateEveryDays })` | Create or replace |
+| `update(name, { description, rotateEveryDays })` | Change the description or reminder; `0` clears the reminder |
+| `rotate(name, value?)` | Replace the value, keeping the previous one for `rollback` |
+| `rollback(name)` | Put back the value a rotation replaced |
+| `remove(name)` | Delete |
+
+<CodeGroup>
+```typescript TypeScript
+await m.secrets.rotate("PAYSTACK_SECRET", newValue);
+// a flow starts failing with the new value?
+await m.secrets.rollback("PAYSTACK_SECRET");
+```
+
+```python Python
+m.secrets.rotate("PAYSTACK_SECRET", new_value)
+# a flow starts failing with the new value?
+m.secrets.rollback("PAYSTACK_SECRET")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/secrets/PAYSTACK_SECRET/rotate" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"value": "sk_live_new…"}'
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/secrets/PAYSTACK_SECRET/rollback" -H "apikey: $PAWABASE_SECRET_KEY"
+```
+</CodeGroup>
+
+Setting secrets from CI keeps them out of Studio forms and out of people's clipboards.
+Secrets are per environment; set each environment's own values.
+
+### Domains
+
+`m.domains` manages custom domains the environment answers on.
+
+| Method | Purpose |
+| --- | --- |
+| `list()` | Domains and their verification state |
+| `add(hostname)` | Register one; the answer says which DNS record proves ownership |
+| `verify(domainId)` | Check the DNS record now |
+| `remove(domainId)` | Remove one |
+
+### Firewall
+
+`m.firewall` manages the gateway's firewall: ordered rules, managed signatures, bans, and what the firewall did.
+
+| Method | Purpose |
+| --- | --- |
+| `rules()` | Rules in the order they are tried |
+| `addRule(rule)` | Add a rule at the end |
+| `updateRule(ruleId, changes)` | Change fields, using the server's field names |
+| `removeRule(ruleId)` | Remove one |
+| `order(ruleIds)` | Set the order; every rule exactly once |
+| `config()`, `setConfig({ managed, autoBan })` | Managed rule sets and automatic bans |
+| `bans({ includeExpired })`, `ban(ip, { seconds, reason })`, `liftBan(banId)` | Bans by address or range |
+| `events({ action, source, ip, path, ruleId, limit })` | What the firewall did |
+| `stats({ hours })` | Totals, a timeline, top addresses, paths, rules and countries |
+| `test(ip, { path, method, userAgent, query, headers, country, role })` | What the firewall would do with a request, without sending it |
+
+A rule has an `action` (`allow`, `block`, `log` or `rate_limit`), conditions on request fields, and a mode: `enforce`, or `simulate`, which only records what it would have done.
+
+<CodeGroup>
+```typescript TypeScript
+await m.firewall.addRule({
+  name: "Slow down token guessing",
+  action: "rate_limit",
+  conditions: [{ field: "path", op: "starts_with", value: "/auth/v1/token" }],
+  rateLimit: { requests: 10, window_seconds: 60, by: "ip", ban_seconds: 900 },
+  mode: "simulate",
+});
+```
+
+```python Python
+m.firewall.add_rule(
+    name="Slow down token guessing",
+    action="rate_limit",
+    conditions=[{"field": "path", "op": "starts_with", "value": "/auth/v1/token"}],
+    rate_limit={"requests": 10, "window_seconds": 60, "by": "ip", "ban_seconds": 900},
+    mode="simulate",
+)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/firewall" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{
+  "name": "Slow down token guessing", "action": "rate_limit", "logic": "all", "match": {}, "mode": "simulate",
+  "conditions": [{"field": "path", "op": "starts_with", "value": "/auth/v1/token"}],
+  "rate_limit": {"requests": 10, "window_seconds": 60, "by": "ip", "ban_seconds": 900}, "enabled": true, "note": ""
+}'
+```
+</CodeGroup>
+
+Start new rules in `simulate`, read `events` for a day, then switch to `enforce`.
+`test` answers "would this request be blocked?" before you find out from a customer.
+
+Condition fields include `ip`, `country`, `method`, `path`, `host`, `query`, `header:<name>`, `query:<name>`, `user_agent`, `origin`, `referer`, `role`, `key_id` and `content_length`.
+Managed rule sets cover `sqli`, `xss`, `traversal`, `scanners`, `sensitive_files`, `no_user_agent` and `methods`, each `off`, `log` or `block`.
+
+## Observation
+
+### Observability
+
+`m.observability` reads the environment's traffic, logs and performance.
+
+| Method | Returns |
+| --- | --- |
+| `overview({ range })` | The environment at a glance: traffic, errors, latency, workers, storage |
+| `analytics({ range, from, to })` | Traffic over a range such as `1h`, `24h` or `7d` |
+| `requests({ status, method, search, requestId, limit })` | Recent requests; `status` may be a class such as `5xx` |
+| `request(requestId)` | One request: logs, database calls, spans, traceback |
+| `logs({ q, minutes, limit, after })` | Application and access logs |
+| `errors({ minutes })` | Recent errors |
+| `routes({ minutes, limit, sort })`, `route(method, route, { minutes })` | Per-route traffic, latency and errors |
+| `system({ minutes })` | CPU, memory and connections |
+| `advisor({ minutes })` | Findings: slow routes, missing indexes, noisy errors |
+| `metrics`, `metricCatalog`, `metricSeries` | Counters and series to chart or alarm on |
+| `workers()`, `configuration()`, `capacity()` | What the environment runs with |
+
+`request(requestId)` is the programmatic form of searching **Project → Activity**: given the `requestId` from a client error, it returns everything the platform recorded about that request.
+Support tooling can fetch it directly when a customer quotes a reference.
+
+<CodeGroup>
+```typescript TypeScript
+const detail = await m.observability.request(error.requestId!);
+```
+
+```python Python
+detail = m.observability.request(error.request_id)
+```
+
+```bash cURL
+curl "$PAWABASE_URL/platform/v1/envs/production/requests/$REQUEST_ID" -H "apikey: $PAWABASE_SECRET_KEY"
+```
+</CodeGroup>
+
+`advisor()` is worth running before a release; it reports routes that are slow and fields that are filtered without an index.
+
+### Alarms
+
+`m.alarms` manages alarms on metrics: when a metric crosses a threshold for a number of checks, recipients are mailed.
+
+| Method | Purpose |
+| --- | --- |
+| `list()`, `create(alarm)`, `update(id, changes)`, `remove(id)` | Alarm definitions |
+| `check(id)` | Evaluate now |
+| `test(id)` | Send the notification now |
+| `history(id?)` | When alarms fired and recovered |
+
+```typescript
+const catalog = await m.observability.metricCatalog();
+console.log(catalog); // the metric names this installation can alarm on
+
+await m.alarms.create({
+  name: "Server errors",
+  metric: serverErrorMetric, // a name taken from the catalog
+  threshold: 10,
+  comparison: "gt",
+  windowMinutes: 5,
+  breachesNeeded: 2,
+  recipients: ["oncall@example.com"],
+});
+
+declare const serverErrorMetric: string;
+```
+
+Metric names differ between installations and versions, so take them from `m.observability.metricCatalog()` rather than writing them from memory.
+`update(id, { mute_minutes: 60 })` silences an alarm for an hour during planned work.
+
+### Status page
+
+`m.statusPage` manages the environment's public status page and its incidents.
+
+| Method | Purpose |
+| --- | --- |
+| `page()`, `configure({ enabled, title, description, contactUrl, components })` | The page and its components |
+| `incidents()`, `openIncident(title, …)`, `updateIncident(id, message, { status, impact })`, `removeIncident(id)` | Incidents and their updates |
+
+Components can be measured automatically from the platform's services (`gateway`, `api`, `auth`, `realtime`, `workers`) or set by hand (`manual`).
+Incident status moves through `investigating`, `identified`, `monitoring` and `resolved`; impact is `none`, `minor`, `major` or `critical`.
+
+### Health
+
+`m.health` reports service health, plan usage and the platform's audit trail.
+
+| Method | Returns |
+| --- | --- |
+| `services()` | Each service with its state, latency and error rate |
+| `usage()` | Each plan limit and how much is used |
+| `retryPolicies()` | How background work is retried |
+| `audit({ action, actor, target, since, until, env })` | Management changes: who did what, to what, when |
+| `exportAudit({ format, … })` | The audit trail as `jsonl` or `csv` text |
+
+The audit trail records changes made through Studio and through this module alike.
+Exporting it on a schedule into your own storage keeps a record beyond the platform's retention.
+
+## Lifecycle
+
+### Environments
+
+`m.environments` manages the project's environments, previews, promotion and blueprints.
+Most of its calls are about the project, not only the client's environment.
+
+| Method | Purpose |
+| --- | --- |
+| `list()`, `getOne(name?)` | Environments |
+| `create(name, { copyFrom })` | A new environment, optionally with another's definitions |
+| `update(name, { infra, auth, settings, isDefault })` | Change infrastructure, sign-in settings or settings; each is merged |
+| `deleteEnvironment(name)` | Delete one |
+| `createPreview(ref, { name, expiresInHours, infra, auth, settings })` | A short-lived copy for a branch or pull request; it expires by itself |
+| `deletePreview(preview)` | Delete a preview |
+| `promote(to, { include })` | Copy this environment's definitions to another; never secrets or keys |
+| `blueprint()` | Export definitions, roles and settings as a document |
+| `applyBlueprint(blueprint, environments)` | Build new environments from a blueprint |
+| `reloadCode()` | Re-read mounted code now |
+
+Promotion is how definitions move from development to production:
+
+<CodeGroup>
+```typescript TypeScript
+const development = manage(service, "development");
+await development.environments.promote("staging");
+// after testing staging:
+await development.withEnvironment("staging").environments.promote("production", { include: ["resources", "policies", "flows"] });
+```
+
+```python Python
+development = service.manage.environment("development")
+development.environments.promote("staging")
+# after testing staging:
+service.manage.environment("staging").environments.promote("production", include=["resources", "policies", "flows"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/development/promote" -H "apikey: $PAWABASE_SECRET_KEY" \
+  -H "content-type: application/json" -d '{"to": "staging"}'
+```
+</CodeGroup>
+
+`include` limits promotion to kinds of definition, which is useful when one part is ready and another is not.
+Secrets and keys are never promoted; each environment keeps its own.
+
+A blueprint is a portable copy of a project's design.
+Applying it creates new environments from it, which suits creating an identical project for a new customer or region.
+
+### Releases, branches and API versions
+
+`m.releases` manages definition branches, immutable revisions, API versions and releases.
+
+| Method | Purpose |
+| --- | --- |
+| `branches()`, `createBranch(name, { fromBranch, fromRevision, protected })` | Branches of the definitions |
+| `draft(branch)` | A branch's definitions as they stand |
+| `merge(branch, { target, force })` | Merge a branch, into `main` by default |
+| `revisions()`, `revision(id)`, `commit(branch, message)` | Immutable snapshots of a branch |
+| `apiVersions()`, `createApiVersion(name, { isDefault })`, `updateApiVersion(name, changes)`, `rollbackApiVersion(name)` | Stable public API versions such as `v2` |
+| `releases()`, `release(revisionId, apiVersion, name, { notes, allowBreaking })`, `activate(releaseId)` | Make a revision the live definitions of an API version |
+| `deployments()` | What was deployed when |
+
+The workflow for a reviewed change: create a branch, change definitions on it with the `branch` option of the definition services, commit a revision, then merge or release it.
+
+<CodeGroup>
+```typescript TypeScript
+const m = manage(service, "development");
+await m.releases.createBranch("add-tickets");
+await m.resources.create(ticketsDefinition, { branch: "add-tickets" });
+await m.policies.create(ticketPolicy, { branch: "add-tickets" });
+const revision = await m.releases.commit("add-tickets", "Add tickets resource");
+await m.releases.merge("add-tickets");
+```
+
+```python Python
+m = service.manage.environment("development")
+m.releases.create_branch("add-tickets")
+m.resources.create(tickets_definition, branch="add-tickets")
+m.policies.create(ticket_policy, branch="add-tickets")
+revision = m.releases.commit("add-tickets", "Add tickets resource")
+m.releases.merge("add-tickets")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/development/branches" -H "apikey: $PAWABASE_SECRET_KEY" \
+  -H "content-type: application/json" -d '{"name": "add-tickets", "protected": false}'
+curl -X POST "$PAWABASE_URL/platform/v1/envs/development/resources?branch=add-tickets" -H "apikey: $PAWABASE_SECRET_KEY" \
+  -H "content-type: application/json" -d @tickets.json
+```
+</CodeGroup>
+
+API versions let you change the API while clients that depend on the old contract keep working.
+A release pins a revision to a version such as `v2`, served at `/rest/v2`, and refuses breaking changes unless `allowBreaking` is set.
+See [Releases and API versions](/operate/releases-and-api-versions).
+
+### Backups
+
+`m.backups` downloads backups, schedules snapshots and restores them.
+
+| Method | Purpose |
+| --- | --- |
+| `download({ include, data, maxRows })` | A backup document: definitions, settings, users, and with `data`, rows |
+| `restore(backup, { include, strategy, dryRun, confirm })` | Put a downloaded backup back |
+| `setSchedule({ enabled, frequency, hour, weekday, keepLast, keepDays, include })` | Automatic snapshots |
+| `snapshots()`, `snapshot(name, { note, include })` | List and take snapshots |
+| `updateSnapshot(id, { name, note, pinned })`, `removeSnapshot(id)` | Rename, annotate, pin, delete |
+| `downloadSnapshot(id)`, `verifySnapshot(id)` | Download, and check integrity |
+| `restoreSnapshot(id, { include, strategy, dryRun, confirm, safetySnapshot })` | Restore; a snapshot of the current state is taken first unless `safetySnapshot` is `false` |
+
+| Restore strategy | Effect | Safety |
+| --- | --- | --- |
+| `merge` (default) | Adds and updates what the backup holds | Leaves other data in place |
+| `replace` | Removes what the chosen parts hold, then restores | Requires `confirm` set to the environment's name |
+
+<CodeGroup>
+```typescript TypeScript
+const before = await m.backups.snapshot("before-pricing-change", { note: "Taken by the release script" });
+await m.backups.updateSnapshot(before.id, { pinned: true });
+```
+
+```python Python
+before = m.backups.snapshot("before-pricing-change", note="Taken by the release script")
+m.backups.update_snapshot(before["id"], pinned=True)
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/snapshots" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"name": "before-pricing-change", "note": "Taken by the release script"}'
+```
+</CodeGroup>
+
+Take a pinned snapshot before risky changes; pinned snapshots survive pruning.
+Practise restores on a test environment, with `dryRun` first, so the steps are familiar before they are needed.
+
+## Workflows
+
+The services above combine into a handful of workflows that teams automate.
+Each one below is a complete script outline, with the reasoning for its order.
+
+### A release script
+
+Releasing definitions from staging to production is a sequence where order matters: protect, move, check, and only then announce.
+
+```typescript
+import { createClient } from "@pawabase/client";
+import { manage } from "@pawabase/client/manage";
+
+const service = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" });
+const production = manage(service, "production");
+const staging = production.withEnvironment("staging");
+
+export async function release(note: string) {
+  const snapshot = await production.backups.snapshot(`pre-release-${new Date().toISOString().slice(0, 10)}`, { note });
+  await production.backups.updateSnapshot(snapshot.id, { pinned: true });
+
+  await staging.environments.promote("production");
+
+  const overview = await production.schema.overview();
+  console.log("tables compared with definitions after promotion:", JSON.stringify(overview, null, 2));
+
+  const advice = await production.observability.advisor({ minutes: 60 });
+  console.log("advisor findings:", JSON.stringify(advice, null, 2));
+
+  return { snapshotId: snapshot.id };
+}
+```
+
+| Stage | Why it comes here |
+| --- | --- |
+| Pinned snapshot | A way back exists before anything changes |
+| Promotion | Definitions move as one step, never secrets or keys |
+| Schema overview | Shows any table that lags its new definition, which `migrate` or the schema plan then addresses |
+| Advisor | Catches slow routes or missing indexes the release introduced |
+
+Run the same script against a copy first, such as a preview of production, when the release is large.
+
+### A new environment from a blueprint
+
+Products that give large customers their own environment, or that run one per region, create them from a blueprint of a reference environment.
+
+```typescript
+const reference = manage(service, "production");
+
+export async function provisionCustomer(slug: string) {
+  const blueprint = await reference.environments.blueprint();
+  await reference.environments.applyBlueprint(blueprint, [slug]);
+  const fresh = reference.withEnvironment(slug);
+  await fresh.secrets.set("PAYSTACK_SECRET", await secretFor(slug, "PAYSTACK_SECRET"));
+  const key = await fresh.keys.create("customer-app", { role: "publishable" });
+  return { environment: slug, publishableKey: key.key };
+}
+
+declare function secretFor(environment: string, name: string): Promise<string>;
+```
+
+A blueprint carries definitions, roles and settings, not data, secrets or keys.
+Each new environment gets its own secrets and keys in the same script, so it is usable as soon as provisioning ends.
+
+### Rotating secrets on a schedule
+
+Secrets can carry a rotation reminder, set with `rotateEveryDays`, which Studio and the listing show.
+A scheduled job can rotate the secrets whose source system issues new values through an API, and keep the old value available for a quick rollback.
+
+```typescript
+export async function rotate(names: string[], issueNewValue: (name: string) => Promise<string>) {
+  const listing = await production.secrets.list();
+  console.log(JSON.stringify(listing, null, 2)); // names, descriptions and reminders, never values
+  for (const name of names) {
+    await production.secrets.rotate(name, await issueNewValue(name));
+  }
+}
+```
+
+Pass the names explicitly rather than inferring them from fields of the listing, whose details vary between versions.
+Rotate in staging first when the secret has a staging counterpart, and keep `rollback(name)` at hand for the first hour after a rotation.
+
+### Responding to an incident
+
+When an attack or an outage starts, the first minutes matter.
+A small runbook script gathers the facts and takes the reversible actions.
+
+```typescript
+export async function incidentFirstResponse(suspectIp: string | null) {
+  const [errors, firewall, services] = await Promise.all([
+    production.observability.errors({ minutes: 15 }),
+    production.firewall.stats({ hours: 1 }),
+    production.health.services(),
+  ]);
+  console.log(JSON.stringify({ errors, firewall, services }, null, 2));
+
+  if (suspectIp) await production.firewall.ban(suspectIp, { seconds: 3600, reason: "incident response" });
+
+  return production.statusPage.openIncident("Elevated error rates", {
+    message: "We are investigating elevated error rates.",
+    impact: "minor",
+    components: ["api"],
+  });
+}
+```
+
+A one-hour ban is reversible and limited; widen it only with evidence from `firewall.events`.
+Opening the incident early keeps customers informed while the team works.
+
+### After a partner's outage
+
+When a webhook endpoint was down, its deliveries failed and stopped retrying.
+Once the partner is back, find and resend them.
+
+```typescript
+export async function recoverWebhooks(endpoint: string, sinceMinutes: number) {
+  const failed = await production.webhooks.deliveries({ status: "failed", endpoint, limit: 100 });
+  console.log(`failed deliveries listed: ${(failed.data ?? []).length}`);
+  const preview = await production.webhooks.redeliverMany({ endpoint, status: "failed", sinceMinutes, dryRun: true });
+  console.log("would redeliver:", preview);
+  return production.webhooks.redeliverMany({ endpoint, status: "failed", sinceMinutes });
+}
+```
+
+Confirm with the partner that their side ignores duplicates before resending large windows.
+
+### Triage of failed jobs
+
+Background jobs that exhausted their retries collect in the failed list.
+Triage means reading why, fixing the cause, then replaying what is safe.
+
+```typescript
+export async function triageFailedJobs() {
+  const failed = await production.jobs.failed();
+  for (const job of (failed.data ?? []) as Array<{ id: string; job: string; error?: string }>) {
+    console.log(job.id, job.job, job.error);
+  }
+  const preview = await production.jobs.replay({ status: "failed", sinceMinutes: 24 * 60, dryRun: true });
+  console.log("would replay:", preview);
+}
+```
+
+Replay only after the cause is fixed; replaying into the same failure fills the list again.
+
+### Definitions kept in a repository
+
+Teams that review every change keep definitions as JSON files in their repository and apply them from CI.
+An upsert helper makes applying idempotent: create what is missing, replace what exists.
+
+```typescript
+import { NotFoundError } from "@pawabase/client";
+
+type DefinitionService = {
+  getOne(name: string, options?: { branch?: string }): Promise<unknown>;
+  create(body: Record<string, unknown>, options?: { branch?: string }): Promise<unknown>;
+  replace(name: string, body: Record<string, unknown>, options?: { branch?: string }): Promise<unknown>;
+};
+
+export async function upsert(service: DefinitionService, body: Record<string, unknown> & { name: string }, branch?: string) {
+  try {
+    await service.getOne(body.name, { branch });
+    return service.replace(body.name, body, { branch });
+  } catch (error) {
+    if (error instanceof NotFoundError) return service.create(body, { branch });
+    throw error;
+  }
+}
+
+export async function applyFromRepo(defs: { policies: any[]; resources: any[]; flows: any[]; routes: any[] }, branch: string) {
+  const m = manage(service, "development");
+  for (const policy of defs.policies) await upsert(m.policies, policy, branch);
+  for (const resource of defs.resources) await upsert(m.resources, resource, branch);
+  for (const flow of defs.flows) await upsert(m.flows, flow, branch);
+  for (const route of defs.routes) await upsert(m.routes, route, branch);
+  return m.releases.commit(branch, `Applied from ${process.env.GIT_COMMIT ?? "local"}`);
+}
+```
+
+Order matters: policies before the resources that refer to them, flows before the routes that call them.
+Applying to a branch and committing a revision keeps the change reviewable in Studio before it is merged.
+
+Deleting definitions that were removed from the repository is a separate, deliberate step.
+List what exists, compare with the files, and remove the difference only after a person confirms.
+
+### Custom domains for customers
+
+White-label products serve each customer on their own domain.
+Registering the domain, showing the customer which DNS record to add, and checking until it is verified is a short loop.
+
+```typescript
+export async function addCustomerDomain(hostname: string) {
+  const added = await production.domains.add(hostname);
+  console.log("ask the customer to add this record:", JSON.stringify(added, null, 2));
+  return added;
+}
+
+export async function waitForDomain(domainId: string, attempts = 30) {
+  for (let i = 0; i < attempts; i++) {
+    const result = await production.domains.verify(domainId);
+    if ((result as { verified?: boolean; status?: string }).verified || (result as { status?: string }).status === "verified") return result;
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+  }
+  throw new Error(`Domain ${domainId} is not verified yet; DNS changes can take hours.`);
+}
+```
+
+DNS changes can take a long time to propagate.
+Run the check from a scheduled job rather than keeping a request open, and tell the customer when verification succeeds.
+The verification answer's exact fields depend on the installation; print one before relying on a field name.
+
+### A daily operations report
+
+A short daily summary of traffic, errors and slow routes helps a team notice trends before they become incidents.
+
+```typescript
+export async function dailyReport() {
+  const [overview, routes, errors, usage] = await Promise.all([
+    production.observability.overview({ range: "24h" }),
+    production.observability.routes({ minutes: 24 * 60, limit: 10 }),
+    production.observability.errors({ minutes: 24 * 60 }),
+    production.health.usage(),
+  ]);
+  return { overview, slowestRoutes: routes, errors, usage };
+}
+```
+
+Send the result to a team channel, or store it for comparison over weeks.
+`usage()` in the same report shows how close the project is to its plan limits, which is easier to act on a week early than on the day a limit is hit.
+
+### Read-only analysis with SQL
+
+Questions the data API cannot answer, such as revenue by week, can be answered with read-only SQL from a script.
+
+```typescript
+const weekly = await production.database.query(
+  "select date_trunc('week', created_at) as week, sum(total_minor) as revenue from orders where status = $1 group by 1 order by 1",
+  ["paid"],
+);
+console.log(weekly);
+```
+
+Statements are read-only unless you pass `allowWrite`, and parameters are sent separately from the SQL text, so values never need to be pasted into the statement.
+The placeholder syntax and the SQL dialect are those of the environment's database; the example is PostgreSQL.
+
+For answers your application shows to people, prefer a custom route, so the query runs under the route's policy and appears in the API's documentation.
+
+### Testing a schedule
+
+A schedule runs at its next time, which may be tomorrow.
+`schedules.run(name)` fires it now, exactly as the scheduler would, which makes it testable during development:
+
+```typescript
+const staging = manage(service, "staging");
+await staging.schedules.run("nightly-digest");
+const runs = await staging.flows.runs({ flow: "send-digest", limit: 1 });
+console.log(runs);
+```
+
+Reading the flow's latest run right after shows whether the scheduled work succeeded and what each block did.
+
+### Following an event through the system
+
+When a record change should have caused several things to happen, the events service shows which did.
+
+```typescript
+const graph = await production.events.graph();
+console.log(JSON.stringify(graph, null, 2)); // which events exist and who consumes each
+
+const recent = await production.events.list({ name: "orders.created", limit: 5 });
+for (const event of (recent.data ?? []) as Array<{ event_id?: string; id?: string }>) {
+  const id = event.event_id ?? event.id;
+  if (id) console.log(await production.events.detail(String(id)));
+}
+```
+
+`detail` lists every consumer an event reached and how each went: the flows it started, the webhooks it queued, the subscriptions it matched.
+An event with no consumers is a subscription that is missing or filtered too narrowly.
+
+### Clearing caches after a release
+
+Promotion changes definitions, and the environment's response cache is keyed by them, so most stale answers disappear on their own.
+Answers cached under keys that did not change, such as an expanded relation whose target changed shape, can linger until they expire.
+Clear them deliberately after releases that change relations or transformers:
+
+<CodeGroup>
+```typescript TypeScript
+await production.cache.invalidate({ resources: ["orders", "customers"] });
+```
+
+```python Python
+production.cache.invalidate(resources=["orders", "customers"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/cache/invalidate" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"tags": [], "resources": ["orders", "customers"]}'
+```
+</CodeGroup>
+
+Clearing a whole resource's cache costs a burst of uncached reads; do it after the release, not during it.
+
+### Changing environment settings
+
+`environments.update(name, { infra, auth, settings })` changes an environment's infrastructure, sign-in settings or general settings.
+Each part is merged with what exists, so you send only what changes.
+
+```typescript
+const current = await production.environments.getOne("production");
+console.log(JSON.stringify(current, null, 2));
+await production.environments.update("production", { settings: { ...changedSettings } });
+
+declare const changedSettings: Record<string, unknown>;
+```
+
+Read the current document first and change the fields you mean to change.
+Settings differ between installations and versions, and a typo in a field name is stored without complaint.
+
+### Capacity of background work
+
+When jobs back up, the questions are how deep the queues are and whether workers are taking jobs.
+
+```typescript
+const [queues, workers, policies] = await Promise.all([production.jobs.queues(), production.jobs.workers(), production.jobs.retryPolicies()]);
+console.log({ queues, workers, policies });
+```
+
+A growing queue with active workers means work arrives faster than it is done.
+A growing queue with no workers means the workers are down.
+The retry policies explain how long failing work keeps coming back before it lands in the failed list.
+
+### Alarms worth having
+
+Most environments benefit from a few alarms from the start.
+Choose the metrics from the catalog; the table describes what each alarm should watch.
+
+| Alarm | Watches | Typical rule |
+| --- | --- | --- |
+| Server errors | The count of `5xx` answers | More than a handful in five minutes, twice in a row |
+| Slow API | A latency percentile of requests | Above your target for ten minutes |
+| Failed jobs | Jobs that exhausted retries | Any, in an hour |
+| Webhook failures | Failed deliveries | Several in an hour for one endpoint |
+| Rate limiting | `429` answers | A sustained rise, which means growth or a loop |
+
+Start with thresholds that fire rarely, then tighten them.
+An alarm that fires every day is soon ignored.
+
+### Firewall recipes
+
+Rules are tried in order, and the first match decides.
+Every recipe below starts in `simulate` mode; switch it to `enforce` after reading its events.
+
+```typescript
+await production.firewall.addRule({
+  name: "Studio-only admin routes from the office",
+  action: "block",
+  logic: "all",
+  conditions: [
+    { field: "path", op: "starts_with", value: "/rest/v1/x/admin" },
+    { field: "ip", op: "not_in_cidr", value: ["203.0.113.0/24"] },
+  ],
+  mode: "simulate",
+});
+
+await production.firewall.addRule({
+  name: "Log traffic without a user agent",
+  action: "log",
+  conditions: [{ field: "user_agent", op: "missing", value: null }],
+});
+
+const verdict = await production.firewall.test("198.51.100.7", { path: "/rest/v1/x/admin/users", method: "GET" });
+console.log(verdict);
+```
+
+| Operators | Meaning |
+| --- | --- |
+| `equals`, `not_equals` | Exact comparison |
+| `contains`, `not_contains`, `starts_with`, `ends_with` | Text comparison |
+| `glob`, `regex` | Pattern matching |
+| `in`, `not_in` | Membership in a list of values |
+| `in_cidr`, `not_in_cidr` | Membership in a list of address ranges |
+| `exists`, `missing` | Whether the field is present; these take no value |
+| `gt`, `lt` | Numeric comparison, such as on `content_length` |
+
+A rate-limit rule counts requests by `ip`, `key` or `ip_path`.
+`firewall.test` shows how a rule set treats a sample request, step by step, without sending anything.
+Use it to check a new rule against the requests you care about before enforcing.
+
+### Checking mail after a deploy
+
+Sign-in emails, invitations and flow notifications all depend on mail delivery.
+A quick check after configuration changes confirms the path works end to end.
+
+```typescript
+const config = await production.mail.config();
+console.log(config); // provider, sender and whether mail is being delivered; never the password
+await production.mail.sendTest(["ops@example.com"]);
+const log = await production.mail.log({ limit: 5 });
+console.log(log);
+```
+
+`log` shows the test message as sent, failed or suppressed.
+A suppressed status usually means the environment is configured not to deliver, which is common and correct for development environments.
+
+### Branches and releases in detail
+
+Branches let a team prepare definition changes without affecting the live environment, review them, and then make them live in one step.
+
+| Step | Call | Effect |
+| --- | --- | --- |
+| Start | `releases.createBranch("pricing-v2", { fromBranch: "main" })` | A draft copy of the definitions |
+| Change | Definition services with `{ branch: "pricing-v2" }` | Edits apply to the draft only |
+| Inspect | `releases.draft("pricing-v2")` | The branch's definitions as they stand |
+| Freeze | `releases.commit("pricing-v2", "New pricing resources")` | An immutable revision |
+| Go live, simple | `releases.merge("pricing-v2")` | The branch becomes the environment's definitions |
+| Go live, versioned | `releases.release(revisionId, "v2", "2.0.0")`, then `activate` | The revision serves `/rest/v2`; `/rest/v1` keeps its contract |
+
+A protected branch refuses merges unless forced, which suits `main` in teams that require review.
+`merge` with `force: true` overrides that protection; reserve it for emergencies and record why.
+
+A release checks compatibility between the revision and the version's previous release.
+Breaking changes, such as a removed field, are refused unless `allowBreaking` is set, which is the moment to ask whether a new API version would be kinder to existing clients.
+
+### A backup schedule
+
+Every environment with data people care about should have scheduled snapshots.
+
+<CodeGroup>
+```typescript TypeScript
+await production.backups.setSchedule({
+  enabled: true,
+  frequency: "daily",
+  hour: 3,
+  keepLast: 14,
+  keepDays: 30,
+});
+```
+
+```python Python
+production.backups.set_schedule(enabled=True, frequency="daily", hour=3, keep_last=14, keep_days=30)
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/platform/v1/envs/production/backup-schedule" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"enabled": true, "frequency": "daily", "hour": 3, "weekday": 0, "keep_last": 14, "keep_days": 30, "include": []}'
+```
+</CodeGroup>
+
+`hour` is in UTC.
+Older snapshots are pruned when they exceed both the count and the age limits, except pinned ones.
+`verifySnapshot(id)` checks that a stored snapshot is intact; running it weekly from a job catches storage problems before a restore depends on them.
+
+### Giving a partner its callback URL
+
+An inbound hook is created once and its URL handed to the partner that will call it.
+Scripts that onboard partners fetch the URL instead of copying it from Studio:
+
+```typescript
+const { url } = (await production.inboundHooks.url("paystack")) as { url: string };
+console.log(`Configure Paystack to call ${url}`);
+```
+
+The URL identifies the environment and the hook; the hook's signature check decides whether a call is accepted.
+Moving a partner from staging to production means giving them the production hook's URL, not changing the staging one.
+
+### A health gate before deploys
+
+A deploy pipeline can refuse to proceed when the environment is already unhealthy, so a release is never blamed for an outage that preceded it.
+
+```typescript
+export async function assertHealthy() {
+  const services = (await production.health.services()) as { data?: Array<{ name: string; state: string }> };
+  const unhealthy = (services.data ?? []).filter((service) => service.state !== "ok" && service.state !== "healthy");
+  if (unhealthy.length) throw new Error(`Not deploying: ${unhealthy.map((s) => `${s.name}=${s.state}`).join(", ")}`);
+}
+```
+
+Print one `services()` answer to learn the state values your installation reports, and adjust the comparison to match.
+
+### Keeping the status page in step with alarms
+
+When an alarm fires, customers benefit from knowing, and the status page is where they look.
+A job that reads alarm history can open and resolve incidents to match.
+
+```typescript
+export async function syncIncidents() {
+  const history = (await production.alarms.history()) as { data?: Array<{ alarm: string; state: string; at: string }> };
+  console.log(JSON.stringify(history, null, 2));
+}
+```
+
+Automating the opening of incidents is safe; automating their wording rarely is.
+Many teams let automation open a generic incident and leave updates to a person.
+
+### Several projects
+
+A secret key belongs to one environment of one project.
+Scripts that work across projects hold one client per project environment, each with its own key:
+
+```typescript
+const projects = {
+  shop: createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.SHOP_PRODUCTION_KEY!, environment: "production" }),
+  blog: createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.BLOG_PRODUCTION_KEY!, environment: "production" }),
+};
+
+for (const [name, client] of Object.entries(projects)) {
+  console.log(name, await manage(client).health.usage());
+}
+```
+
+The gateway URL is shared by every project on an installation; the key decides which project a request reaches.
+
+### Exporting the audit trail
+
+Compliance often asks for a record of who changed what, kept longer than any one system's retention.
+
+```typescript
+import { writeFileSync } from "node:fs";
+
+export async function exportYesterdaysAudit() {
+  const since = new Date(Date.now() - 24 * 3600 * 1000);
+  const text = await production.health.exportAudit({ since, format: "jsonl" });
+  writeFileSync(`audit-${since.toISOString().slice(0, 10)}.jsonl`, text);
+}
+```
+
+Each line is one management change, including those made in Studio.
+Ship the files to storage your compliance process controls.
+
+## How the module is built
+
+Every service is a thin class over one family of management paths.
+Knowing the pattern lets you predict any method's request.
+
+| Part | Becomes |
+| --- | --- |
+| The environment | `/platform/v1/envs/<environment>` |
+| The service's kind | `/flows`, `/policies`, `/webhook-deliveries` and so on |
+| A name or id | One path segment, percent-encoded |
+| Options in camelCase | Body or query fields in snake_case: `sinceMinutes` becomes `since_minutes` |
+| Project-level calls | `/platform/v1/…` without an environment, such as `environments.list()` and `flows.blocks()` |
+
+Each call goes through the client's transport, so retries, timeouts, hooks and error classes all apply.
+Reads are retried after network failures; writes follow the usual rules for their HTTP method.
+
+### Calling endpoints the module does not wrap
+
+The management plane has more endpoints than the module wraps.
+Call them with the client's raw request, which adds the key and applies the same errors:
+
+```typescript
+const types = await service.http.request<string>({
+  path: "/platform/v1/envs/production/types",
+  query: { lang: "typescript" },
+  parse: "text",
+});
+```
+
+The **API Explorer** documents the data plane; the management plane's paths follow the patterns in the table above.
+
+## Keys for automation
+
+A key used by scripts deserves as much thought as the scripts themselves.
+
+| Restriction | Use |
+| --- | --- |
+| **Allowed routes** such as `"GET /platform/v1/envs/production/*"` | A monitoring script that may only read |
+| **Allowed routes** limited to one service's paths | A job that only rotates secrets, or only manages webhooks |
+| **Allowed IP ranges** | CI runners or servers with fixed egress addresses |
+| **Expires** | Keys for one-off migrations |
+| Scopes such as `resource:read` | Scripts that read data through the data plane |
+
+Create separate keys for separate jobs.
+When one leaks or misbehaves, revoking it stops one job, not all of them.
+
+## Copying data between environments
+
+Promotion copies definitions, never data.
+To give a staging environment realistic records, export from one environment and import into the other.
+
+```typescript
+export async function copyResource(from: string, to: string, resource: string, key: string) {
+  const source = manage(service, from);
+  const target = manage(service, to);
+  const exported = await source.resources.export(resource, { format: "json" });
+  const rows = (exported.data ?? exported.rows ?? []) as Array<Record<string, unknown>>;
+  const preview = await target.resources.importRecords(resource, rows, { key, dryRun: true });
+  console.log(`importing into ${to}:`, preview);
+  return target.resources.importRecords(resource, rows, { key });
+}
+```
+
+The shape of an export depends on the format; print one before writing code against it.
+Never copy personal data from production into a less protected environment; anonymize it first, or generate test data instead.
+
+## Studio or a script
+
+Studio and the management module change the same things.
+Which to use depends on how often, and how carefully, a change is made.
+
+| Change | Better in |
+| --- | --- |
+| Exploring, designing a resource, building a flow | Studio |
+| A one-time fix during an incident | Studio, followed by a note in the incident |
+| A change that must happen the same way in several environments | A script |
+| A recurring task, such as rotating secrets or exporting audits | A scheduled script |
+| A change that must be reviewed before it happens | A script on a branch, committed as a revision |
+| Provisioning environments for customers | A script |
+
+Scripts and Studio meet in the audit trail and in definition branches, so a team can mix them freely.
+
+## Testing management scripts
+
+Management scripts change configuration, so they deserve tests as much as application code.
+
+| Level | How |
+| --- | --- |
+| Unit | A fake `fetch` answering `/platform/v1/envs/<env>/…` paths, asserting the requests the script makes |
+| Dry run | Run against a real environment with `dryRun` where available, and read the output |
+| Rehearsal | Run against a preview or test environment created for the purpose |
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient } from "@pawabase/client";
+import { manage } from "@pawabase/client/manage";
+
+test("rotation calls the rotate endpoint for each name", async () => {
+  const paths: string[] = [];
+  const client = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_sk_test",
+    environment: "staging",
+    fetch: async (input, init) => {
+      paths.push(`${init?.method ?? "GET"} ${new URL(input).pathname}`);
+      return Response.json({ data: [] });
+    },
+  });
+  const m = manage(client);
+  for (const name of ["A", "B"]) await m.secrets.rotate(name, "new");
+  assert.deepEqual(paths, ["POST /platform/v1/envs/staging/secrets/A/rotate", "POST /platform/v1/envs/staging/secrets/B/rotate"]);
+  client.dispose();
+});
+```
+
+The test is fast, needs no network, and proves the script targets the environment it should, which is the most important property of any management script.
+
+## Running management scripts in CI
+
+| Practice | Why |
+| --- | --- |
+| Protect production jobs with the CI system's approval step | A person confirms before production changes |
+| Print the environment and a summary of what will change | The approval is informed |
+| Store keys in the CI secret store, one per job | Least authority, easy revocation |
+| Keep the script's output as a build artifact | A record next to the audit trail |
+| Fail loudly on any unexpected answer | A half-finished change is worse than none |
+
+## Words used on this page
+
+| Term | Meaning |
+| --- | --- |
+| Management plane | The `/platform/v1` API that defines and operates environments |
+| Definition | A stored configuration: a resource, policy, flow, route, schedule, webhook, bucket and so on |
+| Branch | A draft copy of an environment's definitions, for reviewed changes |
+| Revision | An immutable snapshot of a branch's definitions |
+| Release | A revision made the live definitions of an API version |
+| Promotion | Copying definitions from one environment to another |
+| Blueprint | A portable document of a project's definitions, roles and settings |
+| Snapshot | A stored backup of an environment, which can be pinned and restored |
+
+## Reading answers
+
+Management calls return the platform's JSON documents, typed as `Record<string, any>`.
+A few conventions make them predictable.
+
+| Convention | Example |
+| --- | --- |
+| Lists are wrapped in `data` | `(await m.flows.list()).data` |
+| Lists that can be long accept `limit`, and some accept `after` or `offset` | `m.flows.runs({ limit: 50, after })` |
+| Field names are snake_case, as stored | `rotate_every_days`, `expires_at` |
+| Created things are returned whole | `keys.create` returns the key, including its secret, once |
+| Secrets are never returned | `secrets.list` has names, not values |
+
+Wrap the answers you use in small typed functions, so the rest of your code does not depend on `any`:
+
+```typescript
+interface FlowRunSummary {
+  id: string;
+  status: "succeeded" | "failed" | string;
+}
+
+export async function recentFailedRuns(flow: string): Promise<FlowRunSummary[]> {
+  const answer = await production.flows.runs({ flow, status: "failed", limit: 20 });
+  return (answer.data ?? []) as FlowRunSummary[];
+}
+```
+
+## The same module in Python
+
+The Python client's `pb.manage` offers the same services with Python naming.
+Scripts can move between the two languages with little change.
+
+| TypeScript | Python |
+| --- | --- |
+| `manage(client, "staging")` | `pb.manage.environment("staging")`, or a client created for that environment |
+| `m.withEnvironment("staging")` | `pb.manage.environment("staging")` |
+| `getOne(name)` | `get_one(name)` |
+| `m.inboundHooks`, `m.mailTemplates`, `m.statusPage` | `pb.manage.inbound_hooks`, `pb.manage.mail_templates`, `pb.manage.status_page` |
+| `m.statusPage.page()` | `pb.manage.status_page.get_page()` |
+| `importRecords(name, rows, { key, dryRun })` | `import_records(name, rows, key=…, dry_run=…)` |
+| `firewall.updateRule(id, changes)` | `firewall.update_rule(id, **changes)` |
+| `{ sinceMinutes: 60 }` | `since_minutes=60` |
+
+See [Python environment management](/clients/python/management).
+
+## Safety
+
+The management plane can change anything in an environment.
+A few habits keep scripts from becoming incidents.
+
+| Habit | Why |
+| --- | --- |
+| Pass the environment explicitly, every time | The fallback is `development`, and the wrong environment is the worst bug a script can have |
+| Print the environment before acting | A human reading the output catches mistakes |
+| Use `dryRun` wherever it exists | Imports, replays, redeliveries and restores show their effect first |
+| Snapshot before destructive work | A pinned snapshot is a way back |
+| Use keys scoped to what the script does | A reporting script should not be able to delete resources |
+| Keep scripts in the repository and run them from CI | Changes are reviewed and logged |
+| Read the audit trail after automated changes | Confirms the script did what it said |
+
+## Errors from the management plane
+
+The module raises the same error classes as the rest of the client.
+Some outcomes are specific to it.
+
+| Error | Usual meaning here |
+| --- | --- |
+| `ConfigError` from `manage()` | The client holds a publishable key |
+| `PermissionError` | The key's scopes, IP ranges or routes exclude the call, or it may not manage that environment |
+| `NotFoundError` | A wrong environment name, or a definition that does not exist |
+| `ValidationError` | A definition body the platform refuses; `issues` names the fields |
+| `ConflictError` | A definition with that name already exists, or a state conflict such as merging a protected branch |
+
+When a definition is refused, the issues point into the JSON body.
+Comparing with a definition read by `getOne` from Studio's own edits is the quickest way to find the difference.
+
+## Where each service lives in Studio
+
+| Service | Studio |
+| --- | --- |
+| `resources`, `schema`, `database` | **Data**, and **Data → SQL** |
+| `schemas`, `transformers` | **Data → Schemas**, **Data → Transformers** |
+| `policies` | **Access → Policies** |
+| `keys` | **Access → API keys** |
+| `secrets` | **Access → Secrets** |
+| `domains`, `firewall` | **Access → Networking** |
+| `flows`, `routes`, `schedules`, `subscriptions` | **Logic → Flows**, **Logic → Routes**, **Logic → Schedules**, **Logic → Event subscriptions** |
+| `webhooks`, `inboundHooks` | **Logic → Webhooks**, **Outbound** and **Inbound** |
+| `events`, `jobs`, `observability` | **Project → Activity** |
+| `buckets` | **Services → Storage** |
+| `mail`, `mailTemplates` | **Services → Mail** |
+| `health.usage` | **Project → Usage & plan** |
+| `backups` | **Project → Backups** |
+| `statusPage` | **Project → Status page** |
+| `environments`, `releases` | **Project → Settings**, and the history sheet for branches, releases and API versions |
+
+Anything you can do in Studio, you can script; anything you script appears in Studio and in the audit trail.
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| `ConfigError: The management plane needs a secret key` | A publishable key | Use a secret key, on a server |
+| Changes appear in development, not production | No environment was passed | Pass it to `createClient` or `manage()` |
+| `PermissionError` with a secret key | Scopes, IP ranges or allowed routes on the key | Check the key under **Access → API keys** |
+| A created resource has no table | Definitions do not create tables | `resources.migrate(name)` |
+| A column change is not applied by `migrate` | `migrate` only creates tables and adds columns | Use `schemaPlan` and `schemaApply` |
+| SQL writes did not trigger flows | SQL bypasses the data plane | Use the data plane, or emit events yourself |
+| A promoted flow fails in production | A secret it reads is missing there | Secrets are per environment; set them |
+| Redelivered webhooks created duplicates at a partner | The partner does not ignore duplicates | Agree on idempotency with the partner first |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can a browser use the management module?">
+    No.
+    It requires a secret key, and a secret key must never reach a browser.
+    Build an endpoint on your server that performs the specific operation after its own checks.
+  </Accordion>
+  <Accordion title="Are management calls rate limited?">
+    They go through the gateway like other calls, with the key's limits.
+    Scripts that loop over many definitions should keep modest concurrency.
+  </Accordion>
+  <Accordion title="Do management changes take effect immediately?">
+    Yes, for the environment they target.
+    Changes on a branch take effect when the branch is merged or released.
+  </Accordion>
+  <Accordion title="Can I undo a promotion?">
+    Restore the snapshot taken before it, or promote the previous definitions back from an environment that still has them.
+    That is why the release script takes a pinned snapshot first.
+  </Accordion>
+  <Accordion title="Why are results untyped?">
+    The management plane's documents are large and change with the platform.
+    Type the fields you use where you use them, and print a full answer once to learn its shape.
+  </Accordion>
+  <Accordion title="Can I manage users with this module?">
+    Users of your application are managed with `admin()`, a separate module with the same rules.
+    `manage()` covers the environment's definitions and operations.
+  </Accordion>
+  <Accordion title="What happens if a script fails halfway?">
+    Each call is its own change; there is no transaction across calls.
+    Write scripts so they can be run again, with upserts and checks, and take a snapshot first when the work is large.
+  </Accordion>
+  <Accordion title="Is there a Python equivalent?">
+    Yes: `pb.manage` in the Python client offers the same services with snake_case names.
+    See [Python environment management](/clients/python/management).
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="User administration" icon="users" href="/clients/typescript/user-administration">The `admin()` module for your application's users.</Card>
+  <Card title="API keys" icon="key" href="/operate/api-keys">Scopes, restrictions and rotation.</Card>
+  <Card title="Environments and promotion" icon="git-branch" href="/operate/environments-and-promotion">How definitions move between environments.</Card>
+  <Card title="Backup and restore" icon="archive" href="/operate/backup-and-restore">Snapshots, schedules and restores.</Card>
+  <Card title="Observability" icon="activity" href="/operate/observability">Requests, logs, metrics and the advisor.</Card>
+  <Card title="Audit log" icon="scroll" href="/operate/audit-log">Who changed what.</Card>
+</CardGroup>
