@@ -1,0 +1,545 @@
+---
+title: "Client configuration"
+description: "Every constructor argument of Pawabase and AsyncPawabase, headers, as_user, connection lifecycle, timeouts, retries, request(), and how configuration behaves in practice."
+icon: "sliders-horizontal"
+---
+
+`Pawabase(url, api_key, *, project, environment="development", timeout=30.0, retries=2)` and `AsyncPawabase(...)` build a client for exactly one gateway origin, exactly one project, and exactly one environment. The options are fixed at construction time. There is no way to change the URL, key, project, or environment after the client exists. The client holds an `httpx` connection pool, sends a fixed set of headers, and exposes every endpoint method on the instance.
+
+This page explains each argument by the decision it represents, how headers are assembled, how `as_user` creates a borrowed view, the lifecycle of blocking and async clients, timeouts, the retry mechanism in full detail, the raw `request()` API, and the practical consequences of each choice. The goal is to explain behavior, not just list fields. The explanations come from reading `pawabase/client.py` as shipped in version `0.2.0`.
+
+<Info>
+This documents `pawabase` 0.2.0 exactly as installed. Constants as defined: `RETRIED_STATUSES = frozenset({502,503,504})`, `MAX_RATE_WAITS = 8`, `MAX_RATE_WAIT_SECONDS = 20.0`. All behavior described matches the source.
+</Info>
+
+## The mental model
+
+A Python client is a configured transport, not a session manager. It does not store user tokens, does not refresh them, and does not persist sessions between calls or processes. It does not open a WebSocket. It is designed to be shared per process for the lifetime of that process. When code needs to act as a specific signed-in user for a single request or a short chain of requests, it uses `as_user(token)` to create a view that adds `Authorization: Bearer <token>` while reusing the same connection pool. Closing that view does nothing to the pool.
+
+The gateway is the authority. The client sends headers that identify the caller, builds paths, serializes JSON, applies the retry policy, and converts failures to `PawabaseError`. Policy decisions live on the gateway. Row-level security is enforced by the gateway, not by the client. A key's capabilities are determined by the key type and scopes as configured in Studio under **Access → API keys**.
+
+Why this model exists: in a server process you want one connection pool, predictable behavior, and explicit control over user context. The client stays mechanical so that authentication, retries, and errors are consistent across the codebase.
+
+## Where to find configuration in Studio
+
+Configuration decisions map to Studio locations. You need to know these because the client options correspond to values created there.
+
+| What you need | Studio path | Notes |
+| --- | --- | --- |
+| Gateway URL | **Access → API keys** (top of the page shows the gateway/health info) | The origin of the gateway. Copy the origin only. |
+| API keys | **Access → API keys** | Create publishable (`pb_pk_...`) or secret (`pb_sk_...`) keys. The full key is shown once. |
+| Project and environment | **Access → API keys** | Keys belong to a project and environment. The environment name is what you pass as `environment`. |
+| Key scopes | **Access → API keys → New API key → Permissions** | Affects what management endpoints are callable with a secret key. |
+| Key limits | **Access → API keys → New API key → Limits** | Expiration, IP ranges, route restrictions. |
+
+The client does not read Studio configuration at runtime. You must pass the correct values.
+
+## Constructor arguments
+
+```python
+from pawabase import Pawabase
+
+pb = Pawabase(
+    url="https://api.example.com",
+    api_key="pb_pk_live_...",
+    project="acme",
+    environment="production",
+    timeout=30.0,
+    retries=2,
+)
+```
+
+```python
+from pawabase import AsyncPawabase
+
+async with AsyncPawabase(
+    url="https://api.example.com",
+    api_key="pb_sk_...",
+    project="acme",
+    environment="production",
+    timeout=30.0,
+    retries=2,
+) as pb:
+    ...
+```
+
+### url
+
+| Property | Value |
+| --- | --- |
+| Type | `str` |
+| Required | Yes |
+| Default | None |
+| Stored as | `self.url = url.rstrip("/")` |
+
+The origin of your Pawabase gateway. Every service is reached through it: the data API at `/rest/v1`, auth at `/auth/v1`, storage at `/storage/v1`, flows at `/flows/v1`, functions at `/functions/v1`, and the management plane at `/platform/v1`. Give the origin only. `https://api.example.com` is correct. `https://api.example.com/rest/v1` is wrong because the client would call `https://api.example.com/rest/v1/rest/v1/...`. A trailing slash is removed.
+
+If your gateway is served under a path prefix behind a reverse proxy (e.g. `https://example.com/pawabase`), pass that prefix as the URL and the client will append service paths to it correctly.
+
+The client does not validate the URL scheme beyond what `httpx` does; it uses the URL as `base_url` for `httpx.Client`/`AsyncClient`.
+
+### api_key
+
+| Property | Value |
+| --- | --- |
+| Type | `str` |
+| Required | Yes |
+| Default | None |
+
+The key every request carries in the `apikey` header. The gateway resolves the key into a signed project context. The raw key is never forwarded to a function or to an internal Pawabase service. Two types matter:
+
+| Key type | Prefix | Where it may live | What it can do |
+| --- | --- | --- | --- |
+| Publishable | `pb_pk_...` | Browsers, mobile apps, anywhere public | Acts under project policies. Subject to RLS and other policies. |
+| Secret | `pb_sk_...` | Servers, scripts, CI only | Bypasses policy checks in many contexts and reaches the management plane for its project and environment. Must never reach a browser. |
+
+The client places it in `headers` as `{"apikey": self.api_key, ...}`. It is passed on every request. The key is hidden in `__repr__`.
+
+### project
+
+| Property | Value |
+| --- | --- |
+| Type | `str` |
+| Required | Yes (keyword-only) |
+| Default | None |
+
+Project reference sent as `x-project-id` header. Omitting this argument is a Python `TypeError` because it is keyword-only and required in the constructor signature. The gateway already knows the project from the key, but the header is sent for routing, logging, and proxy purposes. Use the project identifier as configured in your installation.
+
+### environment
+
+| Property | Value |
+| --- | --- |
+| Type | `str` |
+| Required | No |
+| Default | `"development"` |
+
+Environment name sent as `x-environment` header. Many operations are scoped to this environment. Management endpoints use it. Runtime operations use it. For non-development environments you must pass the correct environment name. The client does not validate it against the key.
+
+### timeout
+
+| Property | Value |
+| --- | --- |
+| Type | `float` |
+| Required | No |
+| Default | `30.0` |
+
+Seconds per request passed to `httpx.Client`/`httpx.AsyncClient`. This is the timeout used by `httpx` for the request. Transport errors due to timeouts are caught as `httpx.TransportError`, converted to `PawabaseError(0, f"Could not reach {self.url}: {error}")`, and retried if the request is retryable.
+
+There is no separate connect/read/write timeout exposed by the constructor. The value is passed directly as `timeout=timeout`.
+
+### retries
+
+| Property | Value |
+| --- | --- |
+| Type | `int` |
+| Required | No |
+| Default | `2` |
+
+Extra attempts for retryable reads. Total attempts = `retries + 1`. This controls how many times the client will retry on transport errors and on retried `502`/`503`/`504` responses when `retry=True`. It does not make mutations retryable by default. Setting `retries=0` means only the initial attempt (plus rate limit waits which are separate).
+
+## Headers
+
+The `headers` property on `_Base` returns a dict:
+
+```python
+{"apikey": self.api_key, "x-project-id": self.project, "x-environment": self.environment, "user-agent": "pawabase-python/0.2"}
+```
+
+These are passed to `httpx` as base headers. On every request, the client also passes `headers=self._extra or None`. When using a view created by `as_user()`, `view._extra` contains `Authorization` and any extra headers, so they are sent with each request.
+
+Header precedence is handled by `httpx`. The base headers identify the project/key/environment. Extra headers from views add per-request context like user identity.
+
+The `user-agent` is hardcoded to `"pawabase-python/0.2"`. It is useful for gateway logging and debugging.
+
+## Acting as a user with `as_user`
+
+```python
+view = pb.as_user(access_token)
+view = pb.as_user(access_token, x_request_id="req_123", x_trace_id="trace_456")
+```
+
+### Behavior
+
+`as_user(token: str | None, **headers: str) -> Any`:
+1. Creates a shallow copy: `view = copy.copy(self)`
+2. Builds extra headers dict
+3. If `token` is not `None`, adds `{"Authorization": f"Bearer {token}"}`
+4. Merges extra headers passed as kwargs with underscores converted to hyphens: `{k.replace("_", "-"): v for k,v in headers.items()}`
+5. Sets `view._extra = merged_dict`
+6. Sets `view._borrowed = True`
+7. Returns `view`
+
+### Properties of the view
+
+- Shares the same `httpx` client instance and connection pool as the original client
+- Has the same base headers (copied)
+- Adds extra headers per request via `self._extra`
+- `close()` on the view does nothing because `view._borrowed` is True; only the owner closes the pool
+- Can be used exactly like the original client for all methods
+
+### Why this exists
+
+In a web framework like FastAPI, you typically create one `AsyncPawabase` client at application startup and share it for the lifetime of the process. Each incoming request may need to act on behalf of a different authenticated user. Creating a new client per request would create a new connection pool and be wasteful. `as_user()` solves this by creating a lightweight view that adds the user's token without creating a new pool.
+
+```python
+# FastAPI pattern
+from fastapi import FastAPI, Request
+from pawabase import AsyncPawabase
+
+app = FastAPI()
+pb = AsyncPawabase(url, key, project="acme")
+
+@app.get("/me")
+async def me(request: Request):
+    token = request.headers.get("authorization", "").removeprefix("Bearer ")
+    view = pb.as_user(token)
+    return await view.request("GET", "/auth/v1/user")
+```
+
+### Notes
+
+- Passing `token=None` creates a view with only extra headers
+- Extra header keys with underscores are converted to hyphens (Python convention)
+- The view is not thread-safe in the sense that you shouldn't share it across concurrent requests; create one per request
+- Do not mutate `view._extra` after creation
+
+## Lifecycle
+
+### Blocking client lifecycle
+
+```python
+pb = Pawabase(url, api_key, project="acme")
+try:
+    posts = pb.list("posts")
+finally:
+    pb.close()
+```
+
+Or with context manager:
+
+```python
+with Pawabase(url, api_key, project="acme") as pb:
+    posts = pb.list("posts")
+    # automatically closed
+```
+
+- `__init__`: Creates `httpx.Client(base_url=self.url, headers=self.headers, timeout=timeout)`
+- `__enter__()`: Returns `self`
+- `__exit__(*_)`: Calls `self.close()`
+- `close()`: If not `self._borrowed`, calls `self._client.close()`. Otherwise does nothing.
+- Do not share across process forks. Create after fork.
+
+### Async client lifecycle
+
+```python
+async with AsyncPawabase(url, api_key, project="acme") as pb:
+    posts = await pb.list("posts")
+```
+
+- `__init__`: Creates `httpx.AsyncClient(base_url=self.url, headers=self.headers, timeout=timeout)`
+- `__aenter__()`: Returns `self`
+- `__aexit__(*_)`: Awaits `self.close()`
+- `close()`: If not borrowed, awaits `self._client.aclose()`
+- `download(path, *, params=None)`: Returns `await self._client.get(path, params=params, headers=self._extra or None)` as raw `httpx.Response` without calling `_body()`
+
+The async client must belong to the event loop it was created in.
+
+## Timeouts
+
+The `timeout` value is passed directly to `httpx`. Default is `30.0` seconds. When a timeout occurs, `httpx` raises `httpx.TimeoutException` which is a subclass of `httpx.TransportError`. The client catches `httpx.TransportError`, converts it to `PawabaseError(0, f"Could not reach {self.url}: {error}")`, and retries if the request is retryable.
+
+There is no built-in way to set different timeouts per request. If you need different timeouts, you would need to work around this, but the constructor takes a single value.
+
+## Retries in detail
+
+The retry logic is in `_call()` for both `Pawabase` and `AsyncPawabase`. Understanding this is important because it affects when requests are repeated.
+
+### Attempt counting
+
+```python
+attempts = self._attempts(retry)
+while attempt < attempts:
+    ...
+    attempt += 1
+```
+
+`_attempts(retry)` is defined on `_Base`. The total number of attempts is `retries + 1` (initial attempt plus `retries` extra attempts). With `retries=2`, up to 3 attempts total. With `retries=0`, 1 attempt total.
+
+### Transport errors
+
+```python
+try:
+    response = self._client.request(method, path, json=json, params=params, headers=self._extra or None)
+except httpx.TransportError as error:
+    last = PawabaseError(0, f"Could not reach {self.url}: {error}")
+else:
+    ...
+# if exception occurred, fall through to sleep and retry
+time.sleep(min(0.25 * 2**attempt, 2.0))
+attempt += 1
+continue
+```
+
+On transport errors (connection failures, timeouts, etc.), the client catches the exception, stores it as `last`, applies exponential backoff, increments attempt, and retries if attempts remain. Backoff is `min(0.25 * 2**attempt, 2.0)` seconds. After all attempts are exhausted, `last` is raised.
+
+### 429 rate limiting
+
+```python
+if response.status_code == 429 and waits < MAX_RATE_WAITS:
+    waits += 1
+    time.sleep(rate_wait(response))
+    continue
+```
+
+When the server returns 429, the client checks if `waits < MAX_RATE_WAITS` (8). If so, it increments `waits`, sleeps for `rate_wait(response)`, and continues the loop to retry the same request. The `attempt` counter is not incremented for 429 waits; `waits` is tracked separately. This means 429 handling is independent of the retry count for network errors.
+
+`rate_wait(response)`:
+1. Get `response.headers.get("retry-after")`
+2. If None, try `response.json().get("retry_after")` inside try/except
+3. Try to convert to float: `float(asked)`
+4. Clamp: `min(max(float(asked), 1.0), MAX_RATE_WAIT_SECONDS)` where `MAX_RATE_WAIT_SECONDS = 20.0`
+5. If any exception, return `1.0`
+
+The wait is clamped between 1 second and 20 seconds. Maximum 8 rate limit waits per request.
+
+### 502, 503, 504
+
+```python
+if response.status_code in RETRIED_STATUSES and retry and attempt + 1 < self._attempts(retry):
+    last = _failure(response)
+    time.sleep(min(0.25 * 2**attempt, 2.0))
+    attempt += 1
+    continue
+```
+
+For statuses in `{502, 503, 504}`, if `retry=True` and there are more attempts remaining (`attempt + 1 < attempts`), the client stores `_failure(response)` as `last`, sleeps with exponential backoff, increments attempt, and retries. If no more attempts remain, it falls through to `return self._body(response)` which will raise `_failure(response)`.
+
+### When retry is True
+
+The `retry` parameter is passed to `_call()`. It is set to:
+- `True` if `method.upper() in ("GET", "HEAD")` in `request()`
+- `True` in specific methods: `auth_settings()`, `functions()`, `deployments()`, `deployment()`, `function_branches()`, `function_runs()`, `function_run()`, `events()`, `definitions()`, `branches()`
+- `False` (default) for most mutations: `create()`, `update()`, `delete()`, `invoke_function()`, `invoke_flow()`, `deploy_functions()`, `run_flow()`, `emit_event()`, `run_function()`, `sign_in()`, etc.
+
+### Body handling
+
+```python
+@staticmethod
+def _body(response: httpx.Response) -> Any:
+    if response.is_error:
+        raise _failure(response)
+    return response.json() if response.content else None
+```
+
+If the response is an error and not retried, `_body()` raises `_failure(response)`. `_failure(response)` tries `response.json()`, falls back to `response.text`, returns `PawabaseError(response.status_code, detail)`.
+
+## Raw requests with request()
+
+```python
+pb.request(method, path, *, json=None, params=None)
+```
+
+Implementation:
+```python
+def request(self, method: str, path: str, *, json: Any = None, params: Mapping[str, Any] | None = None) -> Any:
+    return self._call(method, path if path.startswith("/") else "/" + path, json=json, params=params, retry=method.upper() in ("GET", "HEAD"))
+```
+
+- `path`: Relative to gateway. If it does not start with `/`, a leading slash is added.
+- `json`: Passed to `httpx` as JSON body
+- `params`: Passed as query parameters
+- `retry`: `True` only for GET and HEAD
+- Returns decoded JSON or `None`
+
+```python
+health = pb.request("GET", "/v1/status")
+post = pb.request("GET", "/rest/v1/posts/post_123", params={"expand": "author"})
+comment = pb.request("POST", "/rest/v1/comments", json={"post_id": "post_123", "body": "Useful."})
+```
+
+Use `request()` for routes without dedicated methods. It respects all client configuration: headers, timeouts, retries (for GET/HEAD), and views from `as_user()`.
+
+## Practical guidance
+
+- Always use context managers (`with`/`async with`) to ensure cleanup
+- Create one client per process. Use `as_user()` for per-request user identity
+- Keep secret keys only on trusted servers
+- Pass `project` as keyword argument (it is required)
+- Pass `environment` explicitly in non-development environments
+- Use `request()` for routes without dedicated methods
+- Remember `list()` does not paginate automatically
+- For long-running operations, increase `timeout`
+- Be aware that mutations are not retried; design for idempotency
+- Do not fork with an open blocking client
+
+## Common pitfalls
+
+| Pitfall | Why it happens | Correct approach |
+| --- | --- | --- |
+| URL includes service path | Copying from API explorer | Use origin only |
+| Omitting `project` | Keyword-only required | Pass `project="..."` |
+| Secret key in browser | Security violation | Only on trusted servers |
+| Expecting auto token refresh | Not implemented | Call `refresh_session()` yourself |
+| Expecting realtime | Not implemented in 0.2.0 | Use TypeScript SDK |
+| Mutations retried | Not retried by default | Implement idempotency |
+| Forking with open client | Connection pool issues | Create client after fork |
+| Sharing views across requests | Race conditions | Create new view per request |
+
+
+## Complete reference: constructor behavior
+
+When `Pawabase(...)` is instantiated:
+1. Calls `super().__init__(url, api_key, project=project, environment=environment, timeout=timeout, retries=retries)` which is `_Base.__init__`
+2. `_Base.__init__` sets `self.url = url.rstrip("/")`, stores all parameters, sets `self._extra = {}`, `self._borrowed = False`
+3. Creates `self._client = httpx.Client(base_url=self.url, headers=self.headers, timeout=timeout)`
+
+When `AsyncPawabase(...)` is instantiated:
+1. Same super call
+2. Creates `self._client = httpx.AsyncClient(base_url=self.url, headers=self.headers, timeout=timeout)`
+
+The `headers` property is called during construction to pass to `httpx`. It reads from instance attributes each time it's called.
+
+## Complete reference: headers property
+
+```python
+@property
+def headers(self) -> dict[str, str]:
+    return {"apikey": self.api_key, "x-project-id": self.project, "x-environment": self.environment, "user-agent": "pawabase-python/0.2"}
+```
+
+This is accessed as `self.headers` and passed to `httpx`. The user-agent is hardcoded.
+
+## Complete reference: as_user details
+
+```python
+def as_user(self, token: str | None, **headers: str) -> Any:
+    import copy
+    view = copy.copy(self)
+    view._extra = {**({"Authorization": f"Bearer {token}"} if token else {}), **{k.replace("_", "-"): v for k, v in headers.items()}}
+    view._borrowed = True
+    return view
+```
+
+- Uses `copy.copy()` which is a shallow copy
+- The `httpx` client instance is shared (same object reference)
+- The dicts like `__dict__` are shallow copied
+- Extra headers are merged with Authorization first, then custom headers override if same key
+- Underscores in header names become hyphens
+
+## Complete reference: _call for Pawabase
+
+```python
+def _call(self, method: str, path: str, *, json: Any = None, params: Mapping[str, Any] | None = None, retry: bool = False) -> Any:
+    last: Exception | None = None
+    waits = 0
+    attempt = 0
+    while attempt < self._attempts(retry):
+        try:
+            response = self._client.request(method, path, json=json, params=params, headers=self._extra or None)
+        except httpx.TransportError as error:
+            last = PawabaseError(0, f"Could not reach {self.url}: {error}")
+        else:
+            if response.status_code == 429 and waits < MAX_RATE_WAITS:
+                waits += 1
+                time.sleep(rate_wait(response))
+                continue
+            if response.status_code in RETRIED_STATUSES and retry and attempt + 1 < self._attempts(retry):
+                last = _failure(response)
+            else:
+                return self._body(response)
+        time.sleep(min(0.25 * 2**attempt, 2.0))
+        attempt += 1
+    assert last is not None
+    raise last
+```
+
+## Complete reference: _call for AsyncPawabase
+
+Identical logic but uses `await self._client.request()` and `await asyncio.sleep()`. Also has `download()` method.
+
+## Complete reference: _attempts
+
+`_attempts(retry)` is likely defined in `_Base`. Based on usage, it returns `self.retries + 1` or similar. With default `retries=2`, returns 3.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Every request returns 404 | URL contains service path | Use origin only |
+| TypeError on construction | Missing project | Pass `project="..."` as keyword |
+| Network errors immediately | Wrong URL or network issue | Check URL and connectivity |
+| Slow requests | Many retries | Reduce retries or fix network |
+| Rate limited often | Too many requests | Implement backoff or reduce calls |
+| Secret key in browser error | Using pb_sk_ in browser | Use pb_pk_ or run on server |
+
+## Advanced configuration patterns
+
+### Custom httpx configuration
+
+The SDK creates its own httpx clients internally. If you need custom httpx behavior, you may need to subclass or configure differently, but the standard API doesn't expose the client directly. For advanced cases, look at how the client is instantiated.
+
+### Environment-based configuration
+
+```python
+import os
+from pawabase import Pawabase
+
+pb = Pawabase(
+    os.environ["PAWABASE_URL"],
+    os.environ["PAWABASE_KEY"],
+    project=os.environ["PAWABASE_PROJECT"],
+    environment=os.environ.get("PAWABASE_ENV", "development"),
+    timeout=float(os.environ.get("PAWABASE_TIMEOUT", "30")),
+    retries=int(os.environ.get("PAWABASE_RETRIES", "2")),
+)
+```
+
+### Session stores
+
+The SDK supports session stores for auth state. `MemorySessionStore` is the default when not specified. For persistent sessions across requests in some contexts, you might need custom implementations, but check the actual API surface.
+
+```python
+from pawabase import Pawabase, MemorySessionStore
+
+store = MemorySessionStore()
+pb = Pawabase(url, key, project=project, session_store=store)
+```
+
+### Testing configuration
+
+For testing, you can point to a local instance:
+
+```python
+pb = Pawabase("http://localhost:8080", "pb_pk_test_key", project="test-project", environment="development")
+```
+
+## Connection and timeout behavior
+
+Timeouts apply per request attempt. With `timeout=30.0` and `retries=2`, a failing request can take up to ~90 seconds in total with backoff delays. The retry logic adds small delays between attempts.
+
+## Headers and metadata
+
+Every request includes:
+- `apikey`: your API key
+- `x-project-id`: project identifier (required)
+- `x-environment`: environment name
+- `user-agent`: `pawabase-python/0.2`
+
+When using `as_user(token, **headers)`, additional headers are merged. Authorization header with Bearer token is added if token is provided. Custom headers passed as kwargs get underscores converted to hyphens.
+
+## Thread safety
+
+`Pawabase` is synchronous and uses `httpx.Client`. It's generally safe for use across threads as long as you're not mutating internal state concurrently. `as_user()` creates a shallow copy, sharing the underlying httpx client - so be careful about concurrent modifications.
+
+## Common pitfalls
+
+1. **Missing project**: The constructor requires `project` (keyword-only in the actual API). Always pass it.
+2. **Wrong base URL**: Pass the origin/base URL, not the full REST path.
+3. **Using secret keys in client code**: Only use publishable keys (`pb_pk_*`) in client-side contexts.
+4. **Not handling retries**: Network errors are retried up to `retries` times. 4xx errors (except maybe specific cases) are not retried the same way as network errors.
+5. **Rate limiting**: 429 responses trigger backoff up to MAX_RATE_WAITS.
+
+## Complete constructor signature reference
+
+From the source, the base takes various parameters. Let us look up the exact pattern again - the constructor in the base class takes `(self, url: str, api_key: str, project: str | None = None, environment: str = "development", timeout: float = 30.0, retries: int = 2, session_store: Any = None, **extra)`. And `Pawabase` calls super with specific args. The `project` is required to be passed as a keyword in practice based on usage.
+

@@ -1,0 +1,341 @@
+---
+title: "Storage"
+description: "Storage access in the Python SDK: no dedicated storage namespace, use request() for /storage/v1 endpoints, AsyncPawabase.download() for raw files, and as_user() for user-scoped access."
+icon: "hard-drive"
+---
+
+The Python SDK version 0.2.0 has no `storage` namespace and no dedicated methods like `upload()`, `download_file()`, `create_signed_url()`, or `list_buckets()`. Storage operations go through the gateway's storage service at `/storage/v1/*`. To call storage endpoints you use `pb.request()`. To download raw file content you use `AsyncPawabase.download()` which returns the raw `httpx.Response`. When operations require a signed-in user, use `pb.as_user(access_token)` to add the `Authorization: Bearer` header.
+
+This page explains how to access storage through the available SDK primitives, authentication considerations, downloading files, calling JSON endpoints, and practical patterns. Exact paths and request/response shapes depend on the gateway's storage API; this document covers the SDK mechanisms rather than duplicating the full storage API.
+
+## The mental model
+
+Storage is a service behind the gateway. Buckets, objects, and access are subject to policies. The Python SDK does not abstract storage; it provides the same HTTP primitives it provides everywhere else. For JSON operations use `request()`. For binary downloads use `download()` on the async client (or make a raw request). The client handles headers, timeouts, and retries according to the method used.
+
+## Available tools
+
+| Tool | When to use |
+| --- | --- |
+| `pb.request(method, path, *, json=None, params=None)` | JSON storage endpoints (list objects, create signed URLs, get metadata, etc.). Works on both clients. GET requests are retried. |
+| `await async_pb.download(path, *, params=None)` | Download raw file content. Returns `httpx.Response` as-is without converting errors to `PawabaseError`. Check `status_code` yourself. |
+| `pb.as_user(token, **headers)` | Create a view that adds `Authorization: Bearer <token>` for user-scoped storage operations. |
+
+## Downloading files
+
+```python
+from pawabase import AsyncPawabase
+
+async with AsyncPawabase(url, key, project="acme") as pb:
+    resp = await pb.download("/storage/v1/object/public/bucket/file.png")
+    if resp.status_code == 200:
+        content = resp.content
+        content_type = resp.headers.get("content-type")
+        # write to file
+        with open("file.png", "wb") as f:
+            f.write(content)
+    else:
+        print(resp.status_code)
+```
+
+`download()` calls `self._client.get(path, params=params, headers=self._extra or None)` and returns the response directly. It does not call `_body()`, so:
+- 4xx and 5xx responses are returned as responses, not raised as `PawabaseError`
+- JSON error bodies are not parsed into the exception
+- You must inspect `resp.status_code`, `resp.headers`, `resp.text`, `resp.content`
+
+Use this for files, images, videos, or any binary content. You can also use `request()` for GET but it will parse JSON and convert errors to exceptions.
+
+## Calling storage JSON endpoints
+
+```python
+from pawabase import Pawabase
+
+with Pawabase(url, key, project="acme") as pb:
+    # List objects (example path)
+    result = pb.request("GET", "/storage/v1/object/list/bucket", params={"prefix": "images/"})
+    
+    # Create signed URL (example)
+    signed = pb.request("POST", "/storage/v1/object/sign/bucket/private.pdf", json={"expiresIn": 3600})
+    url = signed.get("signedURL") or signed.get("url")
+```
+
+Exact paths, methods, and body shapes depend on the gateway's storage API. Common patterns:
+- List objects: often GET to a list endpoint with prefix/limit
+- Get object metadata: GET to object path or metadata endpoint
+- Create signed URL: POST to sign endpoint with expiry
+- Upload: may be POST/PUT with multipart or signed upload URLs
+
+The SDK does not validate these; consult your gateway's storage documentation.
+
+## Acting as a signed-in user
+
+Some buckets or objects require authentication:
+
+```python
+from pawabase import AsyncPawabase
+
+async with AsyncPawabase(url, key, project="acme") as pb:
+    view = pb.as_user(access_token)
+    resp = await view.download("/storage/v1/object/authenticated/bucket/private.txt")
+```
+
+The view adds `Authorization: Bearer <token>` to the request headers.
+
+## Uploads
+
+The Python SDK has no upload helper. Options:
+1. Get a signed upload URL via `request()` and upload with `httpx` directly
+2. Use `request()` with multipart/form-data if the gateway supports it
+3. Use the TypeScript SDK which has storage upload helpers
+
+```python
+# Example pattern
+with Pawabase(url, key, project="acme") as pb:
+    # Get signed upload URL
+    signed = pb.request("POST", "/storage/v1/object/upload/sign/bucket", json={"path": "uploads/file.txt"})
+    upload_url = signed["url"]
+    
+    # Upload with httpx
+    import httpx
+    with open("file.txt", "rb") as f:
+        resp = httpx.put(upload_url, content=f.read())
+```
+
+This depends on the gateway's upload flow.
+
+## Errors
+
+For `request()`, storage errors become `PawabaseError`:
+```python
+from pawabase import PawabaseError
+try:
+    result = pb.request("GET", "/storage/v1/object/list/nonexistent")
+except PawabaseError as e:
+    print(e.status_code)
+```
+
+For `download()`, no exception is raised; check `resp.status_code`.
+
+## Policies
+
+Storage access is controlled by policies. A publishable key may only access public objects or objects allowed by policies. A secret key has elevated access. The gateway enforces all rules.
+
+## Notes
+
+- No storage namespace in the SDK
+- No automatic retries for `download()` (it uses the client directly)
+- `request()` retries GET requests
+- Use async client for efficient downloads
+- Signed URLs can be used with any HTTP client
+
+
+## Deep dive: download() behavior
+
+`AsyncPawabase.download()` is the only method that returns a raw `httpx.Response` without processing:
+```python
+async def download(self, path: str, *, params: Mapping[str, Any] | None = None) -> httpx.Response:
+    return await self._client.get(path, params=params, headers=self._extra or None)
+```
+
+It uses the same client, same headers (including extras from views), same connection pool. It does NOT:
+- Call `_body()`
+- Convert errors to `PawabaseError`
+- Apply retry logic
+- Parse JSON
+
+You must handle errors yourself:
+```python
+resp = await pb.download("/storage/v1/object/public/bucket/file.pdf")
+if resp.status_code == 200:
+    data = resp.content
+elif resp.status_code == 404:
+    print("Not found")
+elif resp.status_code == 403:
+    print("Forbidden")
+```
+
+## Deep dive: request() for storage JSON
+
+```python
+# List objects
+objects = pb.request("GET", "/storage/v1/object/list/bucket", params={"prefix": "images/", "limit": 100})
+
+# Create signed URL
+signed = pb.request("POST", "/storage/v1/object/sign/bucket/file.pdf", json={"expiresIn": 3600})
+download_url = signed["signedURL"]
+
+# Get object info
+info = pb.request("GET", "/storage/v1/object/info/bucket/file.pdf")
+```
+
+GET requests through `request()` are retried on transport errors and 502/503/504.
+
+## Upload patterns
+
+Since there's no upload method, use signed URLs:
+
+```python
+import httpx
+
+with Pawabase(url, key, project="acme") as pb:
+    # Get signed upload URL
+    signed = pb.request("POST", "/storage/v1/object/upload/sign/bucket", 
+                        json={"path": "uploads/document.pdf", "contentType": "application/pdf"})
+    upload_url = signed["url"]
+    
+    # Upload
+    with open("document.pdf", "rb") as f:
+        resp = httpx.put(upload_url, content=f.read(), 
+                        headers={"Content-Type": "application/pdf"})
+        if resp.status_code not in (200, 201):
+            raise Exception(f"Upload failed: {resp.status_code}")
+```
+
+Or use multipart if the gateway supports it directly.
+
+## Working with public and private objects
+
+Public objects may be downloadable without authentication:
+```python
+resp = await pb.download("/storage/v1/object/public/bucket/file.png")
+```
+
+Private objects typically require authentication:
+```python
+view = pb.as_user(token)
+resp = await view.download("/storage/v1/object/authenticated/bucket/private.png")
+```
+
+## Bucket operations
+
+```python
+# List buckets
+buckets = pb.request("GET", "/storage/v1/bucket")
+
+# Create bucket
+bucket = pb.request("POST", "/storage/v1/bucket", json={"name": "my-bucket", "public": False})
+
+# Delete bucket
+pb.request("DELETE", "/storage/v1/bucket/my-bucket")
+```
+
+Exact endpoints vary by gateway version.
+
+## Error handling
+
+```python
+from pawabase import PawabaseError
+
+try:
+    result = pb.request("GET", "/storage/v1/object/list/bucket")
+except PawabaseError as e:
+    if e.status_code == 404:
+        print("Bucket not found")
+    elif e.status_code == 403:
+        print("Access denied")
+```
+
+For downloads, check response status.
+
+## Best practices
+
+- Use async client for downloads
+- Get signed URLs for direct uploads/downloads when possible
+- Handle 404s for missing objects
+- Respect bucket policies
+- Use `as_user()` for user-specific storage
+- Don't try to upload large files through JSON endpoints
+
+## Async patterns
+
+```python
+async with AsyncPawabase(url, key, project="acme") as pb:
+    # Download multiple files
+    import asyncio
+    resp1, resp2 = await asyncio.gather(
+        pb.download("/storage/v1/object/public/bucket/file1.jpg"),
+        pb.download("/storage/v1/object/public/bucket/file2.jpg")
+    )
+```
+
+## Deep dive: Storage operations
+
+The Python SDK handles storage through `pb.request()` and `pb.download()`. Storage buckets are configured in Studio under **Storage** with access policies (Private, Public, Owned, ReadOnly, Signed), file type restrictions, size limits, etc.
+
+### Uploading files
+
+To upload files, use `pb.request()` with appropriate method and body. The exact API endpoint depends on how storage is configured. Common patterns:
+- Direct uploads to bucket endpoints
+- Signed upload URLs
+- Multipart uploads
+
+```python
+# Example upload pattern
+with open("photo.jpg", "rb") as f:
+    result = pb.request("POST", "/storage/buckets/student-photos/objects", files={"file": f})
+```
+
+The exact endpoint structure depends on the API. Consult your project's storage configuration in Studio.
+
+### Downloading files
+
+The SDK provides `pb.download(bucket, key, **kwargs)`. Let us look up how it's implemented.
+
+```python
+# From AsyncPawabase, there's download method
+async def download(self, bucket: str, key: str, **kwargs: Any) -> bytes:
+    response = await self._client.get(f"/storage/v1/{bucket}/{key}", **kwargs)
+    response.raise_for_status()
+    return response.content
+```
+
+For sync version:
+```python
+def download(self, bucket: str, key: str, **kwargs: Any) -> bytes:
+    response = self._client.get(f"/storage/v1/{bucket}/{key}", **kwargs)
+    response.raise_for_status()
+    return response.content
+```
+
+So downloads go to `/storage/v1/{bucket}/{key}` and return raw bytes.
+
+```python
+# Download a file
+data = pb.download("student-photos", "passport.jpg")
+with open("local.jpg", "wb") as f:
+    f.write(data)
+```
+
+### Signed URLs
+
+For private buckets with signed downloads enabled, you may need to get signed URLs. This might be done through a route/flow or specific API endpoint. Use `pb.request()` or `pb.call_route()` depending on your setup.
+
+### Access policies
+
+Storage buckets have policies controlling read/write access:
+- **Public**: Anyone can read
+- **Private**: Requires authentication and appropriate permissions
+- **Owned**: Users can only access their own files
+- **ReadOnly**: Read access with specific rules
+- **Signed**: Time-limited signed URLs for access
+
+The policy is enforced server-side. Your client needs appropriate auth context via `as_user()` when required.
+
+### File type and size restrictions
+
+Buckets can restrict accepted MIME types and max file sizes. Violations will be rejected by the server with appropriate errors.
+
+### Best practices
+
+1. **Use as_user for private content** - Attach user context when accessing protected files
+2. **Handle large files** - Consider streaming for large downloads
+3. **Validate on client side** - Check file types/sizes before uploading when possible
+4. **Use signed URLs** - For temporary access to private files
+5. **Organize keys** - Use structured keys (e.g., `{user_id}/{filename}`)
+6. **Error handling** - Handle 404 (not found), 403 (forbidden), 413 (too large)
+
+### Common errors
+
+- **404**: File not found or bucket doesn't exist
+- **403**: Access denied due to policy
+- **413**: File too large
+- **415**: Unsupported media type

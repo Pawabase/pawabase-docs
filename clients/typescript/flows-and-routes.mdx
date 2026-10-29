@@ -1,0 +1,1718 @@
+---
+title: "Flows and routes"
+description: "How the TypeScript client calls server-side logic: running flows directly, calling custom routes and extension routes, what each returns, how their errors arrive, and how to choose between them."
+icon: "workflow"
+---
+
+Records, auth and storage cover what most screens need.
+Some actions are more than one record operation: placing an order, inviting a team, charging a card, generating a report.
+That logic runs on the server, and the client calls it.
+
+Pawabase runs server logic in two forms, [flows](/flows/overview) and extension routes, and exposes it through three kinds of URL.
+This page explains each, what the client's `flows` and `routes` modules send to them, how answers and errors come back, and how to pick the right one.
+
+## The mental model
+
+Server logic is reached through one of three doors.
+Each door has its own URL, its own access check, and its own way of shaping the answer.
+
+| Door | URL | Runs | Access decided by | Client call |
+| --- | --- | --- | --- | --- |
+| A flow called directly | `POST /flows/v1/<flow name>` | A flow whose HTTP trigger has no path | The trigger's `policy`, default `authenticated` | `pawabase.flows.run(name, input)` |
+| A custom route | `<method> /rest/v1/<path>` | The flow bound to the route | The route's policy | `pawabase.routes.get/post/…(path)` |
+| An extension route | `<method> /rest/v1/x/<prefix>/<path>` | Python code mounted next to the server | The policy the code checks with `authorize` | `pawabase.routes.get/post/…("x/…")` |
+
+From the client's point of view, all three are HTTP endpoints that take JSON and give JSON.
+What differs is who wrote them, how they are configured, and what the URL looks like to the rest of the world.
+
+A direct flow call is the quickest to set up: create a flow with an HTTP trigger and call it by name.
+A custom route gives the same flow a REST-shaped URL, with path parameters, a method, input validation, rate limits and caching.
+An extension route is for logic that needs full Python, such as streaming responses or a library a flow block cannot reach, and is written by the operator of the installation.
+
+<Note>
+The client also has a `functions` module.
+Custom functions were removed from the platform, and their endpoints no longer exist.
+Logic that was a function belongs in a flow, a custom route or an extension route.
+</Note>
+
+## Where this logic is configured
+
+| You want to | In Studio |
+| --- | --- |
+| Build a flow and its HTTP trigger | **Logic → Flows**, add a `trigger.http` block and leave **path** empty for direct calls |
+| Set who may call a flow directly | The `policy` field of the flow's `trigger.http` block |
+| Give a flow a REST URL | **Logic → Routes**, **New route**: method, path, and the flow that handles it |
+| See a flow's runs and each block's output | **Logic → Flows**, the flow's runs |
+| See a request that failed | **Project → Activity**, by request id |
+
+Extension routes are not configured in Studio.
+They are Python files mounted next to the server by whoever operates the installation; see [Extension routes](/code/extension-routes).
+
+## Running a flow directly
+
+`flows.run(name, input, options)` sends `POST /flows/v1/<name>` with `input` as the JSON body, and returns the response body.
+
+<CodeGroup>
+```typescript TypeScript
+const quote = await pawabase.flows.run<{ data: { total_minor: number; currency: string } }>("quote-cart", {
+  cart_id: "cart_9",
+  coupon: "WELCOME10",
+});
+console.log(quote.data.total_minor);
+```
+
+```python Python
+quote = pb.flows.invoke("quote-cart", {"cart_id": "cart_9", "coupon": "WELCOME10"})
+print(quote["data"]["total_minor"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/flows/v1/quote-cart" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"cart_id": "cart_9", "coupon": "WELCOME10"}'
+# 200 {"data": {"total_minor": 900, "currency": "GHS"}}  (a flow without response.return)
+```
+</CodeGroup>
+
+### Which flows can be called this way
+
+A flow is directly callable when it has a `trigger.http` block whose **path** is empty.
+A flow whose HTTP trigger has a path is reachable only through the route bound to that path.
+A flow with no HTTP trigger at all, such as one triggered by an event or a schedule, cannot be called over HTTP.
+
+Calling a flow that is not directly callable, or does not exist, answers `404` with the message `no directly invocable flow '<name>'`.
+The client throws `NotFoundError`.
+
+### What the flow receives
+
+The request body becomes the flow's `input`.
+
+| You call | The flow's `input` |
+| --- | --- |
+| `flows.run("x", { a: 1 })` | `{ "a": 1 }` |
+| `flows.run("x", [1, 2])` | `[1, 2]` |
+| `flows.run("x")` | `null`; no body is sent |
+
+The body must be JSON.
+The client sends objects and arrays as JSON for you; a string body that is not JSON answers `400 the body must be JSON`.
+
+The flow also receives the caller's identity.
+Inside the flow, blocks see the signed-in user as `$auth` and the key as `$credential`, exactly as policies do.
+
+What the flow does with that identity is up to the flow.
+Its resource blocks run with service rights: they do not apply the resource's policies, so a `resource.get` inside a flow can read any record, whoever called.
+A flow that must respect the caller's rights checks them explicitly, with the `policy.check` or `auth.require` blocks, or by comparing `$auth.user_id` with the record it loaded.
+This is deliberate: it is what lets a flow perform a privileged step, such as marking an order paid, on behalf of a person who could not do it directly.
+
+### Who may call it
+
+The trigger's `policy` decides.
+It is a condition like any policy, and it defaults to `authenticated`.
+
+| Caller | `policy: authenticated` | `policy: public` |
+| --- | --- | --- |
+| Publishable key, signed out | `401` | Allowed |
+| Publishable key, signed in | Allowed | Allowed |
+| Secret key | Allowed | Allowed |
+
+A refusal answers `401` when the caller is signed out and `403` when the caller is signed in but the policy says no.
+The client throws `AuthenticationError` or `PermissionError` accordingly.
+
+### What comes back
+
+A flow decides its own answer.
+The client returns the response body as it arrives, so its shape depends on how the flow ends:
+
+| The flow ends with | Status | Body the client returns |
+| --- | --- | --- |
+| A `response.return` block | The block's status | The block's body, exactly |
+| An `error.raise` block | The block's status | Thrown as an error; see below |
+| Neither | `200` | `{ "data": <the flow's result> }` |
+
+The `{ data }` wrapper in the third case is the server's, not the client's.
+Flows built to be called from applications usually end with `response.return`, so they control the body and the status.
+
+A small helper keeps call sites clean when you call flows of both kinds:
+
+```typescript
+async function runFlow<T>(name: string, input?: unknown): Promise<T> {
+  const body = await pawabase.flows.run<unknown>(name, input);
+  if (body && typeof body === "object" && "data" in body && Object.keys(body).length === 1) {
+    return (body as { data: T }).data;
+  }
+  return body as T;
+}
+```
+
+The generic type parameter of `run<T>` describes the body you expect.
+It is a promise to the compiler, not a check; validate the shape at runtime if a wrong shape would cause harm.
+
+### Errors from a flow
+
+A flow reports a failure the caller should understand with an `error.raise` block.
+The block sets a status, a machine-readable code and a message, and the server answers with:
+
+```json
+{ "error": "coupon_expired", "message": "This coupon expired on 30 September." }
+```
+
+The client turns that into an error class chosen by the status, with the flow's code in `error.code` and the message in `error.message`:
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, ConflictError, NotFoundError } from "@pawabase/client";
+
+try {
+  await pawabase.flows.run("apply-coupon", { cart_id, code });
+} catch (error) {
+  if (error instanceof ApiError && error.is("coupon_expired")) return showMessage(error.message);
+  if (error instanceof ApiError && error.is("coupon_unknown")) return showMessage("That code does not exist.");
+  if (error instanceof ConflictError) return showMessage("This coupon was already applied.");
+  throw error;
+}
+```
+
+```python Python
+from pawabase import ConflictError, PawabaseError
+
+try:
+    pb.flows.invoke("apply-coupon", {"cart_id": cart_id, "code": code})
+except ConflictError:
+    show_message("This coupon was already applied.")
+except PawabaseError as error:
+    if error.code == "coupon_expired":
+        show_message(error.message)
+    elif error.code == "coupon_unknown":
+        show_message("That code does not exist.")
+    else:
+        raise
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/flows/v1/apply-coupon" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"cart_id": "c9", "code": "OLD"}'
+# HTTP/1.1 422
+# {"error": "coupon_expired", "message": "This coupon expired on 30 September."}
+```
+</CodeGroup>
+
+| Status set by `error.raise` | Client error class |
+| --- | --- |
+| `400` | `ApiError` (or `ValidationError` when `details` lists fields) |
+| `401` | `AuthenticationError` |
+| `403` | `PermissionError` |
+| `404` | `NotFoundError` |
+| `409` | `ConflictError` |
+| `422` | `ValidationError` |
+| `429` | `RateLimitError` |
+| `5xx` | `ServerError` |
+
+Prefer checking `error.code` over the class when the flow defines codes.
+A flow's codes are its API; the status is a coarse category.
+
+Other failures carry the platform's own codes.
+A flow that fails inside a block, for example an HTTP call to another service that times out, answers with the block's failure code and status, and the error's `details` can carry structured information about what failed.
+The flow's run in **Logic → Flows** shows each block's input, output and error for the same request.
+
+### Retries
+
+`flows.run` sends a `POST`, which the client does not repeat after a network failure or a gateway error, because the flow may have run.
+It does repeat after `429`, because a rate-limited request never reached the flow.
+
+When a flow is safe to run twice, for example because it only reads, or because it checks whether its work was already done, say so:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.flows.run("recalculate-totals", { cart_id }, { idempotent: true });
+```
+
+```python Python
+# The Python client never repeats a POST after a network failure; repeat it yourself when that is safe.
+pb.flows.invoke("recalculate-totals", {"cart_id": cart_id})
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `idempotent` | Allow retrying after network failures and `502`/`503`/`504` |
+| `timeoutMs` | A timeout for this call |
+| `signal` | Cancel the call |
+| `headers` | Extra headers for this call |
+
+Cancelling stops the client from waiting.
+It does not stop a flow that has already started on the server.
+
+## Calling custom routes
+
+A custom route is an endpoint you define under `/rest/v1`, with a method and a path, handled by a flow.
+`pawabase.routes` calls it.
+
+<CodeGroup>
+```typescript TypeScript
+const receipt = await pawabase.routes.post<{ refunded: boolean; amount_minor: number }>(
+  `orders/${orderId}/refund`,
+  { reason: "damaged" },
+);
+```
+
+```python Python
+receipt = pb.routes.post(f"orders/{order_id}/refund", {"reason": "damaged"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/orders/$ORDER_ID/refund" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"reason": "damaged"}'
+```
+</CodeGroup>
+
+| Method | HTTP request |
+| --- | --- |
+| `routes.get(path, options)` | `GET /rest/v1/<path>` |
+| `routes.post(path, body, options)` | `POST /rest/v1/<path>` |
+| `routes.put(path, body, options)` | `PUT /rest/v1/<path>` |
+| `routes.patch(path, body, options)` | `PATCH /rest/v1/<path>` |
+| `routes.delete(path, options)` | `DELETE /rest/v1/<path>` |
+| `routes.call(method, path, options)` | Any method |
+
+| Option | Meaning |
+| --- | --- |
+| `query` | Query parameters; `undefined` and `null` values are left out, arrays repeat the key |
+| `body` | For `call`; the other methods take the body as an argument |
+| `headers` | Extra headers |
+| `signal`, `timeoutMs` | Cancellation and a per-call timeout |
+| `idempotent` | Allow retrying a `POST` or `PATCH` after a network failure |
+
+### Paths
+
+The path is the route's path without the `/rest/v1` prefix.
+Leading slashes are removed, and each segment is percent-encoded.
+
+| Route defined as | Call |
+| --- | --- |
+| `GET /reports/monthly` | `routes.get("reports/monthly")` |
+| `POST /orders/{id}/refund` | ``routes.post(`orders/${id}/refund`, body)`` |
+| `GET /search` with `?q=` | `routes.get("search", { query: { q: text } })` |
+
+Because segments are encoded separately, a path parameter cannot contain a slash.
+Put such values in the query string or the body instead.
+
+### What a route answers
+
+A route's flow decides the answer, in the same three ways as a direct flow call:
+
+| The flow ends with | The route answers |
+| --- | --- |
+| `response.return` | That block's status, headers and body |
+| `error.raise` | Its status, with `{ "error": code, "message": message }` |
+| Neither | `200` with the flow's final result as the body |
+
+Note the difference from direct calls in the third row.
+A route returns the flow's result as the body itself; a direct call wraps it in `{ data }`.
+
+The route's configuration adds checks before the flow runs:
+
+| Route setting | Effect | Client error |
+| --- | --- | --- |
+| Policy | Who may call it | `AuthenticationError` (`401`) or `PermissionError` (`403`) |
+| Input schema | The body is validated; invalid input never reaches the flow | `ValidationError` (`422`) |
+| Rate limit | Calls beyond the limit are refused | `RateLimitError` (`429`), retried by the client |
+| Cache | Answers are reused for identical `GET` requests | none; a cached answer looks like any other |
+| Enabled | A disabled route does not exist | `NotFoundError` (`404`) |
+
+A route's response schema is documentation only.
+The client returns whatever the flow sends, so keep the flow and the documented shape in step.
+
+### Route errors with codes
+
+Routes are where error codes pay off.
+A checkout route that ends in `error.raise` blocks with distinct codes lets the screen react precisely:
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError } from "@pawabase/client";
+
+const CHECKOUT_MESSAGES: Record<string, string> = {
+  out_of_stock: "One of the items just sold out.",
+  price_changed: "Prices changed since you opened the cart. Review the new total.",
+  payment_declined: "Your card was declined.",
+};
+
+export async function checkout(cartId: string) {
+  try {
+    return { ok: true as const, order: await pawabase.routes.post(`carts/${cartId}/checkout`) };
+  } catch (error) {
+    if (error instanceof ApiError && CHECKOUT_MESSAGES[error.code]) {
+      return { ok: false as const, message: CHECKOUT_MESSAGES[error.code], code: error.code };
+    }
+    throw error;
+  }
+}
+```
+
+```python Python
+from pawabase import PawabaseError
+
+CHECKOUT_MESSAGES = {
+    "out_of_stock": "One of the items just sold out.",
+    "price_changed": "Prices changed since you opened the cart. Review the new total.",
+    "payment_declined": "Your card was declined.",
+}
+
+
+def checkout(cart_id: str):
+    try:
+        return {"ok": True, "order": pb.routes.post(f"carts/{cart_id}/checkout")}
+    except PawabaseError as error:
+        if error.code in CHECKOUT_MESSAGES:
+            return {"ok": False, "message": CHECKOUT_MESSAGES[error.code], "code": error.code}
+        raise
+```
+</CodeGroup>
+
+The codes are a contract between the flow and the client.
+Document them next to the route, and treat renaming one as a breaking change.
+
+## Calling extension routes
+
+Extension routes are Python routers mounted by the installation's operator.
+They are served under `/rest/v1`, usually with an `x/` prefix that names the extension, such as `/rest/v1/x/billing/invoices`.
+The client calls them with `routes`, like any route:
+
+<CodeGroup>
+```typescript TypeScript
+const invoices = await pawabase.routes.get("x/billing/invoices", { query: { status: "open" } });
+```
+
+```python Python
+invoices = pb.routes.get("x/billing/invoices", status="open")
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/rest/v1/x/billing/invoices" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" --data-urlencode "status=open"
+```
+</CodeGroup>
+
+An extension route checks access in its own code, with the same policy engine the platform uses.
+When it refuses, it answers `401` or `403` exactly like a compiled route, and the client raises the same errors.
+
+Extension routes can answer with anything Python can produce: CSV, streamed files, server-sent events.
+`routes.get` parses JSON and falls back to text; for other kinds of answer, use the transport directly and choose how to read the body:
+
+```typescript
+const csv = await pawabase.http.request<string>({
+  path: "/rest/v1/x/billing/export.csv",
+  query: { month: "2026-09" },
+  parse: "text",
+  timeoutMs: 120_000,
+});
+```
+
+```typescript
+const stream = await pawabase.http.request<ReadableStream<Uint8Array>>({
+  path: "/rest/v1/x/reports/large-export",
+  parse: "stream",
+  timeoutMs: 0,
+});
+```
+
+Ask the operator for the list of extension routes and their codes, because they do not appear in Studio's **Logic → Routes**.
+They do appear in the environment's OpenAPI document when the operator documents them, which the **API Explorer** shows.
+
+## Choosing between a direct flow, a route and an extension route
+
+| Question | Direct flow | Custom route | Extension route |
+| --- | --- | --- | --- |
+| Who builds it | Anyone with Studio access | Anyone with Studio access | The installation's operator, in Python |
+| URL shape | `/flows/v1/<name>`, `POST` only | Any method and path under `/rest/v1` | Any method and path under `/rest/v1/x/…` |
+| Path parameters | No | Yes | Yes |
+| Input validation before running | No; the flow validates | Yes, with an input schema | In code |
+| Rate limits and caching per endpoint | No | Yes | In code |
+| Streaming or non-JSON answers | No | No | Yes |
+| Appears in the API Explorer | As a flow | As a route | When documented |
+| Best for | Actions called from your own app | Public or stable APIs | Capabilities flows cannot express |
+
+Start with a direct flow while building.
+Give it a route when the URL becomes part of a contract, when other systems call it, or when it needs validation and limits.
+Reach for an extension route only when a flow cannot do the job.
+
+## A worked example from flow to screen
+
+Following one action from its definition to the button that calls it shows how the pieces fit.
+The action is "pay an order": load the order, mark it paid, answer with the updated order, and answer with a clear error when the order does not exist.
+
+The flow, as **Logic → Flows** stores it:
+
+```json
+{
+  "name": "pay-order",
+  "definition": {
+    "nodes": [
+      { "id": "start", "data": { "block": "trigger.http", "config": { "method": "POST", "path": "/orders/{id}/pay" } } },
+      { "id": "load", "data": { "block": "resource.get", "config": { "resource": "orders", "id": "{{ input.params.id }}" } } },
+      { "id": "paid", "data": { "block": "resource.update", "config": { "resource": "orders", "id": "{{ input.params.id }}", "data": { "status": "paid" } } } },
+      { "id": "reply", "data": { "block": "response.return", "config": { "status": 200, "body": { "paid": true, "order": "{{ steps.paid.output }}" } } } },
+      { "id": "missing", "data": { "block": "error.raise", "config": { "status": 404, "message": "no such order", "code": "order_not_found" } } }
+    ],
+    "edges": [
+      { "id": "e1", "source": "start", "target": "load" },
+      { "id": "e2", "source": "load", "target": "paid" },
+      { "id": "e3", "source": "load", "target": "missing", "sourceHandle": "missing" },
+      { "id": "e4", "source": "paid", "target": "reply" }
+    ]
+  }
+}
+```
+
+The route, from **Logic → Routes**:
+
+```json
+{ "method": "POST", "path": "/orders/{id}/pay", "handler": "pay-order", "policy": "authenticated", "name": "Pay order" }
+```
+
+The client call and its outcomes:
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, AuthenticationError } from "@pawabase/client";
+
+interface PayOrderAnswer {
+  paid: true;
+  order: { id: string; status: "paid"; total_minor: number };
+}
+
+export async function payOrder(orderId: string) {
+  try {
+    const answer = await pawabase.routes.post<PayOrderAnswer>(`orders/${orderId}/pay`);
+    return { ok: true as const, order: answer.order };
+  } catch (error) {
+    if (error instanceof ApiError && error.is("order_not_found")) return { ok: false as const, reason: "missing" };
+    if (error instanceof AuthenticationError) return { ok: false as const, reason: "signed-out" };
+    throw error;
+  }
+}
+```
+
+```python Python
+from pawabase import AuthenticationError, PawabaseError
+
+
+def pay_order(order_id: str):
+    try:
+        answer = pb.routes.post(f"orders/{order_id}/pay")
+        return {"ok": True, "order": answer["order"]}
+    except AuthenticationError:
+        return {"ok": False, "reason": "signed-out"}
+    except PawabaseError as error:
+        if error.code == "order_not_found":
+            return {"ok": False, "reason": "missing"}
+        raise
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/orders/$ORDER_ID/pay" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+# 200 {"paid": true, "order": {…}}   or   404 {"error": "order_not_found", "message": "no such order"}
+```
+</CodeGroup>
+
+| Situation | Route answer | Client result |
+| --- | --- | --- |
+| The order exists | `200 { "paid": true, "order": {…} }` | `{ ok: true, order }` |
+| The order does not exist | `404 { "error": "order_not_found", "message": "no such order" }` | `{ ok: false, reason: "missing" }` |
+| Signed out | `401`, before the flow runs | `{ ok: false, reason: "signed-out" }` |
+
+The route's policy, `authenticated`, decides who may call it at all.
+The `resource.get` and `resource.update` blocks then run with service rights: they do not apply the `orders` resource's policies.
+As written, any signed-in person could pay any order whose id they know.
+
+A real version of this flow adds a check after `load`: a `policy.check` block with a condition such as "`$auth.user_id` equals the order's `customer_id`", or an `auth.require` block, routed to an `error.raise` with `404 order_not_found` when it fails.
+Answering `404` rather than `403` keeps the flow from revealing which order ids exist, the same choice the data API makes.
+This is the property to remember about flows: they are trusted code, and they enforce exactly the rules you build into them.
+
+The same flow can be called directly instead, by removing the trigger's **path**.
+Then the call is `pawabase.flows.run("pay-order", { id: orderId })`, the flow reads `input.id` instead of `input.params.id`, and the answer without `response.return` would be wrapped in `{ data }`.
+
+## Authorizing inside a flow
+
+Because resource blocks run with service rights, a flow that acts for a person must check that person's rights itself.
+Two blocks do this.
+
+| Block | Config | Branches | Use it to |
+| --- | --- | --- | --- |
+| `auth.require` | `role`, `permission` | `next` | Stop the run unless the caller is signed in, optionally with a role or permission |
+| `policy.check` | `policy`, `record`, `input` | `allowed`, `denied` | Evaluate any policy condition against a record you loaded |
+
+The `pay-order` flow above becomes safe with one more node between `load` and `paid`:
+
+```json
+{
+  "id": "may_pay",
+  "data": {
+    "block": "policy.check",
+    "config": {
+      "policy": {
+        "all": [
+          { "truthy": "$auth.user_id" },
+          { "eq": ["$record.customer_id", "$auth.user_id"] }
+        ]
+      },
+      "record": "{{ steps.load.output }}"
+    }
+  }
+}
+```
+
+and two edges: `allowed` to `paid`, and `denied` to the `missing` node that raises `404 order_not_found`.
+
+From the client's side nothing changes, except that a person who tries to pay someone else's order now gets `order_not_found`, exactly as if the order did not exist.
+That indistinguishability is the point: the flow reveals nothing about orders that are not the caller's.
+
+A useful habit is to reuse the resource's own named policy in `policy.check`, so the flow and the data API agree on who owns what.
+When the ownership rule changes, both follow.
+
+## How a call travels
+
+```text
+client: routes.post("orders/o1/pay")
+  │  POST /rest/v1/orders/o1/pay   apikey, authorization, x-client-info
+  ▼
+gateway: key, origin, firewall, rate limit                  → 401 / 403 / 429
+  ▼
+route: enabled?                                              → 404
+       policy allows the caller?                             → 401 / 403
+       input schema accepts the body?                        → 422
+       cached answer for this GET?                           → cached body
+  ▼
+flow run (service rights, $auth = the caller)
+  │  load → may_pay → paid → reply
+  │  denied → missing (error.raise 404 order_not_found)
+  ▼
+answer: response.return body, error.raise error, or the flow's result
+  ▼
+client: parsed body, or a typed error with code and requestId
+```
+
+Every arrow that leaves the main path is a different error class in the client, which is why handling `AuthenticationError`, `PermissionError`, `ValidationError`, `RateLimitError` and flow codes separately gives people accurate messages.
+
+## Handling failures in one place
+
+Every action in an application fails in the same handful of ways.
+A single function that turns any error into something to show keeps screens consistent and short.
+
+```typescript
+import {
+  ApiError,
+  AuthenticationError,
+  NetworkError,
+  PermissionError,
+  RateLimitError,
+  TimeoutError,
+  ValidationError,
+} from "@pawabase/client";
+
+export type Shown = { message: string; fields?: Record<string, string[]>; retry?: boolean; signIn?: boolean };
+
+export function describe(error: unknown, codes: Record<string, string> = {}): Shown {
+  if (error instanceof ApiError && codes[error.code]) return { message: codes[error.code] };
+  if (error instanceof ValidationError) return { message: "Check the highlighted fields.", fields: error.byField() };
+  if (error instanceof AuthenticationError) return { message: "Your session ended. Sign in again.", signIn: true };
+  if (error instanceof PermissionError) return { message: "You do not have permission to do that." };
+  if (error instanceof RateLimitError) return { message: "Too many requests. Try again in a moment.", retry: true };
+  if (error instanceof NetworkError || error instanceof TimeoutError) return { message: "Could not reach the server. Check your connection.", retry: true };
+  if (error instanceof ApiError && error.status >= 500) return { message: "Something went wrong on our side. Try again.", retry: true };
+  if (error instanceof ApiError) return { message: error.message };
+  return { message: "Something went wrong." };
+}
+```
+
+Each screen passes the codes its action defines, and gets a message, field errors and hints for the buttons it shows.
+Report unexpected errors to your tracker with `requestId` before describing them.
+
+## Calling routes from server actions
+
+Frameworks with server actions, such as Next.js, run the action on the server with the person's cookies.
+The action calls the route as the person through `asUser`, and the browser never sees a token.
+
+```typescript
+"use server";
+import { pawabaseForRequest } from "@/lib/pawabase/server";
+import { describe } from "@/lib/errors";
+
+export async function payOrderAction(orderId: string) {
+  const pawabase = await pawabaseForRequest();
+  try {
+    const answer = await pawabase.routes.post<{ order: { id: string; status: string } }>(`orders/${orderId}/pay`);
+    return { ok: true as const, status: answer.order.status };
+  } catch (error) {
+    return { ok: false as const, ...describe(error, { order_not_found: "This order no longer exists." }) };
+  }
+}
+```
+
+Return plain data from the action.
+Error objects do not cross the server-to-browser boundary intact, so describe them on the server.
+
+## Timeouts and long flows
+
+A flow runs until it finishes, even if the client stops waiting.
+The client's timeout therefore protects the person's screen, not the server's work.
+
+| Situation | What happens |
+| --- | --- |
+| The flow finishes within the client's timeout | The client returns the answer |
+| The flow takes longer than the client's timeout | The client raises `TimeoutError`; the flow keeps running and may complete |
+| The person navigates away and the request is aborted | The client raises `AbortError`; the flow keeps running |
+
+So a timeout does not mean "it did not happen".
+For actions where that matters, follow up: read the record the action changes, or use the attempt-id technique, before offering to try again.
+
+## Rate limits on actions
+
+Routes can carry their own rate limits, and every call also counts against the environment's.
+A rate-limited call answers `429` before the flow runs, so it is always safe to repeat, and the client waits and repeats it automatically when the server asks for a short wait.
+
+Set limits on routes that are expensive or abusable: anything anonymous, anything that sends email or calls paid services, anything that searches.
+A contact form limited to a few calls per minute per caller costs real users nothing and stops a script from emailing your team thousands of times.
+
+## Before exposing a flow to clients
+
+| Check | Why |
+| --- | --- |
+| The trigger or route policy is as narrow as the action | `authenticated` admits every signed-in person and every secret key |
+| The flow checks ownership with `policy.check` or `auth.require` where it acts on someone's data | Resource blocks bypass policies |
+| Expected failures end in `error.raise` with specific codes | Screens can react precisely |
+| The success answer comes from `response.return` | The body is a stable shape, not whatever the last block produced |
+| Inputs are validated by a route schema or `validate.schema` | Bad input fails early with `422` |
+| Repeated calls are harmless, or protected by a unique field | People double-click; networks drop answers |
+| Anonymous or costly routes have rate limits | Abuse is cheap otherwise |
+| The flow's codes are written down next to the route | Clients and flows stay in agreement |
+
+## Work that takes longer than a request
+
+Some actions take longer than a person should wait on a spinner: generating a large report, importing a file, calling a slow partner API.
+Do not stretch the client's timeout to cover them.
+Instead, split the action into "start" and "check".
+
+```text
+client ──POST /rest/v1/reports──▶ route flow
+                                   │ create a reports record with status "queued"
+                                   │ emit an event or queue a job to do the work
+                                   ◀── 202 { id, status: "queued" }
+client watches the reports record (realtime or polling)
+                                   job updates status: "running" → "done" + file key
+client downloads the result through a signed URL
+```
+
+The start call returns quickly with `202 Accepted` and the id of a record that tracks the work:
+
+<CodeGroup>
+```typescript TypeScript
+const started = await pawabase.routes.post<{ id: string; status: string }>("reports", { month: "2026-09" });
+```
+
+```python Python
+started = pb.routes.post("reports", {"month": "2026-09"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/reports" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"month": "2026-09"}'   # 202 {"id": "…", "status": "queued"}
+```
+</CodeGroup>
+
+The screen then follows the record.
+With realtime on for the resource, it gets each status change as it happens:
+
+```typescript
+const channel = pawabase.realtime.channel("resource:reports");
+channel.on("message", async (message) => {
+  const { record } = message.payload as { record: { id: string; status: string; file_key?: string } };
+  if (record.id !== started.id) return;
+  setStatus(record.status);
+  if (record.status === "done" && record.file_key) {
+    const { url } = await pawabase.storage.from("reports").createSignedUrl(record.file_key, { expiresIn: 300 });
+    showDownload(url);
+    await channel.unsubscribe();
+  }
+});
+await channel.subscribe();
+```
+
+Without realtime, poll the record with a growing interval:
+
+```typescript
+async function waitForReport(id: string, signal: AbortSignal) {
+  for (let delay = 1000; ; delay = Math.min(delay * 1.5, 10_000)) {
+    const report = await pawabase.from("reports").get(id, { signal });
+    if (report.status === "done" || report.status === "failed") return report;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+}
+```
+
+This pattern survives reloads and closed tabs: the record holds the state, and any screen that opens later can show it.
+It also makes failures visible, because the job writes `failed` and a reason instead of a request timing out silently.
+
+## A typed layer over your routes
+
+Route paths and answer shapes scattered across components drift apart from the flows that serve them.
+A small module that names each action, types its input and answer, and validates the answer at runtime keeps them together.
+
+```typescript
+import { z } from "zod";
+
+const Order = z.object({ id: z.string(), status: z.enum(["open", "paid", "cancelled"]), total_minor: z.number() });
+const PayOrderAnswer = z.object({ paid: z.literal(true), order: Order });
+const Quote = z.object({ total_minor: z.number(), currency: z.string(), discount_minor: z.number() });
+
+export const api = {
+  async payOrder(orderId: string) {
+    return PayOrderAnswer.parse(await pawabase.routes.post(`orders/${orderId}/pay`));
+  },
+  async quoteCart(cartId: string, coupon?: string) {
+    const body = await pawabase.flows.run<{ data: unknown }>("quote-cart", { cart_id: cartId, coupon });
+    return Quote.parse(body.data);
+  },
+  async searchProducts(text: string, signal?: AbortSignal) {
+    return z.array(z.object({ id: z.string(), name: z.string() })).parse(
+      await pawabase.routes.get("products/search", { query: { q: text }, signal }),
+    );
+  },
+};
+```
+
+Runtime validation turns a changed flow into a clear error at the boundary, instead of an `undefined` deep inside a component.
+Resource types do not describe custom routes, so this layer is the place to describe route shapes.
+
+## Calling flows and routes from a server
+
+Server code calls flows and routes with the same methods.
+What changes is the identity the flow runs with.
+
+| Server client | What the flow sees | Use when |
+| --- | --- | --- |
+| `base.asUser(token)` with a publishable key | `$auth` is the person; `$credential.is_service` is false | The server acts for a person: rendering, proxying |
+| A secret-key client | No person; `$credential.is_service` is true | A job or integration acts for the system |
+
+A trigger or route policy of `authenticated` admits both: a signed-in person, or a service credential.
+Inside the flow, resource blocks run with service rights either way; the difference is what `$auth` and `$credential` contain, and therefore what the flow's own `policy.check` and `auth.require` blocks decide.
+
+Keep that in mind when one flow serves both kinds of caller.
+A flow that creates a record "for the caller" has no caller to assign when a secret key calls it.
+Either give it the person's id explicitly in the input for service calls, checked by a policy that only admits services to that branch, or keep separate flows for the two cases.
+
+## Making actions safe to repeat
+
+People double-click.
+Networks drop responses after the server has done the work.
+An action that charges money or sends messages should be safe when it arrives twice.
+
+The server has no general idempotency-key mechanism, but a unique field gives you one.
+Have the client generate an id for the attempt, and have the flow record it in a resource where the field is unique:
+
+<CodeGroup>
+```typescript TypeScript
+import { ConflictError, NetworkError } from "@pawabase/client";
+
+export async function placeOrder(cartId: string) {
+  const attemptId = crypto.randomUUID();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await pawabase.routes.post("orders", { cart_id: cartId, attempt_id: attemptId }, { idempotent: true });
+    } catch (error) {
+      if (error instanceof ConflictError) return pawabase.from("orders").eq("attempt_id", attemptId).single();
+      if (!(error instanceof NetworkError) || attempt === 2) throw error;
+    }
+  }
+}
+```
+
+```python Python
+import uuid
+
+from pawabase import ConflictError, NetworkError
+
+
+def place_order(cart_id: str):
+    attempt_id = str(uuid.uuid4())
+    for attempt in range(3):
+        try:
+            return pb.routes.post("orders", {"cart_id": cart_id, "attempt_id": attempt_id})
+        except ConflictError:
+            return pb.from_("orders").eq("attempt_id", attempt_id).single()
+        except NetworkError:
+            if attempt == 2:
+                raise
+```
+</CodeGroup>
+
+The flow creates the order with `attempt_id` set, and the resource declares `attempt_id` unique.
+A repeated request with the same `attempt_id` fails with `409` at the database, before any second charge, and the client reads the order the first request created.
+
+With that guarantee in the flow, marking the call `idempotent` is honest, and the client's own retries become safe as well.
+
+## Calling flows from React
+
+In React applications, server actions are mutations: they change data and then the screen should reflect the change.
+TanStack Query's `useMutation` fits flows and routes well.
+
+```tsx
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ApiError } from "@pawabase/client";
+
+export function PayButton({ orderId }: { orderId: string }) {
+  const queryClient = useQueryClient();
+  const pay = useMutation({
+    mutationFn: () => pawabase.routes.post(`orders/${orderId}/pay`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["orders"] }),
+  });
+
+  return (
+    <>
+      <button disabled={pay.isPending} onClick={() => pay.mutate()}>
+        {pay.isPending ? "Paying…" : "Pay"}
+      </button>
+      {pay.error instanceof ApiError && <p role="alert">{pay.error.message}</p>}
+    </>
+  );
+}
+```
+
+Disabling the button while the mutation is pending removes the most common source of double submissions.
+The unique-field technique above handles the rest.
+
+## Validation errors from routes
+
+A route with an input schema validates the body before its flow runs.
+An invalid body answers `422` with a list of issues, one per field, in the same shape as resource validation.
+The client raises `ValidationError`, whose helpers map issues to form fields:
+
+<CodeGroup>
+```typescript TypeScript
+import { ValidationError } from "@pawabase/client";
+
+export async function submitContactForm(values: { name: string; email: string; message: string }) {
+  try {
+    await pawabase.routes.post("contact", values);
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return { ok: false, fields: error.byField() };
+    }
+    throw error;
+  }
+}
+```
+
+```python Python
+from pawabase import ValidationError
+
+
+def submit_contact_form(values: dict):
+    try:
+        pb.routes.post("contact", values)
+        return {"ok": True}
+    except ValidationError as error:
+        issues = error.detail if isinstance(error.detail, list) else []
+        fields: dict[str, list[str]] = {}
+        for issue in issues:
+            field = ".".join(str(part) for part in issue.get("loc", []) if part not in ("body", "query", "path"))
+            fields.setdefault(field, []).append(issue.get("msg", "is invalid"))
+        return {"ok": False, "fields": fields}
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/contact" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"name": "", "email": "x"}'
+# 422 [{"type": "missing", "loc": ["body", "message"], "msg": "Field required"}, …]
+```
+</CodeGroup>
+
+| Helper | Returns |
+| --- | --- |
+| `error.issues` | Every issue: `loc`, `field`, `message`, and the `type` and `input` when the server sent them |
+| `error.fieldError("email")` | The first message for one field, or `undefined` |
+| `error.byField()` | `{ email: ["…"], name: ["…"] }` |
+
+A flow can also validate inside its graph and raise its own `422` with `error.raise`.
+When it puts per-field problems in `details` as a list with field names, the client treats them as validation issues too; otherwise the code and message are what you get.
+
+A route's input schema does not enforce `required` for every shape, and a route without a schema passes the body to the flow unvalidated.
+Validate what matters inside the flow as well, especially values that reach money or permissions.
+
+## GET routes, caching and freshness
+
+A `GET` route can cache its answers on the server for a configured time.
+Cached answers are keyed by the full URL, including the query string.
+
+| Fact | Consequence |
+| --- | --- |
+| Identical `GET` requests within the cache time get the same answer | Fast, cheap reads for data that changes slowly |
+| The route cache is not cleared when records change | A cached answer can be stale for up to the cache time |
+| Every query parameter is part of the key | Equivalent queries written differently are cached separately |
+| `POST`, `PUT`, `PATCH` and `DELETE` are never cached | Actions always run |
+
+Use route caching for answers that are the same for everyone and tolerate staleness, such as a product catalogue or public statistics.
+Do not cache answers that depend on the caller; a cache keyed by URL alone could serve one person's answer to another.
+
+## Versioned APIs
+
+An environment can publish its definitions as numbered API versions.
+A release makes a frozen revision of resources and routes answer under its own prefix, such as `/rest/v2`, while `/rest/v1` keeps serving the previous contract.
+
+`pawabase.routes` always calls `/rest/v1`.
+To call a route in another API version, use a raw request:
+
+<CodeGroup>
+```typescript TypeScript
+const v2 = await pawabase.request("POST", `/rest/v2/orders/${orderId}/pay`);
+```
+
+```python Python
+v2 = pb.request("POST", f"/rest/v2/orders/{order_id}/pay")
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v2/orders/$ORDER_ID/pay" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+Resource queries through `from()` use `/rest/v1` too.
+Applications that move to a new API version usually do so all at once, at a release, so a small wrapper that holds the prefix is enough.
+See [Releases and API versions](/operate/releases-and-api-versions).
+
+## Calls or events
+
+Not every action needs an answer.
+"Send the welcome email", "recompute the leaderboard" and "notify the warehouse" can happen after the request that caused them, without the person waiting.
+
+| Pattern | When | How |
+| --- | --- | --- |
+| A call | The screen needs the result to continue | `flows.run` or `routes.*` |
+| A record change that triggers work | The work follows from data the client writes anyway | Write the record; a flow subscribed to `<resource>.created` does the rest |
+| An emitted event | A server knows something happened and others should react | `manage(service).events.emit(name, payload)` with a secret key |
+
+The second pattern is often the best.
+The client creates an `orders` record, and flows subscribed to `orders.created` send the confirmation, reserve stock and notify the warehouse, each visible in its own run history.
+The client's job ends at "create the record", and adding a reaction later needs no client change.
+
+## Security inside flows
+
+A flow is server code, even when it is a graph.
+The same rules apply as for any endpoint.
+
+| Rule | Why |
+| --- | --- |
+| Check the caller's rights explicitly with `policy.check` or `auth.require` | Resource blocks run with service rights and do not apply resource policies |
+| Take identity from `$auth`, never from the input | Anyone can send `{ "user_id": "someone-else" }` |
+| Validate input that reaches money, permissions or other people | The client is not trusted |
+| Read secrets with the secret block, never send them in answers | Answers reach browsers and logs |
+| Keep the trigger or route policy as narrow as the action | `authenticated` admits every signed-in person and every secret key |
+| Return error codes, not internal details | Messages are shown to people and attackers alike |
+
+The client helps with the last point by surfacing `error.code` and `error.message` only; the flow decides what those contain.
+
+## Debugging a call
+
+When a flow or route call fails unexpectedly, three places together tell the whole story.
+
+| Place | What it shows |
+| --- | --- |
+| The thrown error | `status`, `code`, `message`, `details`, and `requestId` |
+| **Project → Activity**, searched by request id | The request, its duration, its logs and, for a server error, the traceback |
+| **Logic → Flows**, the flow's runs | Each block's input, output, duration and error for that run |
+
+Record `requestId` with every unexpected error in your error tracker.
+With it, the path from "a user saw an error" to "this block failed with this input" takes a minute.
+
+Operators can also run a flow on demand from code, as a chosen user, and get its trace back, with the management module:
+
+<CodeGroup>
+```typescript TypeScript
+import { manage } from "@pawabase/client/manage";
+
+const run = await manage(service).flows.run("pay-order", { params: { id: orderId } }, { asUser: { user_id: "u_7" } });
+console.log(run.status, run.result, run.trace);
+```
+
+```python Python
+run = service.manage.flows.run("pay-order", {"params": {"id": order_id}}, as_user={"user_id": "u_7"})
+print(run["status"], run["result"], run["trace"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/flows/pay-order/run" -H "apikey: $PAWABASE_SECRET_KEY" \
+  -H "content-type: application/json" -d '{"input": {"params": {"id": "o1"}}, "as_user": {"user_id": "u_7"}, "entry": null}'
+```
+</CodeGroup>
+
+That is the fastest way to reproduce a failure a particular person saw.
+See [Environment management](/clients/typescript/management).
+
+## Testing code that calls flows and routes
+
+Client-side code that calls flows and routes can be tested with a fake `fetch` that answers by path:
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient } from "@pawabase/client";
+
+function fakeServer(answers: Record<string, { status: number; body: unknown }>) {
+  return createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    retry: false,
+    fetch: async (input, init) => {
+      const key = `${init?.method ?? "GET"} ${new URL(input).pathname}`;
+      const answer = answers[key] ?? { status: 404, body: "Not found" };
+      return new Response(JSON.stringify(answer.body), { status: answer.status, headers: { "content-type": "application/json" } });
+    },
+  });
+}
+
+test("payOrder maps order_not_found", async () => {
+  const pawabase = fakeServer({
+    "POST /rest/v1/orders/o1/pay": { status: 404, body: { error: "order_not_found", message: "no such order" } },
+  });
+  await assert.rejects(pawabase.routes.post("orders/o1/pay"), (error: any) => error.code === "order_not_found" && error.status === 404);
+  pawabase.dispose();
+});
+
+test("a direct flow answer without response.return is wrapped in data", async () => {
+  const pawabase = fakeServer({ "POST /flows/v1/quote-cart": { status: 200, body: { data: { total_minor: 900 } } } });
+  const body = await pawabase.flows.run<{ data: { total_minor: number } }>("quote-cart", { cart_id: "c1" });
+  assert.equal(body.data.total_minor, 900);
+  pawabase.dispose();
+});
+```
+
+The flows themselves are tested in Studio, with test runs in **Logic → Flows**, and against a development environment.
+Before saving a changed flow from code, the management module's `flows.validate(definition)` reports problems node by node without saving.
+
+## Designing a flow's contract
+
+A flow that clients call is an API, even when only your own app calls it.
+Deciding its contract before building the graph saves rework on both sides.
+
+| Part of the contract | Decide | Example |
+| --- | --- | --- |
+| Input | The fields, their types, which are required | `{ cart_id: string, coupon?: string }` |
+| Success answer | Status and body | `200 { total_minor, currency, discount_minor }` |
+| Expected failures | One code per failure the screen handles differently | `coupon_unknown`, `coupon_expired`, `cart_empty` |
+| Status for each failure | The HTTP category | `404` for unknown, `409` for already applied, `422` for invalid input |
+| Who may call | The policy | `authenticated` |
+
+Choose statuses by what the client should do, not by what went wrong inside:
+
+| Situation | Status | Why |
+| --- | --- | --- |
+| The input is malformed or fails a rule | `422` | The person must change what they sent |
+| The thing referred to does not exist, or is not theirs | `404` | Nothing to act on |
+| The action conflicts with the current state | `409` | Reload and decide again |
+| The caller may not do this | `403` | Asking again will not help |
+| A partner service failed | `502` | The client may try again later |
+| Accepted, finishing in the background | `202` | Follow the tracking record |
+
+Codes are lowercase words joined by underscores, specific to one situation.
+`coupon_expired` tells the screen what to say; `error` or `failed` does not.
+
+## Recipes
+
+The recipes use the client's error classes:
+
+```typescript
+import { RateLimitError, ValidationError } from "@pawabase/client";
+```
+
+Each recipe below pairs the flow's behavior with the client code that calls it.
+The flows are described in words rather than full graphs; build them in **Logic → Flows** with the blocks named.
+
+### A contact form for anonymous visitors
+
+A flow with a pathless HTTP trigger and `policy: public` accepts messages from visitors who are not signed in.
+It validates the input with `validate.schema`, stores the message with `resource.create` and notifies the team with `mail.send`.
+A route in front of it adds a rate limit, which matters for anything anonymous.
+
+```typescript
+export async function sendContactMessage(values: { name: string; email: string; message: string }) {
+  try {
+    await pawabase.routes.post("contact", values);
+    return { ok: true as const };
+  } catch (error) {
+    if (error instanceof ValidationError) return { ok: false as const, fields: error.byField() };
+    if (error instanceof RateLimitError) return { ok: false as const, message: "Please wait a moment before sending another message." };
+    throw error;
+  }
+}
+```
+
+The publishable key is enough, and no session is needed.
+The rate limit is per caller, so one visitor cannot flood the team's inbox.
+
+### A payment checkout session
+
+Starting a hosted checkout with a payment provider needs a secret only the server may hold.
+A route flow reads the provider key with `secret.get`, calls the provider with `http.request`, records the pending payment with `resource.create`, and answers with the provider's checkout URL.
+
+```typescript
+export async function startCheckout(orderId: string) {
+  const { checkout_url } = await pawabase.routes.post<{ checkout_url: string }>(`orders/${orderId}/checkout`);
+  window.location.assign(checkout_url);
+}
+```
+
+The provider later calls back to an [inbound hook](/webhooks/inbound), not to this route.
+Inbound hooks check the provider's signature before a flow runs, which a route cannot do.
+
+### Acting on a selection
+
+A screen that lets people select rows and archive them should not send one request per row.
+A route takes the list of ids, and its flow loads each with `resource.get`, checks that the caller may change it with `policy.check`, and updates it with `resource.update`.
+The check is the flow's job: resource blocks do not apply the resource's policies by themselves.
+
+```typescript
+export async function archiveSelected(ids: string[]) {
+  const answer = await pawabase.routes.post<{ archived: string[]; refused: string[] }>("tasks/archive", { ids });
+  if (answer.refused.length) showMessage(`${answer.refused.length} tasks could not be archived.`);
+  return answer.archived;
+}
+```
+
+Reporting refused ids lets the screen tell people which rows were not theirs to change, instead of failing the whole action.
+Cap the size of `ids` in the flow's input schema, so one call cannot touch an unbounded number of records.
+
+### A computed summary
+
+The data API counts rows but does not sum or group values.
+A `GET` route whose flow lists the relevant records with `resource.list` and computes totals answers a dashboard with one call.
+
+<CodeGroup>
+```typescript TypeScript
+export async function salesSummary(month: string) {
+  return pawabase.routes.get<{ orders: number; revenue_minor: number; average_minor: number }>("reports/sales", { query: { month } });
+}
+```
+
+```python Python
+def sales_summary(month: str):
+    return pb.routes.get("reports/sales", month=month)
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/rest/v1/reports/sales" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" --data-urlencode "month=2026-09"
+```
+</CodeGroup>
+
+If the summary is the same for everyone and changes slowly, give the route a short cache.
+If it depends on the caller, do not.
+
+### Notifying another system after a change
+
+When a record change must reach another system, such as a CRM, the client does not call anything extra.
+It writes the record, and a flow subscribed to the resource event sends it on with `http.request`.
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.from("customers").update(customerId, { plan: "pro" });
+```
+
+```python Python
+pb.from_("customers").update(customer_id, {"plan": "pro"})
+```
+
+```bash cURL
+curl -X PATCH "$PAWABASE_URL/rest/v1/customers/$CUSTOMER_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"plan": "pro"}'
+```
+</CodeGroup>
+
+The person sees the update immediately; the delivery happens after, with its own retries and its own run history.
+This keeps slow or unreliable partners out of the person's request entirely.
+
+## Migrating from custom functions
+
+Custom functions were removed from Pawabase.
+Code that called them through the client needs a new target, and the right one depends on what the function did.
+
+| The function | Replace with | Client change |
+| --- | --- | --- |
+| Took JSON, did a few record operations, returned JSON | A flow with a pathless HTTP trigger | `functions.invoke(name, input)` becomes `flows.run(name, input)`; unwrap `data` if the flow has no `response.return` |
+| Served a REST-shaped URL with path parameters | A custom route backed by a flow | `functions.fetch(name, path, …)` becomes `routes.<method>(path, …)` |
+| Needed a Python or Node library, streaming, or long computation | An extension route, written by the operator | `routes.<method>("x/…")`, or `http.request` for non-JSON answers |
+| Reacted to an event | A flow with an event trigger | Remove the client call; write the record that causes the event |
+| Ran on a schedule | A flow with a schedule | Remove the client call |
+
+`functions.invoke` unwrapped a `{ data }` envelope.
+`flows.run` returns the body as it is, so a flow without `response.return` needs `.data` at the call site.
+
+## What to send
+
+What a client sends to a flow shapes how safe and how fast the flow is.
+
+| Send | Avoid | Why |
+| --- | --- | --- |
+| Ids of records | Whole records copied from the screen | The flow should read current data under policies, not trust a copy |
+| The person's choices | The person's identity | Identity comes from the token, as `$auth` |
+| Amounts as integers in minor units | Floating-point currency | `0.1 + 0.2` is not `0.3` |
+| Dates as ISO strings | `Date` objects with local offsets | The server works in UTC |
+| Small payloads | Files in JSON | Upload files to storage and send the key |
+
+A flow that recomputes prices from ids is correct even when the screen is stale or tampered with.
+A flow that trusts prices sent by the client is not.
+
+## The wire format
+
+| Client call | Request |
+| --- | --- |
+| `flows.run("quote", input)` | `POST /flows/v1/quote` with `input` as JSON |
+| `routes.get("reports/sales", { query: { month } })` | `GET /rest/v1/reports/sales?month=…` |
+| `routes.post("orders/1/pay", body)` | `POST /rest/v1/orders/1/pay` with `body` as JSON |
+| `routes.put(path, body)`, `routes.patch(path, body)` | `PUT` or `PATCH /rest/v1/<path>` |
+| `routes.delete(path)` | `DELETE /rest/v1/<path>` |
+| `routes.call("OPTIONS", path)` | Any method you name |
+
+Each request carries the API key, the person's token when signed in, and `x-client-info`, like every other call.
+
+## Actions on mobile networks
+
+On a phone, the network can disappear between the tap and the answer.
+For actions, that leaves the screen not knowing whether the action happened.
+
+The unique-attempt technique answers that question: retry with the same attempt id when the network returns, and either the first attempt's result or the conflict tells you the action happened once.
+Store pending attempts locally, as the storage page does for uploads, so they survive the app being closed.
+
+Show the person what is going on: "Sending…", then "Waiting for connection", then "Sent".
+Silently retrying in the background is worse than saying so.
+
+## Measuring actions
+
+Flows and routes are where your application's important actions happen, so they deserve their own metrics.
+The client's hooks see every call; tag them by action rather than by URL:
+
+```typescript
+function actionName(url: string) {
+  const path = new URL(url).pathname;
+  if (path.startsWith("/flows/v1/")) return `flow:${path.slice(10)}`;
+  if (path.startsWith("/rest/v1/")) return `route:${path.slice(9).replace(/\/[0-9A-Za-z_-]{8,}(?=\/|$)/g, "/:id")}`;
+  return null;
+}
+
+const pawabase = createClient({
+  url,
+  apiKey,
+  hooks: {
+    onResponse: ({ url, status, durationMs }) => {
+      const name = actionName(url);
+      if (name) metrics.timing("action", durationMs, { name, ok: String(status < 400) });
+    },
+  },
+});
+
+declare const metrics: { timing(name: string, ms: number, tags: Record<string, string>): void };
+```
+
+Replacing ids with `:id` keeps one metric per action instead of one per record.
+
+## Shaping answers for screens
+
+A flow can answer with anything, so answer with what the screen needs.
+Returning whole records copied from resource blocks has two costs.
+
+The first is exposure.
+Resource blocks read with service rights, so a record they return can contain fields the person could never read through the data API, such as write-only fields or another person's details.
+Pick the fields with `transform.pick`, or build the body explicitly in `response.return`.
+
+The second is coupling.
+A screen that reads `answer.order.internal_notes` breaks when someone renames the field, even though the screen never needed it.
+
+| Instead of | Answer with |
+| --- | --- |
+| `{ "order": "{{ steps.paid.output }}" }` | `{ "order": { "id": "…", "status": "…", "total_minor": … } }` |
+| The list of every matching record | The page the screen shows, and a count |
+| An internal error message | A code and a sentence written for people |
+
+## Lists from routes
+
+A route that returns a list should page it, and the simplest contract is the data API's own envelope.
+Client code can then reuse the same pagination helpers for resources and routes.
+
+```typescript
+interface Page<T> {
+  data: T[];
+  page: number;
+  per_page: number;
+  total: number | null;
+}
+
+export async function searchCustomers(text: string, page = 1) {
+  return pawabase.routes.get<Page<{ id: string; name: string }>>("customers/search", {
+    query: { q: text, page, per_page: 20 },
+  });
+}
+
+export async function* everyMatch(text: string) {
+  for (let page = 1; ; page++) {
+    const result = await searchCustomers(text, page);
+    yield* result.data;
+    if (result.data.length === 0 || (result.total !== null && page * result.per_page >= result.total)) return;
+  }
+}
+```
+
+The flow reads `page` and `per_page` from the request's query, passes them to `resource.list`, and answers with the same four fields.
+
+## Calling a route after an upload
+
+Some actions take a file: an import, an avatar crop, a document to sign.
+Upload the file to storage first, then call the route with its key.
+
+```typescript
+export async function importContacts(file: File) {
+  const user = await pawabase.auth.getCachedUser();
+  const key = `${user!.id}/imports/${Date.now()}.csv`;
+  await pawabase.storage.from("imports").upload(key, file, { contentType: "text/csv", timeoutMs: 0 });
+  return pawabase.routes.post<{ id: string; status: string }>("imports", { key });
+}
+```
+
+The flow reads the file through its storage blocks and answers `202` with an import record to follow.
+Flows and routes take JSON; files travel through storage, which has the limits, policies and streaming built for them.
+
+## A public settings route
+
+Many applications need configuration before anyone signs in: feature switches, contact details, maintenance notices.
+A `GET` route with a `public` policy and a short cache serves it to every visitor cheaply.
+
+```typescript
+export async function loadPublicSettings() {
+  try {
+    return await pawabase.routes.get<{ maintenance: boolean; support_email: string; features: string[] }>("settings/public");
+  } catch {
+    return { maintenance: false, support_email: "support@example.com", features: [] };
+  }
+}
+```
+
+The fallback keeps the application usable if the route fails, which matters for something every page loads.
+
+## Flows from scripts and CI
+
+Scripts can call flows and routes with a secret key, which admits them through `authenticated` policies as a service.
+That is useful for maintenance actions you already built as flows, such as "recompute balances for a customer".
+
+For operator tasks, the management module is often the better door.
+`manage(client).flows.run(name, input, { asUser })` runs a flow as an operator, optionally as a chosen person, regardless of its HTTP trigger, and returns the run's status, result, response and per-block trace.
+That trace makes it the right tool for scripts that need to know exactly what happened.
+
+| Need | Use |
+| --- | --- |
+| Call the action as an application would | `flows.run` or `routes.*` with a secret key |
+| Run a flow as a specific person and see its trace | `manage(client).flows.run(name, input, { asUser })` |
+| Run a flow that has no HTTP trigger | `manage(client).flows.run` |
+| Check a flow definition before saving it | `manage(client).flows.validate(definition)` |
+
+## Reading error details
+
+Besides a code and a message, a flow error can carry `details`: structured information such as the fields that failed validation, the limit that was hit, or the record that conflicted.
+The client exposes it as `error.details`, and keeps the whole response body in `error.body`.
+
+<CodeGroup>
+```typescript TypeScript
+try {
+  await pawabase.flows.run("reserve-seats", { event_id, seats: 4 });
+} catch (error) {
+  if (error instanceof ApiError && error.is("not_enough_seats")) {
+    const { available } = (error.details ?? {}) as { available?: number };
+    showMessage(available ? `Only ${available} seats are left.` : "Not enough seats are left.");
+  } else throw error;
+}
+```
+
+```python Python
+from pawabase import PawabaseError
+
+try:
+    pb.flows.invoke("reserve-seats", {"event_id": event_id, "seats": 4})
+except PawabaseError as error:
+    if error.code != "not_enough_seats":
+        raise
+    available = (error.details or {}).get("available")
+    show_message(f"Only {available} seats are left." if available else "Not enough seats are left.")
+```
+</CodeGroup>
+
+Treat `details` as optional and check its shape.
+It is part of a flow's contract only when the flow documents it.
+
+## Words used on this page
+
+| Term | Meaning |
+| --- | --- |
+| Direct flow call | `POST /flows/v1/<name>` to a flow whose HTTP trigger has no path |
+| Custom route | An endpoint under `/rest/v1`, defined in **Logic → Routes**, handled by a flow |
+| Extension route | A Python route mounted by the operator, usually under `/rest/v1/x/…` |
+| Trigger policy | The condition on a flow's `trigger.http` that decides who may call it directly |
+| Route policy | The condition on a route that decides who may call it |
+| `response.return` | The block that sets a flow's status, headers and body |
+| `error.raise` | The block that ends a flow with an error status, code and message |
+| Service rights | How resource blocks run inside a flow: without applying resource policies |
+
+## When a record operation is enough
+
+Not every action needs a flow.
+If an action is "create, change or delete one record, and the resource's policy already says who may", the data API does it with less to build and maintain.
+
+| Action | A record operation is enough when | A flow or route is needed when |
+| --- | --- | --- |
+| Create a comment | The comment's fields come from the person, and the policy covers who may comment | A notification must go out, or a counter must change, in the same action |
+| Mark a task done | The owner may change `done` | Completing the task must also update a project's progress atomically |
+| Cancel an order | The customer may set `status` to `cancelled` | Cancelling must refund a payment and restock items |
+
+A useful middle ground is a record operation plus an event: the client writes the record, and a flow subscribed to the resource's event does the follow-up work.
+The person gets an immediate answer, and the follow-up is still reliable and visible.
+
+## Messages in the person's language
+
+Flows should answer with codes, and clients should turn codes into words.
+That keeps translation where the rest of the interface's text lives.
+
+```typescript
+import type { ApiError } from "@pawabase/client";
+
+const messages: Record<string, Record<string, string>> = {
+  en: { coupon_expired: "This coupon has expired.", out_of_stock: "One of the items just sold out." },
+  fr: { coupon_expired: "Ce coupon a expiré.", out_of_stock: "Un des articles vient d'être épuisé." },
+};
+
+export function messageFor(error: ApiError, locale: string) {
+  return messages[locale]?.[error.code] ?? messages.en[error.code] ?? error.message;
+}
+```
+
+The flow's own `message` is a fallback for codes the client does not know yet, written in the language of your team.
+
+## Changing a flow's contract
+
+Clients in the field keep calling a flow after you change it: mobile apps update slowly, and open browser tabs run yesterday's code.
+Change contracts the way you would change any API.
+
+| Change | Safe for existing clients? | How |
+| --- | --- | --- |
+| Add an optional input field | Yes | Give it a default in the flow |
+| Add a field to the success answer | Yes | Clients ignore what they do not read |
+| Add a new error code | Mostly | Old clients show the fallback message |
+| Rename or remove an input or answer field | No | Add the new one, keep the old one until clients have moved |
+| Change a code's meaning | No | Add a new code |
+| Change a route's path | No | Add the new route, keep the old one for a while |
+
+For larger changes, publish a new [API version](/operate/releases-and-api-versions) and move clients to it deliberately.
+
+## Developing flows across environments
+
+Flows are definitions, like resources and policies, and they live in each environment.
+A common workflow:
+
+| Stage | What happens |
+| --- | --- |
+| Build | Create or change the flow in the `development` environment in Studio, and call it from a local build of the app |
+| Review | Work on a branch of the definitions, so the change can be reviewed before it reaches the main definitions |
+| Test | Promote to a staging or preview environment and run the app's tests against it |
+| Release | Promote to `production`; clients see the new behavior immediately |
+
+The client code does not change between stages; only the environment's URL, key and name do.
+See [Environments and promotion](/operate/environments-and-promotion).
+
+## Common mistakes
+
+| Mistake | Consequence | Fix |
+| --- | --- | --- |
+| Trusting resource blocks to enforce policies | Anyone who may call the flow can act on any record | `policy.check` or `auth.require` in the flow |
+| Reading identity from the input | People act as each other | Use `$auth` |
+| Answering with whole records | Hidden fields leak | Pick fields in `response.return` |
+| No codes on errors | Screens show raw messages or generic failures | `error.raise` with specific codes |
+| Marking non-repeatable actions `idempotent` | Double charges after a retry | Only mark actions that are safe to repeat |
+| Long work inside the request | Timeouts and uncertain outcomes | Start, track with a record, and follow |
+| Caching per-person `GET` routes | One person sees another's answer | Cache only answers that are the same for everyone |
+
+## From the browser or from your server
+
+A browser can call flows and routes directly with a publishable key and the person's session.
+Some applications route these calls through their own server instead.
+Both are valid; the trade-offs are about what sits between the person and the action.
+
+| Question | Call from the browser | Call from your server |
+| --- | --- | --- |
+| Where does the token live? | In the browser | In an HTTP-only cookie on your server |
+| Latency | One hop to the gateway | Two hops |
+| Extra checks before the action | Only what the route and flow do | Anything your server adds |
+| Combining several calls into one | Several requests from the browser | One request from the browser, several from the server |
+| Exposure of the route's URL | Visible in the browser's network panel | Hidden behind your own endpoint |
+
+Hiding a route's URL is not security: anyone with a session can call the route directly, so the route and its flow must be safe on their own.
+Choose the server path for the token handling and the composition, not for obscurity.
+
+## What the person sees while an action runs
+
+An action has a short lifetime on screen, and each moment of it should be visible.
+
+| Moment | Show | Avoid |
+| --- | --- | --- |
+| Before | An enabled button with a clear verb, such as "Pay 42.00" | A vague "Submit" |
+| Running | The button disabled, with "Paying…" | Allowing a second click |
+| Succeeded | The result, such as the updated order | A toast that hides what changed |
+| Failed with a code | The message for that code, and what to do next | The raw error message |
+| Failed without an answer | "We could not confirm the payment. Check your orders before trying again." | Offering to repeat a non-repeatable action blindly |
+
+The last row is the important one.
+After a timeout or a network failure, the action may have happened.
+Point the person to where they can see the outcome, or check it in code, before letting them repeat it.
+
+## A checklist for client code that calls actions
+
+| Check | Why |
+| --- | --- |
+| Each action has a typed wrapper with its path, input and answer | Shapes stay in one place |
+| Each wrapper maps the action's codes to messages | Screens stay short and consistent |
+| Buttons disable while the action runs | Fewer double submissions |
+| Non-repeatable actions carry an attempt id | Retries cannot duplicate work |
+| Unexpected errors are reported with `requestId` | Support can find the run |
+| Long actions follow a tracking record | Outcomes survive reloads and closed tabs |
+
+## Actions and realtime together
+
+An action changes records, and other screens showing those records should update.
+When the resources involved have realtime on, the changes a flow makes are published on `resource:<name>` like any other write, to each subscriber who may read the record.
+
+That gives a clean division of work:
+
+| Part | Responsibility |
+| --- | --- |
+| The screen that started the action | Shows the answer from the route or flow |
+| Other screens, and other people's screens | Update from realtime messages |
+| The flow | Writes records; it does not need to notify anyone itself |
+
+```typescript
+const channel = pawabase.realtime.channel("resource:orders");
+channel.on("message", (message) => {
+  const { change, record } = message.payload as { change: string; record: { id: string; status: string } };
+  if (change === "updated") updateOrderRow(record.id, record.status);
+});
+await channel.subscribe();
+
+declare function updateOrderRow(id: string, status: string): void;
+```
+
+The person who paid sees "Paid" from the route's answer; a colleague watching the orders list sees the row change a moment later.
+
+## Callbacks from other services are not routes
+
+Payment providers, delivery services and other systems call your application back when something happens on their side.
+It is tempting to point them at a route.
+Use an [inbound hook](/webhooks/inbound) instead.
+
+| | Route | Inbound hook |
+| --- | --- | --- |
+| Caller | Your application, with an API key | Another service, with its own signature |
+| Verifies the sender | Through the API key and policy | Through the sender's signature, before the flow runs |
+| Typical URL | `/rest/v1/<path>` | A dedicated hook URL from **Logic → Webhooks** |
+
+The client never calls inbound hooks; it calls routes and flows.
+
+In Studio, **Logic → Webhooks** has two groups.
+**Outbound** holds the endpoints Pawabase sends signed events to, with their delivery history.
+**Inbound** holds the hooks other services call, each with the flow it starts and the signature it expects.
+
+A typical payment integration uses all three doors on this page and both webhook groups:
+
+| Step | Door |
+| --- | --- |
+| The person starts checkout | A custom route that creates a provider session |
+| The provider confirms payment | An inbound hook that marks the order paid |
+| The warehouse is told to ship | An outbound webhook on `orders.updated` |
+| The person's screen updates | Realtime on `resource:orders` |
+
+The client code in that whole integration is two calls: the checkout route, and a realtime subscription.
+Everything else happens between Pawabase and the other services, where it can be retried and inspected.
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Create a flow callable from the client | **Logic → Flows**, add `trigger.http`, leave **path** empty |
+| Restrict who may call it | The trigger's `policy` |
+| Give it a REST URL | **Logic → Routes**, **New route**, choose the method, path and flow |
+| Validate a route's input | The route's input schema |
+| Rate-limit or cache a route | The route's settings |
+| See every run, with each block's input and output | **Logic → Flows**, the flow's runs |
+| Find a failing request | **Project → Activity**, by request id |
+| See the documented shape of routes | **Data → API Explorer** |
+
+## Coming from Supabase Edge Functions
+
+| Supabase | Pawabase | Note |
+| --- | --- | --- |
+| `supabase.functions.invoke("name", { body })` | `pawabase.flows.run("name", body)` | A flow with a pathless HTTP trigger |
+| An Edge Function with its own routing | A custom route per endpoint, or an extension route | Routes have methods, paths, policies, schemas |
+| `{ data, error }` | The body, or a thrown error | Error codes come from `error.raise` |
+| Verifying the JWT inside the function | The trigger or route policy, and `$auth` in blocks | Identity is resolved before the flow runs |
+| `Deno.env.get("SECRET")` | The secret block in the flow | Secrets are managed per environment |
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| `NotFoundError` with `no directly invocable flow` | The flow has no HTTP trigger, or its trigger has a path, or the name is wrong | Clear the trigger's path, or call the route instead |
+| `NotFoundError` from a route | The route is disabled, the path or method differs, or a resource with the same name shadows it | Compare with **Logic → Routes** and the API Explorer |
+| `ApiError` 500 with `missing_flow` | The route names a flow that does not exist, or was renamed | Point the route at the right flow |
+| `ApiError` 400 `the body must be JSON` | A string body that is not JSON was sent to `/flows/v1` | Send an object |
+| `AuthenticationError` when signed out | The default policy is `authenticated` | Set the policy to `public` if anonymous calls are intended |
+| The body is `{ data: … }` and you expected the result | A direct call to a flow without `response.return` | Unwrap `data`, or add `response.return` |
+| The same action ran twice | A retry after a network failure, or a double click | Unique attempt ids, and disable buttons while pending |
+| A `GET` route returns stale data | The route's cache | Shorten or remove caching for that route |
+| An extension route returns text the client did not parse | It answers with a non-JSON type | Use `http.request` with `parse: "text"` or `"stream"` |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can a flow call another flow?">
+    Yes, from inside the flow, with the flow blocks described in [Platform blocks](/flows/platform-blocks).
+    From the client's point of view, it is still one call.
+  </Accordion>
+  <Accordion title="How long can a flow run while the client waits?">
+    As long as the client's timeout allows, 30 seconds by default.
+    Long work should follow the start-and-check pattern instead of a longer timeout.
+  </Accordion>
+  <Accordion title="Can a flow return a file?">
+    A flow answers with JSON.
+    For files, have the flow store the file and return its key, then give the person a signed URL; or use an extension route that streams.
+  </Accordion>
+  <Accordion title="Can I call a route with GET and a body?">
+    No.
+    `routes.get` has no body argument; use the query string.
+  </Accordion>
+  <Accordion title="Does `flows.run` work with a secret key?">
+    Yes.
+    The trigger's default policy admits service credentials, and the flow runs without a person, bypassing resource policies inside it.
+  </Accordion>
+  <Accordion title="Why does my route answer differently from a direct call to the same flow?">
+    A route answers with the flow's result as the body; a direct call wraps it in `{ data }`.
+    With `response.return`, both answer exactly with the block's body.
+  </Accordion>
+  <Accordion title="Do flows run inside a database transaction?">
+    Not as a whole.
+    Each resource block is its own write.
+    When several writes must succeed or fail together, use the `db.transaction` block for them, or design the flow so a later failure can be undone.
+  </Accordion>
+  <Accordion title="Can I see which flow a route calls from the client?">
+    No; the client sees only the route.
+    **Logic → Routes** shows each route's handler, and the API Explorer shows the route's documented shape.
+  </Accordion>
+  <Accordion title="Can external systems call my routes?">
+    Yes, with an API key.
+    For callbacks from services that sign their requests, such as payment providers, use [inbound hooks](/webhooks/inbound), which check signatures before your flow runs.
+  </Accordion>
+</AccordionGroup>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Flows" icon="workflow" href="/flows/overview">How flows are built, triggered and run.</Card>
+  <Card title="Triggers" icon="zap" href="/flows/triggers">The HTTP trigger and its policy.</Card>
+  <Card title="Custom routes" icon="route" href="/data/custom-routes">Defining routes, schemas, limits and caching.</Card>
+  <Card title="Errors and retries in flows" icon="triangle-alert" href="/flows/errors-and-retries">Raising errors with codes from a flow.</Card>
+  <Card title="Extension routes" icon="code" href="/code/extension-routes">Python routes mounted next to the server.</Card>
+  <Card title="Errors and retries" icon="rotate-ccw" href="/clients/typescript/errors-retries">How the client classifies and repeats failures.</Card>
+</CardGroup>

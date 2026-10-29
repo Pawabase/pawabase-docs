@@ -1,763 +1,1668 @@
 ---
-title: "Errors, retries, and cancellation in TypeScript"
-description: "Handle the SDK error hierarchy, validation details, policy refusals, request IDs, safe retry rules, deadlines, aborts, and transport hooks."
+title: "Errors and retries"
+description: "How the TypeScript client reports failures and recovers from them: the error classes, how server answers become errors, validation issues, request ids, which failures are retried and how, timeouts, cancellation and observability."
 icon: "triangle-alert"
 ---
 
-The SDK turns different server error bodies and no-response failures into one class hierarchy.
-Application code should make decisions from the class, status, stable code, and structured fields rather than parsing message text.
+Every call to Pawabase can fail, and the reasons differ in what they mean for your application: a person typed something invalid, a policy said no, the network dropped, the server was briefly busy.
+The client turns every failure into a typed error that says which of these happened, and it repeats the failures that are safe to repeat before you ever see them.
+
+This page explains the error classes and how server answers map onto them, how to read validation problems and request ids, exactly which failures are retried and how, and how timeouts, cancellation and hooks fit in.
+
+## The mental model
+
+A call ends in one of three ways.
+
+| Outcome | What you get | Example |
+| --- | --- | --- |
+| Success | The parsed answer | A page of records |
+| The server answered with an error | An `ApiError` subclass, chosen by the status | `NotFoundError` for a `404` |
+| No answer at all | A transport error | `NetworkError`, `TimeoutError`, `AbortError` |
+
+Before either failure reaches your code, the client decides whether the failure is safe and worth repeating.
+Rate limits are always repeated; gateway hiccups and network drops are repeated for requests that cannot cause harm when sent twice; everything else is thrown at once.
+
+```text
+attempt ──▶ answer 2xx ───────────────────────────▶ return the parsed body
+   │
+   ├──▶ answer 401 with a session ──▶ refresh once ──▶ repeat the attempt
+   │
+   ├──▶ answer 429, or 502/503/504 on a safe request ──▶ wait ──▶ repeat (up to 2 more times)
+   │
+   ├──▶ network failure or timeout on a safe request ──▶ wait ──▶ repeat
+   │
+   └──▶ anything else ──▶ throw the matching error class
+```
+
+Errors are classes, not codes in a result object.
+A successful call returns data directly, and a failed one throws, so the happy path has no checks and the failure path is a `catch` where TypeScript can narrow the error.
+
+## The error classes
+
+Everything the client throws extends `PawabaseError`.
 
 ```text
 PawabaseError
-├── ApiError
-│   ├── AuthenticationError
-│   ├── PermissionError
-│   ├── NotFoundError
-│   ├── ConflictError
-│   ├── ValidationError
-│   ├── PayloadTooLargeError
-│   ├── RateLimitError
-│   └── ServerError
-├── NetworkError
-├── TimeoutError
-├── AbortError
-├── ConfigError
-├── RealtimeError
-└── InvalidQueryError
+├── ApiError                     the server answered with an error status
+│   ├── ValidationError          400 with issues, or 422
+│   ├── AuthenticationError      401
+│   ├── PermissionError          403
+│   ├── NotFoundError            404
+│   ├── ConflictError            409
+│   ├── PayloadTooLargeError     413
+│   ├── RateLimitError           429
+│   └── ServerError              5xx
+├── NetworkError                 no answer: offline, DNS, refused, reset, blocked by CORS
+├── TimeoutError                 an attempt exceeded its timeout
+├── AbortError                   your AbortSignal fired
+├── ConfigError                  the client was configured or used incorrectly
+├── InvalidQueryError            a query the server would answer wrongly, refused before sending
+└── RealtimeError                a realtime request was refused, timed out, or the connection closed
 ```
 
-The distinction between response and no-response errors is operationally important.
-An `ApiError` means Pawabase answered.
-A `NetworkError` or `TimeoutError` means the client did not obtain a usable answer and a write outcome may be ambiguous.
+All are exported from `@pawabase/client`.
 
-## Base errors
-
-Every error created by the package extends `PawabaseError`, which extends JavaScript `Error`.
-
-```typescript
-import {
-  isPawabaseError,
-  PawabaseError,
-} from "@pawabase/client";
-
-try {
-  await runOperation();
-} catch (error) {
-  if (isPawabaseError(error)) {
-    reportKnownClientFailure(error);
-  } else {
-    throw error;
-  }
-}
-```
-
-Use `instanceof PawabaseError` in one JavaScript realm.
-The exported guard is useful at generic error boundaries.
-
-## API error fields
-
-Every `ApiError` exposes normalized context.
-
-| Field | Type | Meaning |
+| Class | When | What to do |
 | --- | --- | --- |
-| `status` | `number` | HTTP status |
-| `code` | `string` | Server code or status-derived stable code |
-| `message` | `string` | Human-readable summary |
-| `details` | `unknown` | Structured server detail when present |
-| `body` | `unknown` | Parsed response body as received |
-| `requestId` | `string \| null` | `x-request-id` for Observability correlation |
-| `method` | `string \| undefined` | Request method |
-| `url` | `string \| undefined` | Request URL |
-| `retryAfter` | `number \| null` | Server-requested wait in seconds |
-| `policy` | `string \| null` | Refusing policy name when the response states it |
+| `ValidationError` | The request was refused as invalid before any policy ran | Show field problems; fix the input |
+| `AuthenticationError` | No valid credentials: wrong key, nobody signed in, or the session ended | Sign the person in again |
+| `PermissionError` | Credentials are valid, but a policy, scope or rule said no | Explain; do not retry |
+| `NotFoundError` | No such record, route or file, or a read policy hides it | Treat as absent |
+| `ConflictError` | A unique value is taken, or the request conflicts with current state | Explain; reload and decide |
+| `PayloadTooLargeError` | The body is larger than the gateway or bucket allows | Shrink it, or use another path |
+| `RateLimitError` | Too many requests, and the wait asked for was longer than the client will wait | Wait `retryAfter` seconds |
+| `ServerError` | The platform failed | Report with the request id; try again later |
+| `NetworkError` | No answer reached the client | Check connectivity; safe requests were already retried |
+| `TimeoutError` | An attempt took longer than its timeout | Decide whether the action may have happened |
+| `AbortError` | Your code cancelled the call | Usually ignore |
+| `ConfigError` | A mistake in setup, such as a secret key in a browser | Fix the code |
+| `InvalidQueryError` | Two filters on one field, a comma inside an `in` value, an uncountable total | Rewrite the query |
+| `RealtimeError` | A channel refused, an acknowledgement timed out | See [Realtime](/clients/typescript/realtime) |
 
-```typescript
-import { ApiError } from "@pawabase/client";
+## What an ApiError carries
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `status` | `number` | The HTTP status |
+| `code` | `string` | A stable machine-readable code (see below) |
+| `message` | `string` | A sentence describing the problem |
+| `details` | `unknown` | Structured extras the server sent: validation issues, a flow's details, a quota's numbers |
+| `body` | `unknown` | The parsed response body, exactly as received |
+| `requestId` | `string \| null` | The gateway's `x-request-id` |
+| `method`, `url` | `string \| undefined` | The request that failed |
+| `retryAfter` | `number \| null` | Seconds the server asked the caller to wait, for `429` and some `503` |
+| `policy` | `string \| null` | The name of the refusing policy, when the server named it |
+| `is(code)` | `(code: string) => boolean` | Whether `code` matches |
+
+### Codes
+
+`code` comes from the server when the answer names one, and from the status otherwise.
+
+| Source | Example codes |
+| --- | --- |
+| The gateway | `invalid_api_key`, `origin_not_allowed`, `rate_limit_exceeded` |
+| The data API | `unique_violation`, `constraint_violation`, `quota_exceeded` |
+| A flow's `error.raise` | Whatever the flow names, such as `coupon_expired` |
+| Derived from the status, when the answer has no code | `bad_request`, `unauthenticated`, `forbidden`, `not_found`, `method_not_allowed`, `conflict`, `payload_too_large`, `unsupported_media_type`, `validation_failed`, `rate_limited`, `server_error`, `http_error` |
+
+Branch on `code` when you handle a specific failure, and on the class when you handle a category.
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, ConflictError } from "@pawabase/client";
 
 try {
-  await client.from("posts").get(id);
+  await pawabase.from("customers").create({ email, name });
 } catch (error) {
-  if (error instanceof ApiError) {
-    logger.warn("Pawabase API refusal", {
-      status: error.status,
-      code: error.code,
-      requestId: error.requestId,
-      policy: error.policy,
-    });
-  }
+  if (error instanceof ConflictError && error.is("unique_violation")) return showEmailTaken();
+  if (error instanceof ApiError && error.is("quota_exceeded")) return showUpgrade();
   throw error;
 }
 ```
 
-Do not log `body` indiscriminately.
-It can contain rejected user input or server detail unsuitable for general logs.
+```python Python
+from pawabase import ConflictError, QuotaExceededError
 
-## Status mapping
-
-| Status | Class | Default derived code | Application interpretation |
-| --- | --- | --- | --- |
-| `400` | `ValidationError` | `validation_failed` | Request shape or value was invalid |
-| `401` | `AuthenticationError` | `unauthenticated` | Key/token absent, invalid, or expired |
-| `403` | `PermissionError` | `forbidden` | Credential recognized but not allowed |
-| `404` | `NotFoundError` | `not_found` | Missing or policy-hidden target |
-| `409` | `ConflictError` | `conflict` | Uniqueness or current-state conflict |
-| `413` | `PayloadTooLargeError` | Status-derived | Request or object too large |
-| `422` | `ValidationError` | `validation_failed` | Structured field validation failed |
-| `429` | `RateLimitError` | `rate_limited` | Rate limit refused the request |
-| `5xx` | `ServerError` | `server_error` | Platform or invoked behavior failed |
-
-When the server supplies its own stable code, the SDK preserves it.
-For example, a bad key can be `invalid_api_key` rather than only `unauthenticated`.
-
-## Narrow by status or code
-
-`isApiError(value, status?)` narrows an unknown value.
-`ApiError.is(code)` compares stable code.
-
-```typescript
-import { isApiError } from "@pawabase/client";
-
-if (isApiError(error, 404)) {
-  renderMissing();
-}
+try:
+    pb.from_("customers").create({"email": email, "name": name})
+except ConflictError as error:
+    if error.code == "unique_violation":
+        return show_email_taken()
+    raise
+except QuotaExceededError:
+    return show_upgrade()
 ```
 
-```typescript
-if (error instanceof ApiError && error.is("invalid_api_key")) {
-  reportDeploymentCredentialProblem();
-}
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/customers" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "ada@example.com", "name": "Ada"}'
+# HTTP/1.1 409
+# x-request-id: req_01JB…
+# {"error": "unique_violation", "message": "A record with the same email already exists.", "details": {"columns": ["email"]}}
 ```
+</CodeGroup>
 
-Prefer class checks for broad UX behavior and stable code checks for a documented specific condition.
-Do not branch on full message text.
+### How server answers become errors
 
-## Authentication versus permission
+Pawabase services answer errors in several shapes.
+The client reads all of them, so your code never parses an error body.
 
-`401` and `403` require different remedies.
-
-| Error | Question to answer | Typical response |
+| Answer body | Where it comes from | How the client reads it |
 | --- | --- | --- |
-| `AuthenticationError` | Is the API key valid, and is a required user session present/current? | Refresh/sign in when appropriate, or fix deployment credentials |
-| `PermissionError` | Which key scope or policy refused a known caller? | Show access denied; inspect `policy`, key scopes, and Studio policy |
+| A bare string, such as `"Not found"` | Most `4xx` from the data API | `message` is the string |
+| A bare array of issues | `422` from request validation | `ValidationError` with `issues` |
+| `{ "error": code, "message": text, "details": … }` | The gateway, flows, routes, quotas | `code`, `message` and `details` from the fields |
+| `{ "detail": text }` or `{ "detail": [issues] }` | The auth service and query parameter validation | `message`, or `issues` |
+| Empty | Some `5xx` | `message` is `Request failed with status N.` |
+| Non-JSON text | Proxies, extension routes | `message` is the text |
 
-Do not automatically sign the user out for every `401`.
-A bad deployment API key affects all users and cannot be fixed by user sign-in.
-The auth client already attempts one eligible refresh and replay when a managed access token caused the failure.
+When a message has the form `policy 'name' refused`, the client extracts the name into `policy`.
 
-## Not found is intentionally ambiguous
+<CodeGroup>
+```typescript TypeScript
+import { PermissionError } from "@pawabase/client";
 
-`NotFoundError` can mean the object does not exist or a read policy hides it.
-This prevents an unauthorized caller from probing identifiers.
-
-`maybeGet()` converts record `404` to `null` for normal optional reads.
-It does not remove the ambiguity.
-
-```typescript
-const post = await client.from("posts").maybeGet(id);
-
-if (!post) {
-  renderUnavailable();
+try {
+  await pawabase.from("invoices").update(id, { status: "void" });
+} catch (error) {
+  if (error instanceof PermissionError) console.warn("refused by", error.policy ?? "an unnamed rule");
 }
 ```
 
-Use neutral UI copy unless the caller has a separate administrative source of truth.
+```python Python
+import re
+
+from pawabase import ForbiddenError
+
+try:
+    pb.from_("invoices").update(invoice_id, {"status": "void"})
+except ForbiddenError as error:
+    match = re.search(r"policy '([^']+)' refused", error.message)
+    print("refused by", match.group(1) if match else "an unnamed rule")
+```
+
+```bash cURL
+curl -i -X PATCH "$PAWABASE_URL/rest/v1/invoices/$INVOICE_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"status": "void"}'
+# HTTP/1.1 403
+# policy 'finance_only' refused
+```
+</CodeGroup>
 
 ## Validation errors
 
-`ValidationError` adds parsed `issues` plus helpers for forms.
+A `ValidationError` lists every problem the server found, so a form can show them all at once.
 
-```typescript
+<CodeGroup>
+```typescript TypeScript
 import { ValidationError } from "@pawabase/client";
 
 try {
-  await client.from("profiles").update(userId, input);
+  await pawabase.from("customers").create(values);
 } catch (error) {
-  if (error instanceof ValidationError) {
-    setFormErrors(error.byField());
-    return;
-  }
-  throw error;
+  if (!(error instanceof ValidationError)) throw error;
+  setFieldErrors(error.byField());
 }
 ```
 
-Each issue can include:
+```python Python
+from pawabase import ValidationError
 
-| Field | Meaning |
+
+def by_field(error: ValidationError) -> dict[str, list[str]]:
+    issues = error.detail if isinstance(error.detail, list) else (error.detail or {}).get("detail", [])
+    fields: dict[str, list[str]] = {}
+    for issue in issues if isinstance(issues, list) else []:
+        field = ".".join(str(part) for part in issue.get("loc", []) if part not in ("body", "query", "path"))
+        fields.setdefault(field, []).append(issue.get("msg", "is invalid"))
+    return fields
+
+
+try:
+    pb.from_("customers").create(values)
+except ValidationError as error:
+    set_field_errors(by_field(error))
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/customers" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "not-an-email"}'
+# HTTP/1.1 422
+# [{"type": "missing", "loc": ["body", "name"], "msg": "Field required"}, {"type": "value_error", "loc": ["body", "email"], "msg": "…"}]
+```
+</CodeGroup>
+
+| Member | Returns |
 | --- | --- |
-| `loc` | Full body/query path, such as `['body', 'email']` |
-| `field` | Normalized field name without body/query prefix |
-| `message` | Validation message |
-| `type` | Validator category when supplied |
-| `input` | Rejected input when supplied |
+| `issues` | Every issue: `loc`, `field`, `message`, and `type` and `input` when the server sent them |
+| `fieldError(name)` | The first message for one field, or `undefined` |
+| `byField()` | `{ email: ["…"], name: ["…"] }` |
 
-`fieldError(name)` returns the first message for one field.
-`byField()` returns all messages grouped by field.
+Each issue's `loc` is the path the server reported, such as `["body", "email"]` or `["query", "per_page"]`.
+`field` is the same path without the `body`, `query` or `path` prefix, joined with dots for nested fields, such as `address.city`.
 
-```typescript
-const emailMessage = error.fieldError("email");
-const allMessages = error.byField();
-```
+| Issue `type` | Typical cause |
+| --- | --- |
+| `missing` | A required field was not sent |
+| `string_type`, `int_type`, `bool_type` | A value of the wrong type |
+| `string_too_short`, `string_too_long` | Outside a length constraint |
+| `greater_than_equal`, `less_than_equal` | Outside a range |
+| `enum`, `literal_error` | Not one of the allowed values |
+| `extra_forbidden` | A field the resource does not declare, or a read-only field |
+| `string_pattern_mismatch` | Does not match the field's pattern |
 
-Nested locations can need application-specific mapping to nested form controls.
-Keep the original `issues` when the flattened field name is not enough.
+The messages are written by the server in English.
+For interfaces in other languages, translate by `type` and use the server's message as a fallback.
 
-## Conflicts
+A `400` is a `ValidationError` only when its body lists issues; otherwise it is a plain `ApiError` with code `bad_request`.
 
-`ConflictError` represents an operation incompatible with current state.
-Common examples include a unique value already in use or a state transition that lost a race.
+## Request ids
 
-Do not retry conflicts without changing input or re-reading state.
-For optimistic UI, restore the server representation and explain the conflict rather than replaying the same request automatically.
+Every answer from the gateway carries an `x-request-id`, and every `ApiError` has it as `requestId`.
+It is the key to everything the platform recorded about that request.
 
-## Rate limits
+<CodeGroup>
+```typescript TypeScript
+import { ApiError } from "@pawabase/client";
 
-`RateLimitError.retryAfter` is the parsed server wait in seconds when available.
-The client automatically retries `429` within its configured retry budget when the requested wait does not exceed `maxRetryAfterMs`.
-
-If the server requests a longer wait, the SDK surfaces the error rather than holding the caller longer than configured.
-
-```typescript
-if (error instanceof RateLimitError) {
-  showRateLimitCountdown(error.retryAfter);
+function report(error: unknown) {
+  const requestId = error instanceof ApiError ? error.requestId : null;
+  errorTracker.capture(error, { tags: { pawabase_request_id: requestId ?? "none" } });
 }
+
+declare const errorTracker: { capture(error: unknown, context: object): void };
 ```
 
-The exported `parseRetryAfter()` understands delta seconds and HTTP dates.
-Most applications can rely on the parsed error field.
+```python Python
+import sentry_sdk
 
-## Server errors
+from pawabase import PawabaseError
 
-`ServerError` covers `5xx` responses.
-Only `502`, `503`, and `504` participate in default transient retry rules.
-A `500` is surfaced immediately because repeating application behavior is not assumed safe or useful.
 
-Preserve `requestId` and inspect **Observability**.
-For functions and flows, also inspect their run history and application logs.
-
-## Network errors
-
-`NetworkError` means no response was available because of conditions such as offline state, DNS failure, connection refusal, or reset.
-It carries method and URL when known.
-
-For a read, retry can be straightforward.
-For a write, the server may have completed the operation before the connection failed.
-Reconcile state before encouraging repeated submission.
-
-## Timeout errors
-
-`TimeoutError` means an SDK deadline elapsed.
-Its `timeoutMs` field records the configured attempt limit.
-
-```typescript
-if (error instanceof TimeoutError) {
-  metrics.increment("pawabase.timeout", {
-    timeout_ms: String(error.timeoutMs),
-  });
-}
+def report(error: Exception) -> None:
+    request_id = error.request_id if isinstance(error, PawabaseError) else None
+    with sentry_sdk.new_scope() as scope:
+        scope.set_tag("pawabase_request_id", request_id or "none")
+        sentry_sdk.capture_exception(error)
 ```
 
-Timeout is per attempt.
-Total call time can include backoff and later attempts.
-An elapsed client deadline does not prove server-side work was cancelled.
+```bash cURL
+# Every answer carries the id to search under Project → Activity:
+curl -s -D - -o /dev/null "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_KEY" | grep -i x-request-id
+```
+</CodeGroup>
 
-## Abort errors
+Search for the id under **Project → Activity** in Studio to see the request's logs, its database calls and, for a server error, the traceback.
+For flows, the run started by that request shows each block's input and output.
 
-`AbortError` means the caller's `AbortSignal` fired.
-It usually represents navigation, superseded search, shutdown, or a parent deadline rather than a platform incident.
+Show the id to people when something unexpected fails, in a form they can copy into a support message.
+It turns "it did not work" into a request you can look up in seconds.
+
+## Errors without an answer
+
+### NetworkError
+
+No answer reached the client: the device is offline, DNS failed, the connection was refused or reset, or, in browsers, a CORS refusal hid the answer.
+The message names the origin that could not be reached, and `method` and `url` say which request.
+
+A CORS problem appears as `NetworkError` because browsers hide refused cross-origin answers from JavaScript.
+If a request fails only in the browser and never from a server, check the environment's allowed origins.
+
+### TimeoutError
+
+An attempt took longer than its timeout, 30 seconds by default.
+`timeoutMs` says which limit was hit.
+
+A timeout does not mean the request did nothing.
+The server may have finished the work after the client stopped waiting.
+For writes, check the outcome before repeating.
+
+### AbortError
+
+Your `AbortSignal` fired.
+It is the expected result of cancelling, for example when a component unmounts or a newer search replaces an older one, and most code ignores it.
 
 ```typescript
+import { AbortError } from "@pawabase/client";
+
 try {
-  await query.withOptions({ signal }).execute();
+  await query.withOptions({ signal }).perPage(20);
 } catch (error) {
-  if (error instanceof AbortError) {
-    return;
-  }
+  if (error instanceof AbortError) return;
   throw error;
 }
 ```
 
-Do not show “Pawabase is down” for an intentional abort.
+### ConfigError
 
-## Configuration errors
+The client was configured or used in a way that cannot work: a missing URL, a secret key in a browser, social sign-in without an environment, a secret key placed in a URL, management calls with a publishable key.
+These are programming mistakes; fix the code rather than handling them at runtime.
 
-`ConfigError` is raised when the client cannot safely or coherently use its configuration.
-Examples include an invalid base URL or a secret key detected in a browser.
+### InvalidQueryError
 
-Configuration failures should fail deployment checks or application startup.
-They are not transient user errors and should not be placed in an automatic retry loop.
+The client refused to send a query because the server would answer it wrongly instead of refusing it:
 
-## Invalid queries
+| Message mentions | Cause |
+| --- | --- |
+| `There is already a filter on` | Two filters on one field; the server would keep only the last |
+| `contains a comma` | An `in` value with a comma; the server would split it |
+| `null needs is()/isNot()` | `null` passed to a comparison |
+| `takes an array`, `takes a string pattern`, `takes null, true or false` | A value of the wrong kind for the operator |
+| `cannot count` | `count()` when a per-row policy makes the total unknown |
+| `operators` in `where()` | One field with more than one operator |
 
-`InvalidQueryError` prevents a record request the public filter grammar would interpret incorrectly.
+It extends `PawabaseError`, not `ApiError`: no request was made.
 
-It is used for:
+## Retries
 
-- a second filter on the same field, because the server would retain only the last;
-- an `in` member containing a comma, because the server splits the list on commas.
+The client repeats failures that are safe to repeat, so a brief outage, a rate limit window or a dropped packet rarely reaches your code.
+It never repeats a request that could do harm twice, unless you say it is safe.
 
-Fix the query design.
-Retrying the same builder cannot help.
+### What is retried
 
-## Realtime errors
+| Failure | `GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE` | `POST`, `PATCH` | `POST`, `PATCH` marked `idempotent` |
+| --- | --- | --- | --- |
+| `429` | Retried | Retried | Retried |
+| `502`, `503`, `504` | Retried | Not retried | Retried |
+| Network failure | Retried | Not retried | Retried |
+| Timeout | Retried | Not retried | Retried |
+| `401` with a session | Refreshed once, then repeated | Refreshed once, then repeated | Refreshed once, then repeated |
+| Any other status | Not retried | Not retried | Not retried |
 
-`RealtimeError` adds a protocol-oriented `code` such as `forbidden`.
-Socket acknowledgements, connection state, and rule refusal use this class.
-HTTP helpers under `client.realtime` use ordinary API error classes.
+Three reasons explain the table.
+A `429` is answered by the gateway before the request reaches any service, so nothing happened and repeating is always safe.
+`PUT` and `DELETE` leave the same final state when repeated, so they count as safe.
+A `POST` that failed with a gateway error or a dropped connection may already have created something, so it is repeated only when you mark it idempotent.
 
-```typescript
-room.on("error", (error) => {
-  if (error.code === "forbidden") {
-    renderChannelDenied();
-  }
-});
-```
+Storage uploads are `PUT`s and are retried; signing a URL is marked idempotent by the client because it creates nothing.
 
-## Default retry policy
+A request whose body is a `ReadableStream` is never repeated, because a stream can be read only once.
 
-The transport uses two additional attempts by default.
-Backoff uses full jitter from a 300 ms initial ceiling up to 8 seconds.
-The default maximum accepted `Retry-After` is 30 seconds.
+### How long the client waits
 
-| Failure | `GET` | `PUT` | `DELETE` | `POST` | `PATCH` |
-| --- | --- | --- | --- | --- | --- |
-| `429` | Retry | Retry | Retry | Retry | Retry |
-| `502`, `503`, `504` | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
-| Network failure | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
-| Timeout | Retry | Retry | Retry | No, unless `idempotent` | No, unless `idempotent` |
-| `500` | No | No | No | No | No |
-| Other `4xx` | No | No | No | No | No |
+| Situation | Wait |
+| --- | --- |
+| The answer has a `Retry-After` header, or a `retry_after` field | That many seconds, if no more than `maxRetryAfterMs` (30 s) |
+| `Retry-After` asks for longer than `maxRetryAfterMs` | No retry; `RateLimitError` with `retryAfter` set |
+| No `Retry-After` | Exponential backoff with full jitter |
 
-The method table is a transport rule, not a proof about business semantics.
-Pawabase treats `PUT` and `DELETE` as naturally repeatable for retry policy.
-Design corresponding routes with stable target identity.
+Backoff waits a random time between zero and `min(maxDelayMs, baseDelayMs × 2^attempt)`: up to 300 ms before the second attempt, up to 600 ms before the third, by default.
+Randomness spreads clients out, so a thousand browsers that failed together do not return together.
 
-## Why `429` can retry writes
+`Retry-After` may be a number of seconds or an HTTP date; the client understands both.
 
-Rate limiting is decided before the handler runs, so a `429` means the operation did not execute.
-That makes waiting and retrying safe across methods within the configured budget.
+### Configuring retries
 
-The SDK follows `Retry-After` when it is short enough.
-An excessive wait is surfaced so the application does not hang unexpectedly.
-
-## Declaring a call idempotent
-
-Function, flow, and route call options expose `idempotent`.
-Set it only when repeating the exact request cannot create a duplicate effect.
-
-```typescript
-await client.flows.run(
-  "rebuild-search-index",
-  { index: "products" },
-  { idempotent: true },
-);
-```
-
-An idempotency key understood by server behavior is stronger than a client boolean alone.
-The boolean only permits transport replay; it does not deduplicate on the server.
-
-## Configure retries
-
-```typescript
-const client = createClient({
+<CodeGroup>
+```typescript TypeScript
+const pawabase = createClient({
   url,
   apiKey,
-  retry: {
-    retries: 3,
-    baseDelayMs: 250,
-    maxDelayMs: 4_000,
-    maxRetryAfterMs: 10_000,
-  },
+  retry: { retries: 3, baseDelayMs: 500, maxDelayMs: 10_000, maxRetryAfterMs: 20_000 },
 });
 ```
 
-Set `retry: false` when a queue, workflow engine, or caller owns a larger retry policy.
-Coordinate retry layers to avoid multiplicative attempts.
+```python Python
+# Python: retries counts extra attempts for reads; backoff is fixed at 0.25 s, 0.5 s, 1 s, up to 2 s.
+# 429s are waited out separately: up to 8 times, 1 to 20 seconds each, for any method.
+pb = Pawabase(url, key, environment="production", retries=3)
+```
+</CodeGroup>
 
-For example, three SDK attempts inside five job attempts can execute up to fifteen HTTP attempts.
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `retries` | `2` | Extra attempts after the first; `0` turns retries off |
+| `baseDelayMs` | `300` | The first backoff ceiling |
+| `maxDelayMs` | `8000` | The largest backoff |
+| `maxRetryAfterMs` | `30000` | The longest server-requested wait the client honors |
 
-## Timeouts and retries together
-
-`timeoutMs` is evaluated for every attempt.
+`retry: false` turns retries off for the whole client.
+Through the transport, a single call can set its own policy, which is merged with the client's:
 
 ```typescript
-const client = createClient({
-  url,
-  apiKey,
-  timeoutMs: 10_000,
-  retry: { retries: 2 },
-});
+await pawabase.http.request({ method: "POST", path: "/rest/v1/payments/charge", body, retry: false });
+await pawabase.http.request({ path: "/rest/v1/reports/slow", retry: { retries: 5 } });
 ```
 
-This does not imply a 10-second total deadline.
-The worst case includes three 10-second attempts plus backoff.
-Use an outer `AbortSignal` when the whole operation needs a fixed end-to-end deadline.
+### Marking a call idempotent
 
-## End-to-end deadline
+`flows.run`, `routes.*` and the transport accept `idempotent: true`.
+Use it only when running the call twice cannot cause harm: reads that happen to use `POST`, recalculations, or actions protected by a unique attempt id.
 
 ```typescript
+await pawabase.routes.post("carts/7/recalculate", undefined, { idempotent: true });
+```
+
+Marking a payment or a message send idempotent without such protection invites double charges and duplicate messages after a dropped connection.
+
+### The 401 refresh
+
+When a request carrying a user's token gets `401`, the client asks the session for a fresh token, once, and repeats the request with it.
+If the session's refresh token is refused, the session ends, listeners get `SIGNED_OUT`, and the request throws `AuthenticationError`.
+
+Code therefore rarely needs to handle expired tokens.
+An `AuthenticationError` that reaches your code means the person really must sign in again, or the API key is wrong.
+
+| `AuthenticationError` with | Meaning |
+| --- | --- |
+| A signed-in session that has now ended | The refresh token was revoked, reused or expired; sign in again |
+| Nobody signed in | The operation needs a signed-in person |
+| Code `invalid_api_key` | The key is wrong, revoked or expired |
+
+The refresh happens only when the token came from the client's own session.
+A stateless client created with `accessToken` or `asUser` cannot refresh, and throws on `401`.
+
+## Timeouts
+
+Every attempt has a timeout, 30 seconds by default.
+When an attempt runs longer, the client aborts it and raises `TimeoutError`, or retries it if the request is safe to repeat.
+
+| Setting | Where | Applies to |
+| --- | --- | --- |
+| `timeoutMs` on `createClient` | Client options | Every attempt of every call |
+| `timeoutMs` on a call | Most methods' options, and `withOptions` on queries | Each attempt of that call |
+| `0` | Either | No timeout |
+
+Because the limit is per attempt, a call that is retried can take longer than its timeout in total.
+
+| Settings | Longest a safe call can take before failing |
+| --- | --- |
+| Default: 30 s timeout, 2 retries | About 90 s, plus up to about 1 s of backoff |
+| 10 s timeout, 2 retries | About 30 s, plus backoff |
+| 10 s timeout, `retry: false` | 10 s |
+
+For interactive screens, a shorter client timeout with retries feels better than one long wait: a stalled connection is abandoned and replaced quickly.
+For uploads, reports and slow flows, set a longer timeout on those calls only.
+
+<CodeGroup>
+```typescript TypeScript
+const pawabase = createClient({ url, apiKey, timeoutMs: 12_000 });
+
+await pawabase.flows.run("build-annual-report", { year: 2026 }, { timeoutMs: 120_000 });
+await pawabase.storage.from("videos").upload("intro.mp4", file, { timeoutMs: 0 });
+```
+
+```python Python
+pb = Pawabase(url, key, environment="production", timeout=12)                 # seconds per attempt
+reports = Pawabase(url, key, environment="production", timeout=120)          # a client for long calls
+reports.flows.invoke("build-annual-report", {"year": 2026})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/flows/v1/build-annual-report" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"year": 2026}' --max-time 120
+```
+</CodeGroup>
+
+## Cancellation
+
+Most methods accept an `AbortSignal`, and queries take one through `withOptions`.
+Aborting stops the attempt in flight and any wait before the next retry, and the call rejects with `AbortError`.
+
+```typescript
+import { AbortError } from "@pawabase/client";
+
 const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), 15_000);
 
-try {
-  return await client
-    .from("posts")
-    .withOptions({ signal: controller.signal })
-    .all({ maxRecords: 500 });
-} finally {
-  clearTimeout(timer);
-}
+const pending = pawabase.from("orders").eq("status", "open").withOptions({ signal: controller.signal }).perPage(50);
+
+controller.abort();
+await pending.catch((error) => {
+  if (!(error instanceof AbortError)) throw error;
+});
 ```
 
-This aborts the complete caller wait even when an SDK attempt timeout and retry budget would allow longer.
+Signals combine with timeouts: whichever fires first ends the attempt.
+Use `AbortSignal.timeout(ms)` for a deadline that covers the whole call, retries included, which the per-attempt timeout does not:
 
-## Hooks for observability
+<CodeGroup>
+```typescript TypeScript
+const deadline = AbortSignal.timeout(15_000);
+await pawabase.from("orders").withOptions({ signal: deadline }).perPage(50);
+```
 
-Transport hooks observe each attempt.
+```python Python
+import asyncio
+
+# A deadline for the whole call, retries included (async client):
+async with asyncio.timeout(15):
+    page = await apb.from_("orders").per_page(50).execute()
+```
+
+```bash cURL
+curl --max-time 15 "$PAWABASE_URL/rest/v1/orders?per_page=50" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN"
+```
+</CodeGroup>
+
+A deadline signal that fires raises `AbortError`, not `TimeoutError`, because from the client's view your code cancelled the call.
+
+Cancelling stops the client from waiting.
+It does not stop work the server has already started, so a cancelled write may still have happened.
+
+| Situation | Use |
+| --- | --- |
+| A component unmounts | An `AbortController` per component, aborted in cleanup |
+| A search input changes | Abort the previous search when starting the next |
+| A whole operation must finish within a time budget | `AbortSignal.timeout(ms)` |
+| A person presses "Cancel" on an upload | An `AbortController` wired to the button |
+
+## Observing failures with hooks
+
+Hooks let you see every attempt, retry and failure without wrapping each call.
+They are configured once, on the client.
+
+| Hook | Called | Receives |
+| --- | --- | --- |
+| `onRequest` | Before each attempt | `method`, `url`, `attempt`, and `headers` with `apikey` and `authorization` masked |
+| `onResponse` | After each attempt that got an answer | `method`, `url`, `attempt`, `status`, `durationMs`, `requestId` |
+| `onRetry` | Before waiting to repeat | `method`, `url`, `attempt`, `reason`, `delayMs` |
+| `onError` | When the client is about to throw | The error, with `method`, `url`, `attempt` |
+
+`reason` in `onRetry` is either `status <n>` or the error's class name, such as `NetworkError` or `TimeoutError`.
+`attempt` counts from `0`.
 
 ```typescript
-const client = createClient({
+import { AbortError, ApiError, createClient } from "@pawabase/client";
+
+const pawabase = createClient({
   url,
   apiKey,
   hooks: {
-    onRequest(info) {
-      metrics.increment("pawabase.request", {
-        method: info.method,
-        attempt: String(info.attempt),
-      });
+    onRetry: ({ method, url, attempt, reason, delayMs }) =>
+      console.info(`retry ${attempt + 1} of ${method} ${new URL(url).pathname} in ${delayMs} ms: ${reason}`),
+    onError: (error, { method, url }) => {
+      if (error instanceof AbortError) return;
+      errorTracker.capture(error, { method, path: new URL(url).pathname, requestId: error instanceof ApiError ? error.requestId : null });
     },
-    onResponse(info) {
-      metrics.timing("pawabase.response_ms", info.durationMs, {
-        status: String(info.status),
-      });
-    },
-    onRetry(info) {
-      metrics.increment("pawabase.retry", {
-        reason: info.reason,
-      });
-    },
-    onError(error, info) {
-      captureTransportError(error, info);
-    },
+  },
+});
+
+declare const errorTracker: { capture(error: unknown, context: object): void };
+```
+
+A hook that throws is ignored; observability can never break a request.
+Hooks never receive response bodies, which keeps personal data out of logs by default.
+
+`onError` runs for every error the client throws from a request, including errors your code will handle, such as a `404` from `maybeGet`.
+Filter what you send to an error tracker: expected outcomes like `NotFoundError` and `ValidationError` are usually noise there.
+
+## A structure for handling errors
+
+Applications that handle errors well usually do it in three layers, each with a narrow job.
+
+| Layer | Handles | Example |
+| --- | --- | --- |
+| The call site | Failures it expects and can act on | A `ConflictError` on sign-up means "email taken" |
+| The feature | Turning remaining errors into something to show | A shared function maps classes and codes to messages |
+| The application | Errors nobody expected | An error boundary reports them with the request id and shows a fallback |
+
+```typescript
+import {
+  ApiError,
+  AuthenticationError,
+  NetworkError,
+  PermissionError,
+  RateLimitError,
+  ServerError,
+  TimeoutError,
+  ValidationError,
+} from "@pawabase/client";
+
+export interface Presentable {
+  message: string;
+  fields?: Record<string, string[]>;
+  canRetry: boolean;
+  mustSignIn: boolean;
+  requestId: string | null;
+}
+
+export function present(error: unknown, codes: Record<string, string> = {}): Presentable {
+  const requestId = error instanceof ApiError ? error.requestId : null;
+  const base = { canRetry: false, mustSignIn: false, requestId };
+  if (error instanceof ApiError && codes[error.code]) return { ...base, message: codes[error.code] };
+  if (error instanceof ValidationError) return { ...base, message: "Some fields need attention.", fields: error.byField() };
+  if (error instanceof AuthenticationError) return { ...base, message: "Please sign in again.", mustSignIn: true };
+  if (error instanceof PermissionError) return { ...base, message: "You do not have permission to do that." };
+  if (error instanceof RateLimitError) return { ...base, message: "Too many requests. Wait a moment and try again.", canRetry: true };
+  if (error instanceof ServerError) return { ...base, message: "Something went wrong on our side.", canRetry: true };
+  if (error instanceof NetworkError || error instanceof TimeoutError) return { ...base, message: "We could not reach the server.", canRetry: true };
+  if (error instanceof ApiError) return { ...base, message: error.message };
+  return { ...base, message: "Something went wrong." };
+}
+```
+
+In React, an error boundary is the application layer for rendering errors, and a global handler covers errors from event handlers and effects:
+
+```tsx
+import { Component, type ReactNode } from "react";
+import { ApiError } from "@pawabase/client";
+
+export class ErrorBoundary extends Component<{ children: ReactNode }, { error: unknown }> {
+  state = { error: null as unknown };
+  static getDerivedStateFromError(error: unknown) {
+    return { error };
+  }
+  componentDidCatch(error: unknown) {
+    errorTracker.capture(error, { requestId: error instanceof ApiError ? error.requestId : null });
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    const requestId = this.state.error instanceof ApiError ? this.state.error.requestId : null;
+    return (
+      <div role="alert">
+        <p>Something went wrong.</p>
+        {requestId && <p>Reference: <code>{requestId}</code></p>}
+      </div>
+    );
+  }
+}
+
+declare const errorTracker: { capture(error: unknown, context: object): void };
+```
+
+## Messages people understand
+
+Error messages are read by people who did nothing wrong, often in a hurry.
+Say what happened and what to do next, in their terms.
+
+| Error | Say | Avoid |
+| --- | --- | --- |
+| `ValidationError` | The field's problem, next to the field | "Request failed with status 422" |
+| `AuthenticationError` after a session ends | "Your session ended. Sign in to continue." | "401 Unauthorized" |
+| `PermissionError` | "You do not have access to this." | Naming the policy |
+| `NotFoundError` on a page | "This item does not exist or was removed." | "404" |
+| `ConflictError` with `unique_violation` | "An account with this email already exists." | "Duplicate key value" |
+| `RateLimitError` | "Please wait a few seconds and try again." | Silent failure |
+| `NetworkError`, `TimeoutError` | "Check your connection." with a retry button | Infinite spinners |
+| `ServerError` | "Something went wrong on our side." with the reference | The server's message |
+
+Policy names, internal messages and stack traces belong in logs, not on screen.
+
+## Rate limits in practice
+
+Rate limits apply per environment at the gateway, and optionally per resource and per route.
+When a limit is reached, the answer is `429` with a `Retry-After`.
+
+| What you see | Meaning |
+| --- | --- |
+| Calls slow down without failing | The client waited for `Retry-After` and repeated them |
+| `RateLimitError` with `retryAfter` | The server asked for a longer wait than `maxRetryAfterMs`, or retries ran out |
+| `RateLimitError` on sign-in with the right password | The account is locked after failed attempts; wait it out |
+
+The gateway also sends `X-RateLimit-Limit` and `X-RateLimit-Remaining` on answers when the limiter is active.
+The client does not read them, but a custom `fetch` can, if you want to slow down before reaching the limit:
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  fetch: async (input, init) => {
+    const response = await fetch(input, init);
+    const remaining = Number(response.headers.get("x-ratelimit-remaining"));
+    if (Number.isFinite(remaining) && remaining < 5) await new Promise((resolve) => setTimeout(resolve, 500));
+    return response;
   },
 });
 ```
 
-Hook failures are swallowed so monitoring cannot fail the application request.
-Headers passed to request hooks have credentials masked.
-Keep your own error capture and body logging policies equally careful.
+Most applications never need this.
+It helps batch jobs that run close to the limit, where slowing down a little avoids long `Retry-After` waits.
 
-## Request IDs and Studio
+## Handling errors in server code
 
-When `requestId` exists, include it in support output and structured logs.
-Open Studio's **Observability** area and search the corresponding request.
-
-```typescript
-if (error instanceof ApiError && error.requestId) {
-  showSupportReference(error.requestId);
-}
-```
-
-A request ID is diagnostic metadata, not a secret and not proof of authorization.
-It is more reliable than comparing approximate timestamps and URLs.
-
-## Form handling pattern
+A server that calls Pawabase and answers its own clients should translate errors, not pass them through.
+Its own clients do not need to know which service failed, and must not see internal details.
 
 ```typescript
-async function saveProfile(input) {
+import express from "express";
+import { ApiError, NetworkError, NotFoundError, PermissionError, ValidationError } from "@pawabase/client";
+
+const app = express();
+
+app.get("/api/orders/:id", async (req, res, next) => {
   try {
-    const profile = await client.from("profiles").update(input.id, input);
-    return { ok: true, profile };
+    res.json(await pawabaseFor(req).from("orders").get(req.params.id));
   } catch (error) {
-    if (error instanceof ValidationError) {
-      return {
-        ok: false,
-        kind: "validation",
-        fields: error.byField(),
-      };
-    }
-
-    if (error instanceof ConflictError) {
-      return {
-        ok: false,
-        kind: "conflict",
-      };
-    }
-
-    if (error instanceof PermissionError) {
-      return {
-        ok: false,
-        kind: "forbidden",
-        requestId: error.requestId,
-      };
-    }
-
-    throw error;
+    next(error);
   }
-}
+});
+
+app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const requestId = error instanceof ApiError ? error.requestId : null;
+  if (error instanceof NotFoundError) return res.status(404).json({ error: "not_found" });
+  if (error instanceof PermissionError) return res.status(403).json({ error: "forbidden" });
+  if (error instanceof ValidationError) return res.status(422).json({ error: "invalid", fields: error.byField() });
+  if (error instanceof NetworkError) return res.status(503).json({ error: "unavailable" });
+  console.error("unexpected", { requestId, error });
+  return res.status(500).json({ error: "internal", reference: requestId });
+});
+
+declare function pawabaseFor(req: express.Request): import("@pawabase/client").PawabaseClient;
 ```
 
-Known expected outcomes become application results.
-Unknown failures continue to the error boundary and monitoring layer.
+Log the Pawabase request id with your own server's request id, so one incident can be followed across both.
 
-## Server action pattern
+Errors from a secret-key client deserve extra care.
+A `PermissionError` there usually means a scope or IP restriction on the key, not a policy, because secret keys bypass policies.
+
+## Testing error handling
+
+Error paths are the least exercised code in most applications.
+A fake `fetch` can produce every failure on demand.
 
 ```typescript
-async function confirmOrder(accessToken, orderId) {
-  const actingClient = baseClient.asUser(accessToken);
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient, ConflictError, NetworkError, RateLimitError, ValidationError } from "@pawabase/client";
 
-  try {
-    return await actingClient.routes.post(
-      "orders/confirm",
-      { order_id: orderId },
-    );
-  } catch (error) {
-    if (error instanceof ApiError) {
-      logger.warn("Order confirmation refused", {
-        status: error.status,
-        code: error.code,
-        requestId: error.requestId,
-      });
-    }
-    throw error;
-  }
+function clientAnswering(...answers: Array<() => Response | Promise<Response>>) {
+  let index = 0;
+  const calls: number[] = [];
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    retry: { retries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async () => {
+      calls.push(index);
+      const answer = answers[Math.min(index, answers.length - 1)];
+      index += 1;
+      return answer();
+    },
+  });
+  return { pawabase, calls };
 }
-```
 
-Do not set `idempotent: true` unless the order route has a stable deduplication or deterministic state contract.
+const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+  () => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 
-## Common incorrect handling
+test("422 becomes ValidationError with fields", async () => {
+  const { pawabase } = clientAnswering(json(422, [{ loc: ["body", "email"], msg: "value is not a valid email", type: "value_error" }]));
+  const error = await pawabase.from("customers").create({ email: "x" }).catch((e) => e);
+  assert.ok(error instanceof ValidationError);
+  assert.deepEqual(error.byField(), { email: ["value is not a valid email"] });
+});
 
-| Pattern | Problem | Better decision |
-| --- | --- | --- |
-| Catch every error and return `null` | Hides permission, auth, validation, and outage distinctions | Convert only an expected class such as not-found |
-| Retry every `POST` | Duplicates side effects after ambiguous failures | Retry only a proven idempotent operation |
-| Match `error.message` | Copy can change and body shapes vary | Match class, status, or stable code |
-| Sign out on every `401` | Deployment key failures look like user expiry | Let managed refresh run; inspect code and scope |
-| Show raw validation body | Poor UX and possible data exposure | Map `issues` to controlled field messages |
-| Ignore `requestId` | Makes operations hard to correlate | Record and display a support reference |
-| Treat timeout as cancellation of server work | Can cause duplicate resubmission | Reconcile state or use a status endpoint |
-| Nest queue and SDK retries blindly | Produces retry storms | Assign ownership and calculate total attempts |
+test("409 unique violation keeps its code and columns", async () => {
+  const { pawabase } = clientAnswering(json(409, { error: "unique_violation", message: "A record with the same email already exists.", details: { columns: ["email"] } }));
+  const error = await pawabase.from("customers").create({ email: "a@b.c" }).catch((e) => e);
+  assert.ok(error instanceof ConflictError);
+  assert.equal(error.code, "unique_violation");
+  assert.deepEqual(error.details, { columns: ["email"] });
+});
 
-## Response-body normalization
+test("a 503 on a read is retried, then succeeds", async () => {
+  const { pawabase, calls } = clientAnswering(json(503, "busy"), json(200, { data: [], page: 1, per_page: 20, total: 0 }));
+  await pawabase.from("orders").perPage(20);
+  assert.equal(calls.length, 2);
+});
 
-Pawabase public surfaces can express errors in several body shapes.
-The SDK reads them into the same hierarchy.
+test("a network failure on a create is not retried", async () => {
+  const { pawabase, calls } = clientAnswering(() => Promise.reject(new TypeError("fetch failed")));
+  await assert.rejects(pawabase.from("orders").create({ total_minor: 1 }), NetworkError);
+  assert.equal(calls.length, 1);
+});
 
-| Response shape | Example source | Normalized behavior |
-| --- | --- | --- |
-| Plain string | Simple API refusal | String becomes `message`; status supplies default code |
-| Bare validation issue array | Schema validation | Becomes `ValidationError.issues` |
-| `{ detail: [...] }` | Validation layer | Detail issues become `ValidationError.issues` |
-| `{ detail: "..." }` | Auth or API refusal | Detail becomes message |
-| `{ error, message, details }` | Gateway, function, or flow | Stable error code, message, and details preserved |
-| Unknown JSON body | Other public error | Preserved in `body` with status-derived class/code |
-
-Application code therefore does not need a different parser for records, auth, routes, functions, and flows.
-
-## Validation locations
-
-A validation issue's `loc` can start with `body`, `query`, or another request area and can contain nested indexes.
-
-```json
-{
-  "loc": ["body", "addresses", 0, "postal_code"],
-  "msg": "invalid postal code",
-  "type": "value_error"
-}
-```
-
-`field` is a convenient flattened field name for ordinary forms.
-For arrays and nested forms, use `loc` to map the message to the exact control.
-
-```typescript
-function formPath(issue: ValidationIssue) {
-  return issue.loc
-    .filter((part) => part !== "body" && part !== "query")
-    .join(".");
-}
-```
-
-Never reflect `input` into HTML without the application's normal escaping and data-handling rules.
-
-## Per-call retry overrides
-
-The lower-level capability option types can override timeout and, where exposed by the transport surface, retry behavior for one request.
-Use a client with `retry: false` when a whole operation must have single-attempt semantics.
-
-```typescript
-const singleAttempt = createClient({
-  url,
-  apiKey,
-  retry: false,
+test("a long Retry-After surfaces as RateLimitError", async () => {
+  const { pawabase } = clientAnswering(json(429, { error: "rate_limit_exceeded", retry_after: 120 }, { "retry-after": "120" }));
+  const error = await pawabase.from("orders").perPage(20).catch((e) => e);
+  assert.ok(error instanceof RateLimitError);
+  assert.equal(error.retryAfter, 120);
 });
 ```
 
-For a query, `withOptions({ timeoutMs, signal })` changes its attempt deadline and cancellation but does not expose an independent query retry object.
-Keep retry ownership at the client or direct transport layer rather than assuming every high-level method has the same option surface.
+Small retry delays in the test client keep these tests fast while still exercising the retry path.
 
-## Backoff distribution
+## How the client picks the class
 
-Full jitter chooses a random delay from zero through the exponential ceiling.
+The class is chosen by status, in this order, after the body has been read:
 
-```text
-attempt 0: 0 .. baseDelayMs
-attempt 1: 0 .. baseDelayMs × 2
-attempt 2: 0 .. baseDelayMs × 4
-...
-capped by maxDelayMs
-```
+| Order | Condition | Class |
+| --- | --- | --- |
+| 1 | `422`, or `400` whose body lists issues | `ValidationError` |
+| 2 | `401` | `AuthenticationError` |
+| 3 | `403` | `PermissionError` |
+| 4 | `404` | `NotFoundError` |
+| 5 | `409` | `ConflictError` |
+| 6 | `413` | `PayloadTooLargeError` |
+| 7 | `429` | `RateLimitError` |
+| 8 | `500` and above | `ServerError` |
+| 9 | Anything else | `ApiError` |
 
-Jitter spreads a fleet of clients after a shared outage.
-Do not write tests that expect one exact delay.
-Assert attempt count and an acceptable time bound, or configure very small ceilings.
+The code, message, details and retry hint are read from the body first, so every class carries them.
+A flow that raises `403` with the code `plan_required` arrives as a `PermissionError` whose `code` is `plan_required`.
 
-## `Retry-After` forms
+## Errors raised before any request
 
-The parser accepts delta seconds and HTTP dates.
+Some errors are raised by the client itself, without a request, because sending would be pointless or harmful.
 
-```text
-Retry-After: 5
-```
+| Error | Raised by | Example |
+| --- | --- | --- |
+| `ConfigError` | `createClient`, auth, storage, `manage`, `admin` | A secret key in a browser; social sign-in without an environment; an empty storage key |
+| `InvalidQueryError` | Query builders and `count()` | A second filter on one field; a comma in an `in` value |
+| `RealtimeError` | Channels | `not_connected` when the connection did not open in time |
 
-```text
-Retry-After: Fri, 09 Oct 2026 12:00:00 GMT
-```
+Some impossible queries are answered locally instead of raising: `in(column, [])` returns an empty page without a request, because it can match nothing.
 
-The normalized `retryAfter` field is seconds.
-A past HTTP date becomes an immediate or zero-length wait under parsing behavior.
-The SDK refuses to sleep beyond `maxRetryAfterMs` and surfaces `RateLimitError` or the relevant API error.
+## Realtime errors compared with HTTP errors
 
-## Attempt numbering in hooks
+| | HTTP calls | Realtime channels |
+| --- | --- | --- |
+| Class | `ApiError` subclasses and transport errors | `RealtimeError` with a `code` |
+| Refusal | `401` or `403` | `forbidden` in the acknowledgement |
+| Too large | `PayloadTooLargeError` | `payload_too_large` |
+| Too fast | `RateLimitError`, retried | `rate_limited`, not retried |
+| Lost connection | `NetworkError`, retried when safe | The connection reconnects; channels rejoin |
 
-Hook attempt numbers are zero-based.
-The original request is attempt `0`; the first retry is attempt `1`.
+The realtime module's HTTP methods, `publish`, `presence` and `history`, raise HTTP errors like any other call.
+
+## Wrapping errors without losing them
+
+When your own layer adds context, wrap the original error as the `cause` instead of replacing it.
+The class, code and request id then remain available to whoever handles it.
 
 ```typescript
-onRetry(info) {
-  logger.warn("Retrying Pawabase request", {
-    nextAttempt: info.attempt + 1,
-    reason: info.reason,
-    delayMs: info.delayMs,
-  });
+export class OrderLoadError extends Error {
+  constructor(readonly orderId: string, options: { cause: unknown }) {
+    super(`Could not load order ${orderId}`, options);
+    this.name = "OrderLoadError";
+  }
+}
+
+try {
+  await pawabase.from("orders").get(orderId);
+} catch (cause) {
+  throw new OrderLoadError(orderId, { cause });
 }
 ```
 
-`onRequest` runs for every actual attempt.
-`onResponse` runs for every obtained response, including a response that will be retried.
-`onError` runs for the final surfaced failure rather than every intermediate retry decision.
+Error trackers show the chain of causes, and handlers can inspect `error.cause instanceof NotFoundError` when they need to.
 
-## Token refresh is separate from transport retries
+## Each class in a sentence of advice
 
-A `401` replay after successful token refresh does not consume the normal retry budget in the same way as a `503` retry.
-It is limited to one refresh decision for the request.
+<AccordionGroup>
+  <Accordion title="ValidationError">
+    Show `byField()` next to the inputs and keep everything the person typed; the request never reached a policy, so nothing changed.
+  </Accordion>
+  <Accordion title="AuthenticationError">
+    The client already tried to refresh; ask the person to sign in again, and keep their unsaved work.
+  </Accordion>
+  <Accordion title="PermissionError">
+    Explain that the action is not allowed, without naming internal policies; retrying will not help.
+  </Accordion>
+  <Accordion title="NotFoundError">
+    Treat the thing as absent, whether it never existed or is hidden; on deletes, treat it as success.
+  </Accordion>
+  <Accordion title="ConflictError">
+    Read `details` for the conflicting columns, explain, and reload the data before the person decides again.
+  </Accordion>
+  <Accordion title="RateLimitError">
+    Wait `retryAfter` seconds before trying again, and tell the person why the action paused.
+  </Accordion>
+  <Accordion title="ServerError">
+    Report it with the request id and offer to try again; the problem is not the person's.
+  </Accordion>
+  <Accordion title="NetworkError and TimeoutError">
+    Offer to try again when the connection returns, and check whether a write already happened before repeating it.
+  </Accordion>
+</AccordionGroup>
 
-The body must be replayable.
-A stream body cannot be replayed after `401`, network failure, or transient status because it may already be consumed.
+## Retry behavior of each method
 
-This matters for direct streaming uploads from a long-lived signed-in client.
-Refresh the session before creating the stream when expiry is near, or use a signed upload URL whose authority is in the URL and does not require user-token refresh.
+The retry rules depend on the HTTP method a call uses, and on whether the client marks it idempotent.
+This table applies them to the client's own methods.
 
-## Ambiguous outcomes
-
-Classify failures by whether server execution is known.
-
-| Failure | Did the server answer? | Write outcome |
+| Method | HTTP | Retried after network failures and `502`–`504` |
 | --- | --- | --- |
-| Validation `4xx` | Yes | Operation refused before successful completion |
-| Permission `403` | Yes | Operation refused |
-| Rate limit `429` | Yes | Handler did not run |
-| Conflict `409` | Yes | Requested state not applied as successful operation |
-| `502`/`503`/`504` | Gateway/service answered | Can be ambiguous depending on architecture and method |
-| Network reset | No usable response | Ambiguous |
-| Client timeout | No timely response | Ambiguous |
-| Caller abort | Caller stopped waiting | Server may continue |
+| Queries, `get`, `maybeGet`, `first`, `count`, `all` | `GET` | Yes |
+| `create`, `createMany` (each row) | `POST` | No |
+| `update` | `PATCH` | No |
+| `replace` | `PUT` | Yes |
+| `delete` | `DELETE` | Yes |
+| `storage.from(b).upload`, `uploadToSignedUrl` | `PUT` | Yes, unless the body is a stream |
+| `download*`, `list`, `listBuckets` | `GET` | Yes |
+| `remove` | `DELETE` | Yes |
+| `createSignedUrl`, `createSignedUploadUrl` | `POST`, marked idempotent | Yes |
+| `flows.run`, `routes.post`, `routes.patch` | `POST`, `PATCH` | Only with `idempotent: true` |
+| `routes.get`, `routes.put`, `routes.delete` | `GET`, `PUT`, `DELETE` | Yes |
+| `auth.signInWithPassword`, `signUp` and other auth `POST`s | `POST` | No |
+| `realtime.publish` | `POST` | No |
+| `manage()` and `admin()` reads | `GET` | Yes |
+| `manage()` and `admin()` writes | `POST`, `PATCH`, `PUT`, `DELETE` | `PUT` and `DELETE` yes; `POST` and `PATCH` no |
 
-For payments, email, external webhooks, and workflow starts, return and persist stable operation IDs so the client can ask what happened.
+Every row is retried after `429`, because a rate-limited request never reached a service.
 
-## UI error taxonomy
+## Checking error screens
 
-Map transport detail into a small application vocabulary while retaining the original error for diagnostics.
+Error screens are user interface, and they break like any other.
+Component tests can render them with real error objects, built the same way the client builds them:
 
 ```typescript
-type SaveFailure =
-  | { kind: "signed_out" }
-  | { kind: "forbidden"; requestId: string | null }
-  | { kind: "validation"; fields: Record<string, string[]> }
-  | { kind: "conflict" }
-  | { kind: "retry_later"; after: number | null }
-  | { kind: "unknown"; requestId: string | null };
+import { NotFoundError, ValidationError } from "@pawabase/client";
+
+const notFound = new NotFoundError({ status: 404, code: "not_found", message: "Not found", requestId: "req_test" });
+const invalid = new ValidationError({
+  status: 422,
+  code: "validation_failed",
+  message: "email: value is not a valid email",
+  issues: [{ loc: ["body", "email"], field: "email", message: "value is not a valid email" }],
+});
 ```
 
-This keeps UI copy stable even when low-level messages vary, while operations teams still receive code and request ID.
+Rendering each screen with each class catches messages that overflow, missing request ids and retry buttons that do nothing.
 
-## Error boundaries and expected results
+## Three failures, followed through
 
-Expected domain outcomes should be handled near the operation.
-Unexpected transport and programming failures should reach a shared error boundary.
+### A deploy during checkout
 
-Do not catch at the client singleton and erase context for every caller.
-A record form, background synchronization job, and realtime status banner need different decisions from the same base classes.
+The installation restarts its services while a person is paying.
 
-## Testing the retry matrix
+```text
+t=0.0 s   GET  /rest/v1/carts/7          200      the cart loads
+t=1.2 s   POST /rest/v1/carts/7/checkout 503      gateway: service restarting
+          POST, not idempotent → not retried → ServerError thrown
+t=1.2 s   screen: "Something went wrong on our side." [Try again]
+t=4.0 s   person presses Try again
+          POST /rest/v1/carts/7/checkout 200      checkout succeeds
+```
 
-Tests should lock down method safety, not only eventual success.
+A `503` from the gateway during a restart usually means the request never reached the flow, but the client cannot know that for a `POST`, so it does not guess.
+The person decides to try again, which is safe here because the checkout route uses a unique attempt id; a second, duplicate checkout would fail with `409`.
 
-| Test input | Expected attempts |
-| --- | --- |
-| `GET` then `503` then success | Two |
-| `POST` then `503` | One |
-| Idempotent `POST` then `503` then success | Two |
-| Any method then `500` | One |
-| Any method then `429` with short wait then success | Two |
-| `429` with wait above configured cap | One surfaced error |
-| Safe method network failure within budget | Retry |
-| Caller abort | One and no retry |
-| Stream body transient failure | One and no replay |
-| Refresh endpoint network failure | No automatic refresh replay |
+Had the request been a `GET`, the client would have waited a fraction of a second and repeated it, and the person would never have known.
 
-Use a fake fetch for attempt counts and a real environment for gateway request IDs and policy fields.
-See [server runtimes and testing](/clients/typescript/server-runtimes-testing).
+### A person on a train
 
-## Error-response security
+The connection drops for twenty seconds while someone reads a list and then saves a note.
 
-Do not expose `body`, internal details, policy names, or complete URLs to end users without review.
-Policy names and request structure can reveal application design.
-Logs should omit access tokens, refresh tokens, API keys, passwords, signed URLs, and sensitive rejected input.
+```text
+t=0 s    GET  /rest/v1/notes?per_page=20       NetworkError
+         safe → wait ~200 ms → NetworkError → wait ~500 ms → NetworkError
+         NetworkError thrown after 3 attempts
+         screen: "We could not reach the server." [Try again]
+t=25 s   connection back; person presses Try again → 200
+t=30 s   PATCH /rest/v1/notes/9                 200
+```
 
-UI copy should describe what the user can do.
-Operational logs should preserve class, status, code, request ID, method, safe route label, and attempt count.
+Three quick attempts cover a blip; they cannot cover twenty seconds.
+For screens used on the move, listen for the browser's `online` event and retry reads automatically when the connection returns, and keep unsaved input in the form so nothing is lost.
 
-## Troubleshooting matrix
+### A session that ends mid-form
 
-| Observation | Likely layer | First evidence |
+A person fills in a long form, leaves the tab for a day, and submits.
+Their refresh token was revoked in the meantime because they changed their password on another device.
+
+```text
+POST /rest/v1/applications            401
+     session refresh → POST /auth/v1/token  401 (refresh token revoked)
+     session cleared, listeners get SIGNED_OUT
+AuthenticationError thrown
+```
+
+The form's values are still in memory.
+Keep them, show a sign-in dialog instead of navigating away, and resubmit after `SIGNED_IN`:
+
+<CodeGroup>
+```typescript TypeScript
+import { AuthenticationError } from "@pawabase/client";
+
+export async function submitWithReauth(submit: () => Promise<unknown>, askToSignIn: () => Promise<void>) {
+  try {
+    return await submit();
+  } catch (error) {
+    if (!(error instanceof AuthenticationError)) throw error;
+    await askToSignIn();
+    return submit();
+  }
+}
+```
+
+```python Python
+from pawabase import AuthenticationError
+
+
+def submit_with_reauth(submit, ask_to_sign_in):
+    try:
+        return submit()
+    except AuthenticationError:
+        ask_to_sign_in()
+        return submit()
+```
+</CodeGroup>
+
+Losing a long form to an expired session is one of the most frustrating failures an application can have, and one of the easiest to prevent.
+
+## Status codes at a glance
+
+| Status | Class | Retried | Typical cause |
+| --- | --- | --- | --- |
+| `400` | `ValidationError` with issues, else `ApiError` | No | Malformed request, bad query parameter, body not JSON |
+| `401` | `AuthenticationError` | After one refresh, when a session exists | No or invalid key or token |
+| `403` | `PermissionError` | No | Policy, scope, CORS origin, firewall, plan quota |
+| `404` | `NotFoundError` | No | Missing, hidden by a policy, disabled operation, unknown route |
+| `405` | `ApiError` (`method_not_allowed`) | No | Wrong method for a path |
+| `409` | `ConflictError` | No | Unique value taken, state conflict |
+| `413` | `PayloadTooLargeError` | No | Body too large |
+| `415` | `ApiError` (`unsupported_media_type`) | No | Wrong content type |
+| `422` | `ValidationError` | No | Body or parameters failed validation |
+| `429` | `RateLimitError` | Yes, any method | Rate limit, account lockout |
+| `500` | `ServerError` | No | Unexpected failure |
+| `502`, `503`, `504` | `ServerError` | For safe requests | Restart, overload, upstream timeout |
+
+## Codes you will meet
+
+| Code | Status | Meaning |
 | --- | --- | --- |
-| `ConfigError` before traffic | Application configuration | Constructor input and runtime |
-| `InvalidQueryError` | Application query construction | Repeated field or comma-containing list member |
-| `401 invalid_api_key` across operations | Deployment credential | **Build → Settings → API keys** |
-| `401` after token expiry | User session | Auth event stream and refresh failure |
-| `403` with `policy` | Authorization | Named policy and current auth/key context |
-| `404` for one record | Existence or read visibility | Neutral result plus policy review |
-| `422` | Request validation | `issues` and **API Explorer** schema |
-| `429` after SDK waits | Sustained rate pressure or excessive requested wait | `retryAfter` and hook retry events |
-| Repeated `503` | Service availability | Request ID and Studio Observability |
-| `NetworkError` only in one runtime | DNS, proxy, TLS, or runtime fetch | URL and transport adapter |
-| `TimeoutError` on long behavior | Deadline or synchronous design | Duration and run history |
-| `AbortError` | Caller lifecycle | Signal owner |
-| `RealtimeError forbidden` | Channel authorization | **Settings → Realtime** rule |
+| `invalid_api_key` | `401` | The key is unknown, revoked or expired |
+| `origin_not_allowed` | `403` | A publishable key used from an origin not in the environment's list |
+| `rate_limit_exceeded` | `429` | The gateway's rate limit |
+| `quota_exceeded` | `403` | The project's plan does not allow more; `details` names the limit |
+| `unique_violation` | `409` | A unique field already has this value; `details.columns` names it |
+| `constraint_violation` | `422` | Another database constraint refused the write |
+| `missing_flow` | `500` | A route names a flow that does not exist |
+| `invalid` | `422` | A flow's schema validation failed; `details` lists the problems |
+| Codes from `error.raise` | Chosen by the flow | Your application's own failures |
+
+## The risk of repeating a request
+
+Retrying is safe when sending a request twice leaves the same result as sending it once.
+The table lists common calls by that property.
+
+| Call | Repeating it | Retried by the client |
+| --- | --- | --- |
+| Any read | Harmless | Yes |
+| `update` (`PATCH`) with absolute values | Harmless: the same values are written again | Only `429`, unless you use your own retry |
+| `update` that increments a counter computed by the client | Harmful: the counter moves twice | Do not compute increments in the client |
+| `replace` (`PUT`) | Harmless | Yes |
+| `delete` | Harmless; the second attempt gets `404` | Yes |
+| `create` | Creates a duplicate, unless a unique field stops it | Only `429` |
+| An upload to a fixed key | Harmless: the same bytes replace themselves | Yes |
+| A flow that charges, sends or notifies | Harmful without an attempt id | Only `429`, unless marked idempotent |
+| A flow protected by a unique attempt id | Harmless: the second attempt gets `409` | When marked idempotent |
+
+The general rule is to make writes naturally repeatable, with absolute values and unique keys, and then let the client's retries do their job.
+
+## Retrying in your own code
+
+The client's retries cover brief failures within one call.
+Some situations need a retry at a higher level:
+
+| Situation | Higher-level retry |
+| --- | --- |
+| A person presses "Try again" | Repeat the whole action, with the same attempt id if it has one |
+| The device comes back online | Repeat reads that failed, and queued writes |
+| A background job meets a `ServerError` | Repeat the job step later, with a longer delay |
+| A batch has a few failed items | Repeat only the failed items |
+
+Avoid stacking retries.
+A loop of three in your code around a client call that already retries twice sends up to nine requests, and a data library with its own retries on top multiplies again.
+
+<CodeGroup>
+```typescript TypeScript
+import { NetworkError, ServerError, TimeoutError } from "@pawabase/client";
+
+export async function withPatience<T>(work: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await work();
+    } catch (error) {
+      const transient = error instanceof ServerError || error instanceof NetworkError || error instanceof TimeoutError;
+      if (!transient || attempt >= attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+    }
+  }
+}
+```
+
+```python Python
+import time
+
+from pawabase import NetworkError, ServerError
+
+
+def with_patience(work, attempts: int = 3):
+    for attempt in range(1, attempts + 1):
+        try:
+            return work()
+        except (ServerError, NetworkError):
+            if attempt >= attempts:
+                raise
+            time.sleep(2 * attempt)
+```
+</CodeGroup>
+
+Use a helper like this for background work, where waiting seconds between attempts is acceptable, and only around operations that are safe to repeat.
+
+## Data libraries and their retries
+
+Libraries such as TanStack Query retry failed queries by default, three times with growing delays.
+Combined with the client's own retries, a failing request can be sent many times.
+
+Tell the library not to retry what the client already retried, and never to retry what will not change:
+
+```typescript
+import { QueryClient } from "@tanstack/react-query";
+import { ApiError, NetworkError, ServerError, TimeoutError } from "@pawabase/client";
+
+export const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: (failureCount, error) => {
+        if (error instanceof ApiError && !(error instanceof ServerError)) return false;
+        if (error instanceof NetworkError || error instanceof TimeoutError || error instanceof ServerError) return failureCount < 1;
+        return false;
+      },
+    },
+    mutations: { retry: false },
+  },
+});
+```
+
+Client errors such as `404`, `403` and `422` will fail the same way every time, so retrying them only delays the error message.
+Mutations should not be retried by the library at all; the client already repeats the safe ones.
+
+## When instanceof fails
+
+`instanceof` compares against one specific class.
+If two copies of `@pawabase/client` end up in a bundle, for example because two packages depend on different versions, an error created by one copy is not an instance of the other copy's classes.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `error instanceof NotFoundError` is false for an obvious `404` | Two copies of the package | Deduplicate the dependency in your lockfile |
+| Errors from a library wrapping the client are not recognized | The library bundles its own copy | Make the client a peer dependency of the library |
+
+Where deduplication is not possible, check the error's `name`, which every class sets:
+
+```typescript
+function isNotFound(error: unknown) {
+  return error instanceof Error && error.name === "NotFoundError";
+}
+```
+
+## Reading an error while debugging
+
+An `ApiError` printed in a console shows its message and stack.
+The useful fields are on the object:
+
+<CodeGroup>
+```typescript TypeScript
+catch (error) {
+  if (error instanceof ApiError) {
+    console.error({
+      status: error.status,
+      code: error.code,
+      message: error.message,
+      requestId: error.requestId,
+      policy: error.policy,
+      details: error.details,
+      url: error.url,
+    });
+  }
+}
+```
+
+```python Python
+except PawabaseError as error:
+    print({
+        "status": error.status_code,
+        "code": error.code,
+        "message": error.message,
+        "request_id": error.request_id,
+        "details": error.details,
+        "body": error.detail,
+    })
+```
+</CodeGroup>
+
+`body` holds the raw answer when the parsed fields are not enough, such as an extension route that answers with its own structure.
+`cause` holds the underlying error for transport failures, such as the runtime's `TypeError` behind a `NetworkError`.
+
+## Errors by part of the client
+
+Each part of the client meets a characteristic set of failures.
+Knowing them tells you which ones a screen should expect.
+
+| Part | Expected failures | Usually unexpected |
+| --- | --- | --- |
+| Records | `ValidationError`, `ConflictError`, `NotFoundError`, `PermissionError`, `InvalidQueryError` | `ServerError` |
+| Auth | `AuthenticationError` (wrong credentials), `PermissionError` (disabled, unverified), `RateLimitError` (locked), `ValidationError` (password policy) | `ConfigError` |
+| Storage | `PermissionError`, `NotFoundError`, `ApiError` for type and size refusals, `PayloadTooLargeError`, `TimeoutError` on large files | `ServerError` |
+| Flows and routes | `ApiError` with the flow's own codes, `ValidationError`, `NotFoundError` | `ApiError` with `missing_flow` |
+| Realtime | `RealtimeError` with `forbidden`, `payload_too_large`, `rate_limited` | `RealtimeError` with `ack_timeout` |
+| Management and administration | `NotFoundError`, `ValidationError`, `ConflictError` | `PermissionError`, which usually means the key's scope or allowed IPs |
+
+"Expected" failures deserve handling at the call site with a specific message.
+"Unexpected" ones go to the application layer and the error tracker.
+
+## Errors and accessibility
+
+An error that appears on screen must also reach people who do not see the screen.
+
+| Practice | How |
+| --- | --- |
+| Announce form errors | Put a summary in an element with `role="alert"` |
+| Tie each message to its field | `aria-describedby` on the input, pointing at the message |
+| Move focus to the first invalid field | Call `focus()` after showing field errors |
+| Keep messages short and specific | "Enter an email address like name@example.com" |
+
+```tsx
+export function FieldError({ id, messages }: { id: string; messages?: string[] }) {
+  if (!messages?.length) return null;
+  return (
+    <p id={id} className="field-error">
+      {messages[0]}
+    </p>
+  );
+}
+
+// <input aria-invalid={!!errors.email} aria-describedby="email-error" … />
+// <FieldError id="email-error" messages={errors.email} />
+```
+
+`ValidationError.byField()` produces exactly the structure these components need.
+
+## Logging without leaking
+
+Errors are logged, shipped to trackers and copied into tickets.
+Decide what goes with them.
+
+| Safe to log | Keep out of logs |
+| --- | --- |
+| `status`, `code`, `message` | Request and response bodies with personal data |
+| `requestId` | Access tokens, refresh tokens, API keys |
+| `method` and the URL's path | Signed URLs, which are credentials until they expire |
+| `policy` | Query strings that contain personal data, such as email searches |
+
+The client helps: hooks receive masked credentials and never receive bodies.
+`error.body` and `error.url` are on the error object, so a logger that serializes whole errors can still leak them.
+Log selected fields rather than the whole object.
+
+## Watching error rates
+
+A sudden change in error rates is often the first sign of a problem, before anyone reports it.
+Count errors by class from the `onError` hook and watch the counts.
+
+| Rising count | Likely cause |
+| --- | --- |
+| `NetworkError` from many users | Your gateway or its network is unreachable for some region |
+| `ServerError` | An installation problem, or a flow failing for everyone |
+| `AuthenticationError` after sign-in | Sessions being revoked, or refresh tokens reused by two refreshers |
+| `PermissionError` after a release | A policy change, or code calling something it should not |
+| `ValidationError` after a release | Client assumptions and definitions are out of step; update the application model |
+| `RateLimitError` | Growth, or a loop sending too many requests |
+
+Pair the counts with the **Project → Activity** view in Studio, which shows the same failures from the server's side.
+
+## Practising failure in development
+
+Error paths are hard to test by hand, because the network and the server rarely fail on cue.
+A wrapper around `fetch` can make them fail on purpose in development builds.
+
+```typescript
+import { createClient } from "@pawabase/client";
+
+const FAILURE_RATE = Number(import.meta.env.VITE_FAILURE_RATE ?? "0");
+
+const unreliableFetch: typeof fetch = async (input, init) => {
+  const roll = Math.random();
+  if (roll < FAILURE_RATE / 3) throw new TypeError("simulated network failure");
+  if (roll < (FAILURE_RATE * 2) / 3) return new Response("busy", { status: 503 });
+  if (roll < FAILURE_RATE) await new Promise((resolve) => setTimeout(resolve, 15_000));
+  return fetch(input, init);
+};
+
+export const pawabase = createClient({
+  url: import.meta.env.VITE_PAWABASE_URL,
+  apiKey: import.meta.env.VITE_PAWABASE_KEY,
+  fetch: import.meta.env.DEV && FAILURE_RATE > 0 ? unreliableFetch : undefined,
+});
+```
+
+Run the app with a failure rate of 0.2 for an afternoon.
+Spinners that never stop, forms that lose their content and buttons that submit twice become obvious.
+
+## Errors during server rendering
+
+When a server renders a page, errors decide the response: a not-found page, a redirect to sign-in, or an error page.
+
+```typescript
+import { notFound, redirect } from "next/navigation";
+import { AuthenticationError, NotFoundError, PermissionError } from "@pawabase/client";
+import { pawabaseForRequest } from "@/lib/pawabase/server";
+
+export default async function OrderPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const pawabase = await pawabaseForRequest();
+  try {
+    const order = await pawabase.from("orders").get(id, { expand: ["items"] });
+    return <OrderView order={order} />;
+  } catch (error) {
+    if (error instanceof NotFoundError || error instanceof PermissionError) notFound();
+    if (error instanceof AuthenticationError) redirect(`/sign-in?next=/orders/${id}`);
+    throw error;
+  }
+}
+
+declare function OrderView(props: { order: unknown }): JSX.Element;
+```
+
+Treating `PermissionError` as not found on pages keeps them from confirming that a record exists to someone who may not see it.
+Anything else is thrown to the framework's error page, which should show the request id.
+
+## Errors in background jobs
+
+A job that processes many items must decide, for each failure, whether to try again later or to give up on that item.
+
+| Error | Classify as | Do |
+| --- | --- | --- |
+| `NetworkError`, `TimeoutError`, `ServerError`, `RateLimitError` | Transient | Retry the item later, with a growing delay |
+| `ValidationError`, `ConflictError`, `NotFoundError` | Permanent for this item | Record the failure and move on |
+| `PermissionError`, `AuthenticationError` | Permanent for the job | Stop; the key or its scope is wrong |
+| `ConfigError`, `InvalidQueryError` | A bug | Stop and fix the code |
+
+Recording permanent failures somewhere people can see them, such as a `failed_imports` resource, turns silent data loss into a list someone can work through.
+
+## Errors from management and administration
+
+`manage()` and `admin()` use the same transport, so their failures are the same classes.
+Two cases are specific to them.
+
+A `PermissionError` from a management call with a secret key is rarely a policy, because secret keys bypass policies.
+It usually means the key's scopes, allowed IP ranges or allowed routes exclude the call, or that the key may not manage the environment named in the path.
+
+A `NotFoundError` often means the environment name is wrong, for example `development` used by default when `environment` was not passed to the client.
+
+## One retry, seen through the hooks
+
+With hooks that log everything, a read that meets a brief outage prints a story like this:
+
+```text
+onRequest   GET /rest/v1/orders  attempt 0
+onResponse  GET /rest/v1/orders  attempt 0  status 503  12 ms  req_01JB…A
+onRetry     GET /rest/v1/orders  attempt 0  reason "status 503"  delay 2000 ms   (Retry-After: 2)
+onRequest   GET /rest/v1/orders  attempt 1
+onResponse  GET /rest/v1/orders  attempt 1  status 200  41 ms  req_01JB…B
+```
+
+The call returns the second answer; your code never sees the first.
+Each attempt has its own request id, so the platform's logs show both.
+When investigating a slow screen, the gap between the two `onRequest` lines is often the explanation.
+
+## Timeouts on edge and serverless platforms
+
+Serverless functions and edge workers stop a request after a fixed time, often between 10 and 60 seconds.
+If the platform's limit is shorter than the client's total time with retries, the platform kills the request and your code never sees a clean error.
+
+| Platform limit | Suggested client settings |
+| --- | --- |
+| 10 s | `timeoutMs: 3000`, `retry: { retries: 1 }` |
+| 30 s | `timeoutMs: 8000`, `retry: { retries: 2 }` |
+| 60 s or more | The defaults |
+
+Keep the worst case, roughly `timeoutMs × (retries + 1)`, below the platform's limit with room for your own work.
+
+## Knowing when the device is offline
+
+Browsers report connectivity through `navigator.onLine` and the `online` and `offline` events.
+They are hints, not guarantees: `onLine` can be true on a network that reaches nothing.
+
+```typescript
+import { NetworkError, TimeoutError } from "@pawabase/client";
+
+export function isOfflineError(error: unknown) {
+  return (error instanceof NetworkError || error instanceof TimeoutError) && !navigator.onLine;
+}
+
+window.addEventListener("online", () => retryFailedReads());
+
+declare function retryFailedReads(): void;
+```
+
+Combining the error class with `navigator.onLine` lets the interface say "You are offline" instead of a generic connection message, and retry automatically when the browser reports the connection is back.
+
+## Rolling back optimistic updates
+
+An optimistic update shows the change before the server confirms it.
+When the server refuses, the screen must return to the truth and say why.
+
+```typescript
+import { ConflictError, PermissionError } from "@pawabase/client";
+
+export async function toggleDone(task: { id: string; done: boolean }, setTask: (task: { id: string; done: boolean }) => void) {
+  const previous = { ...task };
+  setTask({ ...task, done: !task.done });
+  try {
+    setTask(await pawabase.from("tasks").update(task.id, { done: !task.done }));
+  } catch (error) {
+    setTask(previous);
+    if (error instanceof PermissionError) notify("You can no longer change this task.");
+    else if (error instanceof ConflictError) notify("Someone else changed this task. It has been reloaded.");
+    else notify("The change was not saved.");
+  }
+}
+
+declare function notify(message: string): void;
+```
+
+Always restore from a copy taken before the optimistic change, not by applying the inverse change.
+The inverse can be wrong if other changes happened in between.
+
+## Result objects for teams that prefer them
+
+Some teams prefer functions that return `{ ok, value }` or `{ ok, error }` instead of throwing, as supabase-js does.
+A thin wrapper gives you that style without losing the error classes:
+
+```typescript
+import type { PawabaseError } from "@pawabase/client";
+
+export type Result<T> = { ok: true; value: T } | { ok: false; error: PawabaseError };
+
+export async function attempt<T>(work: () => Promise<T>): Promise<Result<T>> {
+  try {
+    return { ok: true, value: await work() };
+  } catch (error) {
+    if (error instanceof Error && "name" in error) return { ok: false, error: error as PawabaseError };
+    throw error;
+  }
+}
+
+const result = await attempt(() => pawabase.from("orders").get(orderId));
+if (!result.ok) return showError(result.error);
+
+declare function showError(error: PawabaseError): void;
+```
+
+The wrapper rethrows anything that is not an `Error`, so bugs such as thrown strings are not mistaken for API failures.
+
+## Showing each error once
+
+A screen that loads several things in parallel can produce several copies of the same error, such as five `NetworkError`s when the connection drops.
+Showing five identical messages helps nobody.
+
+```typescript
+const shown = new Map<string, number>();
+
+export function notifyOnce(key: string, message: string, windowMs = 5000) {
+  const last = shown.get(key) ?? 0;
+  if (Date.now() - last < windowMs) return;
+  shown.set(key, Date.now());
+  notify(message);
+}
+
+// notifyOnce(error.name, present(error).message)
+declare function notify(message: string): void;
+```
+
+Keying by the error class collapses a burst of identical failures into one message.
+
+## Validation messages in other languages
+
+The server writes validation messages in English.
+Translate them by issue `type`, and keep the server's message as a fallback:
+
+```typescript
+import type { ValidationIssue } from "@pawabase/client";
+
+const fr: Record<string, string> = {
+  missing: "Ce champ est obligatoire.",
+  string_too_short: "Ce texte est trop court.",
+  string_too_long: "Ce texte est trop long.",
+  extra_forbidden: "Ce champ n'est pas accepté.",
+};
+
+export function messageFor(issue: ValidationIssue, table: Record<string, string>) {
+  return (issue.type && table[issue.type]) || issue.message;
+}
+```
+
+Constraint details such as the exact minimum length are in the issue's `input` and the field's definition, not in the type; include them in the message when the interface needs them.
+
+## Words used on this page
+
+| Term | Meaning |
+| --- | --- |
+| Attempt | One HTTP request; a call can make several |
+| Safe request | One that leaves the same result when repeated: reads, `PUT`, `DELETE`, or calls marked idempotent |
+| Backoff | The growing, randomized wait between attempts |
+| `Retry-After` | The server's request to wait a number of seconds |
+| Request id | The gateway's id for one attempt, in `x-request-id` and `requestId` |
+| Transport error | A failure with no answer: network, timeout, abort |
+
+## Cancellation and retries together
+
+Retries and cancellation interact in ways that are easy to predict once stated.
+
+| Moment of cancellation | Result |
+| --- | --- |
+| Before the first attempt is sent | `AbortError`; nothing was sent |
+| During an attempt | The attempt is aborted; `AbortError` |
+| While waiting before a retry | The wait ends at once; `AbortError`; no further attempts |
+| After the answer arrived | No effect; the call has already returned |
+
+A cancelled call never produces a `TimeoutError` or a retry afterwards, so cleanup code that aborts on unmount does not leave requests running in the background.
+
+## When to show a request id
+
+Request ids help support, but they are noise for errors people can fix themselves.
+
+| Error | Show the id? |
+| --- | --- |
+| `ValidationError`, `ConflictError` | No; the message tells the person what to change |
+| `AuthenticationError`, `PermissionError`, `NotFoundError` | Rarely; offer it in a "details" area |
+| `ServerError`, unexpected `ApiError` | Yes, as a reference to quote |
+| `NetworkError`, `TimeoutError` | There is none; the request may not have reached the gateway |
+
+Make the id easy to copy, and keep it short on screen by showing the last eight characters with a copy button for the full value.
+
+## Errors in the network panel
+
+The browser's network panel shows each attempt as its own row, which explains failures the client already handled.
+
+| What you see | What happened |
+| --- | --- |
+| Two rows for one call, the first `503` and the second `200` | A retry after a gateway error |
+| A `401` row followed by a `token` row and a repeat of the first | A refresh and replay |
+| A red row with no status and a CORS message in the console | A refused origin, surfaced as `NetworkError` |
+| A row marked cancelled | An `AbortSignal` fired, or a timeout aborted the attempt |
+| A `429` row followed by the same request a few seconds later | A rate limit honored with `Retry-After` |
+
+The response headers of each row include `x-request-id`, the same value the client puts on `requestId`.
+Copy it from there when a failure happens in your own browser, and search for it under **Project → Activity** to see the server's side of the same attempt.
+
+Rows for retried attempts carry their own request ids.
+When a call succeeded after a retry, the failed attempt's id is still worth a look if retries are frequent, because it shows what the server was doing at the time.
+Frequent retries that always succeed are not harmless: each one adds the backoff delay to what people wait for.
+Treat a steady rate of them as a performance problem to fix on the server side.
+
+## A checklist
+
+| Check | Why |
+| --- | --- |
+| Every screen that writes handles `ValidationError` field by field | People can fix their input |
+| Expected codes have specific messages | People know what happened |
+| Unexpected errors reach an error tracker with `requestId` | Support can find them |
+| Expected outcomes are filtered out of the tracker | Real problems stay visible |
+| Data-library retries do not stack on the client's | Failing requests are not multiplied |
+| Non-repeatable actions use attempt ids | Retries cannot duplicate them |
+| Long forms survive an expired session | Nobody loses their work |
+| Error paths have been exercised with injected failures | They work when needed |
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Find a failed request by its id | **Project → Activity**, search by request id |
+| See errors across the environment | **Project → Activity**, the errors view |
+| See why a policy refused | **Access → Policies**, and the request in **Project → Activity** |
+| See why a sign-in failed | **Access → Users & auth → Sign-in activity** |
+| See a flow's failing block | **Logic → Flows**, the flow's runs |
+| See rate limits and firewall refusals | **Access → Networking** |
+
+## Coming from supabase-js
+
+| supabase-js | @pawabase/client |
+| --- | --- |
+| `const { data, error } = await …` | `const data = await …` inside `try` |
+| `if (error) …` | `catch (error) { if (error instanceof …) }` |
+| `error.code` (PostgREST codes such as `23505`) | `error.code` (`unique_violation`, `not_found`, …) |
+| `error.message`, `error.details`, `error.hint` | `error.message`, `error.details` |
+| `AuthApiError`, `AuthRetryableFetchError` | `AuthenticationError`, `NetworkError` |
+| `FunctionsHttpError` | `ApiError` with the flow's code |
+| No automatic retries for data calls | Automatic retries for safe calls |
+
+Code moved from supabase-js often checks `if (error)` after every call.
+With this client, that check disappears, and errors are handled where they mean something.
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| Calls take much longer than expected before failing | Retries multiplied by the timeout | Lower `timeoutMs`; use a deadline signal |
+| A `POST` failed with `503` and was not retried | `POST` is not repeated without `idempotent` | Retry in your code if the action is safe, or mark it idempotent |
+| Duplicate records after network trouble | A create was repeated by your own code | Use unique fields or attempt ids |
+| `RateLimitError` in a batch job | The job runs faster than the limit | Lower concurrency; respect `retryAfter` |
+| `AuthenticationError` immediately after sign-in | The key is wrong, or the token belongs to another environment | Check the key and environment |
+| `NetworkError` only in the browser | CORS refusal | Add the origin under **Access → Networking** |
+| `instanceof` checks fail | Two copies of the package | Deduplicate the dependency |
+| Error tracker full of `NotFoundError` | `onError` reports expected outcomes | Filter expected classes |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can I turn retries off for one call?">
+    Through the transport, yes: `pawabase.http.request({ …, retry: false })`.
+    The convenience methods use the client's policy.
+  </Accordion>
+  <Accordion title="Does the client retry 500 errors?">
+    No.
+    A `500` means the request reached the service and failed there; repeating it usually fails the same way and may repeat side effects.
+    `502`, `503` and `504` are retried for safe requests because they usually mean the request never reached a working service.
+  </Accordion>
+  <Accordion title="Why is a locked account a RateLimitError?">
+    The auth service answers a locked account with `429`, because the lock is a limit on failed attempts.
+    Show a message about waiting, not about the password.
+  </Accordion>
+  <Accordion title="Are errors serializable?">
+    They are `Error` objects and lose their class when serialized.
+    On a server, turn them into plain data, such as `{ code, message, requestId }`, before sending them anywhere.
+  </Accordion>
+  <Accordion title="Can I add my own fields to errors?">
+    Wrap them instead.
+    Throw your own error class with the Pawabase error as its `cause`, so the original stays available.
+  </Accordion>
+  <Accordion title="Does a timed-out request count against my rate limit?">
+    Yes, if it reached the gateway.
+    The gateway counts requests as they arrive, whatever happens to the client afterwards.
+  </Accordion>
+  <Accordion title="Can a request succeed on the server and still throw in the client?">
+    Yes: a timeout, a dropped connection or a cancellation after the server finished.
+    That is why writes that matter should be safe to repeat, or checked before repeating.
+  </Accordion>
+  <Accordion title="How many times will a GET be sent at most?">
+    Three by default: the first attempt and two retries, plus one more after a refresh if the first answer was `401`.
+  </Accordion>
+</AccordionGroup>
 
 ## Related pages
 
 <CardGroup cols={2}>
-  <Card title="General client errors" icon="circle-exclamation" href="/clients/errors">
-    REST status conventions and public error-body context.
-  </Card>
-  <Card title="Client configuration" icon="sliders" href="/clients/typescript/client-configuration">
-    Set retry budgets, attempt timeouts, hooks, and request-scoped identity.
-  </Card>
-  <Card title="Observability" icon="chart-line" href="/operate/observability">
-    Correlate an SDK request ID with platform evidence.
-  </Card>
-  <Card title="API Explorer" icon="compass" href="/operate/api-explorer">
-    Reproduce validation and route behavior against the active environment.
-  </Card>
+  <Card title="Client configuration" icon="sliders-horizontal" href="/clients/typescript/client-configuration">Timeouts, retry policy and hooks as client options.</Card>
+  <Card title="Errors reference" icon="list" href="/reference/errors">Every error code the platform produces.</Card>
+  <Card title="Client errors" icon="triangle-alert" href="/clients/errors">Error handling for clients in any language.</Card>
+  <Card title="Rate limits and CORS" icon="gauge" href="/operate/rate-limits-and-cors">The limits behind `429` and `origin_not_allowed`.</Card>
 </CardGroup>

@@ -1,792 +1,1761 @@
 ---
-title: "Server runtimes and testing with TypeScript"
-description: "Design browser, SSR, edge, Node, React Native, worker, and test clients with explicit session ownership, runtime adapters, cleanup, and deterministic transport tests."
+title: "Servers and testing"
+description: "How to run the TypeScript client on servers, in serverless and edge runtimes and inside web frameworks, how to act for each request's user safely, and how to test code that uses Pawabase at every level from unit tests to end-to-end runs."
 icon: "server"
 ---
 
-The TypeScript package runs in several JavaScript environments, but the correct client lifetime and credential model differ between them.
-The central design question is not “does this runtime support `fetch`?”
-It is “who owns identity and how long can this client retain it?”
+The client runs anywhere `fetch` runs: Node, Bun, Deno, serverless functions, edge workers and the server half of web frameworks.
+On a server, one question shapes everything: whose identity does each request carry?
 
-| Runtime pattern | Client lifetime | Identity owner | Main risk |
-| --- | --- | --- | --- |
-| Browser single-page application | Application lifetime | Managed SDK session | Duplicate clients, exposed secret key, stale UI state |
-| Server-rendered request | One request or stateless shared base plus `asUser()` | Framework cookie/session layer | Cross-user token leakage |
-| Trusted worker | Process or job lifetime | Service configuration | Accidental policy bypass and unbounded retries |
-| Edge function | One invocation or runtime-reused stateless base | Request token | Assuming process memory is durable |
-| React Native application | Application lifetime | Custom persistent storage | Missing storage adapter and deep-link handling |
-| Command-line tool | Command lifetime | Explicit key or adopted session | Timer/socket preventing exit |
-| Unit test | One test or suite fixture | Test-controlled adapter | Hidden network calls and leaked timers |
+This page explains how to answer that question in each kind of server code, how the common frameworks fit, what changes in serverless and edge runtimes, and how to test code that uses Pawabase, from unit tests with no network to end-to-end runs against a real environment.
 
-## Package formats
+## The mental model
 
-`@pawabase/client` publishes ESM, CommonJS, and TypeScript declarations.
-The package export map selects the correct runtime build.
-The package is marked side-effect free so bundlers can omit unused exports when their tree-shaking rules permit it.
+A browser client serves one person.
+A server serves many people at once, plus itself.
+Mixing those identities up is the most serious mistake server code can make with a backend client.
 
-### ESM
+| Server code acts as | Client | Policies |
+| --- | --- | --- |
+| The person who sent the request | A publishable-key base client, and `base.asUser(token)` per request | Applied, exactly as in their browser |
+| Nobody in particular: the system | A secret-key client | Bypassed |
+| A person, for a privileged step your code has checked | Both: `asUser` to read what they may see, the secret-key client for the step | Applied, then deliberately bypassed |
 
-```typescript
-import {
-  createClient,
-  PermissionError,
-  VERSION,
-} from "@pawabase/client";
+```text
+request from Ada ──▶ your server ──▶ base.asUser(ada's token) ──▶ Pawabase sees Ada
+request from Bob ──▶ your server ──▶ base.asUser(bob's token) ──▶ Pawabase sees Bob
+nightly job      ──▶ your server ──▶ service (secret key)      ──▶ Pawabase sees the system
 ```
 
-### CommonJS
+The base client is created once per process.
+`asUser` returns a light, stateless client for one request: it holds that person's token, keeps no session, runs no timers, and is discarded when the request ends.
 
-```typescript
-const {
-  createClient,
-  PermissionError,
-  VERSION,
-} = require("@pawabase/client");
-```
+## Clients on a server
 
-The package requires Node.js 20 or newer for its supported Node environment and type-generation command.
-Node version support does not imply that every Node release has a global WebSocket.
+### The base client
 
-## The exported version
+Create one base client per process, at module scope, with a publishable key:
 
-`VERSION` identifies the installed SDK release.
-The HTTP transport also sends it in the client-information header.
-
-```typescript
-import { VERSION } from "@pawabase/client";
-
-logger.info("Pawabase SDK initialized", {
-  sdkVersion: VERSION,
-});
-```
-
-Record it with deployment metadata when diagnosing behavior that differs between application releases.
-Do not branch business behavior on a version string when capability detection or a server contract is available.
-
-## Browser application ownership
-
-A browser application normally owns one client for the lifetime of the application shell.
-
-```typescript
+<CodeGroup>
+```typescript TypeScript
+// server/pawabase.ts
 import { createClient } from "@pawabase/client";
-import type { Database } from "./pawabase.types";
+import type { Database } from "./database";
 
-export const pawabase = createClient<Database>({
-  url: import.meta.env.PUBLIC_PAWABASE_URL,
-  apiKey: import.meta.env.PUBLIC_PAWABASE_PUBLISHABLE_KEY,
-});
-```
-
-The key must be publishable.
-The client can retain the user session in browser storage, coordinate refresh, and keep one realtime socket.
-
-Creating a client inside a render function can create multiple auth listeners, refresh timers, channel objects, and sockets.
-Put it in a stable module or framework provider.
-
-## Browser environment variables
-
-Build tools often expose variables with a public prefix.
-That prefix is an explicit declaration that the value will be bundled for users.
-
-| Value | May be public? |
-| --- | --- |
-| Gateway URL | Yes |
-| Publishable key | Yes |
-| Project reference | Yes |
-| Environment name | Yes |
-| Secret key | No |
-| User access token | Not as a build variable |
-| Refresh token | Not as a build variable |
-
-Do not rely on an unguessable variable name to protect a bundled secret.
-Anyone who can load the application can inspect its code and requests.
-
-## Server-rendered requests
-
-A server renderer typically receives a user token through a cookie or framework session.
-Create a stateless acting client for that request.
-
-```typescript
-export async function loadPage(request: Request) {
-  const accessToken = await readAccessToken(request);
-
-  const actingClient = createClient<Database>({
-    url: process.env.PAWABASE_URL!,
-    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
-    accessToken,
-  });
-
-  try {
-    const tasks = await actingClient
-      .from("tasks")
-      .order("created_at", "desc")
-      .all({ maxRecords: 200 });
-
-    return renderTasks(tasks);
-  } finally {
-    actingClient.dispose();
-  }
-}
-```
-
-The `accessToken` client does not persist or refresh a session.
-The framework remains responsible for updating cookies or obtaining a replacement token.
-
-## Shared stateless base client
-
-A server can keep one base client for stable transport configuration and derive user clients.
-
-```typescript
-const baseClient = createClient<Database>({
+export const base = createClient<Database>({
   url: process.env.PAWABASE_URL!,
   apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
-  hooks: serverHooks,
+  environment: process.env.PAWABASE_ENV,
 });
+```
 
-export async function readAccount(accessToken: string, accountId: string) {
-  const actingClient = baseClient.asUser(accessToken);
+```python Python
+# server/pawabase.py
+import os
 
-  try {
-    return await actingClient.from("accounts").get(accountId);
-  } finally {
-    actingClient.dispose();
-  }
+from pawabase import AsyncPawabase
+
+base = AsyncPawabase(
+    os.environ["PAWABASE_URL"],
+    os.environ["PAWABASE_PUBLISHABLE_KEY"],
+    environment=os.environ["PAWABASE_ENV"],
+)
+```
+</CodeGroup>
+
+A publishable key on a server is correct whenever the server acts for people.
+It means a bug in your server cannot read or write more than the person could from their own browser.
+
+### Per-request clients
+
+`base.asUser(token)` gives each request a client that acts as its person:
+
+<CodeGroup>
+```typescript TypeScript
+export function pawabaseFor(accessToken: string | null) {
+  return accessToken ? base.asUser(accessToken) : base;
 }
 ```
 
-`asUser()` copies the configuration but uses externally owned identity.
-It does not mutate the base client.
-
-<Warning>
-  Do not sign users into one process-wide managed client.
-  Its mutable session is shared state, so concurrent requests can send the wrong user's token.
-</Warning>
-
-## Cookie-backed storage
-
-A framework can supply a `SessionStorage` adapter, but doing so makes the client a managed-session owner.
-Use this only when the request lifecycle can write updated cookies and serialize refresh safely.
-
-```typescript
-const cookieStorage = {
-  async getItem(key: string) {
-    return cookies.get(key) ?? null;
-  },
-  async setItem(key: string, value: string) {
-    cookies.set(key, value, cookieOptions);
-  },
-  async removeItem(key: string) {
-    cookies.delete(key);
-  },
-};
-
-const client = createClient({
-  url,
-  apiKey,
-  auth: {
-    storage: cookieStorage,
-    storageKey: "pawabase-session",
-  },
-});
+```python Python
+def pawabase_for(access_token: str | None):
+    return base.as_user(access_token) if access_token else base
 ```
 
-Cookie design must account for encryption or signing, size, `Secure`, `HttpOnly`, `SameSite`, path, domain, and expiry.
-A JavaScript SDK running in the browser cannot read an `HttpOnly` cookie; a server adapter can.
+```bash cURL
+curl "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+</CodeGroup>
 
-When a framework already has a tested session-refresh layer, `accessToken` mode is usually clearer than giving two layers ownership.
+| Property of an `asUser` client | Value |
+| --- | --- |
+| Options | Copied from the base client |
+| Token | The one you passed, or the value of a function you passed, read before each request |
+| Session storage | Memory, empty |
+| Automatic refresh | Off; a `401` is thrown |
+| Realtime socket | Opens without a user token |
+| Cost to create | A few objects; no network, no timers |
 
-## Trusted service clients
+Never share an `asUser` client between requests, and never store one in module scope.
+It holds one person's token; reusing it would let another request act as that person.
 
-A worker or backend can use a secret key when the operation is intentionally administrative.
+### The service client
 
-```typescript
-const admin = createClient<Database>({
+Work that acts for the system uses a secret key, in a module only server code imports:
+
+<CodeGroup>
+```typescript TypeScript
+// server/pawabase-service.ts
+import "server-only";
+import { createClient } from "@pawabase/client";
+import type { Database } from "./database";
+
+export const service = createClient<Database>({
   url: process.env.PAWABASE_URL!,
   apiKey: process.env.PAWABASE_SECRET_KEY!,
-  auth: {
-    persistSession: false,
-    autoRefreshToken: false,
-  },
+  environment: process.env.PAWABASE_ENV,
 });
 ```
 
-The secret key bypasses policies.
-The worker must establish its own authorization boundary and input validation.
-Use a publishable key with an end-user token when the worker should preserve user policy behavior.
+```python Python
+# server/pawabase_service.py: imported only by server code
+import os
 
-## Background jobs
+from pawabase import AsyncPawabase
 
-Jobs often have a larger retry policy around the SDK.
-Decide which layer owns retry counts.
+service = AsyncPawabase(os.environ["PAWABASE_URL"], os.environ["PAWABASE_SECRET_KEY"], environment=os.environ["PAWABASE_ENV"])
+```
+</CodeGroup>
 
-```typescript
-const workerClient = createClient({
-  url,
-  apiKey: secretKey,
-  retry: false,
-  timeoutMs: 20_000,
-});
+Keep service-client code small and named for what it does, such as `issueRefund` or `nightlyCleanup`, so reviewers can see every place that bypasses policies.
+
+### A privileged step after your own check
+
+Some actions need more authority than the person has, after a check only your server can make.
+Use both clients: the person's to confirm what they may see, the service client for the step.
+
+<CodeGroup>
+```typescript TypeScript
+export async function refundOrder(accessToken: string, orderId: string) {
+  const asPerson = base.asUser(accessToken);
+  const order = await asPerson.from("orders").get(orderId);
+  if (order.status !== "paid") throw new Error("Only paid orders can be refunded.");
+  const user = await asPerson.auth.getUser();
+  if (!user.roles.includes("support")) throw new Error("Only support staff can refund.");
+  return service.routes.post(`orders/${orderId}/refund`, { by: user.id });
+}
 ```
 
-Disabling SDK retry lets the queue treat one job attempt as one network attempt.
-Keeping SDK retry can absorb brief gateway failures without consuming a job attempt.
-Calculate the product of both budgets before choosing.
+```python Python
+async def refund_order(access_token: str, order_id: str):
+    as_person = base.as_user(access_token)
+    order = await as_person.from_("orders").get(order_id)
+    if order["status"] != "paid":
+        raise ValueError("Only paid orders can be refunded.")
+    user = await as_person.auth.get_user()
+    if "support" not in user["roles"]:
+        raise PermissionError("Only support staff can refund.")
+    return await service.routes.post(f"orders/{order_id}/refund", {"by": user["id"]})
+```
+</CodeGroup>
 
-For side-effecting functions, flows, and routes, a queue retry still needs an idempotency design even when SDK retry is disabled.
+Reading the order as the person proves they may see it; a `NotFoundError` there ends the action before anything privileged happens.
+Often the same rule can live in a flow with `policy.check`, which keeps it in one place for every client; use server code when the check needs something only your server knows.
 
-## Edge runtimes
+## Sessions on a server
 
-Edge runtimes usually provide `fetch`, but support for WebSocket constructors, streams, Node globals, and process environment access varies.
+### Where the session lives
 
-Use web-standard APIs in adapters.
-Keep the client stateless per request.
-Do not assume that an in-memory auth session survives the next invocation or stays isolated to one user.
+A server-rendered application chooses where the session lives, and the choice decides how the client is used.
+
+| Session in | Browser client | Server client | Refresh done by |
+| --- | --- | --- | --- |
+| The browser (`localStorage`) | Normal client | `asUser` with a token the browser sends in a header | The browser client |
+| HTTP-only cookies | `persistSession: false`, or no client | `asUser` with the token from the cookie | Your server |
+
+Pick one owner.
+If the browser and the server both refresh the same session, the second refresh presents a refresh token the first already used, the auth service treats that as theft, and the session ends.
+
+### Cookie sessions
+
+With cookies, your server signs people in, stores tokens in cookies, refreshes them, and signs people out.
+A short-lived, memory-only client does each auth step:
 
 ```typescript
-export default async function handle(request: Request) {
-  const accessToken = request.headers
-    .get("authorization")
-    ?.replace(/^Bearer\s+/i, "") ?? null;
+import { createClient, MemoryStorage } from "@pawabase/client";
 
-  const client = createClient({
-    url: runtimeEnv.PAWABASE_URL,
-    apiKey: runtimeEnv.PAWABASE_PUBLISHABLE_KEY,
-    accessToken,
-    fetch,
+export function authClient() {
+  return createClient({
+    url: process.env.PAWABASE_URL!,
+    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+    environment: process.env.PAWABASE_ENV,
+    auth: { storage: new MemoryStorage(), persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
   });
+}
 
+export function sessionCookies(session: { access_token: string; refresh_token: string; expires_at: number }) {
+  const flags = "Path=/; HttpOnly; Secure; SameSite=Lax";
+  return [
+    `pb-access=${session.access_token}; ${flags}; Expires=${new Date(session.expires_at * 1000).toUTCString()}`,
+    `pb-refresh=${session.refresh_token}; ${flags}; Max-Age=${60 * 60 * 24 * 30}`,
+  ];
+}
+
+export const clearedCookies = [
+  "pb-access=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+  "pb-refresh=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+];
+```
+
+Signing in:
+
+<CodeGroup>
+```typescript TypeScript
+export async function signIn(email: string, password: string) {
+  const client = authClient();
   try {
-    const user = await client.auth.getUser();
-    return Response.json({ user });
+    const result = await client.auth.signInWithPassword({ email, password });
+    if (result.status === "mfa_required") return { mfa: { token: result.mfaToken, factors: result.factors } };
+    return { cookies: sessionCookies(result.session) };
   } finally {
     client.dispose();
   }
 }
 ```
 
-Use realtime only when the edge platform supports the required outbound WebSocket lifecycle and invocation duration.
-An HTTP publish is often a better fit for a short-lived edge function.
+```python Python
+from pawabase import AsyncPawabase, MemorySessionStore
 
-## Node.js WebSocket support
 
-Node.js 22 and newer provides a compatible global WebSocket in supported releases.
-Node.js 20 requires an implementation.
+def auth_client() -> AsyncPawabase:
+    return AsyncPawabase(PAWABASE_URL, PUBLISHABLE_KEY, environment=PAWABASE_ENV, session_store=MemorySessionStore(), auto_refresh=False)
 
-```bash
-npm install ws
+
+async def sign_in(email: str, password: str):
+    async with auth_client() as client:
+        result = await client.auth.sign_in_with_password(email=email, password=password)
+        if result.status == "mfa_required":
+            return {"mfa": {"token": result.mfa_token, "factors": result.factors}}
+        return {"cookies": session_cookies(result.session)}
 ```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -d '{"grant_type": "password", "email": "ada@example.com", "password": "…"}'
+```
+</CodeGroup>
+
+Refreshing, when the access cookie is missing or expired and the refresh cookie remains:
+
+<CodeGroup>
+```typescript TypeScript
+export async function refresh(refreshToken: string) {
+  const client = authClient();
+  try {
+    const wire = await client.request<{ access_token: string; refresh_token: string; expires_in: number; expires_at?: number }>(
+      "POST",
+      "/auth/v1/token",
+      { body: { grant_type: "refresh_token", refresh_token: refreshToken } },
+    );
+    const expiresAt = wire.expires_at ?? Math.floor(Date.now() / 1000) + wire.expires_in;
+    return { cookies: sessionCookies({ ...wire, expires_at: expiresAt }) };
+  } catch {
+    return { cookies: clearedCookies };
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+```python Python
+import time
+
+from pawabase import PawabaseError
+
+
+async def refresh(refresh_token: str):
+    async with auth_client() as client:
+        try:
+            wire = await client.request("POST", "/auth/v1/token", json={"grant_type": "refresh_token", "refresh_token": refresh_token})
+        except PawabaseError:
+            return {"cookies": CLEARED_COOKIES}
+        expires_at = wire.get("expires_at") or time.time() + wire["expires_in"]
+        return {"cookies": session_cookies({**wire, "expires_at": expires_at})}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -d '{"grant_type": "refresh_token", "refresh_token": "…"}'
+```
+</CodeGroup>
+
+Signing out, which also ends the session on the server:
+
+<CodeGroup>
+```typescript TypeScript
+export async function signOut(accessToken: string | null) {
+  if (accessToken) {
+    await base.asUser(accessToken).request("POST", "/auth/v1/logout", { body: { scope: "local" } }).catch(() => undefined);
+  }
+  return { cookies: clearedCookies };
+}
+```
+
+```python Python
+async def sign_out(access_token: str | None):
+    if access_token:
+        try:
+            await base.as_user(access_token).request("POST", "/auth/v1/logout", json={"scope": "local"})
+        except PawabaseError:
+            pass
+    return {"cookies": CLEARED_COOKIES}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/logout" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "content-type: application/json" -d '{"scope": "local"}'
+```
+</CodeGroup>
+
+### Refreshing in one place
+
+Refresh tokens are single-use, so concurrent requests from the same browser must not all refresh.
+Do it in one place, such as middleware that runs before handlers, and only when the access token is missing or about to expire.
+
+```typescript
+// middleware.ts (Next.js)
+import { NextResponse, type NextRequest } from "next/server";
+import { refresh } from "@/lib/pawabase/session";
+
+export async function middleware(request: NextRequest) {
+  const access = request.cookies.get("pb-access")?.value;
+  const refreshToken = request.cookies.get("pb-refresh")?.value;
+  if (access || !refreshToken) return NextResponse.next();
+
+  const { cookies } = await refresh(refreshToken);
+  const response = NextResponse.next();
+  for (const cookie of cookies) response.headers.append("set-cookie", cookie);
+  return response;
+}
+```
+
+The access cookie expires with the token, so "missing" means "expired".
+Browsers often send several requests at once after a page load; when they all arrive without an access cookie, only the first refresh succeeds.
+For applications where that race matters, refresh from a single endpoint the page calls before others, or accept that the losing requests answer `401` and are repeated by the page.
+
+## Frameworks
+
+### Next.js with the App Router
+
+| Place | Client |
+| --- | --- |
+| Server components | `pawabaseForRequest()` from the cookie |
+| Server actions | `pawabaseForRequest()` |
+| Route handlers | `pawabaseForRequest()`, or the service client for privileged routes |
+| Middleware | Refresh only; keep data calls out of it |
+| Client components | A browser client, or calls to your own server actions |
+
+```typescript
+// lib/pawabase/server.ts
+import "server-only";
+import { cookies } from "next/headers";
+import { base } from "./base";
+
+export async function pawabaseForRequest() {
+  const token = (await cookies()).get("pb-access")?.value ?? null;
+  return token ? base.asUser(token) : base;
+}
+```
+
+```tsx
+// app/orders/page.tsx
+import { pawabaseForRequest } from "@/lib/pawabase/server";
+
+export default async function OrdersPage() {
+  const pawabase = await pawabaseForRequest();
+  const { data } = await pawabase.from("orders").order("created_at", "desc").perPage(20);
+  return <ul>{data.map((order) => <li key={order.id}>{order.id}</li>)}</ul>;
+}
+```
+
+Responses rendered for one person must not be cached for others.
+Pages that read cookies are dynamic in Next.js, which is what you want here; do not wrap per-person data calls in shared caches.
+
+### Remix and React Router
+
+Loaders and actions receive the request, so the per-request client comes from its cookie header:
+
+```typescript
+export async function loader({ request }: { request: Request }) {
+  const pawabase = pawabaseFromRequest(request);
+  return pawabase.from("orders").order("created_at", "desc").perPage(20);
+}
+
+function pawabaseFromRequest(request: Request) {
+  const match = /(?:^|;\s*)pb-access=([^;]+)/.exec(request.headers.get("cookie") ?? "");
+  return match ? base.asUser(decodeURIComponent(match[1])) : base;
+}
+```
+
+### SvelteKit
+
+`hooks.server.ts` builds the client once per request and puts it on `locals`:
+
+```typescript
+export const handle = async ({ event, resolve }) => {
+  const token = event.cookies.get("pb-access") ?? null;
+  event.locals.pawabase = token ? base.asUser(token) : base;
+  return resolve(event);
+};
+```
+
+### Express, Fastify and Hono
+
+API servers that receive a bearer token from their own clients pass it through:
+
+```typescript
+import express from "express";
+
+const app = express();
+
+app.use((req, _res, next) => {
+  const token = req.headers.authorization?.replace(/^Bearer /, "") ?? null;
+  (req as express.Request & { pawabase: unknown }).pawabase = token ? base.asUser(token) : base;
+  next();
+});
+
+app.get("/api/orders", async (req, res, next) => {
+  try {
+    const pawabase = (req as express.Request & { pawabase: typeof base }).pawabase;
+    res.json(await pawabase.from("orders").perPage(20));
+  } catch (error) {
+    next(error);
+  }
+});
+```
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono<{ Variables: { pawabase: typeof base } }>();
+
+app.use("*", async (c, next) => {
+  const token = c.req.header("authorization")?.replace(/^Bearer /, "") ?? null;
+  c.set("pawabase", token ? base.asUser(token) : base);
+  await next();
+});
+
+app.get("/api/orders", async (c) => c.json(await c.get("pawabase").from("orders").perPage(20)));
+```
+
+The token your clients send is a Pawabase access token from their own session.
+Your server does not verify it; Pawabase does, on every request the per-request client makes.
+
+## Runtimes
+
+| Runtime | `fetch` | `WebSocket` | Notes |
+| --- | --- | --- | --- |
+| Node 22 and later | Built in | Built in | Everything works |
+| Node 20 | Built in | Pass `ws` for realtime | The package's minimum |
+| Bun | Built in | Built in | |
+| Deno | Built in | Built in | Import through `npm:` |
+| Cloudflare Workers | Built in | Built in | Configuration through the handler's `env`; short request limits |
+| Vercel and Netlify edge functions | Built in | Varies | Short request limits |
+| AWS Lambda on Node | Built in | Built in on Node 22 | Create clients outside the handler |
+
+The client uses no Node-specific modules, so bundlers for edge runtimes accept it without shims.
+
+### Serverless functions
+
+Serverless platforms reuse a process for many invocations while it stays warm.
+Create the base client outside the handler so warm invocations reuse it, and create per-request clients inside.
+
+```typescript
+const base = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_PUBLISHABLE_KEY! });
+
+export const handler = async (event: { headers: Record<string, string | undefined> }) => {
+  const token = event.headers.authorization?.replace(/^Bearer /, "") ?? null;
+  const pawabase = token ? base.asUser(token) : base;
+  const orders = await pawabase.from("orders").perPage(20);
+  return { statusCode: 200, body: JSON.stringify(orders) };
+};
+```
+
+Set timeouts below the platform's limit, with room for retries; see [Errors and retries](/clients/typescript/errors-retries#timeouts-on-edge-and-serverless-platforms).
+
+### Edge workers
+
+Edge workers receive configuration per request and may reuse an isolate for many requests.
+Create the base client lazily from the first request's configuration:
+
+```typescript
+let base: ReturnType<typeof createClient> | null = null;
+
+export default {
+  async fetch(request: Request, env: { PAWABASE_URL: string; PAWABASE_KEY: string }) {
+    base ??= createClient({ url: env.PAWABASE_URL, apiKey: env.PAWABASE_KEY, timeoutMs: 8000 });
+    const token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+    const pawabase = token ? base.asUser(token) : base;
+    return Response.json(await pawabase.from("articles").eq("status", "live").perPage(10));
+  },
+};
+```
+
+### Long-running workers
+
+A worker process that runs for days holds its clients for days.
+That is fine for a secret-key client, which has no session to refresh.
+A worker that signs in as a person, such as a command-line tool that runs a long sync, keeps its session refreshed by the client's timer, which does not keep the process alive on its own.
+
+Call `dispose()` on clients you create dynamically, such as one per job, when the job ends.
+
+## Testing: the levels
+
+Code that uses Pawabase can be tested at four levels.
+Each catches different mistakes, and a healthy project has some of each.
+
+| Level | Talks to | Catches | Speed |
+| --- | --- | --- | --- |
+| Unit | A fake `fetch` | Wrong queries, wrong handling of answers and errors | Milliseconds |
+| Component | A mocked network, such as MSW | Screens that render answers and errors wrongly | Fast |
+| Integration | A real development or test environment | Wrong policies, wrong definitions, wrong assumptions about the server | Seconds |
+| End to end | A browser driving your app against a real environment | Broken flows across pages, sessions, realtime | Slow |
+
+Policies, channel rules and flows exist only on the server.
+Only integration and end-to-end tests can check them.
+Everything that is your own code, such as query building, error mapping and rendering, is cheaper to test at the first two levels.
+
+## Unit tests with a fake server
+
+Every client option that touches the network goes through `fetch`, so a fake `fetch` is a complete fake server.
+A small helper that answers by method and path keeps tests short:
+
+<CodeGroup>
+```typescript TypeScript
+// test/fake-pawabase.ts
+import { createClient, type PawabaseClient } from "@pawabase/client";
+
+type Handler = (request: { url: URL; method: string; body: unknown; headers: Headers }) => { status?: number; body?: unknown; headers?: Record<string, string> };
+
+export function fakePawabase(routes: Record<string, Handler>) {
+  const requests: Array<{ method: string; url: URL; body: unknown; headers: Headers }> = [];
+  const client: PawabaseClient = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    environment: "test",
+    retry: false,
+    fetch: async (input, init) => {
+      const url = new URL(input);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const headers = new Headers(init?.headers);
+      const raw = init?.body;
+      const body = typeof raw === "string" ? safeJson(raw) : raw;
+      requests.push({ method, url, body, headers });
+      const handler = routes[`${method} ${url.pathname}`];
+      if (!handler) return new Response("Not found", { status: 404 });
+      const answer = handler({ url, method, body, headers });
+      return new Response(answer.body === undefined ? null : JSON.stringify(answer.body), {
+        status: answer.status ?? 200,
+        headers: { "content-type": "application/json", ...answer.headers },
+      });
+    },
+  });
+  return { client, requests, done: () => client.dispose() };
+}
+
+function safeJson(text: string) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+export const page = <T>(data: T[], total: number | null = data.length) => ({ body: { data, page: 1, per_page: 20, total } });
+```
+
+```python Python
+# tests/fake_pawabase.py
+import json
+
+import httpx
+
+from pawabase import Pawabase
+
+
+class Wire:
+    """A fake gateway: records requests and answers from a route table."""
+
+    def __init__(self, routes: dict):
+        self.routes, self.requests = routes, []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        handler = self.routes.get(f"{request.method} {request.url.path}")
+        if handler is None:
+            return httpx.Response(404, text="Not found")
+        status, body = handler(request)
+        return httpx.Response(status, json=body)
+
+
+def fake_pawabase(routes: dict) -> tuple[Pawabase, Wire]:
+    wire = Wire(routes)
+    pb = Pawabase("http://gateway.test", "pb_pk_test", environment="test", retries=0)
+    # The package's own tests swap the private httpx client for one with a MockTransport.
+    pb._client = httpx.Client(transport=httpx.MockTransport(wire), base_url="http://gateway.test", headers=pb.headers)
+    return pb, wire
+
+
+def page(rows, total=None):
+    return 200, {"data": rows, "page": 1, "per_page": 20, "total": len(rows) if total is None else total}
+```
+</CodeGroup>
+
+A test of a service function then reads like a specification:
+
+<CodeGroup>
+```typescript TypeScript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { fakePawabase, page } from "./fake-pawabase";
+import { ordersService } from "../src/orders/service";
+
+test("open orders are requested newest first", async () => {
+  const fake = fakePawabase({ "GET /rest/v1/orders": () => page([{ id: "o1", status: "open" }]) });
+  const orders = ordersService(fake.client);
+
+  const result = await orders.open();
+
+  assert.equal(result.data.length, 1);
+  const params = fake.requests[0].url.searchParams;
+  assert.equal(params.get("filter[status]"), "eq.open");
+  assert.equal(params.get("sort"), "-created_at");
+  fake.done();
+});
+
+test("a taken email becomes a field error", async () => {
+  const fake = fakePawabase({
+    "POST /rest/v1/customers": () => ({ status: 409, body: { error: "unique_violation", message: "taken", details: { columns: ["email"] } } }),
+  });
+  const result = await signUpCustomer(fake.client, { email: "a@b.c", name: "A" });
+  assert.deepEqual(result, { ok: false, fields: { email: ["An account with this email exists."] } });
+  fake.done();
+});
+
+declare function signUpCustomer(client: unknown, input: { email: string; name: string }): Promise<unknown>;
+```
+
+```python Python
+import pytest
+
+from pawabase import ConflictError
+from tests.fake_pawabase import fake_pawabase, page
+
+
+def test_open_orders_are_requested_newest_first():
+    pb, wire = fake_pawabase({"GET /rest/v1/orders": lambda request: page([{"id": "o1", "status": "open"}])})
+
+    result = pb.from_("orders").eq("status", "open").order("-created_at").execute()
+
+    assert len(result) == 1
+    params = wire.requests[0].url.params
+    assert params["filter[status]"] == "eq.open"
+    assert params["sort"] == "-created_at"
+
+
+def test_a_taken_email_is_a_conflict():
+    pb, _ = fake_pawabase({
+        "POST /rest/v1/customers": lambda request: (409, {"error": "unique_violation", "message": "taken", "details": {"columns": ["email"]}}),
+    })
+    with pytest.raises(ConflictError) as raised:
+        pb.from_("customers").create({"email": "a@b.c", "name": "A"})
+    assert raised.value.details == {"columns": ["email"]}
+```
+</CodeGroup>
+
+`retry: false` keeps failures immediate.
+Tests of retry behavior itself turn retries back on with tiny delays, as the [errors page](/clients/typescript/errors-retries#testing-error-handling) shows.
+
+### Signed-in fakes
+
+To test code that runs as a signed-in person, give the fake client a session first.
+`setSession` fetches the user, so the fake answers `/auth/v1/user`:
+
+```typescript
+const fake = fakePawabase({
+  "GET /auth/v1/user": () => ({ body: { id: "u1", email: "ada@example.com", roles: ["editor"], identities: [], user_metadata: {}, app_metadata: {} } }),
+  "GET /rest/v1/tasks": ({ headers }) => (headers.get("authorization") ? page([{ id: "t1" }]) : { status: 401, body: "Authentication required" }),
+});
+
+await fake.client.auth.setSession({ access_token: fakeJwt({ exp: Math.floor(Date.now() / 1000) + 900 }), refresh_token: "r1" });
+
+function fakeJwt(claims: Record<string, unknown>) {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(claims)}.signature`;
+}
+```
+
+The client reads the token's expiry from its payload without verifying the signature, so a fake token with an `exp` claim is enough in tests.
+Never do this outside tests; the server verifies every real token.
+
+### Time and expiring sessions
+
+Session refresh depends on time.
+Test runners that fake timers let a test move past an expiry without waiting:
+
+```typescript
+import { test, mock } from "node:test";
+
+test("an expiring session is refreshed before a request", async () => {
+  mock.timers.enable({ apis: ["Date", "setTimeout"] });
+  const now = Math.floor(Date.now() / 1000);
+  let refreshed = 0;
+  const fake = fakePawabase({
+    "GET /auth/v1/user": () => ({ body: { id: "u1", email: "a@b.c", roles: [], identities: [], user_metadata: {}, app_metadata: {} } }),
+    "POST /auth/v1/token": () => {
+      refreshed += 1;
+      return { body: { access_token: fakeJwt({ exp: now + 2000 }), refresh_token: "r2", expires_in: 900, token_type: "bearer" } };
+    },
+    "GET /rest/v1/tasks": () => page([]),
+  });
+  await fake.client.auth.setSession({ access_token: fakeJwt({ exp: now + 900 }), refresh_token: "r1" });
+
+  mock.timers.tick(870 * 1000);
+  await fake.client.from("tasks").perPage(20);
+
+  assert.equal(refreshed, 1);
+  fake.done();
+  mock.timers.reset();
+});
+```
+
+## Component tests with a mocked network
+
+Component tests render real screens with a network mock such as MSW, which intercepts `fetch` in browsers and in Node.
+The client needs no special configuration: it calls `fetch`, and MSW answers.
+
+```typescript
+import { http, HttpResponse } from "msw";
+import { setupServer } from "msw/node";
+
+const server = setupServer(
+  http.get("*/rest/v1/orders", () => HttpResponse.json({ data: [{ id: "o1", status: "open" }], page: 1, per_page: 20, total: 1 })),
+  http.post("*/rest/v1/orders/:id/pay", ({ params }) =>
+    params.id === "missing" ? HttpResponse.json({ error: "order_not_found", message: "no such order" }, { status: 404 }) : HttpResponse.json({ paid: true }),
+  ),
+);
+
+beforeAll(() => server.listen());
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+
+declare function beforeAll(fn: () => void): void;
+declare function afterEach(fn: () => void): void;
+declare function afterAll(fn: () => void): void;
+```
+
+Answer with the platform's real shapes, including error bodies, so components are tested against what they will receive.
+Keep typed fixtures aligned with resource definitions so tests use the platform's real shapes.
+
+## Integration tests against a real environment
+
+Integration tests are the only way to check that policies, rules and flows do what you think.
+They need an environment and keys, and they must leave the environment as they found it.
+
+### Which environment
+
+| Option | Pros | Cons |
+| --- | --- | --- |
+| A dedicated `test` environment | Isolated from developers' data; stable | Its definitions must be kept in step, by promotion |
+| A preview environment per branch | Tests the branch's own definitions | Created and removed per run |
+| The shared `development` environment | No setup | Tests and people disturb each other |
+
+A dedicated environment, refreshed from development by promotion, suits most teams.
+Preview environments suit teams that change definitions often in branches; the management module can create and delete them from CI.
+
+### Test users
+
+Tests need people with known identities and roles.
+Create them with the user-administration module and a secret key, sign them in with normal clients, and delete them afterwards.
+
+<CodeGroup>
+```typescript TypeScript
+// test/people.ts
+import { createClient, MemoryStorage, type PawabaseClient } from "@pawabase/client";
+import { admin } from "@pawabase/client/admin";
+
+const url = process.env.PAWABASE_URL!;
+const environment = process.env.PAWABASE_ENV ?? "test";
+const service = createClient({ url, apiKey: process.env.PAWABASE_SECRET_KEY!, environment });
+const users = admin(service).users;
+
+export interface TestPerson {
+  id: string;
+  email: string;
+  client: PawabaseClient;
+}
+
+export async function person(label: string, roles: string[] = []): Promise<TestPerson> {
+  const email = `${label}+${Date.now()}@test.example.com`;
+  const password = `pw-${crypto.randomUUID()}`;
+  const created = await users.create({ email, password, roles, emailVerified: true });
+  const client = createClient({
+    url,
+    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+    environment,
+    auth: { storage: new MemoryStorage(), persistSession: false },
+  });
+  await client.auth.signInWithPassword({ email, password });
+  return { id: String(created.id), email, client };
+}
+
+export async function forget(p: TestPerson) {
+  p.client.dispose();
+  await users.deleteUser(p.id).catch(() => undefined);
+}
+
+export { service };
+```
+
+```python Python
+# tests/people.py
+import os
+import time
+import uuid
+from dataclasses import dataclass
+
+from pawabase import MemorySessionStore, Pawabase
+
+URL = os.environ["PAWABASE_URL"]
+ENV = os.environ.get("PAWABASE_ENV", "test")
+service = Pawabase(URL, os.environ["PAWABASE_SECRET_KEY"], environment=ENV)
+
+
+@dataclass
+class TestPerson:
+    id: str
+    email: str
+    client: Pawabase
+
+
+def person(label: str, roles: tuple[str, ...] = ()) -> TestPerson:
+    email = f"{label}+{int(time.time() * 1000)}@test.example.com"
+    password = f"pw-{uuid.uuid4()}"
+    created = service.admin.users.create(email=email, password=password, roles=roles, email_verified=True)
+    client = Pawabase(URL, os.environ["PAWABASE_PUBLISHABLE_KEY"], environment=ENV, session_store=MemorySessionStore())
+    client.auth.sign_in_with_password(email=email, password=password)
+    return TestPerson(str(created["id"]), email, client)
+
+
+def forget(p: TestPerson) -> None:
+    p.client.close()
+    try:
+        service.admin.users.delete_user(p.id)
+    except Exception:
+        pass
+```
+</CodeGroup>
+
+Unique emails per run let tests run in parallel and survive leftovers from a crashed run.
+
+### Testing policies as a matrix
+
+Access rules are best tested as a table: who, what, and the expected outcome.
+
+<CodeGroup>
+```typescript TypeScript
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
+import { person, forget, service, type TestPerson } from "./people";
+
+let ada: TestPerson;
+let bob: TestPerson;
+let noteId: string;
+
+before(async () => {
+  [ada, bob] = await Promise.all([person("ada"), person("bob")]);
+  noteId = String((await ada.client.from("notes").create({ title: "Ada's note", body: "private" })).id);
+});
+
+after(async () => {
+  await service.from("notes").delete(noteId).catch(() => undefined);
+  await Promise.all([forget(ada), forget(bob)]);
+});
+
+const cases = [
+  { who: "owner", act: () => ada.client.from("notes").get(noteId), expect: "ok" },
+  { who: "someone else", act: () => bob.client.from("notes").get(noteId), expect: "NotFoundError" },
+  { who: "owner updating", act: () => ada.client.from("notes").update(noteId, { title: "x" }), expect: "ok" },
+  { who: "someone else updating", act: () => bob.client.from("notes").update(noteId, { title: "x" }), expect: "PermissionError" },
+];
+
+for (const c of cases) {
+  test(`notes: ${c.who}`, async () => {
+    const outcome = await c.act().then(() => "ok", (error: Error) => error.name);
+    assert.equal(outcome, c.expect);
+  });
+}
+```
+
+```python Python
+import pytest
+
+from tests.people import forget, person, service
+
+
+@pytest.fixture(scope="module")
+def world():
+    ada, bob = person("ada"), person("bob")
+    note = ada.client.from_("notes").create({"title": "Ada's note", "body": "private"})
+    yield ada, bob, note["id"]
+    service.from_("notes").delete(note["id"])
+    forget(ada)
+    forget(bob)
+
+
+@pytest.mark.parametrize("who, act, expected", [
+    ("owner", lambda ada, bob, nid: ada.client.from_("notes").get(nid), "ok"),
+    ("someone else", lambda ada, bob, nid: bob.client.from_("notes").get(nid), "NotFoundError"),
+    ("owner updating", lambda ada, bob, nid: ada.client.from_("notes").update(nid, {"title": "x"}), "ok"),
+    ("someone else updating", lambda ada, bob, nid: bob.client.from_("notes").update(nid, {"title": "x"}), "ForbiddenError"),
+])
+def test_notes_access(world, who, act, expected):
+    ada, bob, note_id = world
+    try:
+        act(ada, bob, note_id)
+        outcome = "ok"
+    except Exception as error:
+        outcome = type(error).__name__
+    assert outcome == expected
+```
+</CodeGroup>
+
+The table reads like the policy's specification, and a policy change that breaks it fails a named case.
+Include the anonymous case, with a client that has no session, for every resource that should not be public.
+
+### Cleaning up
+
+Tests that create data must remove it, or the environment slowly fills with leftovers that make later tests unreliable.
+
+| Data | Clean up with |
+| --- | --- |
+| Records | The secret-key client, by id, in `after` hooks |
+| Files | `listAll` on a per-run prefix, then `remove` |
+| Users | `admin().users.deleteUser` |
+| Organizations | `admin().orgs.remove` |
+| Realtime | Nothing; channels disappear when unused |
+
+Give everything a test run creates a recognizable marker, such as the run's timestamp in names and keys.
+A periodic job can then remove anything older than a day with that marker, catching leftovers from crashed runs.
+
+### Calling flows in integration tests
+
+Flows can be tested through the doors clients use, or run directly by the management module with a chosen identity and their trace returned:
+
+<CodeGroup>
+```typescript TypeScript
+import { manage } from "@pawabase/client/manage";
+
+const run = await manage(service).flows.run("pay-order", { params: { id: orderId } }, { asUser: { user_id: ada.id } });
+assert.equal(run.status, "succeeded");
+```
+
+```python Python
+run = service.manage.flows.run("pay-order", {"params": {"id": order_id}}, as_user={"user_id": ada.id})
+assert run["status"] == "succeeded"
+```
+</CodeGroup>
+
+Running through the client checks the route or trigger policy too; running through the management module checks the flow's logic in isolation, and its `trace` shows each block when a test fails.
+
+## End-to-end tests
+
+End-to-end tests drive a browser through your application against a real environment.
+They are slow and valuable: they are the only tests that see sessions, redirects, realtime and your interface working together.
+
+### Signing in without the sign-in form
+
+Signing in through the form in every test is slow and makes every test depend on the sign-in page.
+Sign in once through the client, then put the session where the browser client looks for it.
+
+The browser client stores its session in `localStorage` under `pawabase.auth.<gateway host>.<first 14 characters of the API key>`, as JSON.
+
+```typescript
+// e2e/auth.setup.ts (Playwright)
+import { test as setup } from "@playwright/test";
+import { createClient, MemoryStorage } from "@pawabase/client";
+
+setup("sign in as Ada", async ({ page }) => {
+  const url = process.env.PAWABASE_URL!;
+  const apiKey = process.env.PAWABASE_PUBLISHABLE_KEY!;
+  const client = createClient({ url, apiKey, auth: { storage: new MemoryStorage() } });
+  const result = await client.auth.signInWithPassword({ email: process.env.ADA_EMAIL!, password: process.env.ADA_PASSWORD! });
+  if (result.status !== "signed_in") throw new Error("Ada's test account must not require MFA");
+  const storageKey = `pawabase.auth.${url.replace(/^https?:\/\//, "")}.${apiKey.slice(0, 14)}`;
+
+  await page.goto(process.env.APP_URL!);
+  await page.evaluate(([key, value]) => localStorage.setItem(key, value), [storageKey, JSON.stringify(result.session)]);
+  await page.context().storageState({ path: "e2e/.auth/ada.json" });
+  client.dispose();
+});
+```
+
+Tests that use the saved storage state start signed in as Ada.
+If your application stores sessions in cookies instead, set the cookies with the browser context's cookie API.
+
+A storage key derived this way depends on the gateway URL and API key the application was built with.
+Use exactly the same values in the setup as in the application under test.
+
+### Two people at once
+
+Realtime and collaboration need two signed-in browsers.
+Playwright's browser contexts are separate sessions in one browser:
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test("a new order appears on the dashboard of another staff member", async ({ browser }) => {
+  const ada = await browser.newContext({ storageState: "e2e/.auth/ada.json" });
+  const grace = await browser.newContext({ storageState: "e2e/.auth/grace.json" });
+  const adaPage = await ada.newPage();
+  const gracePage = await grace.newPage();
+
+  await gracePage.goto("/dashboard");
+  await expect(gracePage.getByTestId("live-indicator")).toHaveText("Live");
+
+  await adaPage.goto("/orders/new");
+  const reference = `E2E-${Date.now()}`;
+  await adaPage.getByLabel("Reference").fill(reference);
+  await adaPage.getByRole("button", { name: "Create order" }).click();
+
+  await expect(gracePage.getByText(reference)).toBeVisible({ timeout: 10_000 });
+});
+```
+
+Wait for visible outcomes with timeouts, never with fixed sleeps.
+Delivery is usually instant, but test machines are not.
+
+## Test runners
+
+The client works with every common runner.
+A few settings matter.
+
+| Runner | Notes |
+| --- | --- |
+| `node:test` | Built in; `mock.timers` fakes `Date` and `setTimeout` |
+| Vitest | Use the `node` environment for client tests; `jsdom` adds a `window`, which makes the client behave as in a browser |
+| Jest | Node 18 and later provide `fetch`; with `jsdom`, the same browser behavior applies |
+| Playwright | For end-to-end tests; the client can also run in its setup files |
+
+Two behaviors change when a test environment defines `window` and `document`, as `jsdom` does:
+
+| Behavior | Effect in tests |
+| --- | --- |
+| Secret keys are refused | A test that creates a secret-key client in `jsdom` throws `ConfigError`; create it in a `node` environment, or pass `dangerouslyAllowBrowser` in that test only |
+| Sessions use `localStorage` | Sessions persist between tests in the same file; use `MemoryStorage` or clear storage between tests |
+
+Always dispose clients created in tests.
+Refresh timers and realtime sockets otherwise keep running between tests, and some runners wait for them before exiting.
+
+```typescript
+import { afterEach } from "node:test";
+
+const created: Array<{ dispose(): void }> = [];
+export function track<T extends { dispose(): void }>(client: T) {
+  created.push(client);
+  return client;
+}
+afterEach(() => created.splice(0).forEach((client) => client.dispose()));
+```
+
+## Running tests in CI
+
+| Concern | Practice |
+| --- | --- |
+| Keys | Store the test environment's publishable and secret keys in the CI secret store; never commit them |
+| Environment | Point tests at a dedicated test or preview environment, never at production |
+| Isolation | Unique names per run; parallel jobs never share records |
+| Cleanup | `after` hooks, plus a scheduled sweep of leftovers |
+| Rate limits | Keep concurrency modest; test traffic counts against the key's limit |
+| Definitions | Promote definitions to the test environment before running tests that depend on them |
+
+```text
+jobs:
+  test:
+    steps:
+      - npm ci
+      - npm run types:check
+      - npx tsc --noEmit
+      - npm test                    # unit and component tests, no network
+      - npm run test:integration    # against the test environment
+        env: PAWABASE_URL, PAWABASE_ENV=test, PAWABASE_PUBLISHABLE_KEY, PAWABASE_SECRET_KEY
+      - npx playwright test         # end to end, against a preview deployment
+```
+
+Run unit and component tests on every push, integration tests on every pull request, and end-to-end tests before releases or nightly.
+
+### Rate limits and test traffic
+
+The gateway's rate limit is counted per API key: every request made with one key shares one budget, 600 requests per minute by default.
+A large parallel test suite can exhaust it, and a test environment shared with developers then slows down for everyone.
+
+Give CI its own keys, so its traffic has its own budget.
+The same reasoning applies in production: a server or batch job with its own key cannot use up the budget your browsers depend on.
+
+## Flaky tests and their usual causes
+
+| Symptom | Usual cause | Fix |
+| --- | --- | --- |
+| A test passes alone and fails in the suite | Shared data between tests | Unique names and ids per test |
+| Random `401` failures | Two parts of the test refresh the same session | One client per test person; `persistSession: false` |
+| Random `429` failures | Too much parallel traffic on one key | Lower concurrency; a separate key for CI |
+| Realtime assertions time out | The screen asserted before the channel was joined | Wait for a "live" indicator first |
+| Tests hang at the end | Clients not disposed | Dispose in `afterEach` |
+| Lists contain unexpected rows | Leftovers from earlier runs | Filter by the run's marker; sweep leftovers |
+| A policy test passes locally and fails in CI | Different definitions in the two environments | Promote before testing |
+
+## Servers in production
+
+### Logging with request ids
+
+A server that calls Pawabase for its own clients should log both request ids: its own and Pawabase's.
+Then one incident can be followed from your logs into **Project → Activity**.
+
+```typescript
+const base = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  hooks: {
+    onResponse: ({ method, url, status, durationMs, requestId }) => {
+      logger.info({ method, path: new URL(url).pathname, status, durationMs, pawabaseRequestId: requestId, requestId: currentRequestId() });
+    },
+  },
+});
+
+declare const logger: { info(fields: object): void };
+declare function currentRequestId(): string | undefined;
+```
+
+`currentRequestId` would read your framework's per-request context, such as `AsyncLocalStorage` in Node.
+Hooks are defined on the base client and inherited by every `asUser` client, so one definition covers all requests.
+
+### Graceful shutdown
+
+On shutdown, dispose long-lived clients so timers and sockets close cleanly:
+
+```typescript
+process.on("SIGTERM", () => {
+  base.dispose();
+  service.dispose();
+  server.close(() => process.exit(0));
+});
+
+declare const server: { close(callback: () => void): void };
+```
+
+### Caching on servers
+
+Server responses built from one person's data must not be cached for others.
+
+| Data | Cacheable on your server |
+| --- | --- |
+| Public content read with the base client and no token | Yes, if it is the same for everyone |
+| Data read through `asUser` | Only per person, keyed by the person |
+| Data read with the service client | Only if your code makes it safe to share |
+
+A shared cache keyed only by URL, in front of per-person data, is one of the most common ways data leaks between users.
+
+### Organizations on servers
+
+A per-request client carries whichever organization the person's token names.
+A server that must act in another organization of the person needs a token issued for it, which only the person's session can request with `auth.switchOrg`.
+For cookie sessions, have the browser call a server endpoint that switches organization with the refresh cookie and stores the new tokens, in the same way the refresh handler does.
+
+## Integrations on your server
+
+Third-party services call your application back: payment providers, email services, delivery partners.
+Pawabase can receive those callbacks itself with [inbound hooks](/webhooks/inbound), which check the sender's signature and start a flow.
+Receive them on your own server only when the handling needs code a flow cannot run.
+
+```typescript
+app.post("/webhooks/payments", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!verifyProviderSignature(req.body, req.headers["x-signature"])) return res.status(401).end();
+  const event = JSON.parse(req.body.toString("utf8"));
+  if (event.type === "payment.succeeded") {
+    await service.from("orders").update(event.data.order_id, { status: "paid", payment_ref: event.data.id });
+  }
+  res.status(204).end();
+});
+
+declare function verifyProviderSignature(body: Buffer, signature: unknown): boolean;
+```
+
+Verify the signature against the raw body before parsing it.
+Answer quickly, and make the handling safe to repeat, because providers retry deliveries; writing absolute values, as above, is naturally repeatable.
+
+## Background workers
+
+A worker process takes jobs from a queue, a schedule or a polling loop, and uses a secret-key client.
+Three properties make it dependable.
+
+| Property | How |
+| --- | --- |
+| Each job is safe to run twice | Absolute writes, unique keys, checks before side effects |
+| Failures are classified | Transient errors are retried later; permanent ones are recorded |
+| Progress is visible | Status fields on records, or messages to a person's realtime channel |
+
+```typescript
+async function processPendingInvoices() {
+  for await (const invoice of service.from("invoices").eq("status", "pending").order("id")) {
+    try {
+      const pdf = await renderInvoice(invoice);
+      const key = `${invoice.org_id}/invoices/${invoice.id}.pdf`;
+      await service.storage.from("invoices").upload(key, pdf, { contentType: "application/pdf", timeoutMs: 0 });
+      await service.from("invoices").update(invoice.id, { status: "issued", file_key: key });
+    } catch (error) {
+      if (isTransient(error)) continue;
+      await service.from("invoices").update(invoice.id, { status: "failed", failure: String(error) });
+    }
+  }
+}
+
+declare function renderInvoice(invoice: unknown): Promise<Blob>;
+declare function isTransient(error: unknown): boolean;
+```
+
+The upload goes to a fixed key and the update writes absolute values, so running the loop twice over the same invoice produces the same result.
+Many workers like this can instead be flows on a schedule, which run inside Pawabase and keep their own run history; a worker earns its place when it needs libraries or runtimes a flow cannot use.
+
+## Fetching in parallel during rendering
+
+Server rendering waits for the slowest request on the page.
+Start independent requests together:
+
+```typescript
+export async function dashboardData(pawabase: ReturnType<typeof base.asUser>) {
+  const [orders, tasks, user] = await Promise.all([
+    pawabase.from("orders").eq("status", "open").order("created_at", "desc").perPage(5),
+    pawabase.from("tasks").eq("done", false).order("due_on").perPage(5),
+    pawabase.auth.getUser(),
+  ]);
+  return { orders: orders.data, tasks: tasks.data, user };
+}
+```
+
+With streaming frameworks, render the parts independently instead, so the fast parts appear first.
+Either way, a `Promise.all` that rejects on the first failure takes the whole page down; use `Promise.allSettled` for sections that can fail on their own.
+
+## Server keys and their safety
+
+A secret key on a server is the credential with the most authority in your application.
+Treat it accordingly.
+
+| Practice | Why |
+| --- | --- |
+| Keep it in the platform's secret store, never in code or images | Keys in repositories and images spread to every copy |
+| Import secret-key clients only from server-only modules | Bundlers follow imports into browser code |
+| Restrict the key to your servers' addresses with **Allowed IP ranges** | A leaked key is useless from elsewhere |
+| Give each service its own key | One leak or one rate-limit budget does not affect the others |
+| Rotate keys with a grace period | Deployed servers switch without downtime |
+| Never log option objects or headers | Keys end up in log storage |
+
+When rotating, create the replacement with a grace period, deploy servers with the new key, and let the old one expire.
+**Access → API keys** shows each key's **Last used** time, which confirms nothing still uses the old one.
+
+## Testing server code
+
+Server handlers that take a client as a dependency are easy to test with the fake server from the unit-test section.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { fakePawabase, page } from "./fake-pawabase";
+
+function ordersHandler(pawabaseFor: (token: string | null) => ReturnType<typeof fakePawabase>["client"]) {
+  return async (request: Request) => {
+    const token = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+    const result = await pawabaseFor(token).from("orders").perPage(20);
+    return Response.json(result);
+  };
+}
+
+test("the handler forwards the person's token", async () => {
+  const fake = fakePawabase({ "GET /rest/v1/orders": () => page([{ id: "o1" }]) });
+  const handler = ordersHandler((token) => (token ? fake.client.asUser(token) : fake.client));
+
+  const response = await handler(new Request("https://app.test/api/orders", { headers: { authorization: "Bearer tok-1" } }));
+
+  assert.equal(response.status, 200);
+  assert.equal(fake.requests[0].headers.get("authorization"), "Bearer tok-1");
+  fake.done();
+});
+```
+
+`asUser` on the fake client keeps the fake transport, so the test sees exactly which token each request carried.
+That is the property worth testing in server code: that each request runs as the right person.
+
+Middleware that refreshes cookies can be tested the same way, with a fake answering `POST /auth/v1/token`, and assertions on the `set-cookie` headers it produces.
+
+## Load testing
+
+Load tests measure how your application and its Pawabase environment behave under traffic.
+Two facts shape them.
+
+| Fact | Consequence |
+| --- | --- |
+| The gateway's rate limit is per API key, 600 requests per minute by default | A load test on one key measures the limit, not the capacity |
+| The client retries `429` after waiting | A load test that ignores retries reports slow responses instead of refusals |
+
+Give the load test its own keys, ask your installation's operator about the limits that apply, and record retries with the `onRetry` hook so you can tell waiting from working.
+Run load tests against a dedicated environment with production-like data, never against production itself.
+
+## Tests recorded from real answers
+
+Hand-written fixtures drift from what the server really returns.
+Recording answers from a test environment once, and replaying them in unit tests, keeps fixtures honest.
+
+```typescript
+import { writeFileSync } from "node:fs";
+
+export function recordingFetch(path: string): typeof fetch {
+  const recorded: Record<string, unknown> = {};
+  process.on("exit", () => writeFileSync(path, JSON.stringify(recorded, null, 2)));
+  return async (input, init) => {
+    const response = await fetch(input, init);
+    const url = new URL(String(input));
+    recorded[`${init?.method ?? "GET"} ${url.pathname}${url.search}`] = { status: response.status, body: await response.clone().json().catch(() => null) };
+    return response;
+  };
+}
+```
+
+Run an integration test once with a client using `recordingFetch`, review the file, and commit it.
+Unit tests then answer from the recording.
+Re-record when definitions change so fixtures continue to match the deployed API.
+
+Review recordings before committing them: they contain whatever the test environment returned, which must never be real people's data.
+
+## Local development
+
+Developers can run against a shared development environment or a Pawabase stack on their own machine.
+
+| Setup | Pros | Cons |
+| --- | --- | --- |
+| A shared development environment | Nothing to install; shared definitions | Shared data; others' changes affect you |
+| A local stack | Private data; works offline | Definitions must be kept in step with the shared environments |
+
+A local stack's gateway is an `http://localhost` address, which the client accepts.
+Its keys belong to the local environment, so a configuration that reads URL and key from the environment switches between the two without code changes.
+
+## One deployment, several environments
+
+Some products run one server deployment for several Pawabase environments, for example one per region or one per large customer.
+Keep a base client per environment and choose by request:
+
+```typescript
+const bases = new Map<string, ReturnType<typeof createClient>>();
+
+function baseFor(environment: string) {
+  let client = bases.get(environment);
+  if (!client) {
+    const key = process.env[`PAWABASE_KEY_${environment.toUpperCase()}`];
+    if (!key) throw new Error(`No key for ${environment}`);
+    client = createClient({ url: process.env.PAWABASE_URL!, apiKey: key, environment });
+    bases.set(environment, client);
+  }
+  return client;
+}
+
+export function pawabaseFor(environment: string, token: string | null) {
+  const base = baseFor(environment);
+  return token ? base.asUser(token) : base;
+}
+```
+
+A person's token belongs to one environment.
+Sending it to another environment's client fails with `401`, which protects against routing mistakes.
+
+## Words used on this page
+
+| Term | Meaning |
+| --- | --- |
+| Base client | One publishable-key client per process |
+| Per-request client | `base.asUser(token)`, acting as one request's person |
+| Service client | A secret-key client acting for the system |
+| Session owner | The single place that refreshes a person's session |
+| Test person | A user created for tests, signed in with its own client, deleted afterwards |
+| Run marker | A value, such as a timestamp, added to names so a test run's data can be found and removed |
+
+## Choosing an identity, task by task
+
+| Task on the server | Identity | Client |
+| --- | --- | --- |
+| Rendering a page for a signed-in person | The person | `base.asUser(token)` |
+| Rendering a public page | Anonymous | `base` |
+| An API endpoint your app's browsers call | The person | `base.asUser(token)` |
+| A webhook receiver for a payment provider | The system | `service` |
+| A nightly report | The system | `service` |
+| A support tool's "refund" button | The person to check, then the system to act | Both |
+| Seeding test data | The system | `service` |
+| A command-line tool a person runs | The person | A normal client with a stored session |
+
+When a row seems to need the system, ask whether a flow with `policy.check` could do the privileged part instead.
+A flow keeps the rule next to the data, where every client follows it, rather than in one server's code.
+
+## Seeding test data
+
+Tests and demos need data with known shapes.
+A seed script with a secret key creates it, and it should be safe to run more than once.
+
+```typescript
+const plans = [
+  { code: "free", name: "Free", price_minor: 0 },
+  { code: "pro", name: "Pro", price_minor: 2900 },
+];
+
+export async function seedPlans() {
+  for (const plan of plans) {
+    const existing = await service.from("plans").eq("code", plan.code).first();
+    if (existing) await service.from("plans").update(existing.id, plan);
+    else await service.from("plans").create(plan);
+  }
+}
+```
+
+Looking up by a unique business key, here `code`, makes the script an upsert: the second run updates instead of duplicating.
+For thousands of rows, the management module's `resources.importRecords(name, rows, { key: "code" })` does the same in one request; see [Environment management](/clients/typescript/management).
+
+## Resetting a test environment
+
+Integration suites are simpler when they start from a known state.
+The management module can take a snapshot of an environment once it is seeded, and restore it before each suite run.
+
+```typescript
+import { manage } from "@pawabase/client/manage";
+
+const m = manage(service, "test");
+
+export async function captureBaseline() {
+  return m.backups.snapshot("test-baseline", { note: "Seeded data for integration tests" });
+}
+
+export async function resetToBaseline(snapshotId: string) {
+  return m.backups.restoreSnapshot(snapshotId, { strategy: "replace", confirm: "test", safetySnapshot: false });
+}
+```
+
+A `replace` restore removes what the chosen parts hold before restoring, and requires the environment's name typed as `confirm`, so it cannot be run against the wrong environment by accident.
+Use it only on environments that exist for testing.
+
+## A preview environment per pull request
+
+Teams that change definitions in pull requests can give each one its own environment, so tests run against the branch's definitions.
+
+```typescript
+const m = manage(service, "development");
+
+export async function openPreview(prNumber: number) {
+  return m.environments.createPreview(`pr-${prNumber}`, { expiresInHours: 72 });
+}
+
+export async function closePreview(prNumber: number) {
+  return m.environments.deletePreview(`pr-${prNumber}`);
+}
+```
+
+A preview copies its source environment's definitions and expires by itself, so a forgotten preview cleans itself up.
+Previews have their own keys, and a key's secret is shown only when it is created.
+Create keys for CI in the new preview with the management module, such as `manage(service, "pr-12").keys.create("ci", { role: "publishable" })`, and pass them to the test job.
+
+## Integration tests for realtime
+
+Channel rules can only be tested against a real environment.
+Two signed-in test people, each with a client and a WebSocket, check that private channels stay private:
 
 ```typescript
 import WebSocket from "ws";
+import { RealtimeError, type WebSocketConstructor } from "@pawabase/client";
 
-const client = createClient({
-  url,
-  apiKey,
-  realtime: {
-    webSocket: WebSocket,
-  },
-});
-```
-
-If the application never opens realtime, no WebSocket adapter is required for ordinary HTTP capability clients.
-
-## React Native
-
-React Native integration needs deliberate persistent storage and URL callback handling.
-Supply a storage object implementing the SDK's three-method interface.
-
-```typescript
-const sessionStorage = {
-  getItem(key: string) {
-    return AsyncStorage.getItem(key);
-  },
-  setItem(key: string, value: string) {
-    return AsyncStorage.setItem(key, value);
-  },
-  removeItem(key: string) {
-    return AsyncStorage.removeItem(key);
-  },
-};
-
-const client = createClient({
-  url,
-  apiKey,
-  auth: {
-    storage: sessionStorage,
-    detectSessionInUrl: false,
-  },
-});
-```
-
-Handle the application deep link explicitly.
-
-```typescript
-async function handleAuthUrl(url: string) {
-  const result = await client.auth.getSessionFromUrl(url);
-
-  if (result.status === "mfa_required") {
-    navigateToMfa(result);
-  }
-}
-```
-
-Verify that the runtime's `fetch`, `Blob`, `FormData`, streams, and WebSocket behavior match the features the application uses.
-
-## In-memory sessions
-
-`MemoryStorage` is exported for explicit non-persistent session ownership.
-
-```typescript
-import {
-  createClient,
-  MemoryStorage,
-} from "@pawabase/client";
-
-const client = createClient({
-  url,
-  apiKey,
-  auth: {
-    storage: new MemoryStorage(),
-    persistSession: true,
-  },
-});
-```
-
-Persistence here lasts only as long as the storage object and process.
-It does not survive a reload or restart.
-This is appropriate for tests and some command-line tools.
-
-## Command-line tools
-
-A short-lived command should create one client, run bounded work, and dispose it.
-
-```typescript
-async function main() {
-  const client = createClient({
-    url: process.env.PAWABASE_URL!,
-    apiKey: process.env.PAWABASE_SECRET_KEY!,
-    retry: { retries: 2 },
-  });
-
+test("a person cannot join another person's channel", async () => {
+  const ws = { realtime: { webSocket: WebSocket as unknown as WebSocketConstructor } };
+  const ada = await person("ada", [], ws);
+  const bob = await person("bob", [], ws);
   try {
-    for await (const row of client.from("products")) {
-      await writeRow(row);
-    }
+    await ada.client.realtime.channel(`user:${ada.id}`).subscribe();
+    const refused = await bob.client.realtime.channel(`user:${ada.id}`).subscribe().then(() => null, (error) => error);
+    assert.ok(refused instanceof RealtimeError);
+    assert.equal(refused.code, "forbidden");
   } finally {
-    client.dispose();
+    await Promise.all([forget(ada), forget(bob)]);
   }
-}
-
-await main();
-```
-
-Set `maxRecords` for commands triggered by untrusted or accidental input.
-Call `dispose()` so auth timers and sockets do not keep the process active.
-
-## Testing strategy
-
-Test application behavior at three different boundaries.
-
-| Test level | Transport | Purpose |
-| --- | --- | --- |
-| Unit | Fake `fetch`, fake storage, optional fake socket | Deterministic request and error handling |
-| Integration | Local Pawabase installation | Policies, validation, schema, auth, and feature interaction |
-| Contract | Controlled deployed environment | Runtime/proxy behavior and public deployment configuration |
-
-Unit tests should not attempt to prove that a Pawabase policy is correct.
-Integration tests should not replace fast deterministic checks for application branching.
-
-## A minimal fetch fake
-
-The custom `fetch` option is the narrowest HTTP test seam.
-
-```typescript
-function jsonResponse(body: unknown, init: ResponseInit = {}) {
-  return new Response(JSON.stringify(body), {
-    status: init.status ?? 200,
-    headers: {
-      "content-type": "application/json",
-      ...init.headers,
-    },
-  });
-}
-
-const requests: Array<{
-  url: string;
-  init?: RequestInit;
-}> = [];
-
-const fakeFetch = async (url: string, init?: RequestInit) => {
-  requests.push({ url, init });
-  return jsonResponse({
-    data: [],
-    page: 1,
-    per_page: 20,
-    total: 0,
-  });
-};
-
-const client = createClient({
-  url: "https://api.test",
-  apiKey: "pb_pk_test",
-  fetch: fakeFetch,
-  retry: false,
 });
+
+declare function person(label: string, roles: string[], options: object): Promise<{ id: string; client: import("@pawabase/client").PawabaseClient }>;
+declare function forget(p: { client: { dispose(): void } }): Promise<void>;
 ```
 
-After the call, assert the public request contract rather than private SDK state.
+On Node 22 and later the global `WebSocket` works and the `ws` option can be dropped.
+`dispose()` in `forget` closes each person's socket, which lets the test runner exit.
 
-```typescript
-await client.from("posts").eq("status", "live");
+## A request's path through your server
 
-expect(requests).toHaveLength(1);
-expect(requests[0].url).toContain("filter%5Bstatus%5D=eq.live");
-expect(new Headers(requests[0].init?.headers).get("apikey"))
-  .toBe("pb_pk_test");
+```text
+browser ──cookie pb-access──▶ your server
+                               │ middleware: access cookie missing? refresh with pb-refresh, set new cookies
+                               │ handler: pawabase = base.asUser(access token)
+                               │          await pawabase.from("orders")…     ──▶ gateway ──▶ Pawabase (as the person)
+                               │          await service.routes.post(…)       ──▶ gateway ──▶ Pawabase (as the system), only after checks
+                               │ render with the results
+                               ▼
+browser ◀── HTML, set-cookie (when refreshed)
 ```
 
-## Test typed errors
+Each arrow into Pawabase carries exactly one identity, chosen by which client made the call.
+Reading the handler's code, you can tell which identity each line uses, which is what makes the arrangement reviewable.
 
-Return the same public error shapes an application can receive.
+## Server rendering or browser calls
 
-```typescript
-const fakeFetch = async () => {
-  return jsonResponse(
-    [
-      {
-        loc: ["body", "email"],
-        msg: "must be a valid email",
-        type: "value_error.email",
-      },
-    ],
-    {
-      status: 422,
-      headers: {
-        "x-request-id": "req_test_01",
-      },
-    },
-  );
-};
-```
+Some data can be fetched on the server while rendering or in the browser after the page loads.
+The choice affects speed, caching and how sessions are handled.
 
-```typescript
-await expect(client.from("profiles").create(input))
-  .rejects
-  .toMatchObject({
-    name: "ValidationError",
-    requestId: "req_test_01",
-  });
-```
+| Consideration | Fetch on the server | Fetch in the browser |
+| --- | --- | --- |
+| First paint | Data is in the first HTML | A loading state first |
+| Session | Cookie on the server | Session in the browser client |
+| Realtime | Not possible during rendering | Natural |
+| Caching per person | Your server must key caches by person | The browser holds its own data |
+| Request count to Pawabase | One per page render | One per visit, then updates |
 
-Use `instanceof ValidationError` when the test runner preserves one module instance.
-Use public fields when a runner isolates realms or transforms modules in a way that makes constructor identity unreliable.
+Many applications do both: the server renders the first view with `asUser`, and the browser takes over with realtime and its own client.
+That works when the browser and the server agree on who owns the session, as described above.
 
-## Test retries deterministically
+## Readiness checks
 
-Configure short delays and count calls.
+Services that depend on Pawabase can include it in their readiness probe, so an orchestrator does not send traffic to an instance that cannot reach it.
 
 ```typescript
-let attempts = 0;
-
-const fakeFetch = async () => {
-  attempts += 1;
-
-  if (attempts === 1) {
-    return jsonResponse("busy", { status: 503 });
+app.get("/ready", async (_req, res) => {
+  try {
+    const status = await base.status();
+    res.status(status.ok ? 200 : 503).json({ pawabase: status.ok });
+  } catch {
+    res.status(503).json({ pawabase: false });
   }
-
-  return jsonResponse({
-    data: [],
-    page: 1,
-    per_page: 20,
-    total: 0,
-  });
-};
-
-const client = createClient({
-  url: "https://api.test",
-  apiKey: "pb_pk_test",
-  fetch: fakeFetch,
-  retry: {
-    retries: 1,
-    baseDelayMs: 1,
-    maxDelayMs: 1,
-  },
 });
 ```
 
-Assert that a safe read retries and an unsafe `POST` does not retry unless the application explicitly marked its call idempotent.
+`status()` needs no person and no policy, only an accepted key, so it tests exactly "can this instance reach Pawabase".
+Keep it out of liveness probes: a Pawabase outage should stop traffic to the instance, not restart it.
 
-## Test cancellation
+## Performance on servers
 
-The fake must observe `init.signal` rather than returning immediately.
-
-```typescript
-const fakeFetch = async (_url: string, init?: RequestInit) => {
-  await new Promise((_resolve, reject) => {
-    init?.signal?.addEventListener(
-      "abort",
-      () => reject(init.signal?.reason),
-      { once: true },
-    );
-  });
-
-  return new Response();
-};
-```
-
-```typescript
-const controller = new AbortController();
-const pending = client.from("posts")
-  .withOptions({ signal: controller.signal })
-  .execute();
-
-controller.abort();
-
-await expect(pending).rejects.toMatchObject({
-  name: "AbortError",
-});
-```
-
-## Test session persistence
-
-Use one `MemoryStorage` instance across two clients to simulate an application restart without involving browser state.
-
-```typescript
-const storage = new MemoryStorage();
-
-const first = createClient({
-  url,
-  apiKey,
-  fetch: fakeFetch,
-  auth: { storage },
-});
-
-await first.auth.signInWithPassword({ email, password });
-first.dispose();
-
-const second = createClient({
-  url,
-  apiKey,
-  fetch: fakeFetch,
-  auth: { storage },
-});
-
-await second.auth.initialized();
-expect(await second.auth.getCachedUser()).not.toBeNull();
-second.dispose();
-```
-
-Use a unique `storageKey` when several clients share the storage instance in one test process.
-
-## Corrupt-session behavior
-
-The auth client discards an unreadable stored session instead of keeping invalid serialized state.
-Test the application response to a signed-out initial session rather than depending on a parser exception.
-
-```typescript
-const brokenStorage = {
-  getItem() {
-    return "not-json";
-  },
-  setItem() {},
-  removeItem() {},
-};
-```
-
-After initialization, `getSession()` should be `null` and the application should render its signed-out path.
-
-## Realtime tests
-
-Realtime unit tests need a fake implementing the public `WebSocketLike` surface:
-
-```typescript
-interface WebSocketLike {
-  readyState: number;
-  send(data: string): void;
-  close(code?: number, reason?: string): void;
-  onopen: ((event: unknown) => void) | null;
-  onmessage: ((event: { data: unknown }) => void) | null;
-  onclose: ((event: { code: number; reason?: string }) => void) | null;
-  onerror: ((event: unknown) => void) | null;
-}
-```
-
-Test application behavior around public events: subscribed, message, presence, closed, and error.
-Do not assert private reconnect timer fields.
-
-For rule authorization and history retention, use a real local Pawabase environment.
-
-## Cleanup in tests
-
-Every created client should be disposed, even when an assertion fails.
-
-```typescript
-const client = createClient(options);
-
-try {
-  await exercise(client);
-} finally {
-  client.dispose();
-}
-```
-
-Cleanup prevents an auto-refresh timer, storage listener, heartbeat, or reconnect timer from leaking into the next test or keeping the process open.
-
-## Avoid shared mutable fixtures
-
-A suite-wide browser-style client can retain a user, cached channel, or listener across tests.
-Prefer a factory that returns a new client with a unique storage namespace and deterministic adapters.
-
-```typescript
-function testClient(overrides = {}) {
-  return createClient({
-    url: "https://api.test",
-    apiKey: "pb_pk_test",
-    fetch: fakeFetch,
-    retry: false,
-    auth: {
-      storage: new MemoryStorage(),
-      storageKey: crypto.randomUUID(),
-    },
-    ...overrides,
-  });
-}
-```
-
-If a test intentionally verifies persistence, share only the storage object needed for that scenario.
-
-## Local integration tests
-
-A local installation lets tests cover behavior a transport fake cannot establish:
-
-- resource validation compiled from Studio definitions;
-- policy visibility and hidden `404` results;
-- user sign-up and refresh-token rotation;
-- storage bucket limits and policies;
-- function and flow deployment behavior;
-- realtime channel rules, history, and presence;
-- generated type drift against the active environment.
-
-Use a dedicated test environment and data namespace.
-Do not point destructive test cleanup at development or production by relying on a default URL.
-
-## Secrets in test systems
-
-CI can use a scoped secret key for setup and cleanup while test subjects use publishable keys and user sessions.
-
-| Credential | Use in tests |
+| Practice | Effect |
 | --- | --- |
-| Publishable key | Exercise real application policy behavior |
-| User session | Exercise ownership and role rules |
-| Secret key | Provision and clean fixtures under controlled CI access |
+| One base client per process | Connection reuse; no repeated setup |
+| `asUser` per request | A few objects per request; no network, no timers |
+| Parallel independent calls | Page time is the slowest call, not the sum |
+| `select` the columns a page needs | Smaller answers, faster serialization |
+| No per-request realtime connections | Sockets belong in browsers |
+| Timeouts below your platform's limit | Clean errors instead of killed requests |
 
-Keep the secret out of snapshots, request dumps, and test failure output.
-Use separate clients so an administrative key cannot accidentally become the subject of a policy test.
+Creating a full client per request, instead of `asUser`, works but repeats setup work and, in browsers' absence, creates refresh machinery nobody uses.
+It is the most common avoidable cost in server code.
 
-## Observability in runtime tests
+## Common mistakes
 
-Hooks can collect request count, retry count, status, duration, and request IDs.
-
-```typescript
-const observations = [];
-
-const client = createClient({
-  url,
-  apiKey,
-  hooks: {
-    onResponse(info) {
-      observations.push(info);
-    },
-  },
-});
-```
-
-Assert outcomes rather than exact durations.
-For an integration failure, include `requestId` in the test output so the corresponding request can be found in **Observability**.
-
-## Direct `HttpClient` use
-
-`HttpClient` is exported for advanced transport composition.
-Most applications should use `PawabaseClient.request()` because it already has a correctly configured key, token provider, retry policy, and hooks.
-
-Constructing `HttpClient` directly requires a complete `HttpConfig`, including a fetch function, headers, timeout, retry configuration, hooks, and optional token provider.
-That surface is appropriate for infrastructure libraries that deliberately own those pieces.
-
-```typescript
-import { HttpClient } from "@pawabase/client";
-
-const http = new HttpClient({
-  baseUrl: url,
-  apiKey,
-  fetch,
-  headers: {},
-  timeoutMs: 30_000,
-  retry: false,
-  hooks: {},
-  tokens: null,
-});
-```
-
-Do not build a second session-refresh system merely because the transport class is exported.
-For normal raw public endpoints, use the root client's `request()` method.
-
-## Low-level request parsing
-
-`HttpClient.request()` supports parse modes for JSON, text, blobs, array buffers, streams, and raw responses.
-The capability clients choose the correct mode for their public methods.
-
-| Parse mode | Result |
-| --- | --- |
-| `json` | Parsed JSON, or `undefined` for `204` |
-| `text` | Response text |
-| `blob` | `Blob` |
-| `arrayBuffer` | `ArrayBuffer` |
-| `stream` | Response body stream |
-| `response` | Raw successful `Response` |
-
-An absolute URL request sends neither API key nor user token.
-The storage client uses this behavior for signed upload URLs.
-Do not use it as a general way to send Pawabase credentials to another origin.
-
-## Runtime readiness checklist
-
-| Concern | Browser | Node/worker | Edge | React Native |
-| --- | --- | --- | --- | --- |
-| `fetch` | Usually global | Global on supported Node | Usually global | Verify runtime |
-| `WebSocket` | Usually global | Node-version dependent | Platform dependent | Verify runtime |
-| Persistent storage | `localStorage` | Custom | Usually external | Supply adapter |
-| Secret key | Never | Controlled deployment only | Controlled secret binding only | Never |
-| User session | Managed client | Request-scoped preferred | Request-scoped | Managed with custom storage |
-| OAuth callback | Browser URL fragment | Framework callback | Framework callback | Deep link |
-| Disposal | App shutdown/hot reload | Request/job/process cleanup | Invocation cleanup | App teardown/tests |
-
-## Common runtime failures
-
-| Symptom | Cause | Correction |
+| Mistake | Consequence | Fix |
 | --- | --- | --- |
-| User A receives user B's data on SSR | Shared mutable managed session | Use `accessToken` or `asUser()` per request |
-| Node 20 realtime throws configuration error | No WebSocket constructor | Supply a compatible implementation |
-| React Native signs out after restart | No persistent auth storage | Supply async `SessionStorage` |
-| OAuth works in browser but not mobile | Redirect fragment never reaches SDK | Call `getSessionFromUrl()` from deep-link handler |
-| Test process does not exit | Undisposed timer or socket | Dispose every client fixture |
-| Unit test waits through real backoff | Default retry enabled | Disable retry or use a tiny test policy |
-| Edge invocation loses session | Relied on process memory | Supply identity from every request |
-| Policy test unexpectedly succeeds | Fixture used secret key | Exercise with publishable key and intended user |
+| A secret key for everything on the server | Policies never apply; one bug exposes everyone's data | `asUser` with a publishable key for per-person work |
+| An `asUser` client stored in module scope | Requests act as whoever was stored | Create per request |
+| Browser and server both refreshing | Sessions end at random | One session owner |
+| Caching per-person pages globally | People see each other's data | Cache per person, or not at all |
+| Tests against production | Real data changed by tests | A test or preview environment |
+| Clients not disposed in tests | Hanging test runs | Dispose in `afterEach` |
+| One key for browsers, servers and CI | One budget for all traffic | Separate keys |
+
+## Scripts and one-off tasks
+
+One-off scripts, such as a data fix or a migration of records between fields, run with a secret key and change real data.
+A few habits keep them safe.
+
+```typescript
+#!/usr/bin/env node
+import { createClient } from "@pawabase/client";
+
+const dryRun = !process.argv.includes("--apply");
+const environment = process.env.PAWABASE_ENV!;
+const service = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_SECRET_KEY!, environment });
+
+let changed = 0;
+for await (const customer of service.from("customers").is("country", null).select("id", "phone")) {
+  const country = String(customer.phone ?? "").startsWith("+233") ? "GH" : null;
+  if (!country) continue;
+  changed += 1;
+  if (!dryRun) await service.from("customers").update(customer.id, { country });
+}
+console.log(`${dryRun ? "Would change" : "Changed"} ${changed} customers in ${environment}.`);
+service.dispose();
+```
+
+| Habit | Why |
+| --- | --- |
+| A dry run by default, with an explicit flag to apply | The first run shows what would change |
+| The environment printed in the output | Running against the wrong environment becomes obvious |
+| Absolute writes, selected by a condition the write removes | Running twice changes nothing more |
+| A snapshot before large changes | `manage().backups.snapshot(…)` gives a way back |
+
+## A testing checklist
+
+| Check | Why |
+| --- | --- |
+| Query building and error mapping have unit tests with a fake server | Cheap, fast and precise |
+| Screens are tested with real answer and error shapes | Rendering bugs are caught before users see them |
+| Each resource's access rules have a matrix of integration tests | Policies are only tested against the server |
+| Private channels are tested with two people | Channel rules are only tested against the server |
+| Integration tests use their own environment and keys | Tests do not disturb people or production |
+| Every test cleans up, and a sweep catches the rest | The environment stays usable |
+| A few end-to-end tests cover sign-in, a core action and a live update | The pieces work together |
+
+## What to watch on servers
+
+| Metric | From | Tells you |
+| --- | --- | --- |
+| Pawabase request duration by route | `onResponse` | Which calls slow pages down |
+| Retries by reason | `onRetry` | Whether the installation is struggling or limits are close |
+| `401` rate after refresh | `onError` | Sessions ending unexpectedly |
+| `429` rate by key | `onResponse` | How close each key is to its budget |
+| Errors by class | `onError` | Regressions after releases |
+
+## What the browser sends your server
+
+When the browser owns the session and calls your own API, it must send the person's access token, and your server must pass it on unchanged.
+
+```typescript
+// in the browser
+const token = await pawabase.auth.getAccessToken();
+const response = await fetch("/api/orders", { headers: token ? { authorization: `Bearer ${token}` } : {} });
+```
+
+`getAccessToken()` refreshes first when the token is about to expire, so the server receives a token that is valid for at least the refresh margin.
+Your server then builds `base.asUser(token)` from the header.
+
+| Practice | Why |
+| --- | --- |
+| Send the access token only, never the refresh token | The server does not need to refresh, and should not be able to |
+| Use the `authorization` header, not a query parameter | Query strings end up in logs |
+| Answer `401` when the token is refused | The browser client then refreshes or signs the person out |
+
+## Moving a browser app to server rendering
+
+Applications often start as browser-only and add server rendering later.
+The move changes where the session lives, and doing it in order avoids signing everyone out.
+
+| Stage | Change |
+| --- | --- |
+| Start | Browser client with the session in `localStorage` |
+| Add server reads | Browser sends its access token to your server; server uses `asUser` |
+| Move the session to cookies | Server sign-in and refresh endpoints; browser client with `persistSession: false` |
+| Remove token passing | Server reads tokens from cookies; the browser no longer sends them |
+
+During the third stage, people who are signed in through `localStorage` keep that session until it ends.
+Let the browser client adopt the cookie-based flow at their next sign-in rather than forcing everyone out at once.
+
+A practical way to do that is a small migration endpoint.
+On page load, a browser that still holds a `localStorage` session sends its refresh token once to your server, which exchanges it for new tokens, sets the cookies, and answers with success.
+The browser then removes its stored session.
+Because the exchange rotates the refresh token, the browser must stop using its old session immediately after the call, or the next refresh from either side would present a consumed token and end the session.
+
+Remove the migration endpoint after a few weeks, when sessions older than the move have expired on their own.
+Keep an eye on the `401` rate after refresh during the move; a rise means two owners are still refreshing somewhere.
+
+| Signal during the move | Meaning |
+| --- | --- |
+| `SIGNED_OUT` events spike in browsers | The browser client is still refreshing a session the server now owns |
+| Migration endpoint errors with `401` | The browser sent a refresh token that was already rotated |
+| Pages render signed out for signed-in people | Cookies are not reaching the server: check their path and domain |
+
+Each of these points to a specific fix, and none requires signing everyone out.
+Watch them for a week after the move, then remove the migration code with the confidence that every session has a single owner.
+Write down the date of the move in the code that remains, so the next person knows why cookies and tokens are handled the way they are.
+
+## Debugging identity mix-ups
+
+When someone reports seeing data that is not theirs, or not seeing data that is, the question is which identity each request carried.
+
+| Step | How |
+| --- | --- |
+| Find the request | The Pawabase request id in your server's logs, from the `onResponse` hook |
+| See who it ran as | The request in **Project → Activity** shows the caller |
+| Compare with the person | If the caller differs, a client was shared or cached between requests |
+| Check caches | Any cache in front of per-person data must be keyed by person |
+
+Mix-ups almost always come from a shared `asUser` client, a module-level variable holding a token, or a cache keyed without the person.
+Each is visible in code review once you know to look for it.
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Create keys for servers, CI and browsers separately | **Access → API keys**, **New key** |
+| Restrict a server key to your server's addresses | **Allowed IP ranges** on the key |
+| See test users and clean them up by hand | **Access → Users & auth → Users** |
+| See requests from a test run | **Project → Activity**, filtered by time or request id |
+| Keep the test environment's definitions current | Promote from development; see **Project → Settings** for environments |
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| One person sees another's data | An `asUser` client or its result was shared between requests, or cached | Create per request; cache per person |
+| `ConfigError` about secret keys in tests | The test environment defines `window` | Use a `node` environment for that test |
+| Server requests fail with `401` after a while | Per-request tokens expired and nobody refreshed them | Refresh in middleware |
+| Sessions end unexpectedly | The browser and the server both refresh | Choose one owner of the session |
+| `429` under load from a server | All traffic shares one key's budget | Separate keys for servers and jobs; spread work |
+| Edge functions time out | Client timeouts and retries exceed the platform limit | Lower `timeoutMs` and retries |
+| Tests leave users and records behind | Missing cleanup, or crashes before cleanup | `after` hooks plus a scheduled sweep |
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can my server verify a Pawabase access token itself?">
+    The client does not verify tokens; it forwards them, and Pawabase verifies them on every request.
+    A server that needs the person's identity before calling anything can call `asUser(token).auth.getUser()`, which fails with `401` for an invalid token.
+  </Accordion>
+  <Accordion title="Should my server use the person's token or a secret key?">
+    The person's token, through `asUser`, whenever the server acts for them.
+    Use a secret key only for work that is not on anyone's behalf, or for a privileged step after your own check.
+  </Accordion>
+  <Accordion title="Can I run integration tests against production?">
+    Do not.
+    Tests create and delete users and records, and a bug in a test can do real damage.
+    Use a test or preview environment with the same definitions.
+  </Accordion>
+  <Accordion title="How do I test MFA flows?">
+    Unit-test them with a fake server that answers `mfa_required`.
+    For integration tests, enroll a test user's authenticator with a known secret and compute codes in the test with a TOTP library.
+  </Accordion>
+  <Accordion title="Can tests share one signed-in person?">
+    Within one test file, yes, if the tests do not change that person's session.
+    Across parallel files, give each its own person, because a sign-out or MFA change in one would affect the others.
+  </Accordion>
+  <Accordion title="How do I test code that uses `manage()` or `admin()`?">
+    Unit-test it with the fake server, answering `/platform/v1/envs/<env>/…` paths.
+    Integration-test it only against environments that exist for testing, because these modules change configuration and users.
+  </Accordion>
+  <Accordion title="Do per-request clients share connections?">
+    Yes, through the runtime's `fetch`, which pools connections to the gateway across all clients in the process.
+  </Accordion>
+  <Accordion title="Can I use the client in a Node worker thread?">
+    Yes.
+    Each thread has its own clients and its own `fetch`; create them inside the worker.
+  </Accordion>
+</AccordionGroup>
 
 ## Related pages
 
 <CardGroup cols={2}>
-  <Card title="Client configuration" icon="sliders" href="/clients/typescript/client-configuration">
-    Constructor options, session storage, token providers, hooks, and disposal.
-  </Card>
-  <Card title="Errors and retries" icon="triangle-alert" href="/clients/typescript/errors-retries">
-    Deterministic failure handling, retry ownership, deadlines, and cancellation.
-  </Card>
-  <Card title="Generated types" icon="brackets-curly" href="/clients/typescript/generated-types">
-    Keep test and deployment resource contracts aligned.
-  </Card>
-  <Card title="Mobile clients" icon="mobile" href="/clients/mobile">
-    Mobile storage, deep links, network behavior, and application integration.
-  </Card>
+  <Card title="Client configuration" icon="sliders-horizontal" href="/clients/typescript/client-configuration">Options for each runtime, including stateless clients.</Card>
+  <Card title="Authentication" icon="key-round" href="/clients/typescript/authentication">Cookie sessions and the refresh rules.</Card>
+  <Card title="User administration" icon="users" href="/clients/typescript/user-administration">Creating and removing test users.</Card>
+  <Card title="Environment management" icon="settings" href="/clients/typescript/management">Preview environments and flow runs from CI.</Card>
 </CardGroup>
