@@ -1,0 +1,266 @@
+---
+title: "Migrations"
+description: "What Create / migrate table does: immediate, additive-only DDL for SQLite, PostgreSQL and MySQL, with no preview, no rollback and no history, and how to work safely with that."
+icon: "arrow-right"
+---
+
+## The mental model: saving defines, migrating changes the database
+
+A **resource** in Pawabase is a definition: a name, a table, a primary key, a list of fields. Saving a resource in Studio stores that definition and validates it. It does **not** touch your database. The database changes only when you press **Create / migrate table** on the resource's sheet, which sends `POST /platform/v1/projects/{ref}/envs/{env}/resources/{name}/migrate`.
+
+That split is the most important idea on this page:
+
+| Action | What changes | What does not |
+| --- | --- | --- |
+| **Save changes** on a resource | The stored definition, and the `version` of the environment (the API recompiles on the next request) | Every table, column and index in the database |
+| **Create / migrate table** | The database: tables, columns and indexes | The stored definition |
+| **Promote** an environment | Definitions in the target environment | The target's database. Promotion never creates tables |
+| **Delete** a resource | The stored definition | The table and its rows |
+| A **row write** through `/rest/v1` | Rows | The table's structure |
+
+So a definition and a table can disagree, and Pawabase does not stop them from disagreeing. Most of the problems people hit with migrations are one of the two being ahead of the other, and most of this page is about recognising which one.
+
+<Warning>
+A migration runs real DDL (`CREATE TABLE`, `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX`) the moment you press the button, on the live connection of that environment. There is no preview, no dry run, no queue of pending migrations and no rollback. The response lists the statements **after** they ran. Read the sections below before your first migration against a database that matters.
+</Warning>
+
+Everything on this page was run against a real Pawabase API. SQLite was exercised end to end. The PostgreSQL and MySQL statements come from the DDL generator, which was run for every dialect and its output captured, and the places where a dialect's behavior could not be run are said so.
+
+
+## What the button does, step by step
+
+`migrate` is a short deterministic procedure. It looks at your database, compares it with the resource, and issues the difference.
+
+1. **List the tables** that exist in the environment's database.
+2. **If the resource's table is missing**, run one `CREATE TABLE IF NOT EXISTS` statement built from the resource's key, `id_type`, fields and `timestamps` setting, in the dialect of the connected database. If the resource has an `owner_field` that is not also declared as a field, its column is added to the statement.
+3. **If the table exists**, read its actual columns and compare them with every column the resource defines: the key, each field, the two timestamps when `timestamps` is on, and the `owner_field`. For each column that is missing, run `ALTER TABLE ... ADD COLUMN`.
+4. **Emit the index statements**: one `CREATE INDEX` or `CREATE UNIQUE INDEX` for each field marked `indexed` or `unique`, and one `CREATE INDEX` for the `owner_field`. This happens whether the table was just created or already existed.
+5. **Return the statements** that ran.
+
+There is no transaction around the whole procedure. Each statement is its own unit, so a failure part-way leaves the earlier statements applied.
+
+### What the response looks like
+
+Migrating a new `products` resource on SQLite:
+
+```http
+POST /platform/v1/projects/acme/envs/development/resources/products/migrate
+```
+
+```json
+{
+  "resource": "products",
+  "table": "products",
+  "statements": [
+    "CREATE TABLE IF NOT EXISTS \"products\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"sku\" TEXT UNIQUE, \"title\" TEXT, \"price\" REAL, \"stock\" INTEGER, \"active\" INTEGER, \"created_at\" TEXT, \"updated_at\" TEXT)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_products_sku\" ON \"products\" (\"sku\")"
+  ]
+}
+```
+
+In Studio the same call shows the toast **Table migrated** and prints this JSON in the sheet, so you can read what ran.
+
+Run it a second time and the table already matches, so the table statement is gone. Only the index statements remain, and because they are `IF NOT EXISTS` they do nothing:
+
+```json
+{
+  "resource": "products",
+  "table": "products",
+  "statements": [
+    "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_products_sku\" ON \"products\" (\"sku\")"
+  ]
+}
+```
+
+A resource with no indexed fields and a table that already matches returns an empty list:
+
+```json
+{ "resource": "legacy_customers", "table": "legacy_customers", "statements": [] }
+```
+
+An empty list is a successful no-op. It is not an error and it does not mean "nothing is wrong", only that nothing is **missing**.
+
+<Note>
+The statements in the response are the ones that were *issued*. On PostgreSQL and SQLite the repeated index statements are harmless. On MySQL they are not, which is covered under [MySQL](/data/migrations/when-a-migration-fails-part-way#mysql-has-no-if-not-exists-on-indexes).
+</Note>
+
+
+## What migrate never does
+
+Migration is **additive only**. It never:
+
+| It never | Even if |
+| --- | --- |
+| Drops a column | You removed the field from the resource |
+| Changes a column's type | You changed the field's `type` |
+| Adds or removes `NOT NULL` | You changed `required` or `nullable`. `NOT NULL` is never emitted |
+| Adds a `DEFAULT` to a column | You set a field `default`. Defaults apply to new API creates only |
+| Drops a table | You deleted the resource |
+| Renames a column or table | You changed `name` or `table` |
+| Converts a key between integer, UUID and ULID | You changed `id_type` |
+| Drops an index | You cleared `indexed` or `unique` |
+| Backfills rows | You added a field with a default |
+| Copies data between databases | You changed `PAWABASE_DEFAULT_DATA_URL` |
+
+Each of these is a destructive or data-transforming change that depends on what is in the table. Pawabase leaves them to a person with the database in front of them, through the [Database console](/data/database-console/overview) or a direct connection. If you change a field's type and migrate again, nothing happens to the existing column. From then on the definition and the column simply disagree until you resolve it.
+
+
+## Migrations are forward-only
+
+There is no down migration, no rollback command, and no stored history of earlier schema states. `migrate` compares the database as it is **now** with the resource as it is **now** and applies the difference. It cannot replay anything backward because it never stored schema states. The audit log keeps the statements of each successful migration, which is a record of what ran, not a way to undo it.
+
+Three practical consequences:
+
+- **Adding is safe to leave.** If you add a field, migrate, and then decide you do not want it, remove it from the resource. The column stays in the table, harmless. See [what a removed field leaves behind](/data/migrations/changing-what-the-api-sees-without-changing-the-table#what-a-removed-field-leaves-behind).
+- **Removing is a manual job.** A column you want gone is a `DROP COLUMN` you run yourself in the console. Pawabase will not offer to.
+- **Order matters, so rehearse.** Run the migration where it does not matter first and read the `statements`. Each environment has its own database, which is what makes that cheap. See [Environments and promotion](/studio/environments-and-promotion).
+
+
+## Where a migration runs: the environment's database
+
+Every environment has one database, and a migration runs against that one. Which database it is comes from `PAWABASE_DEFAULT_DATA_URL` in the installation's environment file, with `{project}` and `{env}` filled in. See [Your database](/data/your-database/overview) for the full story. For migrations the part that matters is the **table name** that results:
+
+| Environment's database | Physical table name | Why |
+| --- | --- | --- |
+| **A PostgreSQL URL** (the compose default, or your own template) | `pb_<hash>_<table>`, for example `pb_3f9a1c2e7b04_products` | Environments and projects may share a PostgreSQL database, so names are prefixed to keep them apart. The hash is the first 12 hex characters of a SHA-256 of `project:environment`. The name is cut to 63 characters |
+| **A SQLite or MySQL URL** (the development compose file is SQLite) | The `table` you declared, unchanged | One file or database per project and environment, so nothing collides |
+
+The prefix is invisible to the API. `/rest/v1/products` always means the resource called `products`, and the resource's `table` field is the logical name. It only shows when you read the database directly. Two ways to learn a physical name: the `table` field in the response of **Create / migrate table**, which is the physical name the statements ran against, or the hash itself, which is the first 12 hex characters of `sha256("<project>:<environment>")`. The **Database** page labels each table with its resource by comparing the table's name with the resource's declared `table`, so a prefixed table is listed **without** a resource badge on the shared default (read from the code, not run against PostgreSQL).
+
+<Tip>
+If you plan to connect other tools to the database (reporting, a warehouse, a migration tool you already run), point the environment at your own database first. The platform default's prefixed names are an implementation detail, not something to build on.
+</Tip>
+
+
+## The DDL for each dialect
+
+The generator maps each field type to a column type for the connected dialect. This is the complete table, taken from the generator.
+
+| Field type | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| `string` | `TEXT` | `VARCHAR(n)`, where *n* is `max_length`, or 255 when it is not set | `VARCHAR(n)`, same rule |
+| `text` | `TEXT` | `TEXT` | `TEXT` |
+| `email` | `TEXT` | `VARCHAR(320)` | `VARCHAR(320)` |
+| `url` | `TEXT` | `TEXT` | `TEXT` |
+| `integer` | `INTEGER` | `BIGINT` | `BIGINT` |
+| `number` | `REAL` | `DOUBLE PRECISION` | `DOUBLE` |
+| `boolean` | `INTEGER` | `BOOLEAN` | `BOOLEAN` |
+| `datetime` | `TEXT` | `TIMESTAMPTZ` | `DATETIME(6)` |
+| `date` | `TEXT` | `DATE` | `DATE` |
+| `uuid` | `TEXT` | `UUID` | `CHAR(36)` |
+| `json`, `array`, `object`, `ref` | `TEXT` | `JSONB` | `JSON` |
+
+And the primary key:
+
+| `id_type` | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| `integer` (existing resources only) | `"id" INTEGER PRIMARY KEY AUTOINCREMENT` | `"id" BIGSERIAL PRIMARY KEY` | `` `id` BIGINT AUTO_INCREMENT PRIMARY KEY `` |
+| `ulid` | `"id" TEXT PRIMARY KEY` | `"id" CHAR(26) PRIMARY KEY` | `` `id` CHAR(26) PRIMARY KEY `` |
+| `uuid` | `"id" TEXT PRIMARY KEY` | `"id" UUID PRIMARY KEY` | `` `id` CHAR(36) PRIMARY KEY `` |
+
+Three things in these tables surprise people:
+
+1. **`string` has a length on PostgreSQL and MySQL, and the length comes from `max_length`.** A string field with no `max_length` becomes `VARCHAR(255)`. A value longer than 255 characters in a field with no `max_length` is accepted by the API (there is no limit to enforce) and then rejected by the database, as a plain 500. Set `max_length`, or use `text`, for anything that may be long.
+2. **`email` is `VARCHAR(320)`** on PostgreSQL and MySQL, which is the longest an address can be. The API checks the format, the column holds the length.
+3. **`datetime` is not the same type everywhere.** SQLite stores an ISO string that keeps the offset you sent. PostgreSQL stores a timestamp with time zone. MySQL stores a naive `DATETIME(6)` in UTC and converts on the way in. See [what each dialect does with values](/data/migrations/changing-what-the-api-sees-without-changing-the-table#what-each-dialect-does-with-values).
+
+### The same resource in all three dialects
+
+A `products` resource with a unique `sku`, a `title`, a `price`, a `stock`, an `active` flag, a `released` date, a `published_at` timestamp, an `ext` UUID, an `email`, a `site` URL, a `bio` text, and `meta`, `tags`, `dims` and `home` fields holding JSON, produced these:
+
+```sql
+-- SQLite
+CREATE TABLE IF NOT EXISTS "products" (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "sku" TEXT UNIQUE, "title" TEXT, "price" REAL, "stock" INTEGER, "active" INTEGER,
+  "released" TEXT, "published_at" TEXT, "ext" TEXT, "email" TEXT, "site" TEXT, "bio" TEXT,
+  "meta" TEXT, "tags" TEXT, "dims" TEXT, "home" TEXT,
+  "created_at" TEXT, "updated_at" TEXT
+)
+```
+
+```sql
+-- PostgreSQL
+CREATE TABLE IF NOT EXISTS "products" (
+  "id" BIGSERIAL PRIMARY KEY,
+  "sku" VARCHAR(20) UNIQUE, "title" VARCHAR(255), "price" DOUBLE PRECISION, "stock" BIGINT,
+  "active" BOOLEAN, "released" DATE, "published_at" TIMESTAMPTZ, "ext" UUID,
+  "email" VARCHAR(320), "site" TEXT, "bio" TEXT,
+  "meta" JSONB, "tags" JSONB, "dims" JSONB, "home" JSONB,
+  "created_at" TIMESTAMPTZ, "updated_at" TIMESTAMPTZ
+)
+```
+
+```sql
+-- MySQL
+CREATE TABLE IF NOT EXISTS `products` (
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+  `sku` VARCHAR(20) UNIQUE, `title` VARCHAR(255), `price` DOUBLE, `stock` BIGINT,
+  `active` BOOLEAN, `released` DATE, `published_at` DATETIME(6), `ext` CHAR(36),
+  `email` VARCHAR(320), `site` TEXT, `bio` TEXT,
+  `meta` JSON, `tags` JSON, `dims` JSON, `home` JSON,
+  `created_at` DATETIME(6), `updated_at` DATETIME(6)
+)
+```
+
+Notice what is **absent** from all three:
+
+- **No `NOT NULL`.** `required` is checked by the API on create. It never becomes a column constraint.
+- **No `DEFAULT`.** A field's `default` is applied by the API when a create omits the field, not by the database.
+- **No foreign keys.** A `ref` is a JSON column, and a `belongs_to` relation is a convention over a plain column. Nothing stops an orphan. See [Relations](/data/relations/overview).
+- **Only one column-level constraint: `UNIQUE`.** And it appears only in `CREATE TABLE`, as described next.
+
+The statement uses `CREATE TABLE IF NOT EXISTS`, so it is itself safe to run twice. The reason it does not run on the second migrate is that step 2 only runs when the table is missing.
+
+
+## Indexes
+
+Indexes come from three places, and each is a separate statement after the table work.
+
+| Source | Statement | Name |
+| --- | --- | --- |
+| A field with `indexed: true` | `CREATE INDEX IF NOT EXISTS` | `ix_<table>_<column>` |
+| A field with `unique: true` | `CREATE UNIQUE INDEX IF NOT EXISTS` | `ix_<table>_<column>` |
+| The resource's `owner_field` | `CREATE INDEX IF NOT EXISTS` | `ix_<table>_<owner column>` |
+
+The name is `ix_` plus the table and the column, cut to 60 characters. On the platform default the table in the name is the **physical** one with its `pb_<hash>_` prefix, so the names are longer than you wrote and the 60-character cut matters sooner.
+
+For a `tickets` resource where `status` is indexed and `requester_id` is the owner field:
+
+```json
+{
+  "resource": "tickets",
+  "table": "tickets",
+  "statements": [
+    "CREATE TABLE IF NOT EXISTS \"tickets\" ( ... )",
+    "CREATE INDEX IF NOT EXISTS \"ix_tickets_status\" ON \"tickets\" (\"status\")",
+    "CREATE INDEX IF NOT EXISTS \"ix_tickets_requester_id\" ON \"tickets\" (\"requester_id\")"
+  ]
+}
+```
+
+The owner index appears without anyone asking for it, because every owner-scoped read filters on that column and Pawabase knows it.
+
+### `unique` is two constraints on a new table and one on an old one
+
+On `CREATE TABLE`, `unique: true` produces the inline `UNIQUE` on the column **and** a `CREATE UNIQUE INDEX`. On `ALTER TABLE ... ADD COLUMN`, the generator strips `UNIQUE` (most databases cannot add a unique column to a populated table in one statement), so the column is added plain and the unique index that follows is the only thing enforcing it.
+
+| | Inline `UNIQUE` | Unique index |
+| --- | --- | --- |
+| Field present when the table is created | Yes | Yes |
+| Field added to an existing table | **No** | Yes |
+
+Both reject duplicates from the moment they exist. Neither checks rows that were there before. If duplicates already exist, the `CREATE UNIQUE INDEX` fails, and the table-level work before it has already happened. See [the unique index fails](/data/migrations/when-a-migration-fails-part-way#the-unique-index-fails-because-duplicates-exist).
+
+### A unique field that is also the owner field creates a duplicate index statement
+
+A `profiles` resource with a field `user_id` that is `unique` **and** is the `owner_field` emits two statements with the same name:
+
+```json
+[
+  "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_profiles_user_id\" ON \"profiles\" (\"user_id\")",
+  "CREATE INDEX IF NOT EXISTS \"ix_profiles_user_id\" ON \"profiles\" (\"user_id\")"
+]
+```
+
+On SQLite and PostgreSQL the second is silently skipped, because an index of that name already exists and the statement says `IF NOT EXISTS`. Uniqueness holds and nothing breaks. On MySQL, which has no `IF NOT EXISTS` for indexes here, the second statement is expected to fail with a duplicate key name error. This pairing, one row per user, is the natural way to model a profile, so if you run MySQL, expect it. The mitigation is below.

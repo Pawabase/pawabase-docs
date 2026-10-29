@@ -1,0 +1,267 @@
+---
+title: "End-to-end tests"
+description: "End-to-end tests drive a browser through your application against a real environment. They are slow and valuable: they are the only tests that see…"
+icon: "server"
+---
+
+End-to-end tests drive a browser through your application against a real environment.
+They are slow and valuable: they are the only tests that see sessions, redirects, realtime and your interface working together.
+
+### Signing in without the sign-in form
+
+Signing in through the form in every test is slow and makes every test depend on the sign-in page.
+Sign in once through the client, then put the session where the browser client looks for it.
+
+The browser client stores its session in `localStorage` under `pawabase.auth.<gateway host>.<first 14 characters of the API key>`, as JSON.
+
+```typescript
+// e2e/auth.setup.ts (Playwright)
+import { test as setup } from "@playwright/test";
+import { createClient, MemoryStorage } from "@pawabase/client";
+
+setup("sign in as Ada", async ({ page }) => {
+  const url = process.env.PAWABASE_URL!;
+  const apiKey = process.env.PAWABASE_PUBLISHABLE_KEY!;
+  const client = createClient({ url, apiKey, auth: { storage: new MemoryStorage() } });
+  const result = await client.auth.signInWithPassword({ email: process.env.ADA_EMAIL!, password: process.env.ADA_PASSWORD! });
+  if (result.status !== "signed_in") throw new Error("Ada's test account must not require MFA");
+  const storageKey = `pawabase.auth.${url.replace(/^https?:\/\//, "")}.${apiKey.slice(0, 14)}`;
+
+  await page.goto(process.env.APP_URL!);
+  await page.evaluate(([key, value]) => localStorage.setItem(key, value), [storageKey, JSON.stringify(result.session)]);
+  await page.context().storageState({ path: "e2e/.auth/ada.json" });
+  client.dispose();
+});
+```
+
+Tests that use the saved storage state start signed in as Ada.
+If your application stores sessions in cookies instead, set the cookies with the browser context's cookie API.
+
+A storage key derived this way depends on the gateway URL and API key the application was built with.
+Use exactly the same values in the setup as in the application under test.
+
+### Two people at once
+
+Realtime and collaboration need two signed-in browsers.
+Playwright's browser contexts are separate sessions in one browser:
+
+```typescript
+import { test, expect } from "@playwright/test";
+
+test("a new order appears on the dashboard of another staff member", async ({ browser }) => {
+  const ada = await browser.newContext({ storageState: "e2e/.auth/ada.json" });
+  const grace = await browser.newContext({ storageState: "e2e/.auth/grace.json" });
+  const adaPage = await ada.newPage();
+  const gracePage = await grace.newPage();
+
+  await gracePage.goto("/dashboard");
+  await expect(gracePage.getByTestId("live-indicator")).toHaveText("Live");
+
+  await adaPage.goto("/orders/new");
+  const reference = `E2E-${Date.now()}`;
+  await adaPage.getByLabel("Reference").fill(reference);
+  await adaPage.getByRole("button", { name: "Create order" }).click();
+
+  await expect(gracePage.getByText(reference)).toBeVisible({ timeout: 10_000 });
+});
+```
+
+Wait for visible outcomes with timeouts, never with fixed sleeps.
+Delivery is usually instant, but test machines are not.
+
+
+## Test runners
+
+The client works with every common runner.
+A few settings matter.
+
+| Runner | Notes |
+| --- | --- |
+| `node:test` | Built in; `mock.timers` fakes `Date` and `setTimeout` |
+| Vitest | Use the `node` environment for client tests; `jsdom` adds a `window`, which makes the client behave as in a browser |
+| Jest | Node 18 and later provide `fetch`; with `jsdom`, the same browser behavior applies |
+| Playwright | For end-to-end tests; the client can also run in its setup files |
+
+Two behaviors change when a test environment defines `window` and `document`, as `jsdom` does:
+
+| Behavior | Effect in tests |
+| --- | --- |
+| Secret keys are refused | A test that creates a secret-key client in `jsdom` throws `ConfigError`; create it in a `node` environment, or pass `dangerouslyAllowBrowser` in that test only |
+| Sessions use `localStorage` | Sessions persist between tests in the same file; use `MemoryStorage` or clear storage between tests |
+
+Always dispose clients created in tests.
+Refresh timers and realtime sockets otherwise keep running between tests, and some runners wait for them before exiting.
+
+```typescript
+import { afterEach } from "node:test";
+
+const created: Array<{ dispose(): void }> = [];
+export function track<T extends { dispose(): void }>(client: T) {
+  created.push(client);
+  return client;
+}
+afterEach(() => created.splice(0).forEach((client) => client.dispose()));
+```
+
+
+## Running tests in CI
+
+| Concern | Practice |
+| --- | --- |
+| Keys | Store the test environment's publishable and secret keys in the CI secret store; never commit them |
+| Environment | Point tests at a dedicated test or preview environment, never at production |
+| Isolation | Unique names per run; parallel jobs never share records |
+| Cleanup | `after` hooks, plus a scheduled sweep of leftovers |
+| Rate limits | Keep concurrency modest; test traffic counts against the key's limit |
+| Definitions | Promote definitions to the test environment before running tests that depend on them |
+
+```text
+jobs:
+  test:
+    steps:
+      - npm ci
+      - npm run types:check
+      - npx tsc --noEmit
+      - npm test                    # unit and component tests, no network
+      - npm run test:integration    # against the test environment
+        env: PAWABASE_URL, PAWABASE_ENV=test, PAWABASE_PUBLISHABLE_KEY, PAWABASE_SECRET_KEY
+      - npx playwright test         # end to end, against a preview deployment
+```
+
+Run unit and component tests on every push, integration tests on every pull request, and end-to-end tests before releases or nightly.
+
+### Rate limits and test traffic
+
+The gateway's rate limit is counted per API key: every request made with one key shares one budget, 600 requests per minute by default.
+A large parallel test suite can exhaust it, and a test environment shared with developers then slows down for everyone.
+
+Give CI its own keys, so its traffic has its own budget.
+The same reasoning applies in production: a server or batch job with its own key cannot use up the budget your browsers depend on.
+
+
+## Flaky tests and their usual causes
+
+| Symptom | Usual cause | Fix |
+| --- | --- | --- |
+| A test passes alone and fails in the suite | Shared data between tests | Unique names and ids per test |
+| Random `401` failures | Two parts of the test refresh the same session | One client per test person; `persistSession: false` |
+| Random `429` failures | Too much parallel traffic on one key | Lower concurrency; a separate key for CI |
+| Realtime assertions time out | The screen asserted before the channel was joined | Wait for a "live" indicator first |
+| Tests hang at the end | Clients not disposed | Dispose in `afterEach` |
+| Lists contain unexpected rows | Leftovers from earlier runs | Filter by the run's marker; sweep leftovers |
+| A policy test passes locally and fails in CI | Different definitions in the two environments | Promote before testing |
+
+
+## Servers in production
+
+### Logging with request ids
+
+A server that calls Pawabase for its own clients should log both request ids: its own and Pawabase's.
+Then one incident can be followed from your logs into **Project → Activity**.
+
+```typescript
+const base = createClient({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  hooks: {
+    onResponse: ({ method, url, status, durationMs, requestId }) => {
+      logger.info({ method, path: new URL(url).pathname, status, durationMs, pawabaseRequestId: requestId, requestId: currentRequestId() });
+    },
+  },
+});
+
+declare const logger: { info(fields: object): void };
+declare function currentRequestId(): string | undefined;
+```
+
+`currentRequestId` would read your framework's per-request context, such as `AsyncLocalStorage` in Node.
+Hooks are defined on the base client and inherited by every `asUser` client, so one definition covers all requests.
+
+### Graceful shutdown
+
+On shutdown, dispose long-lived clients so timers and sockets close cleanly:
+
+```typescript
+process.on("SIGTERM", () => {
+  base.dispose();
+  service.dispose();
+  server.close(() => process.exit(0));
+});
+
+declare const server: { close(callback: () => void): void };
+```
+
+### Caching on servers
+
+Server responses built from one person's data must not be cached for others.
+
+| Data | Cacheable on your server |
+| --- | --- |
+| Public content read with the base client and no token | Yes, if it is the same for everyone |
+| Data read through `asUser` | Only per person, keyed by the person |
+| Data read with the service client | Only if your code makes it safe to share |
+
+A shared cache keyed only by URL, in front of per-person data, is one of the most common ways data leaks between users.
+
+### Organizations on servers
+
+A per-request client carries whichever organization the person's token names.
+A server that must act in another organization of the person needs a token issued for it, which only the person's session can request with `auth.switchOrg`.
+For cookie sessions, have the browser call a server endpoint that switches organization with the refresh cookie and stores the new tokens, in the same way the refresh handler does.
+
+
+## Integrations on your server
+
+Third-party services call your application back: payment providers, email services, delivery partners.
+Pawabase can receive those callbacks itself with [inbound hooks](/webhooks/inbound), which check the sender's signature and start a flow.
+Receive them on your own server only when the handling needs code a flow cannot run.
+
+```typescript
+app.post("/webhooks/payments", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!verifyProviderSignature(req.body, req.headers["x-signature"])) return res.status(401).end();
+  const event = JSON.parse(req.body.toString("utf8"));
+  if (event.type === "payment.succeeded") {
+    await service.from("orders").update(event.data.order_id, { status: "paid", payment_ref: event.data.id });
+  }
+  res.status(204).end();
+});
+
+declare function verifyProviderSignature(body: Buffer, signature: unknown): boolean;
+```
+
+Verify the signature against the raw body before parsing it.
+Answer quickly, and make the handling safe to repeat, because providers retry deliveries; writing absolute values, as above, is naturally repeatable.
+
+
+## Background workers
+
+A worker process takes jobs from a queue, a schedule or a polling loop, and uses a secret-key client.
+Three properties make it dependable.
+
+| Property | How |
+| --- | --- |
+| Each job is safe to run twice | Absolute writes, unique keys, checks before side effects |
+| Failures are classified | Transient errors are retried later; permanent ones are recorded |
+| Progress is visible | Status fields on records, or messages to a person's realtime channel |
+
+```typescript
+async function processPendingInvoices() {
+  for await (const invoice of service.from("invoices").eq("status", "pending").order("id")) {
+    try {
+      const pdf = await renderInvoice(invoice);
+      const key = `${invoice.org_id}/invoices/${invoice.id}.pdf`;
+      await service.storage.from("invoices").upload(key, pdf, { contentType: "application/pdf", timeoutMs: 0 });
+      await service.from("invoices").update(invoice.id, { status: "issued", file_key: key });
+    } catch (error) {
+      if (isTransient(error)) continue;
+      await service.from("invoices").update(invoice.id, { status: "failed", failure: String(error) });
+    }
+  }
+}
+
+declare function renderInvoice(invoice: unknown): Promise<Blob>;
+declare function isTransient(error: unknown): boolean;
+```
+
+The upload goes to a fixed key and the update writes absolute values, so running the loop twice over the same invoice produces the same result.
+Many workers like this can instead be flows on a schedule, which run inside Pawabase and keep their own run history; a worker earns its place when it needs libraries or runtimes a flow cannot use.

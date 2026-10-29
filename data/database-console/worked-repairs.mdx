@@ -1,0 +1,227 @@
+---
+title: "Worked repairs"
+description: "Each of these is a complete repair, in the order you would run it, with the reasoning."
+icon: "terminal"
+---
+
+Each of these is a complete repair, in the order you would run it, with the reasoning.
+
+### Purging spam older than a date
+
+**Situation.** A public `comments` resource accepted spam for a week. You want every comment marked `spam` and older than 30 days gone.
+
+```sql
+-- 1. how many, and are they what you think?
+SELECT COUNT(*) AS n FROM comments WHERE status = 'spam' AND created_at < '2026-09-01';
+SELECT id, left_part FROM (SELECT id, substr(body, 1, 60) AS left_part FROM comments
+                           WHERE status = 'spam' AND created_at < '2026-09-01' LIMIT 10) AS sample;
+
+-- 2. keep a copy of what will go
+CREATE TABLE comments_purged_20261001 AS
+SELECT * FROM comments WHERE status = 'spam' AND created_at < '2026-09-01';
+
+-- 3. delete in batches until 0 rows are affected
+DELETE FROM comments WHERE id IN (
+  SELECT id FROM comments WHERE status = 'spam' AND created_at < '2026-09-01' LIMIT 5000
+);
+
+-- 4. confirm
+SELECT COUNT(*) AS remaining FROM comments WHERE status = 'spam' AND created_at < '2026-09-01';
+```
+
+**Notes.** The second statement of step 1 uses a subquery so that it works on every dialect. The batch limit keeps each statement short enough to finish inside the 15-second limit. On MySQL, use `DELETE FROM comments WHERE status = 'spam' AND created_at < '2026-09-01' LIMIT 5000` directly. The timestamps are text on SQLite, so an ISO date compares correctly as long as every stored value has the same form.
+
+### Renaming an enum value
+
+**Situation.** Tickets were `closed`, and the new vocabulary is `solved`. Clients already send `solved`.
+
+```sql
+-- 1. the vocabulary as it is now
+SELECT status, COUNT(*) AS n FROM tickets GROUP BY status ORDER BY n DESC;
+
+-- 2. change the data
+UPDATE tickets SET status = 'solved' WHERE status = 'closed';
+
+-- 3. only now change the enum in the resource definition
+```
+
+**Notes.** The order is the whole repair. If the enum is changed first, every row still holding `closed` breaks the reads of any list that includes it. The data moves first, and the definition follows.
+
+### Cleaning up after a column was split
+
+**Situation.** `full_name` became `first_name` and `last_name`. The new fields are empty for old rows.
+
+```sql
+SELECT COUNT(*) AS missing FROM profiles WHERE first_name IS NULL AND full_name IS NOT NULL;
+
+-- PostgreSQL
+UPDATE profiles
+SET first_name = split_part(full_name, ' ', 1),
+    last_name  = NULLIF(trim(substr(full_name, length(split_part(full_name, ' ', 1)) + 1)), '')
+WHERE first_name IS NULL AND full_name IS NOT NULL;
+```
+
+**Notes.** Names do not split cleanly, so check a sample before running it, and keep `full_name` until clients have moved. SQLite and MySQL have no `split_part`, so use `substr` and `instr` (SQLite) or `SUBSTRING_INDEX` (MySQL).
+
+### Reassigning rows to a different owner
+
+**Situation.** A user was merged into another account, and their tickets must follow.
+
+```sql
+SELECT COUNT(*) AS n FROM tickets WHERE requester_id = 'u-old';
+UPDATE tickets SET requester_id = 'u-new' WHERE requester_id = 'u-old';
+```
+
+**Notes.** The owner field is the one the API never lets a client change, since `PATCH` drops it. This is exactly the kind of change the console exists for. Afterwards, owner-scoped policies show the tickets to the new owner.
+
+### Finding what a slow list is doing
+
+**Situation.** `GET /rest/v1/tickets?sort=created_at` is slow.
+
+```sql
+EXPLAIN QUERY PLAN SELECT * FROM tickets ORDER BY created_at DESC LIMIT 20;
+-- ... USE TEMP B-TREE FOR ORDER BY   (no index on created_at)
+```
+
+**Fix.** Either sort by `id`, which is indexed and tracks creation order, or add the index with **allow writes**:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_tickets_created_at ON tickets (created_at);
+```
+
+Run the `EXPLAIN` again to confirm the plan now says `SEARCH ... USING INDEX`. See [Sorting and pagination](/data/sorting-pagination/overview).
+
+
+## SQL that differs between dialects
+
+A statement that works in one dialect often needs a change in another. These are the differences you meet most in the console.
+
+| Need | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| Quote an identifier | `"name"` | `"name"` | `` `name` `` |
+| Limit rows | `LIMIT n` | `LIMIT n` | `LIMIT n` |
+| Page | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` | `LIMIT n OFFSET m` |
+| Boolean literal | `1` / `0` | `TRUE` / `FALSE` | `TRUE` / `FALSE` |
+| Concatenate | `a \|\| b` | `a \|\| b` | `CONCAT(a, b)` |
+| Now | `CURRENT_TIMESTAMP` (text, no offset) | `now()` | `NOW()` (naive) |
+| Date part | `substr(ts, 1, 10)` or `date(ts)` | `date_trunc('day', ts)` | `DATE(ts)` |
+| Case-insensitive match | `LIKE` (case-insensitive for ASCII) | `ILIKE` | `LIKE` (follows the collation) |
+| Extract from JSON | `json_extract(col, '$.k')` | `col->>'k'` | `JSON_UNQUOTE(JSON_EXTRACT(col, '$.k'))` |
+| Insert or ignore | `INSERT OR IGNORE INTO ...` | `INSERT ... ON CONFLICT DO NOTHING` | `INSERT IGNORE INTO ...` |
+| Update with a join | `UPDATE ... FROM` | `UPDATE ... FROM` | `UPDATE a JOIN b ON ... SET ...` |
+| Delete with a limit | Not available. Use a subquery on `id` | Not available. Use a subquery on `id` | `DELETE ... LIMIT n` |
+| Parameter marker (API) | `?` | `$1` | `%s` |
+
+The builder uses only the first row and the boolean literal, which is why a builder statement runs on every dialect. Anything you add by hand is written in the dialect of the environment.
+
+
+## Mistakes people make
+
+| Mistake | What happens | The habit |
+| --- | --- | --- |
+| Running a write straight from the builder | The action ticks **allow writes** for you and nothing asks again | Read the generated SQL, check for a `WHERE` |
+| A condition with an empty value | It is dropped, and a delete loses its `WHERE` | Look for the warning *No condition: this affects every row.* |
+| Typing `null` with `=` | `= NULL` matches nothing | Use **IS NULL** |
+| Searching text with a `;` in it | The statement is a write, so it needs **allow writes** and returns no rows | Pass the value as a parameter |
+| A leading comment | The statement is refused as a write | Put comments last, or omit them |
+| Relying on the unticked box for safety | A newline can defeat the word check | Control who has operator access, use a read-only role for viewers |
+| Using the wrong table name on the shared PostgreSQL default | `no such table`, or the wrong environment's table | Use the physical `pb_<hash>_` name from a migrate response |
+| Expecting rows back from `RETURNING` | Only `affected` is returned | Read the row afterwards |
+| Fixing data and expecting webhooks | None fire | Change through the API or a flow |
+| Expecting the table browser's order to be stable | There is no `ORDER BY` | Use the SQL window with an order |
+| Running `EXPLAIN ANALYZE` on a write | PostgreSQL runs it | Use plain `EXPLAIN` |
+| Retrying after a `504` | The first run may still complete | Check the table, then retry |
+| Leaving scratch tables behind | Clutter, and possibly sensitive copies | Drop them when done |
+
+
+## Troubleshooting
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| The Database page shows an error | The environment's database is unreachable. The page's overview is a plain 500 in that case | Check the connection with a read through `/rest/v1`. See [Your database](/data/your-database/overview) |
+| *No tables yet.* | The database has no tables, for example right after a switch | Migrate each resource |
+| A resource has no badge in the Tables card | Not a resource table, or a prefixed `pb_` table on the shared PostgreSQL default | Match it by name |
+| `this statement writes; set allow_write to run it` | The statement writes | Tick **allow writes**, or rewrite it as a read |
+| A read returned `affected` and no rows | It was classed as a write, probably because of a `;` or a leading comment | Remove it, or use a parameter |
+| `<Type>: no such table` / `relation does not exist` | The table name is wrong or unmigrated, or it is the unprefixed name on the shared default | Check the Tables card |
+| `OperationalError: near "X": syntax error` | A typo, or SQL from another dialect | Check against the table of differences |
+| `You can only execute one statement at a time` | A `;` between two statements | Run them one at a time |
+| `the query timed out` | More than 15 seconds | Add a `LIMIT`, an index, or batch it |
+| *Showing the first 5000 rows.* | The result was cut | Add `LIMIT`, or aggregate in SQL |
+| A write succeeded and the API still shows old data | A cache. The console clears every resource tag, so check for a cache outside Pawabase, such as a client or CDN | Refresh with a no-cache request |
+| A value you wrote makes a list fail | It breaks a validation rule on read, such as an enum | Fix the value. See [Validation](/data/validation/overview) |
+| Nothing happened in webhooks after a fix | The console publishes no events | Re-run the change through the API if downstream must know |
+
+
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Is the console read-only by default?">
+    Yes. **allow writes** starts unticked, a statement that writes is refused, and every read runs in a transaction the database itself holds read-only. Ticking **allow writes** is still only a checkbox, so who may open the Database page is what decides who can write.
+  </Accordion>
+  <Accordion title="Can I run several statements at once?">
+    No. Each run is one statement; two statements are refused with `400` `unsupported_sql`, and neither runs.
+  </Accordion>
+  <Accordion title="Can I use a transaction?">
+    Not across runs. Each run is its own statement with nothing to roll back. For atomic work use a flow with `db.transaction`, or a direct connection.
+  </Accordion>
+  <Accordion title="Does a console write trigger webhooks and realtime?">
+    No. It is audited and it clears resource caches, and that is all. Use the API or a flow if downstream systems must hear about the change.
+  </Accordion>
+  <Accordion title="Why was my SELECT refused as a write?">
+    Something inside it writes: a data-modifying `WITH`, `SELECT … INTO`, or `FOR UPDATE`. Or, on the read path, the database refused a write it attempted (a function that changes rows). Run the write part separately with **allow writes**.
+  </Accordion>
+  <Accordion title="Why is there no history of my queries?">
+    The window keeps none. Keep the statements you reuse in your own notes or in source control. Writes are in the audit log, cut to 2,000 characters.
+  </Accordion>
+  <Accordion title="Can I export a table?">
+    Page it with the rows route (500 at a time) or run a `SELECT`, up to 5,000 rows per run. For a whole table, use the database's own dump tools.
+  </Accordion>
+  <Accordion title="Can end users or API keys reach it?">
+    No. The routes require an operator.
+  </Accordion>
+  <Accordion title="Does a console write respect policies and validation?">
+    No. It skips both, which is why it can write values the API would refuse. Check the data afterwards with the queries in the recipes.
+  </Accordion>
+  <Accordion title="Why can I not join my tables in the builder?">
+    The builder joins along foreign keys, and Pawabase creates none. Write the join by hand in the text area.
+  </Accordion>
+  <Accordion title="Will the console show other environments' data?">
+    Only the environment you are in. On the shared PostgreSQL default, all environments live in one database, so a hand-written query that names a prefixed table of another environment can reach it. Name tables carefully.
+  </Accordion>
+</AccordionGroup>
+
+
+## What to remember
+
+- **The console skips everything the API adds**: validation, policies, transformers, events, realtime.
+- **Two surfaces**: the table browser (read only) and the SQL window (with **allow writes**).
+- **The builder writes SQL from clicks.** Read it before you run it, and watch for a missing `WHERE`.
+- **Statements are parsed**: exactly one query, describing statement, data change or schema change. Reads run in a database-enforced read-only transaction.
+- **SQL is confined to the environment**: on the shared PostgreSQL it runs as the environment's own role, which cannot reach other schemas or the platform's tables.
+- **Writes are audited and clear every resource's cache.** They publish no events.
+- **Limits**: one statement, 5,000 rows, 15 seconds, 100,000 characters.
+- **Errors carry the database's own message**, which makes the console the best place to diagnose a failed migration.
+- **Preview, count, back up, write, compare.** Every time.
+
+
+## Terms
+
+| Term | Meaning |
+| --- | --- |
+| **Table browser** | The left card and table view of the Database page. Read only |
+| **SQL window** | The modal opened by the **SQL** button |
+| **Query builder** | The click-through section inside the SQL window that writes the statement |
+| **allow writes** | The checkbox that permits a statement that writes |
+| **Classifier** | The check that decides whether a statement is a read |
+| **Read path / write path** | Fetching rows in a read-only transaction, or executing and counting. The parsed statement picks one |
+| **`database.write`** | The audit event for a recognised console write, with the SQL cut to 2,000 characters |
+| **`query_timeout`** | The environment's limit on a statement's run time, 15 seconds by default |
+| **Physical table name** | The table's real name in the database, possibly `pb_<hash>_` prefixed |
+
+<CardGroup cols={2}>
+  <Card title="Your database" icon="hard-drive" href="/data/your-database/overview" />
+  <Card title="Migrations" icon="arrow-right" href="/data/migrations/overview" />
+  <Card title="Filtering" icon="filter" href="/data/filtering/overview" />
+  <Card title="Audit log" icon="scroll-text" href="/studio/audit-log" />
+</CardGroup>

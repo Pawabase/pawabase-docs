@@ -1,0 +1,128 @@
+---
+title: "What a reset actually does"
+description: "The side effects are the reason this flow deserves care. Five things happen, and all of them are deliberate."
+icon: "key"
+---
+
+The side effects are the reason this flow deserves care. Five things happen, and all of them are deliberate.
+
+### 1. The password is replaced
+
+`set_password` writes the new hash through Sillo's user model, which uses `passlib` — bcrypt by default, with a `pbkdf2_sha256` fallback. The old hash is gone; there is no grace period and no copy.
+
+### 2. The lockout counters are cleared
+
+`failed_logins` is set to zero and `locked_until` to null, in the same write as the password.
+
+This is the part that is easy to miss, and it matters for the most common support case. Someone who has typed the wrong password five times, been locked, and then used a recovery link is now able to sign in. A locked account does not need an administrator once recovery is available.
+
+It also means recovery is a way around the lockout threshold — deliberately. The mailbox is a stronger credential than a password someone has already failed with, so possession of it re-establishes trust.
+
+<Warning>
+Treat "requested a reset" as a security event in your own product. A support agent who cannot explain a lockout should check whether someone recently used a recovery link on that account. It means the account's password was changed, and any other sessions it had were ended.
+</Warning>
+
+### 3. Every session is revoked
+
+`revoke_all` ends every token family the account holds: the `JWTToken` rows are revoked and the `SessionInfo` rows are stamped. This covers every device, every browser, and every refresh token ever issued.
+
+The reasoning is direct. A person who resets their password is usually doing it because they think someone else has access. Leaving the other sessions alive would defeat the purpose of the reset entirely — the intruder would keep their session while the legitimate owner changed the password underneath them.
+
+| Situation | After the reset |
+| --- | --- |
+| The attacker's session on another device | Revoked. Their next request fails. |
+| The owner's session on this device | Revoked too — and then replaced by the new session the flow returns. |
+| A refresh token captured earlier | Revoked. It cannot be redeemed. |
+| Someone replaying a consumed refresh token | Detected as reuse, and the whole family is revoked again. |
+
+### 4. Two records are written
+
+| Record | Where | Contents |
+| --- | --- | --- |
+| A login event | `akz_login_events` | kind `password_reset`, method `recovery`, success true, with IP and user agent. |
+| An event | the event bus and the API's event endpoint | `user.password_reset` with the user id, actor the user. |
+
+Both exist and they answer different questions. The login event is per environment and visible in Studio's **Sign-in activity** tab; it is the record for support and audit. The published event is what other services subscribe to.
+
+<Note>
+The event name is `user.password_reset`, not `user.password_changed`. The latter is emitted by the signed-in profile update route when a person changes their own password while signed in. Two different flows, two different events — useful if you want to alert only on the destructive one.
+</Note>
+
+### 5. A session is started
+
+The flow returns a full session with the method recorded as `recovery`. So a successful reset leaves the person signed in, on whichever device they opened the link.
+
+That is convenient, and it is worth being deliberate about whether you want it. A frontend that ignores the returned tokens and then redirects to sign-in still works; a frontend that stores them is signed in immediately. Either is fine, but pick one deliberately, because storing them means a reset becomes a login.
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIs...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1750000900,
+  "session_id": "a41c8f0d3e7b49a2",
+  "org": null,
+  "org_role": null,
+  "user": { "...": "the user object" }
+}
+```
+
+<Warning>
+MFA is not consulted on this path. A person with a second factor enabled who resets their password gets an `aal1` session, not a challenge, because the mailbox link is treated as sufficient proof. If your product requires `aal2` for sensitive operations, gate on `$auth.aal` in a policy rather than expecting the reset flow to ask.
+</Warning>
+
+
+## Building it into a frontend
+
+The three screens a recovery flow needs, and the failure handling each one owes the person.
+
+### Screen one: "forgot your password"
+
+Ask for an address, then say something that is true regardless of the outcome.
+
+```text
+If that address has an account, a message is on its way.
+It usually arrives within a minute.
+```
+
+Do not say "we sent you an email", because for an unregistered address that is false and the person will find out an hour later. Do not offer a link to sign up, because that turns the page into a membership oracle.
+
+The resend control should be on a timer rather than disabled by a response. A 30-second cooldown is polite and stays well under the 10-per-minute limit.
+
+### Screen two: the new-password form
+
+This is the page at `/auth/callback` when `type=recovery`. The cases you must handle:
+
+| Case | What to render |
+| --- | --- |
+| No `token` in the query string | An explanation that the link is incomplete, with a link back to screen one. |
+| A `422` from the submit | The `problems` list. Keep the form open and keep the token. |
+| A `400` from the submit | "This link is no longer valid", with a button to request a new one. |
+| Success | Store the session, then send the person into the application. |
+
+The `422` and `400` cases are the ones that get conflated, and conflating them strands people. A `422` means the link is fine and the password is not; telling that person to request a new link costs them a round trip through their inbox for no reason.
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/recover/confirm" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "apikey: $PAWABASE_PUBLISHABLE_KEY" \
+  -H "content-type: application/json" \
+  -d '{"token": "'"$TOKEN"'", "password": "'"$NEW_PASSWORD"'"}'
+```
+
+<Note>
+Send the API key from the frontend as a publishable key, exactly as for every other auth route. The reset route needs no secret of your own, and treating it as if it did is a common source of leaked keys.
+</Note>
+
+### Screen three: done
+
+If you stored the returned tokens, go straight in. If you did not, send them to sign-in and say so: *"Your password is changed. Sign in with it."*
+
+Do not say *"You're all set"* unless they are actually signed in. That is precisely the confusion the hosted page causes, and it is worth avoiding in your own version.
+
+### A note on double submission
+
+A reset is not idempotent, because the token is single-use. If your form can be submitted twice — a double click, a retried request, a flaky connection — the second attempt returns `400` even though the first succeeded.
+
+The reliable pattern is to disable the button on submit and, on a `400`, check whether the reset actually completed before telling the person it failed. If you have a session stored from a first success, you know it did. If you do not, redirect to sign-in and let the outcome speak for itself: either the new password works, or it does not.

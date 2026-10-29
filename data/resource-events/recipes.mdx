@@ -1,0 +1,251 @@
+---
+title: "Recipes"
+description: "Each of these was built and run. The flows are shown as nodes and edges, ready to paste into a flow's JSON tab."
+icon: "zap"
+---
+
+Each of these was built and run. The flows are shown as nodes and edges, ready to paste into a flow's **JSON** tab.
+
+### A counter that stays correct
+
+A `posts` resource has `comment_count`, and every comment created or deleted should update it. **Recompute** from the table, so a repeat is harmless.
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "comments", "operations": ["created", "deleted"] } } },
+    { "id": "q", "data": { "block": "db.query", "config": {
+        "sql": "SELECT COUNT(*) AS n FROM comments WHERE post_id = ?",
+        "params": ["{{ input.event.payload.record.post_id }}"]
+    } } },
+    { "id": "u", "data": { "block": "resource.update", "config": {
+        "resource": "posts",
+        "id": "{{ input.event.payload.record.post_id }}",
+        "data": { "comment_count": "{{ steps.q.output.0.n }}" }
+    } } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "t", "target": "q" },
+    { "id": "e2", "source": "q", "target": "u" }
+  ]
+}
+```
+
+Run: three comments were created through the API, and after the queue ran the post's `comment_count` was `3`. One comment was deleted, and it became `2`. The query block returns a **list of rows**, so the count is read as `steps.q.output.0.n`.
+
+Two things to note. The flow works from the **deleted** event's record, which still has the `post_id`, because a deleted event carries the row as it was. And the `resource.update` it makes is itself a write, so it publishes `posts.updated`, which any other consumer of `posts` will receive. See [event chains](#event-chains).
+
+### An audit trail
+
+A flow that records every change to `posts` in an `audit_log` resource:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.event", "config": { "event": "posts.*" } } },
+    { "id": "c", "data": { "block": "resource.create", "config": {
+        "resource": "audit_log",
+        "data": {
+          "event": "{{ input.event.name }}",
+          "actor": "{{ input.event.actor }}",
+          "record_id": "{{ input.event.payload.record.id }}",
+          "snapshot": "{{ input.event.payload.record }}"
+        }
+    } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "c" }]
+}
+```
+
+with `audit_log` declared as a resource with the fields `event`, `actor`, `record_id` and a `json` field `snapshot`, and its own **Emit events** switched **off** so that the audit rows do not generate events of their own. A run produced rows such as:
+
+```json
+{
+  "event": "posts.updated",
+  "actor": null,
+  "record_id": 1,
+  "snapshot": { "id": 1, "title": "P", "comment_count": 3, "created_at": "...", "updated_at": "..." }
+}
+```
+
+The whole record went into the `json` field as an object. Notice `"actor": null`: that update was made by the counter flow above, and **a write made by a flow that an event started has no actor**, because the flow runs as the system. The audit trail therefore says who made a change only for changes made by a person.
+
+Because `snapshot` holds the raw record, the audit resource holds hidden fields. Give it a tight read policy, or leave `snapshot` out.
+
+### A notification when something happens
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "orders", "operations": ["created"] } } },
+    { "id": "m", "data": { "block": "mail.send", "config": {
+        "to": ["sales@example.com"],
+        "subject": "New order {{ input.event.payload.record.id }}",
+        "text": "Total: {{ input.event.payload.record.total }}"
+    } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "m" }]
+}
+```
+
+Check the Overview's `mail` entry: an installation with no mail configured reports `suppressed (not configured)`, and a flow that sends mail then delivers nothing. This recipe is a pattern assembled from blocks that were run separately, so test the mail path in your environment.
+
+### Only react to some changes
+
+Use a subscription with a condition, which filters **before** anything is queued, so a flow does not start for events it would ignore:
+
+```json
+{
+  "name": "big_orders",
+  "event": "orders.created",
+  "target_type": "flow",
+  "target": "review_order",
+  "condition": { "gte": ["$event.payload.record.total", 1000] },
+  "enabled": true
+}
+```
+
+All of these conditions were run on `orders.*` subscriptions, and each fired as expected for an API write and for a Records-tab write:
+
+| Condition | Fires for |
+| --- | --- |
+| `{"gte": ["$event.payload.record.total", 1000]}` | Orders of 1000 or more |
+| `{"eq": ["$event.payload.record.status", "paid"]}` | Paid orders |
+| `{"exists": "$event.actor"}` | Changes that have an actor (a person, or `studio`) |
+| `{"ne": ["$event.actor", "studio"]}` | Everything except Records-tab writes |
+| `{"eq": ["$event.name", "orders.created"]}` | Creations only |
+| `{"eq": ["$event.payload.change", "created"]}` | The same, by the payload's `change` |
+
+### Keeping a cached expand fresh
+
+A cached `posts` list that expands `author` does not follow a change to the author. A flow can clear it:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "authors", "operations": ["updated"] } } },
+    { "id": "c", "data": { "block": "cache.invalidate", "config": { "tags": ["resource:posts"] } } }
+  ],
+  "edges": [{ "id": "e1", "source": "t", "target": "c" }]
+}
+```
+
+Run: after the author was renamed through the API, the cached `?expand=author` list showed the new name, and the run's output was `1`, the number of entries it removed. See [Caching](/data/caching/a-cached-expand-does-not-follow-the-related-resource#a-cached-expand-does-not-follow-the-related-resource).
+
+### Cascading a delete
+
+There are no foreign keys, so deleting a parent leaves its children. A flow on the parent's `deleted` event can remove them. The flow reads `input.event.payload.record.id`, lists the children with a `resource.list` (filter `author_id` equal to that id) and removes them. Remember that each child deletion publishes its own `deleted` event.
+
+### Forwarding a shaped event
+
+To hand a third party a record without its hidden fields, build the payload in a flow and emit it as a custom event, which an endpoint then delivers:
+
+```json
+{
+  "nodes": [
+    { "id": "t", "data": { "block": "trigger.resource", "config": { "resource": "vault", "operations": ["created"] } } },
+    { "id": "s", "data": { "block": "transform.map", "config": {
+        "value": "{{ input.event.payload.record }}",
+        "transformer": { "pick": ["id", "label"], "case": "camel" }
+    } } },
+    { "id": "e", "data": { "block": "event.emit", "config": { "event": "public.vault.created", "payload": "{{ steps.s.output }}" } } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "t", "target": "s" },
+    { "id": "e2", "source": "s", "target": "e" }
+  ]
+}
+```
+
+A webhook endpoint subscribed to `public.vault.created` receives only `id` and `label`. The raw `vault.created` event still exists in the log, so this narrows what leaves, and does not erase what was recorded.
+
+
+## Event chains
+
+A consumer that writes to a resource publishes **more events**, which can start more consumers. This is how the counter flow above led to the audit flow: the counter's update published `posts.updated`, and the audit flow, listening to `posts.*`, recorded it. Chains are useful, and they have a failure mode:
+
+| Chain | Result |
+| --- | --- |
+| A flow on `orders.updated` that updates the same order | **A loop.** Each update publishes another `updated`. Nothing stops it |
+| Two flows, each updating the resource the other listens to | The same loop, longer |
+| A flow on `comments.created` that updates `posts` | A chain of two, ending where `posts` has no matching consumer |
+
+Pawabase does not detect loops. Prevent them:
+
+- **Switch events off** on resources that consumers write only for bookkeeping (the audit log above).
+- **Narrow the trigger's `operations`** so the flow's own change is not one of them.
+- **Add a condition**: act only when a field is in a particular state, so the second pass finds nothing to do.
+- **Make the write a no-op the second time.** The counter recomputes a value that does not change, but it still publishes an `updated` event on each write, so it relies on nothing else listening to `posts.updated` in a way that updates comments.
+- **Watch Flow runs.** A loop shows up as the same flow succeeding in a rapid stream.
+
+
+## The two switches on a resource
+
+Whether a resource announces its changes is decided by two switches, in the **Behaviour** section of the resource's sheet:
+
+| Switch | Hint | Default | Effect when on |
+| --- | --- | --- | --- |
+| **Emit events** | `<name>.created / updated / deleted` | **On** | Each successful write publishes an event |
+| **Broadcast changes** | *Push row changes to realtime subscribers.* | **Off** | Each successful write is published to the channel `resource:<name>` |
+
+In the stored definition they are `events` (default `true`) and `realtime` (default `false`):
+
+```json
+{ "name": "orders", "events": true, "realtime": false }
+```
+
+There is no separate **Events** tab on the resource: the switch is on the main sheet, and the sheet's tabs are **Configure**, **Records** (for an existing resource) and **JSON**.
+
+### Turning events off
+
+With **Emit events** off, a write publishes nothing, and no consumer, webhook or subscription hears about it. This was run: a resource with events off accepted a create and the event log gained no entry.
+
+| Turn it off for | Why |
+| --- | --- |
+| A resource that holds **secrets** or hidden fields that no consumer needs | The raw record never leaves the table |
+| **Bookkeeping** resources that consumers write: audit logs, counters, caches | Their writes would otherwise publish events and start chains |
+| A resource that is **bulk loaded** through the API | A thousand writes would be a thousand events, a thousand queued consumers and perhaps a thousand webhook deliveries |
+| A resource with **no consumers** at all | One less thing to publish and log |
+
+Turning events off does not affect the API, the cache clearing, validation or policies: the resource works exactly as before and simply stays silent. The switch is read **at write time**, so turning it back on affects the next write, and nothing is published retroactively for writes made while it was off.
+
+### Bulk loads
+
+A load of 50,000 rows through the API publishes 50,000 events, and each is recorded and routed. Three ways to avoid the flood:
+
+1. **Turn events off, load, turn them on.** Simple, and consumers miss the loaded rows, which may be what you want.
+2. **Load with SQL**, in the console or outside Pawabase. No events at all, and the cache needs a manual clear. See [Database console](/data/database-console/overview).
+3. **Load through a function** and publish **one** summary event at the end (`await ctx.runtime.emit("orders.imported", {"count": 50000})`), after switching the resource's events off. Consumers react to the summary.
+
+### Broadcast changes
+
+Realtime has its own switch because it is a different audience: browsers and apps that hold a live connection. With **Broadcast changes** on, each write publishes the same payload as the event (`resource`, `change`, `record`) to `resource:<name>`.
+
+| | Event | Realtime broadcast |
+| --- | --- | --- |
+| Needs the switch | **Emit events** | **Broadcast changes** |
+| Goes to | Flows, subscriptions, webhooks | Subscribers of `resource:<name>` |
+| Recorded in the event log | Yes | No |
+| Retried | By each consumer's own job | Not at all. **Best effort** |
+| A failure fails the write? | No | No. It is logged |
+| Record is raw | Yes | **Yes** |
+
+The two are independent: a resource can broadcast without emitting events, and the other way round. A resource with only **Broadcast changes** on updates live clients and starts no flow.
+
+
+## Events and the other parts of the platform
+
+| Part | Relationship to resource events |
+| --- | --- |
+| **The cache** | The same after-write step clears the resource's entries and publishes the event. A cache clear and an event always happen together for a write through Pawabase |
+| **Policies** | A write is checked by its policy before it happens. Consumers are **not** checked: they run as the system and can read and write any resource |
+| **Transformers** | Not applied to events. See above |
+| **Validation** | Runs before the write. A write that fails validation publishes nothing. A write made by a flow or a function skips validation, and still publishes |
+| **Migrations** | Publish nothing |
+| **The Database console** | Publishes nothing. It clears caches and is audited |
+| **The Records tab** | Publishes, with the actor `studio` |
+| **Releases** | An event carries the id of the release that was serving, and queued work started by it keeps that release, so a flow started by an event runs the **definitions of that release**, not the latest edits |
+| **Promotion** | Subscriptions and webhooks are definitions and are copied by **promote**. A webhook's signing secret is not something to assume was copied: check the target, and set one if it was not |
+| **Environments** | Events belong to one environment. A write in `development` never reaches a consumer in `production` |
+
+The **Policies** row is worth a moment. A flow started by an event runs with `authenticated: false, kind: "system"`: it is not the person who made the change, and it is not subject to the resource policies. What it may do is limited only by the blocks it contains. Review event-triggered flows with the same care as routes.

@@ -1,0 +1,231 @@
+---
+title: "Direct uploads with signed URLs"
+description: "A signed upload URL lets a browser or device upload one object straight to storage, without holding any key that could do anything else. It is the…"
+icon: "folder"
+---
+
+A signed upload URL lets a browser or device upload one object straight to storage, without holding any key that could do anything else.
+It is the right design in two situations:
+
+| Situation | Why a signed upload URL helps |
+| --- | --- |
+| Your server decides what may be uploaded, and where | The server signs a URL for one key, one content type and one size limit |
+| You need upload progress in a browser | The browser can upload with `XMLHttpRequest`, which reports progress |
+
+The server side creates the URL:
+
+<CodeGroup>
+```typescript TypeScript
+const slot = await documents.createSignedUploadUrl(`${orgId}/contracts/${contractId}.pdf`, {
+  expiresIn: 600,
+  contentType: "application/pdf",
+  maxBytes: 20 * 1024 * 1024,
+});
+return { uploadUrl: slot.url, expiresAt: slot.expires_at };
+```
+
+```python Python
+slot = documents.create_signed_upload_url(
+    f"{org_id}/contracts/{contract_id}.pdf",
+    expires_in=600,
+    content_type="application/pdf",
+    max_bytes=20 * 1024 * 1024,
+)
+return {"upload_url": slot["url"], "expires_at": slot["expires_at"]}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/storage/v1/sign/documents/$ORG_ID/contracts/c1.pdf" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"method": "PUT", "expires_in": 600, "content_type": "application/pdf", "max_bytes": 20971520}'
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `expiresIn` | Seconds the URL is valid; 300 by default |
+| `contentType` | The only content type the upload may have |
+| `maxBytes` | The largest upload the URL accepts |
+
+The signer must be allowed to write the key itself, under the bucket's write policy.
+
+The uploading side sends the file with `uploadToSignedUrl`, which sends no API key and no token:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.storage.from("documents").uploadToSignedUrl(uploadUrl, file, { contentType: "application/pdf" });
+```
+
+```python Python
+pb.storage.from_("documents").upload_to_signed_url(upload_url, Path("contract.pdf"), content_type="application/pdf")
+```
+
+```bash cURL
+# No key and no token: the URL is the credential.
+curl -X PUT "$UPLOAD_URL" -H "content-type: application/pdf" --data-binary @contract.pdf
+```
+</CodeGroup>
+
+Or with `XMLHttpRequest`, for progress:
+
+```typescript
+function uploadWithProgress(url: string, file: File, onProgress: (fraction: number) => void) {
+  return new Promise<void>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.setRequestHeader("content-type", file.type || "application/octet-stream");
+    xhr.upload.onprogress = (event) => event.lengthComputable && onProgress(event.loaded / event.total);
+    xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(`upload failed: ${xhr.status} ${xhr.responseText}`)));
+    xhr.onerror = () => reject(new Error("network error"));
+    xhr.send(file);
+  });
+}
+```
+
+| Answer | Cause |
+| --- | --- |
+| `413` | The file is larger than `maxBytes` |
+| `415` | The content type differs from the one the URL was signed for |
+| `404` | The URL expired, was altered, or is for another environment |
+
+An upload through a signed URL is retried by the client like any upload, because it is safe to repeat while the URL is valid.
+
+
+## Designing keys
+
+A key is more than a file name.
+It is what policies inspect, what listings group by, what appears in URLs and logs, and what decides whether two uploads collide.
+A little design up front saves migrations later.
+
+### Put the boundary first
+
+Policies can read each segment of a key.
+Putting the access boundary in the first segment makes the policy one comparison.
+
+| Who may access | Key shape | Policy condition |
+| --- | --- | --- |
+| One user | `<user id>/…` | `$auth.user_id` is set and `$object.segments.0` equals it |
+| One organization | `<org slug>/…` | `$auth.org` is set and `$object.segments.0` equals it |
+| Anyone signed in, writes by owner only | `<user id>/…` with a read policy of `authenticated` | Write: the first segment equals the user id |
+
+```typescript
+const key = `${user.id}/receipts/${receiptId}.pdf`;
+```
+
+When the boundary is not in the key, the policy has nothing to compare, and the bucket must fall back to "everyone signed in", which is rarely right for private files.
+
+### Decide between overwriting and versioning
+
+Two strategies, each with a clear trade-off:
+
+| Strategy | Key | When the file changes | Good for |
+| --- | --- | --- | --- |
+| Stable key | `u_7/avatar.png` | Upload to the same key | Files with one current version, small storage |
+| Versioned key | `u_7/avatar-01JB9C2W.png` | Upload a new key, update the record, delete the old | Files that browsers and CDNs cache aggressively |
+
+A stable key is simpler, but every cache that holds the old bytes keeps serving them until it expires.
+A versioned key never has that problem, because a new version is a new URL.
+For avatars, logos and anything served with long cache lifetimes, versioned keys avoid "I changed my picture but it still shows the old one".
+
+### Keep personal data out of keys
+
+Keys appear in URLs, logs, browser history and listing results.
+Use ids, not names or email addresses:
+
+| Avoid | Prefer |
+| --- | --- |
+| `ada.lovelace@example.com/passport.jpg` | `u_7/identity/01JB9C2W.jpg` |
+| `invoices/Acme Ltd - September.pdf` | `org_acme/invoices/2026-09.pdf` |
+
+The original file name can live in a record field, where policies protect it, and be used as the download name.
+
+### Characters
+
+Keys can contain any characters, and the client encodes each segment when it builds a path.
+Leading slashes are removed, and an empty key is refused with `ConfigError` before any request.
+Spaces, `#`, `?` and non-ASCII characters work, but they make URLs harder to read and copy.
+Lowercase letters, digits, hyphens, underscores, dots and slashes are the safe set.
+
+
+## Bucket designs
+
+The same client calls serve very different buckets.
+What changes is the bucket's policies and limits.
+The designs below cover most applications; each shows the bucket settings in the form the **JSON** view of a bucket uses.
+
+### Public avatars, written by their owners
+
+```json
+{
+  "name": "avatars",
+  "public": true,
+  "accepts": ["image/png", "image/jpeg", "image/webp"],
+  "max_bytes": 2097152,
+  "read_policy": "public",
+  "list_policy": "authenticated",
+  "write_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] }
+}
+```
+
+Anyone can render an avatar from its URL.
+Only signed-in users can list the bucket.
+Each person can write only below their own id.
+
+### Private documents per user
+
+```json
+{
+  "name": "documents",
+  "public": false,
+  "max_bytes": 26214400,
+  "read_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] },
+  "write_policy": { "all": [{ "truthy": "$auth.user_id" }, { "eq": ["$object.segments.0", "$auth.user_id"] }] }
+}
+```
+
+Nobody sees anyone else's files, not even by guessing keys.
+Browsers display these files through signed URLs created on demand.
+
+### Files shared within an organization
+
+```json
+{
+  "name": "team-files",
+  "read_policy": { "all": [{ "truthy": "$auth.org" }, { "eq": ["$object.segments.0", "$auth.org"] }] },
+  "write_policy": { "all": [{ "truthy": "$auth.org" }, { "eq": ["$object.segments.0", "$auth.org"] }] },
+  "delete_policy": { "in": ["$auth.org_role", ["owner", "admin"]] }
+}
+```
+
+Members of an organization read and add files under its slug.
+Only admins and owners delete.
+The token must be issued for the organization, which `auth.switchOrg` arranges.
+
+### Write once, never overwrite
+
+```json
+{
+  "name": "evidence",
+  "write_policy": "authenticated",
+  "update_policy": { "service": true },
+  "delete_policy": { "service": true }
+}
+```
+
+People can add files but cannot replace or remove them; only a secret key can.
+Use this for audit material, signed contracts and anything whose history must not change.
+
+### An inbox that only servers read
+
+```json
+{
+  "name": "inbox",
+  "write_policy": "authenticated",
+  "read_policy": { "service": true },
+  "list_policy": { "service": true }
+}
+```
+
+People upload; a server job with a secret key processes and moves the files.
+Uploaders cannot read back what others sent.
+
+See [Bucket access](/storage/access) for the policy language, including the `service` shorthand.

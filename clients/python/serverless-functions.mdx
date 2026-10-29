@@ -1,0 +1,266 @@
+---
+title: "Serverless functions"
+description: "Serverless platforms reuse a process for many invocations while it is warm. Create the client at module level so warm invocations reuse it, and…"
+icon: "python"
+---
+
+Serverless platforms reuse a process for many invocations while it is warm.
+Create the client at module level so warm invocations reuse it, and per-request views inside the handler.
+
+```python
+import json
+
+from pawabase import Pawabase
+
+base = Pawabase(PAWABASE_URL, PUBLISHABLE_KEY, environment=PAWABASE_ENV, timeout=8)
+
+
+def handler(event, context):
+    token = (event.get("headers") or {}).get("authorization", "").removeprefix("Bearer ") or None
+    pb = base.as_user(token) if token else base
+    page = pb.from_("orders").per_page(20).execute()
+    return {"statusCode": 200, "body": json.dumps(dict(page.raw))}
+```
+
+Keep the timeout well below the platform's limit, so failures surface as clean exceptions rather than killed invocations.
+
+
+## Clients and processes
+
+A client holds open connections and, possibly, a session.
+Neither survives being pickled or sent to another process.
+
+Libraries that send work to other processes, such as `multiprocessing` and some task queues, should send ids and parameters, and let each process build its own client.
+The same applies to sessions: send the access token to a process that should act as a person, and build an `as_user` view there.
+
+
+## Flask
+
+Flask applications use the blocking client, with a per-request view kept on `g`.
+
+```python
+from flask import Flask, g, jsonify, request
+
+from myapp.pawabase_client import base
+
+app = Flask(__name__)
+
+
+@app.before_request
+def attach_pawabase():
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ") or None
+    g.pawabase = base().as_user(token) if token else base()
+
+
+@app.get("/api/orders")
+def orders():
+    page = g.pawabase.from_("orders").order("-created_at").per_page(20).execute()
+    return jsonify(dict(page.raw))
+```
+
+`g` lives for one request, so each view belongs to exactly one person.
+
+
+## Django async views
+
+Django supports `async def` views.
+In them, use the async client, created once per process, so the event loop is not blocked:
+
+```python
+from django.http import JsonResponse
+
+from myapp.pawabase_client import async_base
+
+
+async def order_count(request):
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ") or None
+    pb = async_base().as_user(token) if token else async_base()
+    return JsonResponse({"open": await pb.from_("orders").eq("status", "open").count()})
+```
+
+Mixing sync and async views in one project is fine; give each its matching client.
+
+
+## Names in Python and TypeScript
+
+The two clients share concepts and endpoints; their names follow each language's conventions.
+
+| Python | TypeScript |
+| --- | --- |
+| `pb.from_("t")` | `pawabase.from("t")` |
+| `.in_(…)`, `.not_in(…)`, `.is_(…)`, `.is_not(…)` | `.in(…)`, `.notIn(…)`, `.is(…)`, `.isNot(…)` |
+| `.per_page(n)` | `.perPage(n)` |
+| `.order("-created_at")` or `.order("created_at", "desc")` | `.order("created_at", "desc")` |
+| `.execute()` | `await query` |
+| `.iterate()`, `for row in query` | `for await (const row of query)` |
+| `maybe_get`, `create_many` | `maybeGet`, `createMany` |
+| `pb.auth.sign_in_with_password(email=…, password=…)` | `pawabase.auth.signInWithPassword({ email, password })` |
+| `pb.auth.on_auth_state_change(listener)` | `pawabase.auth.onAuthStateChange(listener)` |
+| `pb.auth.oauth_url(provider)` | `pawabase.auth.signInWithOAuthUrl(provider)` |
+| `bucket.public_url(key)`, `transform_url(…)` | `bucket.getPublicUrl(key)` |
+| `pb.flows.invoke(name, input)` (or `run`) | `pawabase.flows.run(name, input)` |
+| `pb.as_user(token)` | `pawabase.asUser(token)` |
+| `pb.manage`, `pb.admin` | `manage(client)`, `admin(client)` |
+| `error.status_code`, `error.request_id` | `error.status`, `error.requestId` |
+
+
+## A session store of your own
+
+`SessionStore` is a protocol with two methods: `get()` returns the stored session or `None`, and `set(session)` stores one, or forgets it when given `None`.
+Any object with those methods works.
+
+A command-line tool on a desktop can keep the session in the operating system's keychain:
+
+```python
+import json
+
+import keyring
+
+from pawabase import Session
+
+
+class KeyringSessionStore:
+    def __init__(self, service: str, account: str) -> None:
+        self.service, self.account = service, account
+
+    def get(self) -> Session | None:
+        raw = keyring.get_password(self.service, self.account)
+        return Session.from_dict(json.loads(raw)) if raw else None
+
+    def set(self, session: Session | None) -> None:
+        if session is None:
+            try:
+                keyring.delete_password(self.service, self.account)
+            except keyring.errors.PasswordDeleteError:
+                pass
+        else:
+            keyring.set_password(self.service, self.account, json.dumps(session.to_dict()))
+```
+
+`Session.to_dict()` and `Session.from_dict()` are the serialization the built-in file store uses.
+A server handling many people should not keep sessions in a shared store; it uses `as_user` with each request's token instead.
+
+
+## A first look at tests
+
+The client sends every request through an `httpx` client, so tests can answer requests without a network.
+The package's own tests replace the client's internal `httpx` client with one that uses `httpx.MockTransport`:
+
+```python
+import httpx
+
+from pawabase import Pawabase
+
+
+def fake_client(handler) -> Pawabase:
+    pb = Pawabase("http://gateway.test", "pb_pk_test", environment="test", retries=0)
+    pb._client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://gateway.test", headers=pb.headers)
+    return pb
+
+
+def test_open_orders_query():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"data": [], "page": 1, "per_page": 20, "total": 0})
+
+    pb = fake_client(handler)
+    pb.from_("orders").eq("status", "open").execute()
+    assert seen[0].url.params["filter[status]"] == "eq.open"
+```
+
+`_client` is a private attribute, used here the way the package's own tests use it.
+The `respx` library mocks `httpx` without touching private attributes, and works the same way for the async client.
+The [servers and testing page](/clients/python/servers-and-testing) covers both, and integration tests against a real environment.
+
+
+## Python code or a flow
+
+Logic that reacts to data can live in your Python code or in a Pawabase flow.
+
+| Choose a flow when | Choose Python when |
+| --- | --- |
+| The logic is a sequence of record operations, conditions, emails and HTTP calls | It needs Python libraries: data science, PDF generation, image processing |
+| It should run on events, schedules or routes without a server of your own | You already run a server or worker where it fits naturally |
+| Non-developers should be able to read and adjust it in Studio | It is complex enough to need unit tests and code review |
+| Its runs should appear in **Logic → Flows** with per-block traces | Its runs are part of your own observability |
+
+Both can work together: a flow handles the trigger and calls your Python service through `http.request`, or your Python worker emits an event that flows react to.
+
+
+## What the package does not do
+
+| You might expect | Instead |
+| --- | --- |
+| Joins or SQL from the client | Relations with `expand`; computed answers from a [custom route](/data/custom-routes/overview); SQL from `pb.manage.database` with a secret key |
+| Two bounds on one field in one query | Filter one bound on the server and the other in Python, or use a route |
+| Transactions across calls | A flow or route that performs the steps on the server |
+| Idempotency keys | Unique fields that turn a repeat into a `409` |
+| Model classes for rows | Generated `TypedDict`s, or your own dataclasses or Pydantic models |
+| Custom functions | Removed from the platform; flows, routes and extension routes replace them |
+| Live channels on the blocking client | `AsyncPawabase` |
+
+
+## Exceptions at a glance
+
+```text
+PawabaseError (RuntimeError)
+├── NetworkError            no answer: DNS, refused, reset, timed out
+├── AuthenticationError     401
+├── ForbiddenError          403
+│   └── QuotaExceededError  403 with code quota_exceeded
+├── NotFoundError           404
+├── ConflictError           409
+├── ValidationError         400 or 422
+│   └── QueryError          a query refused before sending
+├── RateLimitedError        429 that outlasted the client's waiting
+├── ServerError             5xx
+└── RealtimeError           a realtime request refused or timed out
+ConfigError (RuntimeError)  the client used in a way that cannot work
+```
+
+Every `PawabaseError` has `status_code`, `detail` (the body), `code`, `message`, `details` and `request_id`.
+`ConfigError` is not a `PawabaseError`: it signals a mistake in your code, not a failed request.
+See [Errors and retries](/clients/python/errors-retries).
+
+
+## Checking the installed version
+
+```python
+import pawabase
+
+print(pawabase.__version__)  # "0.3.0"
+```
+
+Include the version in bug reports, along with the `request_id` of a failing request.
+
+
+## Common mistakes
+
+| Mistake | Consequence | Fix |
+| --- | --- | --- |
+| Leaving out `environment=` in production code | Requests, URLs and management calls name `development` | Pass it from configuration |
+| A secret key on a server that acts for people | Policies never apply | A publishable key with `as_user` |
+| A client per request | Connection pools are created and thrown away | One per process; views per request |
+| The blocking client in async handlers | The event loop stalls | `AsyncPawabase` |
+| A client created before forking | Corrupted connections in workers | Create after the fork |
+| `all()` without `max_records` on large tables | Memory grows without bound | `iterate()`, or a cap |
+| Catching `Exception` around every call | Bugs look like network problems | Catch `PawabaseError` subclasses |
+
+
+## Coming from supabase-py
+
+| supabase-py | pawabase | Note |
+| --- | --- | --- |
+| `create_client(url, key)` | `Pawabase(url, key, environment=…)` | Pass the environment |
+| `supabase.table("t").select("*").execute()` | `pb.from_("t").execute()` | All columns by default |
+| `.select("id, author(name)")` | `.select("id").expand("author")` | Relations by name |
+| `.eq("a", 1).gte("b", 2)` | Same | One filter per field |
+| `.range(0, 9)` | `.page(1).per_page(10)` | Pages from 1 |
+| `response.data` | `page.data`, or the row itself for single-record calls | No wrapper object for rows |
+| `APIError` | `PawabaseError` subclasses | By status |
+| `supabase.auth.sign_in_with_password({...})` | `pb.auth.sign_in_with_password(email=…, password=…)` | Keyword arguments; may return `mfa_required` |
+| `supabase.storage.from_("b").upload(path, file)` | `pb.storage.from_("b").upload(key, file)` | Always replaces |
+| `supabase.functions.invoke(…)` | `pb.flows.invoke(…)` or `pb.routes.post(…)` | Server logic is flows and routes |
+| `acreate_client` | `AsyncPawabase` | Same methods, awaited |

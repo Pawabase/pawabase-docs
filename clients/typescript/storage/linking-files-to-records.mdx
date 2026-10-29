@@ -1,0 +1,234 @@
+---
+title: "Linking files to records"
+description: "Most files belong to a record: an avatar to a profile, an attachment to a message, a receipt to an expense. Storage does not know about records, so…"
+icon: "folder"
+---
+
+Most files belong to a record: an avatar to a profile, an attachment to a message, a receipt to an expense.
+Storage does not know about records, so your application keeps the link, usually as a key stored in a record field.
+
+The safest order is: upload first, then write the record.
+
+```typescript
+export async function attachReceipt(expenseId: string, file: File) {
+  const user = await pawabase.auth.getCachedUser();
+  const key = `${user!.id}/receipts/${expenseId}-${Date.now()}.${extensionOf(file)}`;
+  await pawabase.storage.from("receipts").upload(key, file);
+  try {
+    return await pawabase.from("expenses").update(expenseId, { receipt_key: key, receipt_name: file.name });
+  } catch (error) {
+    await pawabase.storage.from("receipts").remove(key).catch(() => undefined);
+    throw error;
+  }
+}
+
+function extensionOf(file: File) {
+  return file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "bin";
+}
+```
+
+If the record update fails, the upload is removed, so no file is left without a record.
+If the cleanup itself fails, an orphan remains, which is harmless and can be collected later.
+
+The reverse order, record first, risks a record that points at a file that never arrived.
+That shows up as a broken image or a failed download in front of a user, which is worse than an unreferenced file nobody sees.
+
+Deleting works the other way round: delete the record, then the file.
+A flow subscribed to the record's `deleted` event can delete the file on the server, which also catches deletions made from Studio or other clients.
+
+### Finding orphans
+
+A periodic job with a secret key can compare a bucket's keys with the keys records refer to:
+
+```typescript
+async function findOrphans() {
+  const referenced = new Set<string>();
+  for await (const expense of service.from("expenses").isNot("receipt_key", null).select("id", "receipt_key")) {
+    referenced.add(expense.receipt_key as string);
+  }
+  const orphans: string[] = [];
+  for await (const file of service.storage.from("receipts").listAll()) {
+    if (!referenced.has(file.key)) orphans.push(file.key);
+  }
+  return orphans;
+}
+```
+
+Leave a grace period before deleting orphans, such as only those older than a day by `modified`, so an upload whose record is still being written is not removed.
+
+
+## Patterns for common screens
+
+### An avatar picker
+
+An avatar picker checks the file before uploading, shows a preview at once, uploads under a versioned key, and then points the profile at the new key.
+
+```typescript
+const AVATAR_TYPES = ["image/png", "image/jpeg", "image/webp"];
+const AVATAR_MAX = 2 * 1024 * 1024;
+
+export async function changeAvatar(file: File, preview: (url: string) => void) {
+  if (!AVATAR_TYPES.includes(file.type)) return { error: "Choose a PNG, JPEG or WebP image." };
+  if (file.size > AVATAR_MAX) return { error: "Choose an image smaller than 2 MB." };
+
+  const local = URL.createObjectURL(file);
+  preview(local);
+
+  const user = await pawabase.auth.getCachedUser();
+  const key = `${user!.id}/avatar-${Date.now()}.${file.type.split("/")[1]}`;
+  try {
+    await pawabase.storage.from("avatars").upload(key, file);
+    const previous = await pawabase.from("profiles").first();
+    await pawabase.from("profiles").update(previous!.id, { avatar_key: key });
+    if (previous?.avatar_key) await pawabase.storage.from("avatars").remove(previous.avatar_key as string).catch(() => undefined);
+    return { key };
+  } finally {
+    URL.revokeObjectURL(local);
+  }
+}
+```
+
+The client-side checks mirror the bucket's `accepts` and `max_bytes`.
+They exist to give a fast, friendly message; the server enforces the same limits regardless.
+Reading the limits from `listBuckets()` instead of hard-coding them keeps the two in step.
+
+### Uploading many files
+
+A drop zone that accepts many files should upload a few at a time and report each file's outcome, rather than failing the whole batch on one bad file.
+
+```typescript
+export async function uploadAll(files: File[], folder: string, onEach: (name: string, ok: boolean, message?: string) => void) {
+  const bucket = pawabase.storage.from("team-files");
+  const queue = [...files];
+  const workers = Array.from({ length: 3 }, async () => {
+    for (let file = queue.shift(); file; file = queue.shift()) {
+      try {
+        await bucket.upload(`${folder}/${file.name}`, file, { timeoutMs: 0 });
+        onEach(file.name, true);
+      } catch (error) {
+        onEach(file.name, false, error instanceof Error ? error.message : String(error));
+      }
+    }
+  });
+  await Promise.all(workers);
+}
+```
+
+Three parallel uploads saturate most connections.
+More rarely helps and makes rate limits more likely.
+
+### A file browser with folders
+
+Listings return `prefixes` alongside `files`, which is enough to render folders and breadcrumbs.
+
+```typescript
+export async function openFolder(path: string) {
+  const prefix = path ? `${path.replace(/\/+$/, "")}/` : "";
+  const page = await pawabase.storage.from("team-files").list({ prefix, limit: 200 });
+  const folders = page.prefixes.map((full) => ({ name: full.slice(prefix.length).replace(/\/$/, ""), path: full.replace(/\/$/, "") }));
+  const files = page.files.map((file) => ({ name: file.key.slice(prefix.length), key: file.key, size: file.size }));
+  const crumbs = path.split("/").filter(Boolean).map((part, index, all) => ({ name: part, path: all.slice(0, index + 1).join("/") }));
+  return { folders, files, crumbs, more: page.cursor };
+}
+```
+
+Folders are not real objects.
+A folder exists while at least one key starts with its prefix, and disappears when the last such object is deleted.
+To show an empty folder, store a placeholder object, such as `.keep`, and hide it in the listing.
+
+### A download button for a private file
+
+Create the signed URL when the person clicks, not when the page renders.
+A URL created at render time may expire before it is clicked, and it is visible in the page source the whole time.
+
+```typescript
+export async function downloadPrivate(bucket: string, key: string, fileName: string) {
+  const { url } = await pawabase.storage.from(bucket).createSignedUrl(key, { expiresIn: 60 });
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.click();
+}
+```
+
+Sixty seconds is plenty for a browser to start a download.
+The `download` attribute suggests a file name; whether the browser uses it for a cross-origin URL depends on the browser.
+
+### Showing private images
+
+Private images in a list, such as attachment thumbnails, need a signed URL each.
+Sign them in parallel when the list loads, with an expiry longer than people stay on the page:
+
+```typescript
+export async function withImageUrls<T extends { image_key: string | null }>(rows: T[]) {
+  const bucket = pawabase.storage.from("attachments");
+  return Promise.all(
+    rows.map(async (row) => ({
+      ...row,
+      image_url: row.image_key ? (await bucket.createSignedUrl(row.image_key, { expiresIn: 3600 })).url : null,
+    })),
+  );
+}
+```
+
+Each signature is a request.
+For screens with hundreds of private images, consider whether those images really need to be private, or serve them from a server route that checks access once and streams many.
+
+### A gallery with responsive images
+
+For public images, transformations give each screen size the right file from one original.
+
+```tsx
+export function Photo({ base, alt }: { base: string; alt: string }) {
+  const at = (width: number) => `${base}?width=${width}&format=webp&quality=80`;
+  return (
+    <img
+      src={at(640)}
+      srcSet={`${at(320)} 320w, ${at(640)} 640w, ${at(1280)} 1280w`}
+      sizes="(max-width: 700px) 100vw, 640px"
+      alt={alt}
+      loading="lazy"
+    />
+  );
+}
+```
+
+`base` is the gateway file URL of the original.
+The browser picks a width; the gateway produces and caches it.
+
+### Importing a CSV someone uploaded
+
+Files that your code processes are read with the download methods, not URLs.
+
+```typescript
+export async function previewCsv(key: string) {
+  const text = await pawabase.storage.from("imports").downloadText(key);
+  const [header, ...lines] = text.split(/\r?\n/).filter(Boolean);
+  const columns = header.split(",");
+  return { columns, rows: lines.slice(0, 20).map((line) => line.split(",")) };
+}
+```
+
+Splitting on commas is enough for a preview.
+For the real import, use a CSV parser that handles quoted fields, and send rows to the management module's `importRecords` from a server.
+
+
+## Caching and changed files
+
+Browsers and CDNs cache files they download.
+How long depends on the response's cache headers, which a bucket's cache settings control for gateway file URLs.
+
+| Situation | What people see | What to do |
+| --- | --- | --- |
+| A file is replaced at the same key | The old version, until caches expire | Use versioned keys, or add `?v=<etag>` to the URL |
+| A file is deleted | The cached copy, until caches expire | Expect it; delete is not instant for cached readers |
+| A signed URL expires | A `404` for new requests; cached copies may still display | Keep expiries short for sensitive files |
+| A transformed variant of a replaced image | The old variant, until caches expire | Versioned keys again |
+
+The `etag` returned by `upload` changes whenever the bytes change.
+Appending it to a stable key's URL is a cheap way to make browsers fetch the new version:
+
+```typescript
+const stored = await logos.upload("org_acme/logo.png", file);
+const url = `${fileUrl("production", "logos", stored.key)}?v=${encodeURIComponent(stored.etag ?? Date.now().toString())}`;
+```

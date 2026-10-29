@@ -1,0 +1,251 @@
+---
+title: "How values are converted, type by type"
+description: "A filter value is text, and before it reaches SQL it is converted to the type of the column it is compared with. The conversion is the same one that…"
+icon: "filter"
+---
+
+A filter value is text, and before it reaches SQL it is converted to the type of the column it is compared with. The conversion is the same one that encodes a value on write, so a filter finds what a write stored. When the conversion fails, the request is a `500`, because the failure happens after the field was accepted and no layer turns it into a `400`.
+
+| Field type | Accepted in a filter | Behavior to know | Fails with `500` when |
+| --- | --- | --- | --- |
+| `string`, `text`, `email`, `url` | Any text | Compared as text, case as the database defines it | Never, any text converts |
+| `integer` | Whole numbers, surrounding spaces tolerated | `filter[qty]=3` is `qty = 3` | `abc`, `1.0`, `1e3`, an empty value |
+| `number` | Decimal numbers | `filter[price]=1.50` matches `1.5` | `abc`, an empty value |
+| `boolean` | Use `is.true`, `is.false`, `is.null` | `eq.false` returns the **true** rows | Never from `eq`, but it returns the wrong rows |
+| `date` | `YYYY-MM-DD` | `gte.2026-03-01` works on every database | A timestamp such as `2026-01-01T00:00:00`, or a non-date |
+| `datetime` | ISO 8601 with `Z` or an offset, or a plain date | `gte.2026-03-01` and `gte.2026-03-01T00:00:00Z` both work | A value that is not a timestamp |
+| `uuid` | Lowercase, hyphenated | On SQLite, uppercase and hyphen-less forms matched nothing | Never from conversion, but the wrong form finds no rows |
+| `json`, `array`, `object`, `ref` | `is.null` and `isnot.null` only | `eq` compares against the JSON-encoded filter text and never matched a stored object | Not applicable |
+
+### Dates and timestamps
+
+A `date` is compared as a date, and a plain date works in a filter on a `datetime` field, where it means the start of that day in UTC:
+
+```text
+filter[released]=gte.2026-03-01                    ->  a date field
+filter[created_at]=gte.2026-03-01                  ->  a timestamp, from the start of the day
+filter[published_at]=gte.2026-03-01T00:00:00Z      ->  the same instant, written out
+filter[published_at]=gte.2026-06-01T12:00:00%2B02:00   ->  an offset, with the + sent as %2B
+```
+
+The `+` in an offset must be percent-encoded as `%2B`, because an unencoded `+` in a query string is read as a space. The `Z` form avoids the problem.
+
+What a timestamp comparison means depends on the database, and this is where an environment on SQLite and one on PostgreSQL can disagree:
+
+| Database | How `datetime` is stored | What a comparison does |
+| --- | --- | --- |
+| PostgreSQL | An absolute instant | Chronological, offsets are honored |
+| MySQL | UTC, without the zone | Chronological, in UTC |
+| SQLite | ISO text, with the offset the writer used | A text comparison, so two instants with different offsets can compare in the wrong order |
+
+Write and filter in UTC and the three agree. A filter value with an offset is converted to the form the column stores, and on SQLite that preserves the offset you typed, so it is compared as text against values that may carry other offsets.
+
+A timestamp value in a filter on a **date** field is the one conversion that does not forgive: `filter[released]=eq.2026-01-01T00:00:00` returned a `500`. Filter a date with a date.
+
+### Booleans, once more
+
+The conversion of a boolean filter is the single most surprising one in this feature, so it earns a table of its own. Rows: one with `active` true, one false, one never set.
+
+| Request | Rows returned |
+| --- | --- |
+| `filter[active]=true` | The true row |
+| `filter[active]=false` | The **true** row |
+| `filter[active]=eq.false` | The **true** row |
+| `filter[active]=0` | The **true** row |
+| `filter[active]=1` | The true row |
+| `filter[active]=is.true` | The true row |
+| `filter[active]=is.false` | The false row |
+| `filter[active]=is.null` | The never-set row |
+
+Only the `is` forms distinguish true from false. If you generate filters from a typed client, make the boolean branch of the generator emit `is.true` and `is.false`, and never `eq`.
+
+### UUIDs
+
+A UUID is stored lowercase and hyphenated, and on SQLite a filter value is compared to that text as written. In testing, the lowercase hyphenated form matched, and the uppercase and hyphen-less forms of the same UUID matched nothing. PostgreSQL stores a real UUID and compares by value, so it would match all three. Normalize UUIDs to lowercase with hyphens in the client, which also makes development and production agree.
+
+### JSON columns
+
+The structured types are one column of serialized text. `is.null` and `isnot.null` work on them, and nothing inside them can be filtered. An equality filter was tried against a row holding exactly the object in the filter, and it matched nothing, because the filter value is encoded as a JSON string and the stored value is a JSON object. See [Field types](/data/field-types/overview) for how to make a nested value queryable.
+
+
+## Combining filters
+
+### Everything is `AND`
+
+Every filter in the request, plus any the policy adds, must hold for a row to be returned. Five filters on five fields:
+
+```text
+filter[qty]=gte.1 & filter[price]=gte.1 & filter[name]=like.a* & filter[status]=eq.live & filter[owner_id]=1
+  ->  the three rows that met all five
+```
+
+### Alternatives on one field: `in`
+
+There is no `OR` operator and no way to group. The one case that is easy is several acceptable values for a single field, which `in` expresses:
+
+```text
+filter[status]=in.live,draft
+```
+
+An `OR` across different fields (status is live, or the owner is me) cannot be written as filters. It can be written as a policy (see below), as a custom route that builds the query, or as two requests whose results the client merges.
+
+### Not: `neq` and `nin`
+
+Negation is by operator, and it excludes `NULL` rows, as described. "Anything except these, including unset" needs two requests, or a field that is never `NULL`.
+
+### The same field twice
+
+When a key is repeated, **the last one wins**, and the earlier ones are dropped without an error. That is why a two-sided range on one field does not work. It also means that a client that assembles filters from several sources can silently lose one, so build the set of filters as a map keyed by field before generating the URL, and decide on purpose which one survives.
+
+### Working around the missing range
+
+Four patterns give a two-sided range. They trade convenience for different costs.
+
+| Pattern | How | Cost |
+| --- | --- | --- |
+| Fetch with one bound, cut client-side | `filter[qty]=gte.2`, then drop rows above 4 | Transfers rows you throw away, and breaks `total` and pagination |
+| A second column | Store the same value in another field (`qty_copy`) and filter `gte` on one and `lte` on the other | You keep two columns in step in the code that writes them |
+| A custom route | A route and flow that build the query with both bounds | A flow, and its own paging, see [Custom routes](/data/custom-routes/overview) |
+| A bucket field | Precompute a coarse bucket (`price_band`) and filter it with `eq` or `in` | A migration and a rule for filling the field |
+
+For dates, the common case is "this month". With a stored `month` text field (`2026-03`) it is one equality filter. For "the last seven days" a one-sided `gte` is enough, since nothing in the future needs excluding. The two-sided case is the rare one, and it is usually a report, which belongs in the **Database** console or in a flow, see [Database console](/data/database-console/overview).
+
+
+## Writing filters into a URL
+
+A query string has its own rules, and four characters in filter values cause nearly all of the trouble.
+
+| Character | Problem | In a value, write |
+| --- | --- | --- |
+| `+` | Read as a space | `%2B` |
+| `%` | Starts a percent-escape | `%25` |
+| `&` | Ends the parameter | `%26` |
+| `#` | Starts a fragment, and the rest is dropped | `%23` |
+| `,` | Splits the list in `in` and `nin` | Not escapable. Do not put commas in list values |
+| `*` | Is a wildcard in `like` | Not escapable. It acts as a wildcard |
+| `_` | Is a wildcard in `like` | Not escapable. It acts as a wildcard |
+| space | Fine encoded as `%20`, tolerated by integer conversion | `%20` |
+
+The brackets of the key are the one thing that may be left as typed or encoded, and an encoder that percent-encodes them (`%5B` and `%5D`) produces a request the API accepts.
+
+### A helper that gets it right
+
+A builder that holds filters as a map, rejects the operators that do not exist, writes booleans with `is`, and encodes values:
+
+```typescript
+type Op = "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in" | "nin" | "is" | "isnot";
+
+export function buildFilters(filters: Record<string, [Op, unknown] | unknown>): string {
+  const parts: string[] = [];
+  for (const [field, spec] of Object.entries(filters)) {
+    let [op, value]: [Op, unknown] = Array.isArray(spec) ? (spec as [Op, unknown]) : ["eq", spec];
+
+    // Booleans must use `is`: `eq.false` returns the true rows.
+    if (typeof value === "boolean") {
+      op = op === "neq" ? "isnot" : "is";
+      value = String(value);
+    }
+    if (value === null) {
+      op = op === "neq" || op === "isnot" ? "isnot" : "is";
+      value = "null";
+    }
+    if (Array.isArray(value)) {
+      if (value.some((v) => String(v).includes(","))) throw new Error(`a value in ${field} contains a comma`);
+      value = value.join(",");
+    }
+    if (value instanceof Date) value = value.toISOString();   // UTC, with Z
+
+    parts.push(`filter[${field}]=${encodeURIComponent(`${op}.${value}`)}`);
+  }
+  return parts.join("&");
+}
+
+// buildFilters({ status: ["in", ["live", "draft"]], active: true, qty: ["gte", 10] })
+//   -> "filter[status]=in.live%2Cdraft&filter[active]=is.true&filter[qty]=gte.10"
+```
+
+Because it takes a map, a field can appear only once, which matches what the server does and removes the silent last-wins surprise. The `encodeURIComponent` of the whole `op.value` text encodes the dot too (it leaves `.` alone, which is correct) and encodes the comma of a list as `%2C`, which the server decodes before splitting. A Python equivalent:
+
+```python
+from urllib.parse import quote
+
+OPS = {"eq", "neq", "gt", "gte", "lt", "lte", "like", "ilike", "in", "nin", "is", "isnot"}
+
+def build_filters(filters: dict) -> str:
+    parts = []
+    for field, spec in filters.items():
+        op, value = spec if isinstance(spec, tuple) else ("eq", spec)
+        if op not in OPS:
+            raise ValueError(f"unknown operator {op!r}")
+        if isinstance(value, bool):
+            op, value = ("isnot" if op == "neq" else "is"), str(value).lower()
+        elif value is None:
+            op, value = ("isnot" if op in ("neq", "isnot") else "is"), "null"
+        elif isinstance(value, (list, tuple)):
+            if any("," in str(v) for v in value):
+                raise ValueError(f"a value in {field} contains a comma")
+            value = ",".join(str(v) for v in value)
+        elif hasattr(value, "isoformat"):
+            value = value.isoformat().replace("+00:00", "Z")
+        parts.append(f"filter[{field}]={quote(f'{op}.{value}', safe='.')}")
+    return "&".join(parts)
+```
+
+Both builders validate what the server does not: an operator that is misspelled (which the server would silently read as part of the value) and a comma in a list value (which the server would silently split). They cannot check that a number is a number, since they do not know the field's type. Validate numeric and date inputs before they reach the builder, because the server will turn a bad one into a `500`.
+
+
+## Filters and policies
+
+A list operation has a policy, and the policy and the caller's filters are applied together. How they combine depends on what the policy asks, and there are three cases.
+
+### A policy that depends only on the caller
+
+`authenticated`, a role check or `service` is decided from the token before any row is read. If it passes, the caller's filters are applied as written. If it fails, the request is refused before the query runs.
+
+### A policy that compares a record field to a known value
+
+`owner` is the common one, and conditions such as `{"eq": ["$record.status", "live"]}` have the same form. Pawabase turns these into **equality filters of its own** and adds them to the query. Two consequences follow, both observed with a list policy of `owner`:
+
+| Caller request | Result |
+| --- | --- |
+| No filters, signed in as user 1 | Only user 1's rows, with a correct `total` |
+| `filter[owner_id]=2` | Zero rows: the policy's `owner_id = 1` and the caller's `owner_id = 2` are both applied |
+| `filter[owner_id]=1` | The same rows as with no filter |
+| `filter[status]=eq.live` | The caller's live rows only |
+
+A caller cannot widen what a policy allows. The two conditions are `AND`ed, and a filter that contradicts the policy returns nothing and says nothing. Because the work is done in SQL, `total` and paging are correct.
+
+### A policy that needs the row: the residual
+
+A condition that cannot be reduced to an equality (a comparison such as `gt`, an `any` of two different tests) is evaluated against each row after the query. The database cannot apply it, so Pawabase reads a page of rows and discards the ones the policy refuses. That has three effects, each reproduced with a policy `{"gt": ["$record.qty", 2]}` on a resource of seven rows:
+
+```text
+GET /rest/v1/bigs                        ->  200  total: null,  rows b3 b4 b5 b6 b7
+GET /rest/v1/bigs?per_page=2&page=1      ->  200  total: null,  data: []              (rows 1 and 2 were refused; nothing was left)
+GET /rest/v1/bigs?per_page=2&page=2      ->  200  total: null,  rows b3 b4
+```
+
+| Effect | Consequence |
+| --- | --- |
+| `total` is `null` | A per-row policy makes the database count unreliable, so none is reported |
+| A page can come back **empty or short** while more rows exist | The page was filled before the policy ran, and some of its rows were removed |
+| Paging by "stop at an empty page" stops too early | See [Sorting and pagination](/data/sorting-pagination/overview) |
+
+The same applies to the caller's own filters: they narrow the rows read, and the policy then removes more of them.
+
+<Warning>
+**`select` can empty a residual list.** A per-row policy reads the columns of each row, and the row it sees is the row with only the **selected** columns. A request that selects a column list that leaves out what the policy needs sees the policy refuse every row:
+
+```text
+GET /rest/v1/bigs?select=title            ->  200  data: []               (the policy needs qty, which was not selected)
+GET /rest/v1/bigs?select=title,qty        ->  200  rows b3 b4 b5 b6 b7
+GET /rest/v1/mixed?select=title           ->  200  data: []               (the policy reads status and owner_id)
+GET /rest/v1/mixed                        ->  200  rows
+```
+
+There is no error. If a resource has a policy that reads record fields and the list is empty only when `select` is used, include those fields in `select`, or drop `select`. The fields to include are the ones the policy's conditions name after `$record.`.
+</Warning>
+
+### Service credentials
+
+A request made with a secret key bypasses policies, so only the caller's filters apply. A server-side job that lists a resource with a secret key and `filter[owner_id]=2` sees all of user 2's rows, whatever the list policy would have allowed a user.

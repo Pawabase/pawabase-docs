@@ -1,0 +1,178 @@
+---
+title: "Frequently asked questions, second pass"
+description: "When something is wrong and you need to look at the facts rather than infer them, three tables answer almost every question."
+icon: "mail-check"
+---
+
+<AccordionGroup>
+  <Accordion title="Does verification reset anything if the account was locked?">
+    No. Redemption stamps the address and starts a session; it does not clear `failed_logins` or `locked_until` the way a successful sign-in does. A locked account that redeems a verification link is still locked. Use a recovery link or Studio's **Enable** to clear it.
+  </Accordion>
+  <Accordion title="Can a disabled account be verified?">
+    The verification request will send, because that route does not check the disabled flag. Redemption consumes the token and then fails when it tries to start a session, so the address is stamped but no session is created. Expect a `401` on the redemption and a consumed token.
+  </Accordion>
+  <Accordion title="Why did the redemption return a session when I only wanted the boolean?">
+    Because that is what the route does, and it is deliberate. If you need a boolean without a session, read `GET /auth/v1/user` afterwards with the session you now hold, or subscribe to `user.verified`.
+  </Accordion>
+  <Accordion title="Can I use verification links for one-time passcodes instead?">
+    Not with the built-in routes. There is no route that sends a numeric code, and no route that accepts one. A password policy of "minimum length 8" plus a link is a different product decision from "six digits typed into a form". If you want codes, build them in your own application with the data tooling and your own mail.
+  </Accordion>
+  <Accordion title="How long are the old tokens kept?">
+    The row persists with `used_at` set or `expires_at` past. Nothing prunes them on a schedule in the code you should depend on. Treat the table as an audit trail rather than as a working set, and size it accordingly if you request messages at volume.
+  </Accordion>
+  <Accordion title="Does the sign-up event fire before or after verification?">
+    `user.created` fires when the account is created, which is before the message is sent and well before verification. `user.verified` fires at redemption. If you provision on creation, you are provisioning for people who may never confirm.
+  </Accordion>
+</AccordionGroup>
+
+
+## Inspecting the state
+
+When something is wrong and you need to look at the facts rather than infer them, three tables answer almost every question.
+
+### The token rows
+
+```sql
+SELECT id, purpose, email, created_at, expires_at, used_at
+FROM akz_one_time_tokens
+WHERE project = 'acme' AND env = 'production' AND purpose = 'verify'
+ORDER BY id DESC
+LIMIT 20;
+```
+
+| Column | Reading it |
+| --- | --- |
+| `purpose` | Which flow created it. If you expected `verify` and see `magic`, you are looking at the wrong table. |
+| `user_id` | Null for a token issued against an address with no account. |
+| `expires_at` | Compare with `used_at`. A row with `used_at` set is spent. |
+| `used_at` | Non-null means a redemption succeeded. Null on a row past its expiry means nobody arrived. |
+
+The row's `id` is the token's payload. You cannot reconstruct a redeemable token from it alone, which is exactly why you can safely paste it into a support ticket.
+
+<Warning>
+Do not write to this table to force a resend or to clear `used_at`. Clearing it makes a genuinely consumed link redeemable again, and nothing records that you did so. Issue a new token through the API instead.
+</Warning>
+
+### The accounts
+
+```sql
+SELECT id, email, username, email_verified_at, disabled_at, failed_logins, locked_until, mfa_enabled
+FROM akz_users
+WHERE project = 'acme' AND env = 'production'
+  AND (email_verified_at IS NULL OR locked_until IS NOT NULL)
+ORDER BY id DESC;
+```
+
+This finds the two populations that generate support: accounts waiting on a confirmation, and accounts currently locked out. Both are ordinary queries, and both answer questions faster than the UI can.
+
+### The sessions started by a verification
+
+```sql
+SELECT family, method, aal, created_at, last_refreshed_at, revoked_at
+FROM akz_sessions
+WHERE project = 'acme' AND env = 'production' AND method = 'email_verification'
+ORDER BY created_at DESC;
+```
+
+`method` is the field that distinguishes a session begun by a link from one begun by a password or a provider. It is set by the sign-in path, not by the client, so a client cannot forge it.
+
+<Note>
+Every one of these queries is scoped by `project` and `env`, because that is how every query in the identity layer is scoped. A query that omits them returns rows across environments, and it will eventually return somebody else's user.
+</Note>
+
+
+## Turning verification on without breaking anything
+
+The rollout that causes the fewest problems, and the two that cause the most.
+
+### A safe rollout
+
+| Order | Action | Why here |
+| --- | --- | --- |
+| 1 | Set `site_url`. | Links should already point at your application before anyone is required to use one. |
+| 2 | Add the `redirect_urls` your confirmation flow needs. | A disallowed target fails at the moment of redemption, which is the worst time to discover it. |
+| 3 | Build and deploy `/auth/callback`. | It needs to exist before the first message that points at it. |
+| 4 | Test the whole flow with **Sign-up enabled** and the flag off. | Messages are only sent when the flag is on, so you must turn it on to test it — but you can do that in staging first. |
+| 5 | Turn on `require_email_verification`. | Existing accounts are unaffected, so this is safe to do at any time. |
+| 6 | Watch the Sign-in activity tab for `403`s. | You will not see them there; watch your application's logs instead. |
+
+### The mistake that costs the most
+
+Turning on `require_email_verification` in production without a `site_url`.
+
+The result is that every new account gets a message pointing at Akountz's hosted page, confirms there, and is told *"You're all set"* — and then cannot sign in on your application until they type their password, which they did not expect. Worse, if your account creation flow had depended on the sign-up response containing a session, the integration may be treating `session: null` as an error rather than as a normal outcome.
+
+### The other mistake
+
+Testing with an address you already used in a different environment. You get `409 an account with this email already exists` from the wrong environment, or a link that fails to redeem for no visible reason. The tenancy rule is doing its job.
+
+
+## Reference summary
+
+Everything on one page, for the reader who wants the shape rather than the reasoning.
+
+### Routes
+
+| Method | Path | Purpose | Rate limited |
+| --- | --- | --- | --- |
+| POST | `/auth/v1/signup` | Create an account; sends the message when the flag is on. | 30/60s, `akz:auth` |
+| POST | `/auth/v1/verify/request` | Send or re-send the confirmation message. | 10/60s, `akz:links` |
+| POST | `/auth/v1/verify` | Redeem the token, stamp the address, start a session. | no |
+| POST | `/auth/v1/token` | Password sign-in; refuses unverified accounts when the flag is on. | 30/60s, `akz:auth` |
+| GET | `/auth/v1/links/{project}/{env}/verify` | The hosted page, when `site_url` is empty. | no |
+| GET | `/auth/v1/user` | The signed-in person, with `email_verified`. | no |
+| GET | `/auth/v1/settings` | Whether verification is required. | no |
+
+### Configuration
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `require_email_verification` | `false` | Refuses password sign-in for unverified accounts; sends the message at sign-up. |
+| `site_url` | `""` | Where the link goes, and the base of the redirect allowlist. |
+| `redirect_urls` | `[]` | Extra allowed redirect prefixes. |
+| `emails.verify.subject` | `Confirm your email for {project}` | Message subject. |
+| `emails.verify.text` | see above | Message body. |
+| `public_url` | `""` | Where Akountz is reachable, used when `site_url` is empty. |
+
+Configuration is JSON throughout. There is no TOML in auth settings, and an unset key falls back to its default rather than to "off". See [Environment settings](/reference/environment-settings) for where the block lives.
+
+### Model
+
+| Thing | Where it lives |
+| --- | --- |
+| The verification stamp | `AuthUser.email_verified_at`, table `akz_users`. |
+| The token | `OneTimeToken`, table `akz_one_time_tokens`, purpose `verify`. |
+| The session it starts | `SessionInfo`, table `akz_sessions`, method `email_verification`. |
+| The account | `AuthUser`, table `akz_users`, unique on `(project, env, email)`. |
+
+### Errors
+
+| Status | Detail | Cause |
+| --- | --- | --- |
+| 400 | `the link is invalid or has expired` | Any redemption failure. |
+| 400 | `redirect_to is not an allowed URL` | The target is outside `site_url` and `redirect_urls`. |
+| 403 | `sign-up is disabled` | `signup_enabled` is false. |
+| 403 | `confirm your email address first` | Password sign-in with an unverified account while the flag is on. |
+| 409 | `an account with this email already exists` | Sign-up with an address already in this environment. |
+| 422 | `a valid email address is required` | The address failed normalisation. |
+| 422 | Schema error on `token` | Fewer than 10 or more than 2048 characters. |
+
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Password recovery" icon="key" href="/auth/password-recovery/overview">The same mechanism with a one-hour lifetime, and what a reset revokes.</Card>
+  <Card title="Magic links" icon="wand-magic-sparkles" href="/auth/magic-links/overview">Passwordless sign-in that also verifies the address.</Card>
+  <Card title="Managing users" icon="users" href="/auth/managing-users/overview">Creating, disabling and unlocking accounts from Studio.</Card>
+  <Card title="Configuration" icon="sliders" href="/auth/configuration/overview">Every key in the environment's `auth` block, with defaults.</Card>
+  <Card title="Tokens and sessions" icon="key-round" href="/auth/tokens-and-sessions">The claims the returned session carries.</Card>
+  <Card title="Security model" icon="lock" href="/auth/security-model/overview">How the layers combine into a threat model.</Card>
+</CardGroup>
+
+<Info>
+If you are reading this to work out why a link in someone's inbox is not working, start at [What goes wrong](/auth/email-verification/where-the-sign-in-refusal-sits#what-goes-wrong) rather than at the mechanism.
+</Info>
+
+<Note>
+Every link-based flow in Pawabase shares the mechanism described under [The one-time token behind every link](/auth/email-verification/overview#the-one-time-token-behind-every-link). Reading that section once will save you a return trip when the next page covers a different purpose on the same machinery.
+</Note>

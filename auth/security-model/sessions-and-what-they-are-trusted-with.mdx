@@ -1,0 +1,250 @@
+---
+title: "Sessions and what they are trusted with"
+description: "SessionInfo records an IP and a user-agent for each session. Those are records for inspection, not enforcement. There is no IP binding, no device…"
+icon: "shield-check"
+---
+
+### What is recorded, and what is enforced
+
+`SessionInfo` records an IP and a user-agent for each session. Those are **records
+for inspection, not enforcement**. There is no IP binding, no device fingerprint,
+and no mechanism that refuses a legitimate token because it arrived from a new
+address.
+
+The IP comes from `X-Forwarded-For` when that header is present — the first entry
+in the list. If your clients can set that header themselves, or you are not behind
+a proxy that normalises it, the recorded value is whatever was sent. Treat the
+column as a debugging aid.
+
+A sudden change of IP or user-agent on a session is a signal worth noticing when
+reviewing the session list in Studio. It is not a signal the system acts on.
+
+### No absolute session expiry
+
+A session has no independent `expires_at`. It ends when its refresh tokens expire
+and stop being refreshable, or when something revokes it.
+
+If your application needs a maximum session age — eight hours, say, regardless of
+activity — you have to enforce it yourself from the session's `created_at`. The
+data is there; the enforcement is yours.
+
+<Accordion title="What the assurance level does and does not gate">
+`aal` is `"aal1"` for a password-only session and `"aal2"` once MFA has passed. It
+travels in the token and on the session row.
+
+What exists: the claim is available to you, and MFA is required for a session to
+reach `aal2` when the user has it enabled.
+
+What does not exist: there is **no `require_aal` directive, no `min_aal` config
+key, and no way to demand a minimum assurance level declaratively.** If an
+operation must require MFA, you check the `aal` claim yourself in a policy
+condition or in your handler.
+</Accordion>
+
+
+## Claims you can and cannot trust
+
+The token carries two metadata blobs and they are not equivalent. This is the
+single most consequential distinction in the whole claim set.
+
+| Claim | Source | Who can change it | Trust it for |
+| --- | --- | --- | --- |
+| `meta` | `user_metadata` | **The user**, via `PATCH /auth/v1/user` | Nothing security-relevant |
+| `app` | `app_metadata` | Service keys and Studio only | Anything |
+
+If a policy decides "is this user an employee" from a claim, and that claim came
+from `meta`, the user granted it to themselves. The same information in `app` is
+only writable by an administrator.
+
+The other claims have their own character:
+
+| Claim | Trust | Because |
+| --- | --- | --- |
+| `sub`, `email`, `username` | High | Server-owned, user cannot change the id |
+| `roles`, `perms` | High, with staleness | Server-derived; changes land on next refresh |
+| `org`, `org_role` | High, with staleness | Read at issue time from the membership row |
+| `aal` | High, with staleness | Server-set; MFA state changes land on next refresh |
+| `exp` | High | Cryptographically protected |
+
+Everything except `exp` is a **snapshot**. The token is correct as of the moment it
+was minted and can be up to `access_ttl` out of date by the time it is used. For
+roles and permissions that is a deliberate performance trade-off. For organization
+membership it is the thing to watch, because a removed member keeps their claims
+until their next refresh.
+
+<Warning>
+Do not build a policy that reads `meta` to decide access. The moment a user can
+edit a claim, that claim is an input they control.
+</Warning>
+
+
+## Passwords: what the policy actually enforces
+
+Two policies, and the difference between them is larger than it looks.
+
+| Policy | Behaviour |
+| --- | --- |
+| `basic` (default) | Length only, against `password_min_length` (default 8) |
+| `strict` | The full validator, which returns a **list** of problems |
+
+Either way a password over 1024 characters adds `"Password is too long."` to the
+problem list.
+
+When the policy fails, the response is a `422` whose body is a *list*:
+
+```json
+{
+  "message": "the password does not meet the policy",
+  "problems": ["Password must be at least 12 characters."]
+}
+```
+
+<Warning>
+`problems` is a list, not a string. A client that renders only the first problem
+hides the rest, and users fix one issue at a time. Render all of them.
+</Warning>
+
+Studio exposes this as a **Policy** segmented control — **Basic** or **Strict** —
+next to **Minimum length**, under **Users & auth → Configuration → Passwords**.
+
+### Email normalisation
+
+Addresses are stripped and lowercased, then must match a simple pattern and be at
+most 255 characters, or they are rejected with `422 a valid email address is
+required`. Because of the lowercasing, **all lookups are case-insensitive** — which
+is a security property worth having and a source of confusion when you are
+comparing strings yourself.
+
+
+## MFA specifics worth knowing
+
+The implementation details that have security consequences, rather than the
+enrolment flow itself.
+
+**TOTP secrets are encrypted at rest.** They are sealed with the platform's
+secret box, which is keyed by `master_key`. They are never stored in plaintext,
+and `master_key` must be backed up with the database — rotating it without that
+backup makes every stored secret and TOTP factor unreadable.
+
+**A TOTP code is accepted exactly once.** The last accepted time step is recorded,
+and a step at or below it is rejected. This is why a code observed over a shoulder
+cannot be replayed within its thirty-second window. A small window of clock drift
+on either side is tolerated.
+
+**Recovery codes are stored hashed and shown once.** They are generated as random
+values, stored as SHA-256 hashes, and the raw codes are returned only at
+generation. Ten are issued. There is no way to recover them — a user who loses
+them uses the admin MFA reset route.
+
+<Info>
+Storing them hashed is what makes a database dump insufficient for account
+takeover on the MFA path. It is the reason recovery codes are not a weaker
+credential than the TOTP secret they replace.
+</Info>
+
+**MFA is opt-in per user, and gated per environment.** The `mfa_enabled` flag on
+the environment lets users enrol; the flag on the user says whether they have. A
+user with MFA enrolled does not get a challenge if the environment has MFA turned
+off — the check is both, not either.
+
+**Disabling MFA requires a current code.** Someone holding a session cannot
+quietly remove the second factor. The same applies to replacing recovery codes,
+which additionally requires a TOTP code rather than a recovery code.
+
+### Password recovery is the strongest single credential
+
+A recovery link sets the password, clears the lockout counters, and **revokes
+every existing session**. That last part is what makes recovery safe: if the reset
+was initiated because the account was compromised, the attacker's sessions die
+with the legitimate ones.
+
+What recovery does *not* do is require MFA re-enrolment. If the user had MFA
+enabled, it stays enabled, and the recovery-completed session is a normal `aal1`
+session that will be challenged at the next sign-in where MFA applies.
+
+<Warning>
+The recovery link is valid for one hour. Treat possession of an unopened recovery
+email as account takeover, and do not forward it. Because recovery does not
+require a second factor, it is the weakest link in an otherwise strong chain —
+which is the argument for enabling MFA for anything that matters.
+</Warning>
+
+
+## Magic links and social sign-in
+
+### Magic links
+
+A magic link is a single-use, signed, time-limited token that carries the user.
+It lives **15 minutes**, it cannot be reused, and it is consumed by a conditional
+update so two concurrent clicks produce one success and one failure.
+
+The security property is that there is no shared secret to phish — but the link
+itself is a bearer credential for its lifetime. Anyone who obtains the email can
+use it. A magic link arriving at `aal1` is not a second factor.
+
+Completing a magic link also marks the address verified, so an unverified user who
+signs in by magic link ends up verified. That is deliberate: proving control of the
+inbox is the same proof.
+
+### Social sign-in
+
+The security-relevant rule in the social callback is about account linking: **an
+unverified provider email never attaches itself to an existing account.** Only a
+profile whose email is marked verified by the provider will match an existing
+account by address.
+
+Without that rule, anyone who could register an OAuth account with a victim's
+unverified email address would be silently signed in as that victim. It is the
+single most important line in the callback's account-resolution order.
+
+The full order, in case you need to reason about an edge case:
+
+1. If the flow is a **linking** flow, the link token is consumed and the identity
+   attaches to that user. If it already belongs to someone else, the flow fails
+   with `identity_already_linked`.
+2. Otherwise look up the identity by provider and subject within this
+   environment. Found — sign in.
+3. Not found, and the provider email is **verified** — match an existing account
+   by address.
+4. Not found — create an account, but only if sign-up is enabled. Otherwise
+   `signup_disabled`. An address already in use but unverified gives
+   `signup_unverified_conflict`; a provider profile with no email gives
+   `email_required`.
+5. The resolved account is disabled — `account_disabled`.
+
+<Warning>
+Step 3 is the security boundary, and step 4's `signup_unverified_conflict` is what
+stops a fresh OAuth attempt from colliding with an existing unverified signup.
+Neither is configurable, and both are load-bearing.
+</Warning>
+
+## Sign-in methods compared on security properties
+
+What each method actually buys you, stated without marketing. The useful question
+for any of them is: **what is the credential, and who can present it?**
+
+| Method | Credential | Factors | `aal` | Main weakness |
+| --- | --- | --- | --- | --- |
+| Password | A shared secret the user knows | 1 | `aal1` | Phishable, reusable, guessable at scale |
+| Magic link | Possession of the email | 1 | `aal1` | The link is a bearer credential for 15 minutes |
+| Social | An assertion from the provider | 1 | `aal1` | Depends entirely on the provider's own assurance |
+| Any of the above + TOTP | The above, plus a rotating code | 2 | `aal2` | The code is phishable; no phishing-resistant factor exists |
+
+Two observations that the table makes obvious.
+
+**Adding a second factor changes the credential, not the first one.** TOTP makes
+guessing the password insufficient, but it does nothing about phishing — an
+attacker who relays both the password and a live code in real time still gets in.
+There is no hardware-key or WebAuthn factor in this system to raise the bar
+further.
+
+**Only two of these can reach `aal2` without a password at all** — magic link and
+social, both completed through the MFA challenge. What matters for policy is the
+`aal` claim, not which method produced the session.
+
+<Info>
+A recovery-completed session is `aal1` even for a user who has MFA enabled,
+because recovery does not challenge. If your application treats `aal2` as
+"required for this operation", a user who reset their password is temporarily back
+to `aal1` — which is correct behaviour, and worth designing around.
+</Info>

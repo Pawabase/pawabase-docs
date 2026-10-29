@@ -1,0 +1,257 @@
+---
+title: "Errors and retries"
+description: "How the TypeScript client reports failures and recovers from them: the error classes, how server answers become errors, validation issues, request ids, which failures are retried and how, timeouts, cancellation and observability."
+icon: "triangle-alert"
+---
+
+Every call to Pawabase can fail, and the reasons differ in what they mean for your application: a person typed something invalid, a policy said no, the network dropped, the server was briefly busy.
+The client turns every failure into a typed error that says which of these happened, and it repeats the failures that are safe to repeat before you ever see them.
+
+This page explains the error classes and how server answers map onto them, how to read validation problems and request ids, exactly which failures are retried and how, and how timeouts, cancellation and hooks fit in.
+
+## The mental model
+
+A call ends in one of three ways.
+
+| Outcome | What you get | Example |
+| --- | --- | --- |
+| Success | The parsed answer | A page of records |
+| The server answered with an error | An `ApiError` subclass, chosen by the status | `NotFoundError` for a `404` |
+| No answer at all | A transport error | `NetworkError`, `TimeoutError`, `AbortError` |
+
+Before either failure reaches your code, the client decides whether the failure is safe and worth repeating.
+Rate limits are always repeated; gateway hiccups and network drops are repeated for requests that cannot cause harm when sent twice; everything else is thrown at once.
+
+```text
+attempt ──▶ answer 2xx ───────────────────────────▶ return the parsed body
+   │
+   ├──▶ answer 401 with a session ──▶ refresh once ──▶ repeat the attempt
+   │
+   ├──▶ answer 429, or 502/503/504 on a safe request ──▶ wait ──▶ repeat (up to 2 more times)
+   │
+   ├──▶ network failure or timeout on a safe request ──▶ wait ──▶ repeat
+   │
+   └──▶ anything else ──▶ throw the matching error class
+```
+
+Errors are classes, not codes in a result object.
+A successful call returns data directly, and a failed one throws, so the happy path has no checks and the failure path is a `catch` where TypeScript can narrow the error.
+
+
+## The error classes
+
+Everything the client throws extends `PawabaseError`.
+
+```text
+PawabaseError
+├── ApiError                     the server answered with an error status
+│   ├── ValidationError          400 with issues, or 422
+│   ├── AuthenticationError      401
+│   ├── PermissionError          403
+│   ├── NotFoundError            404
+│   ├── ConflictError            409
+│   ├── PayloadTooLargeError     413
+│   ├── RateLimitError           429
+│   └── ServerError              5xx
+├── NetworkError                 no answer: offline, DNS, refused, reset, blocked by CORS
+├── TimeoutError                 an attempt exceeded its timeout
+├── AbortError                   your AbortSignal fired
+├── ConfigError                  the client was configured or used incorrectly
+├── InvalidQueryError            a query the server would answer wrongly, refused before sending
+└── RealtimeError                a realtime request was refused, timed out, or the connection closed
+```
+
+All are exported from `@pawabase/client`.
+
+| Class | When | What to do |
+| --- | --- | --- |
+| `ValidationError` | The request was refused as invalid before any policy ran | Show field problems; fix the input |
+| `AuthenticationError` | No valid credentials: wrong key, nobody signed in, or the session ended | Sign the person in again |
+| `PermissionError` | Credentials are valid, but a policy, scope or rule said no | Explain; do not retry |
+| `NotFoundError` | No such record, route or file, or a read policy hides it | Treat as absent |
+| `ConflictError` | A unique value is taken, or the request conflicts with current state | Explain; reload and decide |
+| `PayloadTooLargeError` | The body is larger than the gateway or bucket allows | Shrink it, or use another path |
+| `RateLimitError` | Too many requests, and the wait asked for was longer than the client will wait | Wait `retryAfter` seconds |
+| `ServerError` | The platform failed | Report with the request id; try again later |
+| `NetworkError` | No answer reached the client | Check connectivity; safe requests were already retried |
+| `TimeoutError` | An attempt took longer than its timeout | Decide whether the action may have happened |
+| `AbortError` | Your code cancelled the call | Usually ignore |
+| `ConfigError` | A mistake in setup, such as a secret key in a browser | Fix the code |
+| `InvalidQueryError` | Two filters on one field, a comma inside an `in` value, an uncountable total | Rewrite the query |
+| `RealtimeError` | A channel refused, an acknowledgement timed out | See [Realtime](/clients/typescript/realtime/overview) |
+
+
+## What an ApiError carries
+
+| Property | Type | Meaning |
+| --- | --- | --- |
+| `status` | `number` | The HTTP status |
+| `code` | `string` | A stable machine-readable code (see below) |
+| `message` | `string` | A sentence describing the problem |
+| `details` | `unknown` | Structured extras the server sent: validation issues, a flow's details, a quota's numbers |
+| `body` | `unknown` | The parsed response body, exactly as received |
+| `requestId` | `string \| null` | The gateway's `x-request-id` |
+| `method`, `url` | `string \| undefined` | The request that failed |
+| `retryAfter` | `number \| null` | Seconds the server asked the caller to wait, for `429` and some `503` |
+| `policy` | `string \| null` | The name of the refusing policy, when the server named it |
+| `is(code)` | `(code: string) => boolean` | Whether `code` matches |
+
+### Codes
+
+`code` comes from the server when the answer names one, and from the status otherwise.
+
+| Source | Example codes |
+| --- | --- |
+| The gateway | `invalid_api_key`, `origin_not_allowed`, `rate_limit_exceeded` |
+| The data API | `unique_violation`, `constraint_violation`, `quota_exceeded` |
+| A flow's `error.raise` | Whatever the flow names, such as `coupon_expired` |
+| Derived from the status, when the answer has no code | `bad_request`, `unauthenticated`, `forbidden`, `not_found`, `method_not_allowed`, `conflict`, `payload_too_large`, `unsupported_media_type`, `validation_failed`, `rate_limited`, `server_error`, `http_error` |
+
+Branch on `code` when you handle a specific failure, and on the class when you handle a category.
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, ConflictError } from "@pawabase/client";
+
+try {
+  await pawabase.from("customers").create({ email, name });
+} catch (error) {
+  if (error instanceof ConflictError && error.is("unique_violation")) return showEmailTaken();
+  if (error instanceof ApiError && error.is("quota_exceeded")) return showUpgrade();
+  throw error;
+}
+```
+
+```python Python
+from pawabase import ConflictError, QuotaExceededError
+
+try:
+    pb.from_("customers").create({"email": email, "name": name})
+except ConflictError as error:
+    if error.code == "unique_violation":
+        return show_email_taken()
+    raise
+except QuotaExceededError:
+    return show_upgrade()
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/customers" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "ada@example.com", "name": "Ada"}'
+# HTTP/1.1 409
+# x-request-id: req_01JB…
+# {"error": "unique_violation", "message": "A record with the same email already exists.", "details": {"columns": ["email"]}}
+```
+</CodeGroup>
+
+### How server answers become errors
+
+Pawabase services answer errors in several shapes.
+The client reads all of them, so your code never parses an error body.
+
+| Answer body | Where it comes from | How the client reads it |
+| --- | --- | --- |
+| A bare string, such as `"Not found"` | Most `4xx` from the data API | `message` is the string |
+| A bare array of issues | `422` from request validation | `ValidationError` with `issues` |
+| `{ "error": code, "message": text, "details": … }` | The gateway, flows, routes, quotas | `code`, `message` and `details` from the fields |
+| `{ "detail": text }` or `{ "detail": [issues] }` | The auth service and query parameter validation | `message`, or `issues` |
+| Empty | Some `5xx` | `message` is `Request failed with status N.` |
+| Non-JSON text | Proxies, extension routes | `message` is the text |
+
+When a message has the form `policy 'name' refused`, the client extracts the name into `policy`.
+
+<CodeGroup>
+```typescript TypeScript
+import { PermissionError } from "@pawabase/client";
+
+try {
+  await pawabase.from("invoices").update(id, { status: "void" });
+} catch (error) {
+  if (error instanceof PermissionError) console.warn("refused by", error.policy ?? "an unnamed rule");
+}
+```
+
+```python Python
+import re
+
+from pawabase import ForbiddenError
+
+try:
+    pb.from_("invoices").update(invoice_id, {"status": "void"})
+except ForbiddenError as error:
+    match = re.search(r"policy '([^']+)' refused", error.message)
+    print("refused by", match.group(1) if match else "an unnamed rule")
+```
+
+```bash cURL
+curl -i -X PATCH "$PAWABASE_URL/rest/v1/invoices/$INVOICE_ID" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"status": "void"}'
+# HTTP/1.1 403
+# policy 'finance_only' refused
+```
+</CodeGroup>
+
+
+## Validation errors
+
+A `ValidationError` lists every problem the server found, so a form can show them all at once.
+
+<CodeGroup>
+```typescript TypeScript
+import { ValidationError } from "@pawabase/client";
+
+try {
+  await pawabase.from("customers").create(values);
+} catch (error) {
+  if (!(error instanceof ValidationError)) throw error;
+  setFieldErrors(error.byField());
+}
+```
+
+```python Python
+from pawabase import ValidationError
+
+
+def by_field(error: ValidationError) -> dict[str, list[str]]:
+    issues = error.detail if isinstance(error.detail, list) else (error.detail or {}).get("detail", [])
+    fields: dict[str, list[str]] = {}
+    for issue in issues if isinstance(issues, list) else []:
+        field = ".".join(str(part) for part in issue.get("loc", []) if part not in ("body", "query", "path"))
+        fields.setdefault(field, []).append(issue.get("msg", "is invalid"))
+    return fields
+
+
+try:
+    pb.from_("customers").create(values)
+except ValidationError as error:
+    set_field_errors(by_field(error))
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/customers" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"email": "not-an-email"}'
+# HTTP/1.1 422
+# [{"type": "missing", "loc": ["body", "name"], "msg": "Field required"}, {"type": "value_error", "loc": ["body", "email"], "msg": "…"}]
+```
+</CodeGroup>
+
+| Member | Returns |
+| --- | --- |
+| `issues` | Every issue: `loc`, `field`, `message`, and `type` and `input` when the server sent them |
+| `fieldError(name)` | The first message for one field, or `undefined` |
+| `byField()` | `{ email: ["…"], name: ["…"] }` |
+
+Each issue's `loc` is the path the server reported, such as `["body", "email"]` or `["query", "per_page"]`.
+`field` is the same path without the `body`, `query` or `path` prefix, joined with dots for nested fields, such as `address.city`.
+
+| Issue `type` | Typical cause |
+| --- | --- |
+| `missing` | A required field was not sent |
+| `string_type`, `int_type`, `bool_type` | A value of the wrong type |
+| `string_too_short`, `string_too_long` | Outside a length constraint |
+| `greater_than_equal`, `less_than_equal` | Outside a range |
+| `enum`, `literal_error` | Not one of the allowed values |
+| `extra_forbidden` | A field the resource does not declare, or a read-only field |
+| `string_pattern_mismatch` | Does not match the field's pattern |
+
+The messages are written by the server in English.
+For interfaces in other languages, translate by `type` and use the server's message as a fallback.
+
+A `400` is a `ValidationError` only when its body lists issues; otherwise it is a plain `ApiError` with code `bad_request`.

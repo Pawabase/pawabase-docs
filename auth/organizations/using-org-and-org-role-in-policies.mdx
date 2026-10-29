@@ -1,0 +1,226 @@
+---
+title: "Using org and org_role in policies"
+description: "The claims arrive in the policy context as plain strings. From Principal.aspolicycontext:"
+icon: "building"
+---
+
+The claims arrive in the policy context as plain strings. From `Principal.as_policy_context`:
+
+```python
+def as_policy_context(self) -> dict[str, Any]:
+    """What policies see under ``auth``."""
+    return {
+        "authenticated": True,
+        "kind": self.kind,
+        "user_id": self.identity,
+        "email": self.email,
+        "roles": self.roles,
+        "permissions": self.permissions,
+        "org": self.org,
+        "org_role": self.claims.get("org_role"),
+        "aal": self.claims.get("aal"),
+        "session_id": self.claims.get("sid"),
+        "claims": self.claims,
+    }
+```
+
+with `org` sourced straight from the claim:
+
+```python
+@property
+def org(self) -> str | None:
+    return self.claims.get("org")
+```
+
+Conditions are **JSON, not TOML**. There is no expression string, no `&&`, no `==`, and no permission-checking function to call. The operators are `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `starts_with`, `ends_with`, `matches`, combined with `all`, `any`, `not` and the shorthands. Full reference in [Auth in policies](/auth/auth-in-policies/overview).
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$auth.org", "acme-hq"] },
+    { "any": [
+      { "eq": ["$auth.org_role", "owner"] },
+      { "eq": ["$auth.org_role", "admin"] }
+    ] }
+  ]
+}
+```
+
+Because `$auth.org` can be `null` for a de-scoped session, prefer `eq` over `contains` when comparing it. To say "this request must be organization-scoped" without naming a slug:
+
+```json
+{ "not_in": ["$auth.org", [null, ""]] }
+```
+
+And to require a second factor *and* an organization administrator:
+
+```json
+{
+  "all": [
+    { "aal": "aal2" },
+    { "exists": "$auth.org" },
+    { "in": ["$auth.org_role", ["owner", "admin"]] }
+  ]
+}
+```
+
+<Warning>
+`{"contains": ["$auth.org", "acme"]}` would also match `acme-hq` and `acme-labs`, because `contains` falls back to a substring test when the left side is a string. Slugs share prefixes surprisingly often. Use `eq`, or `starts_with` if you genuinely mean a prefix.
+</Warning>
+
+A note on service credentials: a request carrying a secret key never reaches any of this. `PolicyEngine.check` short-circuits:
+
+```python
+if lookup(context, "credential.is_service"):
+    return Decision(True, "service", "service credential bypasses policies")
+```
+
+So a Studio operator or a server-to-server call with the secret key can read and write every organization's data regardless of `org_role`. That is the intended escape hatch for administration, and the reason you should never ship a secret key to a client. The Python-side equivalent — a method on the principal object, not a condition operator — is described in [Auth in policies](/auth/auth-in-policies/the-shorthands#permission).
+
+
+## Row-level tenancy with org data
+
+Policies that put `$auth.org` into a SQL filter need the record to carry an organization column you can compare against. The engine's pushdown only fires for conjunctions of `eq` between one `$record.<column>` and a literal:
+
+```python
+def pushdown(residual: Condition) -> tuple[dict[str, Any], Condition | None]:
+    """Split a residual into SQL equality filters and what is left.
+
+    Only conjunctions of ``eq`` between one ``$record.<column>`` and a literal
+    are pushed down. That is exactly the ownership and tenancy shape, and it is
+    the part pagination depends on.
+    """
+```
+
+So this is the shape that keeps a list endpoint correctly paginated:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$record.org_slug", "$auth.org"] }
+  ]
+}
+```
+
+`$auth.org` is a known value at plan time, so it is resolved into the SQL `WHERE` clause and the database does the filtering. Two important consequences:
+
+- If `$auth.org` is `null` (a de-scoped session), the filter becomes `org_slug = NULL`, which matches no rows in SQL — the user sees an empty list rather than everything. That is the safe default.
+- If you write `{"eq": ["$record.org_slug", "$auth.org_role"]}` by mistake, you get a filter on the wrong column, and the engine will not warn you. Compare a column to the claim that names it.
+
+
+## Events organizations emit
+
+Organization changes publish onto the platform event stream, scoped to the `(project, env)` that owns them, with the acting user as `actor`:
+
+| Event | Payload | Emitted by |
+| --- | --- | --- |
+| `organization.created` | `{"organization": slug, "user_id": ...}` | `POST /orgs` |
+| `organization.deleted` | `{"organization": slug}` | `DELETE /orgs/{slug}` |
+| `invitation.created` | `{"organization": slug, "email": ..., "role": ...}` | `POST /orgs/{slug}/invitations` |
+| `invitation.accepted` | `{"organization": slug, "user_id": ...}` | `POST /invitations/accept` |
+
+<Warning>
+Not every organization change emits an event. **Role changes, member removals, and every team operation are silent.** If you need an audit trail of who was demoted or removed, build it yourself — Akountz does not provide one for organizations.
+</Warning>
+
+The membership-removal path is worth planning around specifically, since it is also the one that de-scopes live sessions. If your application cares, the observable signal is the `org` claim becoming `null` on a refresh — that is the moment a removal has taken effect.
+
+
+## The admin and Studio view
+
+Studio's Users page has five tabs — `Users`, `Roles`, `Organizations`, `Sign-in activity`, `Configuration` — and the Organizations tab is read-only:
+
+The Organizations tab is a read-only table with the columns **Name**, **Slug**, **Members** and **Created**. Selecting a row fetches that organization's admin payload and renders it as raw JSON. The empty state reads:
+
+> No organizations. Users create them through /auth/v1/orgs.
+
+Two things this tells you honestly:
+
+- There is no "New organization" button, and no edit control anywhere on the tab. Organizations are a user-side primitive; an operator can look, but not create or change one.
+- The detail pane is the raw JSON from the admin endpoint — members with `user_id`, `email` and `role`, plus teams. Read-only by construction.
+
+The underlying routes are service-only:
+
+```python
+@r.get(f"{base}/orgs", auth=SERVICE_ONLY, tags=["admin"], summary="All organizations")
+async def orgs(ctx: HttpContext, project: str, env: str):
+    rows = (
+        await Organization.filter(project=project, env=env)
+        .annotate(member_count=Count("memberships"))
+        .order_by("slug")
+    )
+    return {
+        "data": [
+            {
+                "id": o.id,
+                "slug": o.slug,
+                "name": o.name,
+                "members": o.member_count,
+                "created_at": o.created_at.isoformat() if o.created_at else None,
+            }
+            for o in rows
+        ]
+    }
+```
+
+Note `Count("memberships")` — the member count is an annotated join over the `related_name` on `Membership`, not a stored column. Deleting a membership decrements it immediately.
+
+```python
+@r.get(
+    f"{base}/orgs/{{slug}}",
+    auth=SERVICE_ONLY,
+    tags=["admin"],
+    summary="One organization with members and teams",
+)
+async def org(ctx: HttpContext, project: str, env: str, slug: str):
+    found = await Organization.get_or_none(project=project, env=env, slug=slug)
+    if found is None:
+        raise HTTPException(status_code=404, detail="no such organization")
+    members = await Membership.filter(organization=found).prefetch_related("user")
+    teams = await Team.filter(organization=found)
+    return {
+        "slug": found.slug,
+        "name": found.name,
+        "metadata": found.metadata,
+        "members": [
+            {"user_id": str(m.user.id), "email": m.user.email, "role": m.role} for m in members
+        ],
+        "teams": [{"slug": t.slug, "name": t.name} for t in teams],
+    }
+```
+
+`auth=SERVICE_ONLY` means these are reachable only with a Pawabase service credential — Studio's own operator token. A user access token cannot reach them, whatever its `org_role`.
+
+
+## What organizations are not
+
+This section exists because each of these is a plausible thing to go looking for.
+
+<AccordionGroup>
+  <Accordion title="There is only one organization model">
+    The models are `Organization` and `Membership`, plus `Team`, `TeamMember` and `Invitation`. The join row between a user and an organization is `Membership`, and its role field is `role`.
+  </Accordion>
+  <Accordion title="There is no specialised or blueprint variant">
+    There is exactly one organization shape. No subtype, no template, no vertical-specific variant, no starter data. A commerce organization and a family organization are the same five tables with different slugs.
+  </Accordion>
+  <Accordion title="There is no per-organization auth configuration">
+    `password_policy`, `password_min_length`, `access_ttl`, `refresh_ttl`, `signup_enabled`, `require_email_verification`, `magic_link_enabled`, `mfa_enabled` — every one is read from the **environment's** `auth` block via `AuthConfig`. There is no organization-scoped override for any of them, and no mechanism to add one.
+  </Accordion>
+  <Accordion title="There is no per-organization AAL">
+    `aal` is a property of `SessionInfo` — the session — set to `aal1` at start and `aal2` after MFA. It is not a property of an organization and cannot be configured per organization. A policy demanding `{"aal": "aal2"}` demands it of every session that touches that operation.
+  </Accordion>
+  <Accordion title="There is no `invite_only` flag">
+    Whether an organization accepts self-service joins is an application-level decision. Akountz gives you creation, membership and invitations as primitives; it does not model "open" versus "closed" organizations. Note also that there is no route to add yourself to an organization you were not invited to, so the default is effectively closed.
+  </Accordion>
+  <Accordion title="There is no `left_at` on Membership">
+    Leaving or being removed deletes the row. If you need a record of departures, the `Membership` table will not give it to you.
+  </Accordion>
+  <Accordion title="There are no team claims on the token">
+    `org` and `org_role` are the only organization claims. No `teams`, no `team`, nothing about `TeamMember` reaches a policy.
+  </Accordion>
+  <Accordion title="There is no organization listing for ordinary users">
+    `GET /auth/v1/orgs` returns *your* organizations. There is no "list all organizations" endpoint reachable with a user token; only the `SERVICE_ONLY` admin route, which Studio uses.
+  </Accordion>
+</AccordionGroup>

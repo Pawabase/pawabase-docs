@@ -1,0 +1,269 @@
+---
+title: "Which resources to cache"
+description: "A walk through common kinds of resource, with a recommendation and the reason."
+icon: "clock"
+---
+
+A walk through common kinds of resource, with a recommendation and the reason.
+
+| Resource | Recommendation | Reason |
+| --- | --- | --- |
+| **Product catalogue** (public, staff-edited via API) | 60 to 300 | High read-to-write ratio, shared `anon` entries, every write clears |
+| **Blog posts, docs, pages** | 60 to 600 | Same, written rarely |
+| **Categories, tags, countries, settings** | 300 to 3,600 | Almost never change. If they change by SQL, invalidate after |
+| **Feature flags** | 5 to 30 | Must change quickly, small and hot, so a short time still removes most load |
+| **A user's own orders or tickets** | 5 to 15 | Per-user entries, few repeat reads. Short, so little to go stale |
+| **A live feed** | 0 to 5 | Freshness matters more than the saving |
+| **Anything read with `expand`** | 0 to 15 | Related changes do not clear it |
+| **Audit or event logs** | 0 | Written constantly |
+| **Counters, stock levels, balances** | 0 | A stale number is a wrong number |
+| **A search endpoint** (many different filters) | 0 or short | Few repeated queries, and every query is its own entry |
+| **A resource with an outside-state policy** | 0 | The body can go stale relative to that state |
+
+If two rows seem to apply, choose the **shorter** time. A short time costs a little database load. A long one costs correctness.
+
+
+## Reading the Observability page
+
+The cache is diagnosed from **Observability**, so it is worth knowing the page.
+
+The header reads *Trace a request from HTTP entry through policies, flows, events, user logs, and every executed flow step.* and has a time range picker (**last hour**, **last 6 hours**, **last day**, and a longer one).
+
+| Part | What it shows |
+| --- | --- |
+| **Metric cards** | One card per recorded metric, titled with the metric's name, with its total and a small bar chart over the window. *No metrics recorded in this window.* when empty. Refreshes every 15 seconds |
+| **The request list** | Rows with **When**, **Method**, **Path**, **Status**, **Duration**, **Caller** and **Request id**. Refreshes every 10 seconds. Three filters above it: **Search path**, **Exact request id**, and a status choice of **every status**, **2xx success**, **4xx client error**, **5xx server error** |
+| **Cache** card | The cache backend and statistics, as JSON. With an **Invalidate** button and a text box for resources |
+
+Click a request row to open **Request trace**:
+
+| Section | Shows |
+| --- | --- |
+| The summary line | **completed** or **failed**, the duration, and counts of flows, events, jobs and user logs |
+| **HTTP request** | The method, path and status, the matched route, duration and start time, the **Caller** and **IP**, any error, and a JSON block with the user agent and **notes** |
+| **User logs** | Messages written by flows, with level and flow and node |
+| **Flow runs** | Each flow the request triggered, with status, input and output, and the step trace |
+| **Events** | Each event the request published |
+| **Jobs** | Each background job it queued |
+
+For caching, the **notes** in the HTTP request block are the place to look. They record what the request did on the way through, including the cache decision.
+
+### Reading a cache question from a trace
+
+| You want to know | Look at |
+| --- | --- |
+| Was this request answered from the cache? | The cache note in the HTTP request's notes: `hit` or `miss` |
+| Did a write clear what I expected? | The **Events** section of the write's trace: the resource's `created`, `updated` or `deleted` event shows the write went through the after-write step that clears the tag |
+| Who made the request, and as what role? | **Caller** and the notes. The identity and role decide the key |
+| Did a manual clear happen? | The audit log, action `cache.invalidated` |
+
+
+## Debugging a stale read, step by step
+
+A user says they changed something and still see the old value. Work down this list; it ends at the cause.
+
+<Steps>
+  <Step title="Is caching on for this resource?">
+    Open the resource and read **Cache responses**. If it is `0`, the cache is not the cause: look for a client cache or a CDN.
+  </Step>
+  <Step title="Was the read a hit?">
+    Find the request in **Observability** and open its trace. If the notes say `miss`, the data came from the database, and the value really is old there.
+  </Step>
+  <Step title="How was the value changed?">
+    Through `/rest/v1`, the Records tab, a flow or the console (recognised): the resource's entries were cleared. By SQL elsewhere, a script, or another application: Pawabase was not told.
+  </Step>
+  <Step title="Which backend is it?">
+    The **Cache** card: `MemoryCache` with more than one API process means the clear reached only one of them.
+  </Step>
+  <Step title="Is the value inside an `expand`?">
+    If the stale value is a related row, the entry is tagged by the parent only.
+  </Step>
+  <Step title="Is the value a computed one?">
+    A transformer `set` of `now`, or a value from a related lookup, is frozen at build time.
+  </Step>
+  <Step title="Invalidate, then read again">
+    Press **Invalidate** for the resource. If the value is now correct, the entry was stale and you have identified the path. If it is still wrong, the data itself is old: check the database in the console.
+  </Step>
+</Steps>
+
+Write down which step found it. Over time, one of them will dominate, and that is where to invest: a Redis, an invalidation call in a job, or a shorter time.
+
+
+## Settings for each environment
+
+| Environment | Suggestion |
+| --- | --- |
+| **Development** | Leave caching **off** for most resources, so what you see is what the database holds. Turn it on for the one resource you are testing, and test hits, clears and expiry |
+| **Staging** | The same settings as production, including Redis, so behavior matches |
+| **Production** | Redis if more than one process. Times chosen by the table above. Rate limits on public cached resources. A runbook entry for invalidation |
+
+Because a cache time is part of the resource's definition, **promotion copies it**. A resource promoted from development with `cache_ttl: 0` arrives off, and one with `300` arrives with `300`. Check the target after a promote, particularly if development and production intentionally differ.
+
+
+## Myths
+
+| Myth | What is true |
+| --- | --- |
+| "The cache makes my API faster for every request" | Only for repeated queries from callers who share an entry. A varied or per-user load gets little |
+| "A cache hit skips the policy" | The gate runs first. A hit skips the work after it |
+| "Cached data is always a little stale" | Not through Pawabase, when the cache is shared. A write through the API is visible at once |
+| "I can cache a resource I write to with SQL" | Only if you invalidate after, or accept staleness up to the time |
+| "The cache is per resource, so it is isolated" | It is per installation, with keys separated by prefix. One Redis serves all |
+| "A longer time is always better" | Not when writes outpace reads, or when staleness for outside changes matters |
+| "The CDN will cache these responses" | No cache headers are sent, so it should not |
+| "`expand` is just a join, so it follows the data" | It is a copy inside the parent's entry |
+
+
+## A client that keeps keys stable
+
+The most effective thing a client can do for the cache is send the same query for the same data. A small helper builds requests from a whitelist, so nothing unexpected reaches the key.
+
+```ts
+const LIST_PARAMS = ["page", "per_page", "sort", "select", "expand"] as const
+
+type Filters = Record<string, string>
+
+export function listUrl(resource: string, opts: {
+  page?: number
+  perPage?: number
+  sort?: string
+  select?: string[]
+  expand?: string[]
+  filters?: Filters
+}) {
+  const query = new URLSearchParams()
+  // Only parameters the API understands, in a fixed order.
+  if (opts.page && opts.page > 1) query.set("page", String(opts.page))
+  query.set("per_page", String(opts.perPage ?? 20))
+  if (opts.sort) query.set("sort", opts.sort)
+  if (opts.select?.length) query.set("select", [...opts.select].sort().join(","))
+  if (opts.expand?.length) query.set("expand", [...opts.expand].sort().join(","))
+  for (const [field, value] of Object.entries(opts.filters ?? {}).sort()) {
+    query.set(`filter[${field}]`, value)
+  }
+  return `/rest/v1/${resource}?${query}`
+}
+```
+
+What it does for the cache:
+
+| Choice | Why |
+| --- | --- |
+| Parameters from a fixed list, never forwarded from the page's URL | No `utm_*` or `fbclid` can leak into a key |
+| `page` omitted when it is 1 | `?page=1` and no `page` are different keys, so pick one form |
+| A fixed `per_page` | Fewer distinct entries |
+| `select` and `expand` sorted | `a,b` and `b,a` are two entries |
+| Filters in sorted order | Pawabase sorts parameters itself, but sorting also makes your own logs comparable |
+| No empty values | `?expand=` is its own key |
+
+And for time-based filters, round the value so the key repeats:
+
+```ts
+// A "last hour" filter that repeats for a full minute instead of changing every request
+function lastHour(now = Date.now()) {
+  const minute = Math.floor(now / 60_000) * 60_000
+  return new Date(minute - 3_600_000).toISOString()
+}
+
+listUrl("events", { filters: { created_at: `gte.${lastHour()}` } })
+```
+
+The same idea in Python:
+
+```python
+from urllib.parse import urlencode
+
+
+def list_url(resource, *, page=1, per_page=20, sort=None, select=(), expand=(), filters=None):
+    params = []
+    if page > 1:
+        params.append(("page", page))
+    params.append(("per_page", per_page))
+    if sort:
+        params.append(("sort", sort))
+    if select:
+        params.append(("select", ",".join(sorted(select))))
+    if expand:
+        params.append(("expand", ",".join(sorted(expand))))
+    for field, value in sorted((filters or {}).items()):
+        params.append((f"filter[{field}]", value))
+    return f"/rest/v1/{resource}?{urlencode(params)}"
+```
+
+
+## Keeping the cache honest after outside writes
+
+Anything that changes a cached resource without going through Pawabase should finish by clearing it. A nightly import is the usual case.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="https://api.example.com/platform/v1/projects/shop/envs/production"
+
+# 1. load the data, outside Pawabase
+psql "$DATABASE_URL" -f nightly_prices.sql
+
+# 2. clear what that touched
+curl -fsS -X POST \
+  -H "Authorization: Bearer $OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"resources": ["products", "prices"]}' \
+  "$BASE/cache/invalidate"
+```
+
+The response is the number of entries removed. Zero is fine: it means nothing was cached for those resources at that moment. The call is recorded in the audit log as `cache.invalidated`.
+
+If the importer is a flow, use the **Cache invalidate tags** block (`cache.invalidate`) with the tags `resource:products` and `resource:prices`. It clears the same entries as the endpoint and needs no operator credential. A function can do the same with `ctx.runtime.cache_invalidate(["resource:products"])`. A route's cached answers are not cleared by this call, because they carry no tags. For a route that summarises these resources, give it a short time, or accept that it catches up when it expires.
+
+### Order matters
+
+Clear **after** the data has changed, never before. A clear before the load leaves a window in which a reader rebuilds the entry from the old data and keeps it for the whole cache time.
+
+
+## A review of the key, in one place
+
+A last summary of what makes two requests share an entry, for resources:
+
+| Same entry if all of these match | Different entry if any differ |
+| --- | --- |
+| The project and environment | Another project or environment |
+| The definitions' version (or release) | Any definition saved since |
+| The resource and the operation | Another resource, or `list` against `get` |
+| The caller's identity (or `anon`) | A different user, or signed in against signed out |
+| The role | A different role |
+| Every query parameter and its value, in any order (list) | Any parameter added, removed or changed, including meaningless ones |
+| The `id` and `expand` (get) | `1` against `01`, `expand` against none, `expand` empty |
+
+And for routes, the same table with the route's id in place of the resource, and the path parameters, query **and body** in place of the query.
+
+
+## Inside the two backends
+
+Both backends come from the framework Pawabase is built on, and knowing how they store things explains several behaviors above.
+
+### `MemoryCache`
+
+| Property | What it means for you |
+| --- | --- |
+| Entries are held in an ordered dictionary, inside the API process | They are lost on restart and are not visible to other processes |
+| Values are stored **serialized as JSON** | A value must be JSON, and anything that is not (a datetime, for instance) is turned into text on the way in. That is why a cached `{{ now }}` came back with a space where a fresh one had a `T` |
+| Pawabase creates it with **no maximum size** | The store grows without bound. There is no least-recently-used eviction in this configuration, so the only thing that removes an entry is its expiry (and tag invalidation) |
+| Tags are sets of keys | A tag invalidation removes every key in the set, and returns how many it removed. That count is the `invalidated` number the endpoint returns |
+| The cache time is absolute | An entry lives `cache_ttl` seconds from the write. Reading it does not extend it |
+
+### `RedisCache`
+
+| Property | What it means for you |
+| --- | --- |
+| Entries are Redis strings with a native expiry | Redis removes them when they expire |
+| Keys are namespaced `pawabase` | Several installations can share a Redis server without collisions |
+| Tags are Redis **sets** of member keys | Clearing a tag reads the whole set, deletes every key in it in one call, and then deletes the set |
+| The same serialization as above | Values are JSON |
+| Clears are global | Every API process that uses the Redis URL sees the same entries and the same clears |
+
+One detail follows from the tag sets. A tag set lists the keys written under it and is only emptied when the tag is cleared. An entry that **expires** disappears from Redis, but its key stays in the tag's set until the next clear of that tag. For a resource that is written often, the set is rebuilt constantly and stays small. For a resource that is **never written** but cached with many distinct keys (a read-only table with minted parameters), the set grows with every distinct key ever cached, until a write or a manual invalidate empties it. This is from reading the backend, not from a run. If you cache a read-only resource on a public endpoint, schedule an invalidate now and then, and limit the keys with the habits above.
+
+### Which one are you on
+
+The Overview's infrastructure panel and the Cache card both say. The rule is exactly one condition: `PAWABASE_REDIS_URL` set means Redis, empty means memory. There is no fallback from one to the other: if the URL is set and Redis is unreachable, the cache calls fail, which is a Redis availability question, not a Pawabase one.

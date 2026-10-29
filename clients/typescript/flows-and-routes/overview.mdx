@@ -1,0 +1,242 @@
+---
+title: "Flows and routes"
+description: "How the TypeScript client calls server-side logic: running flows directly, calling custom routes and extension routes, what each returns, how their errors arrive, and how to choose between them."
+icon: "workflow"
+---
+
+Records, auth and storage cover what most screens need.
+Some actions are more than one record operation: placing an order, inviting a team, charging a card, generating a report.
+That logic runs on the server, and the client calls it.
+
+Pawabase runs server logic in two forms, [flows](/flows/overview) and extension routes, and exposes it through three kinds of URL.
+This page explains each, what the client's `flows` and `routes` modules send to them, how answers and errors come back, and how to pick the right one.
+
+## The mental model
+
+Server logic is reached through one of three doors.
+Each door has its own URL, its own access check, and its own way of shaping the answer.
+
+| Door | URL | Runs | Access decided by | Client call |
+| --- | --- | --- | --- | --- |
+| A flow called directly | `POST /flows/v1/<flow name>` | A flow whose HTTP trigger has no path | The trigger's `policy`, default `authenticated` | `pawabase.flows.run(name, input)` |
+| A custom route | `<method> /rest/v1/<path>` | The flow bound to the route | The route's policy | `pawabase.routes.get/post/…(path)` |
+| An extension route | `<method> /rest/v1/x/<prefix>/<path>` | Python code mounted next to the server | The policy the code checks with `authorize` | `pawabase.routes.get/post/…("x/…")` |
+
+From the client's point of view, all three are HTTP endpoints that take JSON and give JSON.
+What differs is who wrote them, how they are configured, and what the URL looks like to the rest of the world.
+
+A direct flow call is the quickest to set up: create a flow with an HTTP trigger and call it by name.
+A custom route gives the same flow a REST-shaped URL, with path parameters, a method, input validation, rate limits and caching.
+An extension route is for logic that needs full Python, such as streaming responses or a library a flow block cannot reach, and is written by the operator of the installation.
+
+<Note>
+The client also has a `functions` module.
+Custom functions were removed from the platform, and their endpoints no longer exist.
+Logic that was a function belongs in a flow, a custom route or an extension route.
+</Note>
+
+
+## Where this logic is configured
+
+| You want to | In Studio |
+| --- | --- |
+| Build a flow and its HTTP trigger | **Logic → Flows**, add a `trigger.http` block and leave **path** empty for direct calls |
+| Set who may call a flow directly | The `policy` field of the flow's `trigger.http` block |
+| Give a flow a REST URL | **Logic → Routes**, **New route**: method, path, and the flow that handles it |
+| See a flow's runs and each block's output | **Logic → Flows**, the flow's runs |
+| See a request that failed | **Project → Activity**, by request id |
+
+Extension routes are not configured in Studio.
+They are Python files mounted next to the server by whoever operates the installation; see Extension routes.
+
+
+## Running a flow directly
+
+`flows.run(name, input, options)` sends `POST /flows/v1/<name>` with `input` as the JSON body, and returns the response body.
+
+<CodeGroup>
+```typescript TypeScript
+const quote = await pawabase.flows.run<{ data: { total_minor: number; currency: string } }>("quote-cart", {
+  cart_id: "cart_9",
+  coupon: "WELCOME10",
+});
+console.log(quote.data.total_minor);
+```
+
+```python Python
+quote = pb.flows.invoke("quote-cart", {"cart_id": "cart_9", "coupon": "WELCOME10"})
+print(quote["data"]["total_minor"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/flows/v1/quote-cart" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"cart_id": "cart_9", "coupon": "WELCOME10"}'
+# 200 {"data": {"total_minor": 900, "currency": "GHS"}}  (a flow without response.return)
+```
+</CodeGroup>
+
+### Which flows can be called this way
+
+A flow is directly callable when it has a `trigger.http` block whose **path** is empty.
+A flow whose HTTP trigger has a path is reachable only through the route bound to that path.
+A flow with no HTTP trigger at all, such as one triggered by an event or a schedule, cannot be called over HTTP.
+
+Calling a flow that is not directly callable, or does not exist, answers `404` with the message `no directly invocable flow '<name>'`.
+The client throws `NotFoundError`.
+
+### What the flow receives
+
+The request body becomes the flow's `input`.
+
+| You call | The flow's `input` |
+| --- | --- |
+| `flows.run("x", { a: 1 })` | `{ "a": 1 }` |
+| `flows.run("x", [1, 2])` | `[1, 2]` |
+| `flows.run("x")` | `null`; no body is sent |
+
+The body must be JSON.
+The client sends objects and arrays as JSON for you; a string body that is not JSON answers `400 the body must be JSON`.
+
+The flow also receives the caller's identity.
+Inside the flow, blocks see the signed-in user as `$auth` and the key as `$credential`, exactly as policies do.
+
+What the flow does with that identity is up to the flow.
+Its resource blocks run with service rights: they do not apply the resource's policies, so a `resource.get` inside a flow can read any record, whoever called.
+A flow that must respect the caller's rights checks them explicitly, with the `policy.check` or `auth.require` blocks, or by comparing `$auth.user_id` with the record it loaded.
+This is deliberate: it is what lets a flow perform a privileged step, such as marking an order paid, on behalf of a person who could not do it directly.
+
+### Who may call it
+
+The trigger's `policy` decides.
+It is a condition like any policy, and it defaults to `authenticated`.
+
+| Caller | `policy: authenticated` | `policy: public` |
+| --- | --- | --- |
+| Publishable key, signed out | `401` | Allowed |
+| Publishable key, signed in | Allowed | Allowed |
+| Secret key | Allowed | Allowed |
+
+A refusal answers `401` when the caller is signed out and `403` when the caller is signed in but the policy says no.
+The client throws `AuthenticationError` or `PermissionError` accordingly.
+
+### What comes back
+
+A flow decides its own answer.
+The client returns the response body as it arrives, so its shape depends on how the flow ends:
+
+| The flow ends with | Status | Body the client returns |
+| --- | --- | --- |
+| A `response.return` block | The block's status | The block's body, exactly |
+| An `error.raise` block | The block's status | Thrown as an error; see below |
+| Neither | `200` | `{ "data": <the flow's result> }` |
+
+The `{ data }` wrapper in the third case is the server's, not the client's.
+Flows built to be called from applications usually end with `response.return`, so they control the body and the status.
+
+A small helper keeps call sites clean when you call flows of both kinds:
+
+```typescript
+async function runFlow<T>(name: string, input?: unknown): Promise<T> {
+  const body = await pawabase.flows.run<unknown>(name, input);
+  if (body && typeof body === "object" && "data" in body && Object.keys(body).length === 1) {
+    return (body as { data: T }).data;
+  }
+  return body as T;
+}
+```
+
+The generic type parameter of `run<T>` describes the body you expect.
+It is a promise to the compiler, not a check; validate the shape at runtime if a wrong shape would cause harm.
+
+### Errors from a flow
+
+A flow reports a failure the caller should understand with an `error.raise` block.
+The block sets a status, a machine-readable code and a message, and the server answers with:
+
+```json
+{ "error": "coupon_expired", "message": "This coupon expired on 30 September." }
+```
+
+The client turns that into an error class chosen by the status, with the flow's code in `error.code` and the message in `error.message`:
+
+<CodeGroup>
+```typescript TypeScript
+import { ApiError, ConflictError, NotFoundError } from "@pawabase/client";
+
+try {
+  await pawabase.flows.run("apply-coupon", { cart_id, code });
+} catch (error) {
+  if (error instanceof ApiError && error.is("coupon_expired")) return showMessage(error.message);
+  if (error instanceof ApiError && error.is("coupon_unknown")) return showMessage("That code does not exist.");
+  if (error instanceof ConflictError) return showMessage("This coupon was already applied.");
+  throw error;
+}
+```
+
+```python Python
+from pawabase import ConflictError, PawabaseError
+
+try:
+    pb.flows.invoke("apply-coupon", {"cart_id": cart_id, "code": code})
+except ConflictError:
+    show_message("This coupon was already applied.")
+except PawabaseError as error:
+    if error.code == "coupon_expired":
+        show_message(error.message)
+    elif error.code == "coupon_unknown":
+        show_message("That code does not exist.")
+    else:
+        raise
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/flows/v1/apply-coupon" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"cart_id": "c9", "code": "OLD"}'
+# HTTP/1.1 422
+# {"error": "coupon_expired", "message": "This coupon expired on 30 September."}
+```
+</CodeGroup>
+
+| Status set by `error.raise` | Client error class |
+| --- | --- |
+| `400` | `ApiError` (or `ValidationError` when `details` lists fields) |
+| `401` | `AuthenticationError` |
+| `403` | `PermissionError` |
+| `404` | `NotFoundError` |
+| `409` | `ConflictError` |
+| `422` | `ValidationError` |
+| `429` | `RateLimitError` |
+| `5xx` | `ServerError` |
+
+Prefer checking `error.code` over the class when the flow defines codes.
+A flow's codes are its API; the status is a coarse category.
+
+Other failures carry the platform's own codes.
+A flow that fails inside a block, for example an HTTP call to another service that times out, answers with the block's failure code and status, and the error's `details` can carry structured information about what failed.
+The flow's run in **Logic → Flows** shows each block's input, output and error for the same request.
+
+### Retries
+
+`flows.run` sends a `POST`, which the client does not repeat after a network failure or a gateway error, because the flow may have run.
+It does repeat after `429`, because a rate-limited request never reached the flow.
+
+When a flow is safe to run twice, for example because it only reads, or because it checks whether its work was already done, say so:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.flows.run("recalculate-totals", { cart_id }, { idempotent: true });
+```
+
+```python Python
+# The Python client never repeats a POST after a network failure; repeat it yourself when that is safe.
+pb.flows.invoke("recalculate-totals", {"cart_id": cart_id})
+```
+</CodeGroup>
+
+| Option | Meaning |
+| --- | --- |
+| `idempotent` | Allow retrying after network failures and `502`/`503`/`504` |
+| `timeoutMs` | A timeout for this call |
+| `signal` | Cancel the call |
+| `headers` | Extra headers for this call |
+
+Cancelling stops the client from waiting.
+It does not stop a flow that has already started on the server.

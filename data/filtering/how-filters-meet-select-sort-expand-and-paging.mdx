@@ -1,0 +1,248 @@
+---
+title: "How filters meet `select`, `sort`, `expand` and paging"
+description: "A list request is evaluated in a fixed order, and knowing it explains what each parameter can see."
+icon: "filter"
+---
+
+A list request is evaluated in a fixed order, and knowing it explains what each parameter can see.
+
+| Stage | What happens | Sees |
+| --- | --- | --- |
+| 1. Filters | The caller's filters and the policy's equality filters become the `WHERE` clause | The table's columns |
+| 2. Sort | `ORDER BY` the requested fields, or the key if none | The filtered rows |
+| 3. Page | `LIMIT` and `OFFSET` from `per_page` and `page` | The sorted rows |
+| 4. Count | A second query counts the rows that match the filters | The same `WHERE` |
+| 5. Residual policy | A per-row policy removes rows from the page, and `total` becomes `null` | The page's rows, with the selected columns only |
+| 6. Expand | Related rows are attached to what is left | The surviving rows |
+| 7. Transformer | The response is reshaped | The final rows |
+
+Three practical results follow from the table.
+
+**A filter narrows before the page is cut.** `total` is the number of rows that match the filters, so a "showing 11 to 20 of 51" label is `total` from a filtered request. Counting a filter without fetching rows is a request with `per_page=1`, which was run:
+
+```text
+GET /rest/v1/things?filter[qty]=gte.150&per_page=1   ->  total: 51,  data: [one row]
+GET /rest/v1/things?filter[qty]=lt.0&per_page=1      ->  total: 0,   data: []
+```
+
+**`select` limits the columns that are read.** The filter conditions can still name columns that are not selected, because the filter runs in the database. The one exception is the residual policy, which only sees the selected columns, as shown above. Unselected declared fields come back as `null`, and the key is always included.
+
+**`expand` cannot be used to filter.** Related rows are attached after the filtering and paging, so a filter cannot refer to a column of a related resource, and an expansion never changes which parent rows are returned. To find the posts that have a comment containing a word, find the comments first, then fetch the posts by `in` of their ids.
+
+### Two queries per list
+
+Each list request runs a query for the page and a second query that counts the matching rows with the same filters (the count is skipped only when a per-row policy makes it unreliable). On a large table the count can cost as much as the page, so a client that does not need `total` pays for it anyway. The cost of both is governed by whether the filter can use an index, the next section.
+
+
+## Filters and indexes
+
+Whether a filter is fast depends on the database's plan for it, and the plan is the database's to choose. These are plans observed on SQLite for a table of 200 rows with `name` and `qty` marked `indexed` and `note` not, using `EXPLAIN QUERY PLAN` in the **Database** console, which allows it as a read-only statement.
+
+| Query | Plan |
+| --- | --- |
+| `WHERE name = 'item010' ORDER BY id LIMIT 20` | **Search** using the index on `name` |
+| `WHERE qty >= 190 ORDER BY id LIMIT 20` | **Scan** of the table in key order |
+| `WHERE name LIKE 'item01%' ORDER BY id LIMIT 20` | **Scan** |
+| `WHERE name LIKE '%010' ORDER BY id LIMIT 20` | **Scan** |
+| `WHERE note = 'n5' ORDER BY id LIMIT 20` | **Scan** (`note` has no index) |
+| `SELECT COUNT(*) WHERE qty >= 190` | **Search** using a covering index on `qty` |
+
+Reading it:
+
+- **Equality on an indexed column is a lookup.** This is the case an index is for, and it is what `filter[sku]=A-1` should be.
+- **A range filter combined with the default order may still scan.** With no `sort`, results are ordered by the key, and the planner here preferred walking the key in order and stopping at the limit over using the index on `qty`. When the sort is on the filtered column (`sort=qty`), an index on it can serve both. The count query, which has no order, did use the index.
+- **A pattern with a leading wildcard cannot use an index**, and in this run neither could the prefix form, since SQLite's `LIKE` optimization needs a particular collation setting. Treat `like` as a scan unless you have checked the plan on your own database.
+- **An unindexed column is a scan.** For a small table that is fine. For a table of millions, a filter on an unindexed column is a slow request.
+
+PostgreSQL and MySQL make different choices, and an index that SQLite ignored may be used by them. The way to know is to run `EXPLAIN` on the same statement in the console against the environment's own database. The statement for a filtered list is the one shown above, with the parameters filled in.
+
+| Practice | Why |
+| --- | --- |
+| Mark `indexed` on fields clients filter by with `eq`, `in` or ranges | The index is created by **Create / migrate table**, see [Migrations](/data/migrations/overview) |
+| Mark `unique` for natural keys | A unique field is indexed, and gives you lookup by `eq` |
+| Index the **Owner field** | Pawabase does this for you, so `owner` policies are lookups |
+| Sort by the filtered column when you filter a range | The index can serve both |
+| Prefer `eq` and `in` over `like` for identifiers | They can use an index, and `like` on `_` and `%` is also inexact |
+| Avoid `like` with a leading wildcard on large tables | A full scan, whatever the indexes are |
+| Do not filter on JSON columns | There is nothing to filter on, and no index to use |
+
+For a real search feature (words, relevance, typos) a `like` is the wrong tool on any database, and there is no full-text operator. Use the database's full-text search from a route or a flow, or an external search service, and keep ids in Pawabase.
+
+
+## Where to try filters in Studio
+
+Filtering is a property of the data API, and Studio gives you fewer places to try it than you might expect.
+
+| Place | Can you filter there | What it offers |
+| --- | --- | --- |
+| **API Explorer** | **No.** `filter[...]` is not a declared parameter, so the **Query parameters** card lists only `page`, `per_page`, `sort`, `select` and `expand` | Everything but filters. To test a filter, use a client |
+| **Resources**, then a resource, **Records** tab | No. It lists the first twenty records with **Refresh** | Browsing and editing |
+| **Database**, then a table | No filter box. It pages through rows fifty at a time with **Prev** and **Next** | Browsing |
+| **Database**, **SQL**, the query builder | Yes, as SQL | The builder's **Where** rows, covered below |
+| **Observability** | Search by request path and status, not by data | Finding the requests that carried a filter |
+
+Because the Explorer cannot send filters, the quickest way to try one is a command-line request with your project key:
+
+```bash
+curl -s "$GATEWAY/rest/v1/products?filter[status]=eq.live&filter[stock]=gte.10&select=title,stock" \
+  -H "apikey: $PUBLISHABLE_KEY"
+```
+
+### The query builder's `Where` rows
+
+The **SQL** button on **Database** opens a modal with a query builder, whose **Where** section is the nearest thing Studio has to a filter editor. Its rows are `column`, `operator`, `value`, with a choice of **AND** or **OR** between rows after the first, and its operators are `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `NOT LIKE`, `IN`, `IS NULL` and `IS NOT NULL`. Each click rewrites the SQL below it. The builder can express an `OR`, which the data API cannot, because it produces SQL and does not go through the filter parser.
+
+| Data API filter | Builder row | SQL |
+| --- | --- | --- |
+| `filter[status]=eq.live` | `status` `=` `live` | `WHERE "status" = 'live'` |
+| `filter[qty]=gte.10` | `qty` `>=` `10` | `WHERE "qty" >= 10` |
+| `filter[name]=like.a*` | `name` `LIKE` `a%` | `WHERE "name" LIKE 'a%'` |
+| `filter[id]=in.1,2` | `id` `IN` `1, 2` | `WHERE "id" IN (1, 2)` |
+| `filter[released]=is.null` | `released` `IS NULL` | `WHERE "released" IS NULL` |
+| not expressible | add a second row joined with **OR** | `WHERE "status" = 'live' OR "owner_id" = '1'` |
+
+Use the builder to look at the data a filter would match, to compare counts, and to check a plan with `EXPLAIN`. It queries the table directly, so it ignores the resource's policy, the field definitions and the cache. A result in the builder tells you what the table holds, and a result from the API tells you what a caller sees. See [Database console](/data/database-console/overview).
+
+
+## What goes wrong, as the API reports it
+
+| Request | Status and body | Cause |
+| --- | --- | --- |
+| `?filter[nope]=1` | `400` `{"error": "bad_request", "message": "cannot filter on unknown field 'nope'"}` | The field is not declared, and is not the key, a timestamp or the owner field |
+| `?filter[status]=is.maybe` | `400`, "is/isnot take null, true or false" | An operand other than the three allowed |
+| `?filter[qty]=gte.abc` | `500` plain text | The value cannot be converted to an integer |
+| `?filter[qty]=1.0` | `500` | The same, for a whole number written with a fraction |
+| `?filter[qty]=in.1,2,,3` | `500` | An empty element in a list |
+| `?filter[qty]=GTE.3` | `500` | A misspelled operator, so the value is `GTE.3` |
+| `?filter[released]=eq.2026-01-01T00:00:00` | `500` | A timestamp in a date filter |
+| `?filter[status]=in.a,b` on a status that contains commas | `200`, no rows | The list splits on commas |
+| `?filter[qty]=gte.2&filter[qty]=lte.4` | `200`, only the last applied | A repeated key |
+| `?filter[active]=false` | `200`, the **true** rows | A boolean filtered with `eq` |
+| `?filter[meta]={"k":1}` | `200`, no rows | A JSON column never matches an equality filter |
+| `?select=title` on a resource with a residual policy | `200`, no rows | The policy cannot see the columns it needs |
+
+The first two rows are the only ones that return a `400` with a message. The rest are either a `500` that is really a bad input, or a `200` that is really a wrong answer. A client that checks only for errors misses the second group, which is why the helper functions earlier on this page exist, and why the regression list at the end of the page is worth running.
+
+<Info>
+A request that fails with a `500` here leaves a row in **Observability** with the status `500` and the policy that passed (`policy: …` in the request's **notes**), and no error text. Searching the path and filtering on **5xx server error** finds them, and the **Request trace** shows when they started, which is usually enough to tie a burst of them to a deploy of a client that builds filters.
+</Info>
+
+
+## Recipes
+
+Each of these uses only what the filter syntax supports, and the results were checked against a running API.
+
+### A search box
+
+Match a term anywhere in a name, case-insensitively, and show a count:
+
+```text
+GET /rest/v1/products?filter[title]=ilike.*mug*&sort=title&per_page=20&select=id,title
+```
+
+A search over more than one field (title or description) needs an `OR`, which the filter syntax lacks. Two requests, merged by id in the client, or a route that runs one query. For a table that will grow, replace this with the database's full-text search, as above.
+
+### Status tabs with counts
+
+A tab strip of **All**, **Live**, **Draft** needs a count for each. One request per tab with `per_page=1` returns only `total`:
+
+```text
+GET /rest/v1/orders?per_page=1                         ->  total: 214
+GET /rest/v1/orders?filter[status]=eq.live&per_page=1  ->  total: 160
+GET /rest/v1/orders?filter[status]=eq.draft&per_page=1 ->  total: 54
+```
+
+Three small requests are cheaper than one that downloads the rows and counts them. If the field can be `NULL`, the counts for the values do not add up to the whole, since an unset status is in none of the values.
+
+### "My" records, and records for a user
+
+When the list policy is `owner`, the caller already sees only their own rows, and no filter is needed. When a staff caller with a different policy needs one user's rows, filter by the owner field:
+
+```text
+GET /rest/v1/tickets?filter[requester_id]=eq.u-1
+```
+
+A caller whose policy is `owner` who asks for someone else's rows gets zero rows and no error, as shown earlier. If a UI shows "no results" for that, it is correct, and it is also the signal that the caller does not have access.
+
+### Keyset pagination: next page by key
+
+Offset paging gets slower and less stable as the page number grows. Because the key is filterable and sortable, "the next page" can be "rows after the last one I saw":
+
+```text
+GET /rest/v1/things?sort=id&per_page=3                    ->  ids 1, 2, 3     total 200
+GET /rest/v1/things?sort=id&per_page=3&filter[id]=gt.3    ->  ids 4, 5, 6     total 197
+GET /rest/v1/things?sort=id&per_page=3&filter[id]=gt.6    ->  ids 7, 8, 9     total 194
+GET /rest/v1/things?sort=-id&per_page=3&filter[id]=lt.198 ->  ids 197, 196, 195
+```
+
+`total` in these responses counts the rows remaining after the key, not the whole table, which is the right meaning for "how many more". The same works for a timestamp key (`filter[created_at]=lt.<last seen>&sort=-created_at`), with the caution that two rows can share a timestamp, which makes the key unstable for ties. The primary key is unique, so it is the safe choice, and it applies to both integer and UUID keys (UUIDs sort as text, which is stable though not chronological).
+
+### New rows since the last poll
+
+A client that polls for changes keeps the highest key it has seen and asks for what is greater:
+
+```text
+GET /rest/v1/messages?filter[id]=gt.1042&sort=id&per_page=100
+```
+
+This only finds **new** rows. A row that was updated after the client saw it keeps its key, so it is not returned again. For updates, filter on the timestamp (`filter[updated_at]=gt.<last poll>`), and for deletes there is nothing to find, since a deleted row is gone. If you need to react to all three, subscribe to the resource's events or realtime channel instead of polling, see [Resource events](/data/resource-events/overview).
+
+### Exporting everything
+
+A complete export walks the table in key order by keyset, which does not skip or repeat rows when others are being written, as an offset walk can:
+
+```python
+import httpx
+
+def export(base, key, resource, page_size=200):
+    last = None
+    while True:
+        params = {"sort": "id", "per_page": page_size}
+        if last is not None:
+            params["filter[id]"] = f"gt.{last}"
+        r = httpx.get(f"{base}/rest/v1/{resource}", params=params, headers={"apikey": key})
+        r.raise_for_status()
+        rows = r.json()["data"]
+        if not rows:
+            return
+        yield from rows
+        last = rows[-1]["id"]
+```
+
+Stop on an empty `data`, which is correct here because the filter is on the key and there is no per-row policy. With a per-row policy, an empty page does not mean the end, see [Sorting and pagination](/data/sorting-pagination/overview). Use a secret key from a server for a full export, since a publishable key sees only what its policy allows.
+
+### A date window
+
+Today's new records, the one range that needs one bound only:
+
+```text
+GET /rest/v1/orders?filter[created_at]=gte.2026-10-01&sort=-created_at
+```
+
+A window with both ends is the two-sided case that cannot be written, and the practical answers are a stored month or day field, a second query bounded by a key rather than a time (find the first key after the start, then use `gt` on that key), or a route. The second is a fair general method: **time ranges are easy to express as key ranges when keys are assigned in time order**, as auto-increment keys are.
+
+
+## How the filter text is parsed, exactly
+
+The parsing rules are small, and a table of edge cases shows all of them. The resource has an integer `qty`, a number `price` and a text `name`, with rows whose names include `eq.x`, `x`, `.dot` and `a.b`.
+
+| Request | Read as | Result |
+| --- | --- | --- |
+| `filter[name]=x` | `eq`, value `x` | The row named `x` |
+| `filter[name]=eq.x` | `eq`, value `x` | The same |
+| `filter[name]=eq.eq.x` | `eq`, value `eq.x` | The row named `eq.x`: only the first dot splits |
+| `filter[name]=a.b` | `a` is not an operator, so the whole text is the value | The row named `a.b` |
+| `filter[name]=eq.a.b` | `eq`, value `a.b` | The same row |
+| `filter[name]=.dot` | An empty operator is not an operator, so the value is `.dot` | The row named `.dot` |
+| `filter[name]=eq..dot` | `eq`, value `.dot` | The same row |
+| `filter[price]=.5` | The value `.5` | A number field converts it to `0.5` |
+| `filter[name]=like.*.*` | `like`, pattern `*.*` | Names containing a dot |
+| `filter[name]=in.eq.x,x` | `in`, values `eq.x` and `x` | Both rows |
+| `filter[qty]=gt.-1` | `gt`, value `-1` | Every row: negative numbers work |
+| `filter[qty]=-1` | `eq`, value `-1` | No rows |
+| `filter[qty]=+3` | A `+` becomes a space, the value is ` 3` | Works for an integer, which tolerates the space |
+| `filter[qty]=%2B3` | `+3` | Also works: an integer accepts a leading `+` |
+
+The rules, stated: the key must be `filter[` followed by a field name and `]`, and the value is split at its **first** dot. If the text before the dot is one of the twelve lowercase operator names, it is the operator and the rest is the value. Otherwise there is no operator, and the entire text is the value of an equality test. Nothing else is interpreted, which is why a value can contain dots, brackets and operator names freely, as long as it does not begin with an operator and a dot.
+
+A `+` is the odd case. It is a space in a query string, which an integer conversion forgives and a text value does not, so `filter[name]=a+b` searches for `a b`. Encode `+` as `%2B` in every value.

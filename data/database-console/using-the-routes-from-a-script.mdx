@@ -1,0 +1,261 @@
+---
+title: "Using the routes from a script"
+description: "The console's routes are ordinary platform API calls, so anything the window does you can do from a script, with the same operator credentials."
+icon: "terminal"
+---
+
+The console's routes are ordinary platform API calls, so anything the window does you can do from a script, with the same operator credentials.
+
+```bash
+BASE="https://api.example.com/platform/v1/projects/acme/envs/production/database"
+AUTH="Authorization: Bearer $OPERATOR_TOKEN"
+
+# overview
+curl -s -H "$AUTH" "$BASE"
+
+# one table
+curl -s -H "$AUTH" "$BASE/tables/tickets"
+
+# a page of rows
+curl -s -H "$AUTH" "$BASE/tables/tickets/rows?limit=100&offset=0"
+
+# a read
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT status, COUNT(*) AS n FROM tickets GROUP BY status"}' "$BASE/query"
+
+# a write
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"sql":"UPDATE tickets SET status = $1 WHERE status = $2","params":["solved","closed"],"allow_write":true}' "$BASE/query"
+```
+
+A script that runs a repair, checks the count before and after, and stops if they disagree:
+
+```python
+import os
+import requests
+
+BASE = "https://api.example.com/platform/v1/projects/acme/envs/production/database"
+HEADERS = {"Authorization": f"Bearer {os.environ['OPERATOR_TOKEN']}"}
+
+
+def run(sql, params=(), write=False):
+    response = requests.post(
+        f"{BASE}/query",
+        headers=HEADERS,
+        json={"sql": sql, "params": list(params), "allow_write": write},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+condition = "status = $1 AND updated_at < $2"
+args = ["pending", "2026-06-01"]
+
+expected = run(f"SELECT COUNT(*) AS n FROM tickets WHERE {condition}", args)["rows"][0]["n"]
+print("rows to change:", expected)
+
+result = run(
+    f"UPDATE tickets SET status = 'solved' WHERE {condition}", args, write=True
+)
+print("affected:", result["affected"])
+
+if result["affected"] != expected:
+    raise SystemExit("the count changed between the preview and the write. Investigate")
+```
+
+Because the script goes through the same routes, its writes are audited and clear caches exactly as a click would.
+
+### Reading a whole table
+
+The rows route pages with `limit` (at most 500) and `offset`. A script that copies a table reads pages until one comes back short:
+
+```python
+def all_rows(table, page=500):
+    offset = 0
+    while True:
+        batch = requests.get(
+            f"{BASE}/tables/{table}/rows", headers=HEADERS, params={"limit": page, "offset": offset}, timeout=30
+        ).json()["data"]
+        yield from batch
+        if len(batch) < page:
+            return
+        offset += page
+```
+
+The rows have no `ORDER BY`, so the pages are in the table's natural order. For a table that is changing, use the SQL route with `ORDER BY id` and a keyset condition instead, or the offsets can repeat or skip rows.
+
+
+## Who can use the console
+
+The four routes require an **operator**, the same level as the rest of Studio's platform API. An end user's token, a publishable key and a secret key do not reach them.
+
+| Credential | Console access |
+| --- | --- |
+| Studio operator session | Yes |
+| An operator token used from a script | Yes |
+| A publishable key (`pk_...`) | No |
+| A secret key (`sk_...`) | No. It is for the data plane |
+| An end user's access token | No |
+
+Two consequences:
+
+- **Console access equals database access.** There is no per-table or per-environment narrowing beyond which environment the URL names, and no read-only operator level for these routes. If someone needs to look at data but not change it, give them a database role that can only read, and let them use their own client. See [Your database](/data/your-database/switching-the-database#a-read-only-role-for-people).
+- **Every write is attributed.** The `database.write` event records who ran it, so the trail answers "who changed this" for anything the console recognised as a write.
+
+
+## A reproduced session
+
+This sequence, on SQLite, shows where the parser and the database draw the lines. Each step is covered by the platform's tests (`tests/platform/test_data_correctness.py`, `test_sql_isolation.py`).
+
+<Steps>
+  <Step title="Create rows">
+    An `accounts` resource is created, migrated, and given rows through the API, one of them with the email `a;b@x.io`.
+  </Step>
+  <Step title="Read with a quoted semicolon and a comment">
+    `-- who` on its own line, then `SELECT email FROM accounts WHERE email = 'a;b@x.io'`, takes the read path and returns the row. The parser knows a `;` inside a string is not a statement break.
+  </Step>
+  <Step title="Look at the structure and the plan">
+    `PRAGMA table_info(accounts)` returns one row per column, and `EXPLAIN QUERY PLAN SELECT * FROM accounts WHERE email = 'a'` returns the plan as rows.
+  </Step>
+  <Step title="Try to change a setting from a read">
+    `PRAGMA user_version = 5` is refused with `400`, even with **allow writes** ticked: the read path's authorizer allows the read form of a setting, not the assignment.
+  </Step>
+  <Step title="Hide a write in a read">
+    `WITH gone AS (DELETE FROM accounts RETURNING id) SELECT * FROM gone` is refused with `400`: the parser sees the `DELETE` inside. A `COUNT(*)` afterwards is unchanged.
+  </Step>
+  <Step title="Batch a write behind a read">
+    `SELECT 1; DELETE FROM accounts` is refused with `400` `unsupported_sql` even with **allow writes**. Neither statement runs.
+  </Step>
+  <Step title="Write with permission">
+    `UPDATE accounts SET nickname = 'x'` is refused without **allow writes** and runs with it, reporting `affected`.
+  </Step>
+</Steps>
+
+
+## What values look like in results
+
+The API decodes a value by its field type: a boolean becomes `true`, a JSON column becomes an object. The console has no field types to go by, so it returns what the driver gives it, with a few conversions for JSON-safety. This is one row, written through the API and then read back both ways, on SQLite:
+
+```json
+{
+  "id": 1,
+  "flag": 1,
+  "meta": "{\"a\": 1}",
+  "tags": "[\"x\", \"y\"]",
+  "price": 1.5,
+  "u": "123e4567-e89b-12d3-a456-426614174000",
+  "d": "2026-10-01",
+  "at": "2026-10-01T10:00:00+02:00",
+  "created_at": "2026-10-01T21:44:15.501985+00:00",
+  "updated_at": "2026-10-01T21:44:15.501985+00:00"
+}
+```
+
+The same record through `GET /rest/v1/items/1` shows `"flag": true` and `"meta": {"a": 1}`, because the API knows the types.
+
+| Type | In a console result |
+| --- | --- |
+| Boolean | `1` and `0` on SQLite. `true` and `false` on PostgreSQL and MySQL |
+| JSON, array, object | **JSON text** on SQLite, as a string. Other drivers may return text or a parsed value, so check before you rely on one |
+| Datetime | A string. On SQLite exactly as stored, offset included. Other dialects return an ISO string from the driver's value |
+| Date | An ISO string |
+| UUID | A string |
+| Decimal | A float |
+| `NULL` | `null` |
+| A binary column | **A `500`** with no message. The value cannot be written as JSON |
+
+The last row is a trap. `SELECT X'FF00' AS b` answered a plain `500`, and so would the table browser on a table with a binary column. If a table has one, select the other columns by name.
+
+### Why this matters
+
+A query result is the **database's** view, which is the right view for checking storage and a poor one for checking what a client sees. Two habits follow:
+
+- **To check what a client sees, call the API.** The console cannot show you transformers, `select`, or decoding.
+- **To check what is stored, use the console, and read booleans and JSON accordingly.** A `1` is a `true`, and a JSON string is an object.
+
+
+## Queries to keep for each kind of resource
+
+A short library per shape of resource. Each is a read.
+
+### A catalog (`products`)
+
+```sql
+-- low stock
+SELECT sku, title, stock FROM products WHERE stock < 5 ORDER BY stock, id LIMIT 50;
+
+-- status mix
+SELECT status, COUNT(*) AS n FROM products GROUP BY status ORDER BY n DESC;
+
+-- rows with no price
+SELECT id, sku FROM products WHERE price_minor IS NULL;
+
+-- products created this week
+SELECT id, sku, created_at FROM products WHERE created_at >= '2026-09-24' ORDER BY id DESC;
+```
+
+### Tickets with an owner (`tickets`)
+
+```sql
+-- load per requester
+SELECT requester_id, COUNT(*) AS n FROM tickets GROUP BY requester_id ORDER BY n DESC LIMIT 20;
+
+-- tickets with no owner (invisible to every owner-scoped policy)
+SELECT id, subject FROM tickets WHERE requester_id IS NULL;
+
+-- oldest open
+SELECT id, subject, created_at FROM tickets WHERE status = 'open' ORDER BY id LIMIT 20;
+
+-- priority mix
+SELECT priority, status, COUNT(*) AS n FROM tickets GROUP BY priority, status ORDER BY priority, status;
+```
+
+The second query matters more than it looks. A row whose owner is `NULL` matches no owner policy, so it exists and no end user can see it. Rows get there through flows, the Records tab, the console, or a field added after the rows existed.
+
+### An append-only log (`audit_events`)
+
+```sql
+-- the newest events
+SELECT id, occurred_at, actor, action FROM audit_events ORDER BY id DESC LIMIT 50;
+
+-- volume per day
+SELECT substr(occurred_at, 1, 10) AS day, COUNT(*) AS n FROM audit_events GROUP BY day ORDER BY day DESC LIMIT 14;
+
+-- the noisiest actions
+SELECT action, COUNT(*) AS n FROM audit_events GROUP BY action ORDER BY n DESC LIMIT 10;
+```
+
+### Profiles with a unique owner (`profiles`)
+
+```sql
+-- more than one profile per user (should be none)
+SELECT user_id, COUNT(*) AS n FROM profiles GROUP BY user_id HAVING COUNT(*) > 1;
+
+-- profiles with no display name
+SELECT id, user_id FROM profiles WHERE display_name IS NULL OR display_name = '';
+```
+
+### Switches (`feature_flags`)
+
+```sql
+SELECT key, enabled, rollout_percent FROM feature_flags ORDER BY key;
+
+-- flags that are on for everyone
+SELECT key FROM feature_flags WHERE enabled = 1 AND rollout_percent = 100;
+```
+
+On PostgreSQL and MySQL write `enabled = TRUE` instead of `= 1`.
+
+
+## Keeping a library of statements
+
+The window has no saved queries, so a team that uses the console regularly keeps its own.
+
+| Where | Good for |
+| --- | --- |
+| A file in your repository, such as `ops/console/*.sql` | Statements you reuse, reviewed like code |
+| A runbook with each repair, its preview and its check | Repairs that happen rarely and carry risk |
+| A resource of your own with a `sql` text field and a description | A shared, searchable list inside Pawabase |
+
+Whatever the home, store the **preview** and the **check** next to each write. A bare `UPDATE` in a notes file is a hazard. The same statement with its `SELECT COUNT(*)` before and after is a procedure.

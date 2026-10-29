@@ -1,0 +1,184 @@
+---
+title: "Sessions on a server"
+description: "A server-rendered application chooses where the session lives, and the choice decides how the client is used."
+icon: "server"
+---
+
+### Where the session lives
+
+A server-rendered application chooses where the session lives, and the choice decides how the client is used.
+
+| Session in | Browser client | Server client | Refresh done by |
+| --- | --- | --- | --- |
+| The browser (`localStorage`) | Normal client | `asUser` with a token the browser sends in a header | The browser client |
+| HTTP-only cookies | `persistSession: false`, or no client | `asUser` with the token from the cookie | Your server |
+
+Pick one owner.
+If the browser and the server both refresh the same session, the second refresh presents a refresh token the first already used, the auth service treats that as theft, and the session ends.
+
+### Cookie sessions
+
+With cookies, your server signs people in, stores tokens in cookies, refreshes them, and signs people out.
+A short-lived, memory-only client does each auth step:
+
+```typescript
+import { createClient, MemoryStorage } from "@pawabase/client";
+
+export function authClient() {
+  return createClient({
+    url: process.env.PAWABASE_URL!,
+    apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+    environment: process.env.PAWABASE_ENV,
+    auth: { storage: new MemoryStorage(), persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  });
+}
+
+export function sessionCookies(session: { access_token: string; refresh_token: string; expires_at: number }) {
+  const flags = "Path=/; HttpOnly; Secure; SameSite=Lax";
+  return [
+    `pb-access=${session.access_token}; ${flags}; Expires=${new Date(session.expires_at * 1000).toUTCString()}`,
+    `pb-refresh=${session.refresh_token}; ${flags}; Max-Age=${60 * 60 * 24 * 30}`,
+  ];
+}
+
+export const clearedCookies = [
+  "pb-access=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+  "pb-refresh=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+];
+```
+
+Signing in:
+
+<CodeGroup>
+```typescript TypeScript
+export async function signIn(email: string, password: string) {
+  const client = authClient();
+  try {
+    const result = await client.auth.signInWithPassword({ email, password });
+    if (result.status === "mfa_required") return { mfa: { token: result.mfaToken, factors: result.factors } };
+    return { cookies: sessionCookies(result.session) };
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+```python Python
+from pawabase import AsyncPawabase, MemorySessionStore
+
+
+def auth_client() -> AsyncPawabase:
+    return AsyncPawabase(PAWABASE_URL, PUBLISHABLE_KEY, environment=PAWABASE_ENV, session_store=MemorySessionStore(), auto_refresh=False)
+
+
+async def sign_in(email: str, password: str):
+    async with auth_client() as client:
+        result = await client.auth.sign_in_with_password(email=email, password=password)
+        if result.status == "mfa_required":
+            return {"mfa": {"token": result.mfa_token, "factors": result.factors}}
+        return {"cookies": session_cookies(result.session)}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -d '{"grant_type": "password", "email": "ada@example.com", "password": "…"}'
+```
+</CodeGroup>
+
+Refreshing, when the access cookie is missing or expired and the refresh cookie remains:
+
+<CodeGroup>
+```typescript TypeScript
+export async function refresh(refreshToken: string) {
+  const client = authClient();
+  try {
+    const wire = await client.request<{ access_token: string; refresh_token: string; expires_in: number; expires_at?: number }>(
+      "POST",
+      "/auth/v1/token",
+      { body: { grant_type: "refresh_token", refresh_token: refreshToken } },
+    );
+    const expiresAt = wire.expires_at ?? Math.floor(Date.now() / 1000) + wire.expires_in;
+    return { cookies: sessionCookies({ ...wire, expires_at: expiresAt }) };
+  } catch {
+    return { cookies: clearedCookies };
+  } finally {
+    client.dispose();
+  }
+}
+```
+
+```python Python
+import time
+
+from pawabase import PawabaseError
+
+
+async def refresh(refresh_token: str):
+    async with auth_client() as client:
+        try:
+            wire = await client.request("POST", "/auth/v1/token", json={"grant_type": "refresh_token", "refresh_token": refresh_token})
+        except PawabaseError:
+            return {"cookies": CLEARED_COOKIES}
+        expires_at = wire.get("expires_at") or time.time() + wire["expires_in"]
+        return {"cookies": session_cookies({**wire, "expires_at": expires_at})}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/token" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "content-type: application/json" \
+  -d '{"grant_type": "refresh_token", "refresh_token": "…"}'
+```
+</CodeGroup>
+
+Signing out, which also ends the session on the server:
+
+<CodeGroup>
+```typescript TypeScript
+export async function signOut(accessToken: string | null) {
+  if (accessToken) {
+    await base.asUser(accessToken).request("POST", "/auth/v1/logout", { body: { scope: "local" } }).catch(() => undefined);
+  }
+  return { cookies: clearedCookies };
+}
+```
+
+```python Python
+async def sign_out(access_token: str | None):
+    if access_token:
+        try:
+            await base.as_user(access_token).request("POST", "/auth/v1/logout", json={"scope": "local"})
+        except PawabaseError:
+            pass
+    return {"cookies": CLEARED_COOKIES}
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/auth/v1/logout" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "content-type: application/json" -d '{"scope": "local"}'
+```
+</CodeGroup>
+
+### Refreshing in one place
+
+Refresh tokens are single-use, so concurrent requests from the same browser must not all refresh.
+Do it in one place, such as middleware that runs before handlers, and only when the access token is missing or about to expire.
+
+```typescript
+// middleware.ts (Next.js)
+import { NextResponse, type NextRequest } from "next/server";
+import { refresh } from "@/lib/pawabase/session";
+
+export async function middleware(request: NextRequest) {
+  const access = request.cookies.get("pb-access")?.value;
+  const refreshToken = request.cookies.get("pb-refresh")?.value;
+  if (access || !refreshToken) return NextResponse.next();
+
+  const { cookies } = await refresh(refreshToken);
+  const response = NextResponse.next();
+  for (const cookie of cookies) response.headers.append("set-cookie", cookie);
+  return response;
+}
+```
+
+The access cookie expires with the token, so "missing" means "expired".
+Browsers often send several requests at once after a page load; when they all arrive without an access cookie, only the first refresh succeeds.
+For applications where that race matters, refresh from a single endpoint the page calls before others, or accept that the losing requests answer `401` and are repeated by the page.

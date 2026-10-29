@@ -1,0 +1,250 @@
+---
+title: "Sorting and indexes"
+description: "An ORDER BY is cheap when the database can read rows already in that order from an index, and costs a sort when it cannot. Which one happens is…"
+icon: "sort"
+---
+
+An `ORDER BY` is cheap when the database can read rows already in that order from an index, and costs a sort when it cannot. Which one happens is visible in the query plan, and the **Database** console allows `EXPLAIN QUERY PLAN` as a read-only statement, so you can check on your own data. These plans were captured on SQLite for a table of 50,000 rows with `kind` and `stamp` indexed and `score` not:
+
+| Query | Plan | What it means |
+| --- | --- | --- |
+| `ORDER BY "stamp" LIMIT 20 OFFSET 40000` | `SCAN events USING INDEX ix_events_stamp` | The index delivers rows in order. A deep offset is a walk, with no sort |
+| `ORDER BY "score" LIMIT 20 OFFSET 40000` | `SCAN events`, `USE TEMP B-TREE FOR ORDER BY` | Every row is read and sorted before the offset can be applied |
+| `WHERE "kind"='k3' ORDER BY "id" LIMIT 20 OFFSET 2000` | `SEARCH events USING INDEX ix_events_kind` | The filter uses its index, and the key order comes along with it |
+| `WHERE "kind"='k3' ORDER BY "stamp" LIMIT 20` | `SEARCH ... ix_events_kind`, `USE TEMP B-TREE FOR ORDER BY` | The filter's index finds the rows, but they are then sorted separately |
+| `ORDER BY "score", "id" LIMIT 20` | `SCAN events`, `USE TEMP B-TREE FOR ORDER BY` | Adding the key as a tiebreak did not make the sort cheaper |
+
+The pattern is the one to carry away. A sort on an indexed field is read from the index. A sort on a field with no index is computed, and the cost of computing it is paid on every page, including page 1. A filter and a sort on **different** fields cannot share one single-column index, so a screen that lists "the `k3` events by `stamp`" uses one index and then sorts.
+
+### What to index for a list screen
+
+| Screen | Index that helps | How to get it |
+| --- | --- | --- |
+| Newest first, no filter | `created_at`, or the key if it grows with time | Order by `-id`, which needs no new index |
+| Sorted by a field the user picks | One index per sortable column | Mark `indexed` on those fields |
+| Filtered by status, newest first | A composite index on `(status, created_at)` | Create it by hand in the **Database** console |
+| Filtered by owner, newest first | A composite index on `(owner_id, created_at)` | The owner field is indexed on its own, and the composite is by hand |
+| A column that every list sorts by | `indexed` | The field editor's JSON tab |
+
+The field editor can mark one column `indexed` and cannot create a composite index. When a screen needs one, the **Database** console can, with **allow writes** ticked:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_orders_status_created ON orders (status, created_at);
+```
+
+An index you create this way is not in the resource's definition, so it is not recreated by **Create / migrate table** in another environment. Record it in your own migration notes and apply it wherever the resource exists. Confirm that it is used with `EXPLAIN` before and after. See [Database console](/data/database-console/overview) and [Migrations](/data/migrations/overview).
+
+
+## How big a page should be
+
+A larger `per_page` means fewer requests and a larger response, and the response size is easy to predict from the rows. These sizes are for a resource of four small fields:
+
+| `per_page` | Response size | Per row |
+| --- | --- | --- |
+| 20 | about 3.1 KB | 153 bytes |
+| 100 | about 15.3 KB | 152 bytes |
+| 200 | about 30.8 KB | 153 bytes |
+| 200, with `select=id` | about 12.1 KB | 61 bytes |
+
+The size is linear in the number of rows, and the work in the database is almost flat: fetching 200 rows took 9 ms against 6 ms for 20. So a page size of a hundred or two hundred is the efficient choice for anything a program consumes, and twenty is a choice for what a person reads.
+
+`select` shrinks the response by dropping the values of the columns you do not choose, but it does not drop their keys. The declared fields you did not select come back as `null`, so `select=id` still returned a row of the form `{"kind": null, "score": null, ..., "id": 7}`. The saving was 60 percent, and not the 90 that the single column suggests. A [transformer](/data/transformers/overview) with `pick` removes the keys entirely.
+
+
+## Paging inside a flow or a function
+
+A flow reads a resource with the `resource.list` block, which takes `limit` and `offset` directly and not `page`:
+
+```json
+{"block": "resource.list",
+ "config": {"resource": "events", "filters": {"kind": "k3"}, "sort": "id", "limit": 200, "offset": 0}}
+```
+
+The block's output is `{"data": [...], "total": N, "limit": 200, "offset": 0}`. Three rules apply, taken from the data layer. The page size is capped at **200** here too: a larger `limit` is accepted and the store reads at most 200 rows, while the output still shows the `limit` you asked for. `total` is exact, because a flow is trusted and no per-row policy applies. And `filters` are equalities only. A loop over a large table in a flow therefore walks `offset` in steps of 200, with the same cost profile as the HTTP API, and for a big export a loop with a `control.while` block and `filters` on the key is a keyset walk. In a function, `ctx.runtime.resource_list(resource, filters=..., sort=..., limit=..., offset=...)` does the same. Prefer a `db.query` with a key condition when the table is large, since it can use any index and is not limited to equality.
+
+
+## Exports and reports
+
+A full export has different needs from a screen: it must see every row exactly once, tolerate writes happening meanwhile, and not hold the database busy. These choices follow from the sections above.
+
+| Need | Method |
+| --- | --- |
+| Every row, once, while writes continue | Keyset by key, with a server key, 100 to 200 rows per request |
+| A consistent point-in-time copy | Not available through the data API. Use the database's own tools on a replica or a backup, see Backups |
+| A report with aggregates | A route with `db.query`, or a query in the **Database** console. The data API has no aggregate operators |
+| Rows matching a filter, once | The same keyset walk with the filters added. The `total` of the first response is the count at that moment |
+| A very large table, rarely | A scheduled flow that walks the table and writes the result to a bucket, see [Schedules](/jobs/schedules) |
+
+A keyset export tolerates inserts, because new rows have larger keys and are picked up at the end, and tolerates deletes, because a missing row is simply absent. It does not see updates to rows it has already passed, so the export reflects each row as of the moment it was read, not as of a single instant.
+
+
+## Lists that update while the user looks at them
+
+A screen that shows page 1 of "newest first" and receives new rows through a [realtime](/realtime/resource-changes) subscription has a design question: what happens to the page when a row arrives. Pagination and live updates fight each other, and the options are few.
+
+| Approach | Behavior | Cost |
+| --- | --- | --- |
+| Re-fetch the current page on every event | Always consistent with the server | A request per event, and a flicker unless handled |
+| Insert the new row at the top when the sort and filters match | Instant, no request | The client must apply the same sort and filter logic, and the page grows past `per_page` |
+| Show "N new rows" and let the user apply | Stable view, user in control | One extra control |
+| Page by key and prepend new keys above the first | Consistent without a re-fetch | Only for sorts that follow the key |
+
+The third is the least surprising for users reading a list: the rows they are looking at do not move. The event payload carries the record, so the client can count new rows and only fetch when asked. See [Resource events](/data/resource-events/overview) for the payload and [Realtime](/realtime/overview) for the channel.
+
+
+## Designing the sort for each screen
+
+A list screen has a default order and perhaps a few user choices. Decide them from what the screen is for, then make sure each has an index.
+
+| Screen | Default sort | Offer | Index |
+| --- | --- | --- | --- |
+| Activity feed | `-id` or `-created_at` | Nothing | The key |
+| Orders table | `-created_at,id` | Status, total, customer | `created_at`, plus the others as `indexed` |
+| Directory of people | `name,id` | Name, newest | `name` |
+| Leaderboard | `-score,id` | Nothing | `score` |
+| Search results | The database's relevance, in a route | Nothing | Not applicable |
+| Admin table over everything | `id` | Any column | Accept scans, small tables only |
+
+For every row, the sort ends in the key so ties cannot reorder between pages. A `-created_at,id` sort has descending time and ascending key for ties, which is a total order.
+
+
+## How the envelope compares with other APIs
+
+If you are building a client library or porting one, the parts of this envelope to compare are these:
+
+| API style | Pagination | Pawabase |
+| --- | --- | --- |
+| Offset (`page`, `per_page`) | Page numbers and a total | The native mode, with `total` and the caveats above |
+| Cursor (`starting_after`, `has_more`) | An opaque cursor, a boolean | Not provided. Use `filter[id]=gt.<last>` and a short page as "no more" |
+| Link headers (`rel="next"`) | URLs in a header | Not provided. Build the next URL yourself |
+| `Range` and `Content-Range` | A range header | Not provided |
+| GraphQL connections (`edges`, `pageInfo`) | A cursor per edge | Not provided |
+
+A thin wrapper that turns Pawabase's envelope into the shape your application expects (a `nextCursor`, a `hasMore`) is a few lines, and it is the right place to hide the per-row policy caveats from the rest of the code. A wrapper should return `hasMore` as unknown when `total` is `null` and the page was empty, and let the caller decide.
+
+
+## Measuring paging on your own data
+
+Numbers from another table are a guide and not an answer. This script times a handful of the requests that matter against your own resource, from a server, with a secret key, so that you can see where the cliff is before users do:
+
+```python
+import os, statistics, time
+import httpx
+
+BASE, KEY = os.environ["PAWABASE_URL"], os.environ["PAWABASE_SECRET_KEY"]
+H = {"apikey": KEY}
+
+def timed(params, runs=5):
+    samples = []
+    for _ in range(runs):
+        t = time.perf_counter()
+        r = httpx.get(f"{BASE}/rest/v1/events", params=params, headers=H)
+        r.raise_for_status()
+        samples.append((time.perf_counter() - t) * 1000)
+    return statistics.median(samples), r.json().get("total")
+
+total = httpx.get(f"{BASE}/rest/v1/events", params={"per_page": 1}, headers=H).json()["total"]
+last_page = max(1, total // 20)
+
+for label, params in [
+    ("first page, default order",         {"per_page": 20}),
+    ("middle page, default order",        {"per_page": 20, "page": last_page // 2}),
+    ("last page, default order",          {"per_page": 20, "page": last_page}),
+    ("first page, sort=score",            {"per_page": 20, "sort": "score,id"}),
+    ("last page, sort=score",             {"per_page": 20, "sort": "score,id", "page": last_page}),
+    ("keyset near the end",               {"per_page": 20, "sort": "id", "filter[id]": f"gt.{total - 20}"}),
+]:
+    ms, t = timed(params)
+    print(f"{label:34s} {ms:8.1f} ms")
+```
+
+Read the output as a ratio. If the last page of an unindexed sort costs ten or fifty times the first, the sort needs an index, or that screen needs keyset paging. Run it against a copy of production data when you can, since an empty development database hides every one of these costs. A table that is fast at ten thousand rows can be slow at ten million, and the sort that causes it is rarely the one anyone was watching.
+
+
+## Sorting recipes
+
+The sort is the database's order of a column, and several orders people want are not that. Each of these was checked against a resource of six rows named `item2`, `item10`, `Item1`, `apple`, `Banana` and `cherry`.
+
+### Text does not sort the way a person sorts it
+
+```text
+GET /rest/v1/items?sort=name
+  ->  Banana, Item1, apple, cherry, item10, item2
+```
+
+On SQLite the comparison is by bytes, so every uppercase name comes before every lowercase one, and `item10` comes before `item2` because `1` sorts before `2` as a character. Neither case-insensitive nor natural ordering is available as a `sort` option. The answers are the same as for searching: store a normalized copy and sort on it.
+
+| Wanted order | Store | Sort by |
+| --- | --- | --- |
+| Case-insensitive | `name_lower`, the name in lowercase | `sort=name_lower,id` |
+| Ignoring accents | `name_sort`, lowercase with accents removed | `sort=name_sort,id` |
+| Natural (`item2` before `item10`) | `name_key`, the name with digit runs zero-padded (`item0002`, `item0010`) | `sort=name_key,id` |
+| By locale rules | The database's collation, set on the column | Not controllable through the field editor |
+
+The copy has to be written by whatever writes the row (a route, a flow, a trigger), and kept in step when the name changes. Index it if the list is long. PostgreSQL and MySQL collations often make the first two unnecessary, which is another place where development on SQLite and production on PostgreSQL behave differently.
+
+### An enum sorts alphabetically, not by workflow
+
+```text
+GET /rest/v1/items?sort=status   ->  closed, new, open, solved   (alphabetical)
+```
+
+A status field with the values `new`, `open`, `solved` and `closed` sorts as `closed, new, open, solved`, which is rarely the order a workflow has. Give the status a numeric **rank** and sort on that, keeping the text for display:
+
+```json
+{"name": "status", "type": "string", "enum": ["new", "open", "solved", "closed"]}
+{"name": "status_rank", "type": "integer", "enum": [1, 2, 3, 4]}
+```
+
+```text
+GET /rest/v1/items?sort=status_rank,name
+```
+
+The two fields have to agree, so set both from one place, a route or a flow that maps the status to its rank. If the order is the only reason for the number, a policy cannot enforce the agreement, and a mismatch is a data bug that no validation will catch.
+
+### Numbers and signs
+
+Numbers sort numerically, including negatives and fractions, and `NULL` goes where the database puts it:
+
+```text
+GET /rest/v1/items?sort=score    ->  -2, -0.5, 0.5, 1.5, 10.25, 100
+GET /rest/v1/items?sort=-score   ->  100, 10.25, 1.5, 0.5, -0.5, -2
+```
+
+### Sort by several columns, deterministically
+
+A multi-column sort is a list, and its last term should be the key. This is the shape for a table with a primary and a secondary order:
+
+```text
+sort=status_rank,-created_at,id
+```
+
+A client that supports clicking column headers should keep a list of `(field, direction)` pairs, append the key at the end, and put the clicked column first. This helper builds the parameter from that list and toggles direction when the same column is clicked again:
+
+```typescript
+type SortTerm = { field: string; desc: boolean };
+
+export function toggleSort(current: SortTerm[], field: string, additive = false): SortTerm[] {
+  const existing = current.find((t) => t.field === field);
+  const next: SortTerm = { field, desc: existing ? !existing.desc : false };
+  const others = current.filter((t) => t.field !== field);
+  return additive ? [...others, next] : [next];        // shift-click keeps the others
+}
+
+export function sortParam(terms: SortTerm[], key = "id"): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const t of terms) {
+    if (seen.has(t.field)) continue;                    // a repeated field adds nothing
+    seen.add(t.field);
+    parts.push(`${t.desc ? "-" : ""}${t.field}`);
+  }
+  if (!seen.has(key)) parts.push(key);                  // end in the key: a total order
+  return parts.join(",");
+}
+
+// sortParam(toggleSort([], "status")) -> "status,id"
+// sortParam(toggleSort([{ field: "status", desc: false }], "created_at", true)) -> "status,created_at,id"
+```
+
+Because `sort` is a single parameter and the last repeated parameter wins, build it once as a comma-separated string and never append to a URL that already has one.

@@ -1,0 +1,215 @@
+---
+title: "Testing error handling"
+description: "Error paths are the least exercised code in most applications. A fake fetch can produce every failure on demand."
+icon: "triangle-alert"
+---
+
+Error paths are the least exercised code in most applications.
+A fake `fetch` can produce every failure on demand.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient, ConflictError, NetworkError, RateLimitError, ValidationError } from "@pawabase/client";
+
+function clientAnswering(...answers: Array<() => Response | Promise<Response>>) {
+  let index = 0;
+  const calls: number[] = [];
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    retry: { retries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: async () => {
+      calls.push(index);
+      const answer = answers[Math.min(index, answers.length - 1)];
+      index += 1;
+      return answer();
+    },
+  });
+  return { pawabase, calls };
+}
+
+const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+  () => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+
+test("422 becomes ValidationError with fields", async () => {
+  const { pawabase } = clientAnswering(json(422, [{ loc: ["body", "email"], msg: "value is not a valid email", type: "value_error" }]));
+  const error = await pawabase.from("customers").create({ email: "x" }).catch((e) => e);
+  assert.ok(error instanceof ValidationError);
+  assert.deepEqual(error.byField(), { email: ["value is not a valid email"] });
+});
+
+test("409 unique violation keeps its code and columns", async () => {
+  const { pawabase } = clientAnswering(json(409, { error: "unique_violation", message: "A record with the same email already exists.", details: { columns: ["email"] } }));
+  const error = await pawabase.from("customers").create({ email: "a@b.c" }).catch((e) => e);
+  assert.ok(error instanceof ConflictError);
+  assert.equal(error.code, "unique_violation");
+  assert.deepEqual(error.details, { columns: ["email"] });
+});
+
+test("a 503 on a read is retried, then succeeds", async () => {
+  const { pawabase, calls } = clientAnswering(json(503, "busy"), json(200, { data: [], page: 1, per_page: 20, total: 0 }));
+  await pawabase.from("orders").perPage(20);
+  assert.equal(calls.length, 2);
+});
+
+test("a network failure on a create is not retried", async () => {
+  const { pawabase, calls } = clientAnswering(() => Promise.reject(new TypeError("fetch failed")));
+  await assert.rejects(pawabase.from("orders").create({ total_minor: 1 }), NetworkError);
+  assert.equal(calls.length, 1);
+});
+
+test("a long Retry-After surfaces as RateLimitError", async () => {
+  const { pawabase } = clientAnswering(json(429, { error: "rate_limit_exceeded", retry_after: 120 }, { "retry-after": "120" }));
+  const error = await pawabase.from("orders").perPage(20).catch((e) => e);
+  assert.ok(error instanceof RateLimitError);
+  assert.equal(error.retryAfter, 120);
+});
+```
+
+Small retry delays in the test client keep these tests fast while still exercising the retry path.
+
+
+## How the client picks the class
+
+The class is chosen by status, in this order, after the body has been read:
+
+| Order | Condition | Class |
+| --- | --- | --- |
+| 1 | `422`, or `400` whose body lists issues | `ValidationError` |
+| 2 | `401` | `AuthenticationError` |
+| 3 | `403` | `PermissionError` |
+| 4 | `404` | `NotFoundError` |
+| 5 | `409` | `ConflictError` |
+| 6 | `413` | `PayloadTooLargeError` |
+| 7 | `429` | `RateLimitError` |
+| 8 | `500` and above | `ServerError` |
+| 9 | Anything else | `ApiError` |
+
+The code, message, details and retry hint are read from the body first, so every class carries them.
+A flow that raises `403` with the code `plan_required` arrives as a `PermissionError` whose `code` is `plan_required`.
+
+
+## Errors raised before any request
+
+Some errors are raised by the client itself, without a request, because sending would be pointless or harmful.
+
+| Error | Raised by | Example |
+| --- | --- | --- |
+| `ConfigError` | `createClient`, auth, storage, `manage`, `admin` | A secret key in a browser; social sign-in without an environment; an empty storage key |
+| `InvalidQueryError` | Query builders and `count()` | A second filter on one field; a comma in an `in` value |
+| `RealtimeError` | Channels | `not_connected` when the connection did not open in time |
+
+Some impossible queries are answered locally instead of raising: `in(column, [])` returns an empty page without a request, because it can match nothing.
+
+
+## Realtime errors compared with HTTP errors
+
+| | HTTP calls | Realtime channels |
+| --- | --- | --- |
+| Class | `ApiError` subclasses and transport errors | `RealtimeError` with a `code` |
+| Refusal | `401` or `403` | `forbidden` in the acknowledgement |
+| Too large | `PayloadTooLargeError` | `payload_too_large` |
+| Too fast | `RateLimitError`, retried | `rate_limited`, not retried |
+| Lost connection | `NetworkError`, retried when safe | The connection reconnects; channels rejoin |
+
+The realtime module's HTTP methods, `publish`, `presence` and `history`, raise HTTP errors like any other call.
+
+
+## Wrapping errors without losing them
+
+When your own layer adds context, wrap the original error as the `cause` instead of replacing it.
+The class, code and request id then remain available to whoever handles it.
+
+```typescript
+export class OrderLoadError extends Error {
+  constructor(readonly orderId: string, options: { cause: unknown }) {
+    super(`Could not load order ${orderId}`, options);
+    this.name = "OrderLoadError";
+  }
+}
+
+try {
+  await pawabase.from("orders").get(orderId);
+} catch (cause) {
+  throw new OrderLoadError(orderId, { cause });
+}
+```
+
+Error trackers show the chain of causes, and handlers can inspect `error.cause instanceof NotFoundError` when they need to.
+
+
+## Each class in a sentence of advice
+
+<AccordionGroup>
+  <Accordion title="ValidationError">
+    Show `byField()` next to the inputs and keep everything the person typed; the request never reached a policy, so nothing changed.
+  </Accordion>
+  <Accordion title="AuthenticationError">
+    The client already tried to refresh; ask the person to sign in again, and keep their unsaved work.
+  </Accordion>
+  <Accordion title="PermissionError">
+    Explain that the action is not allowed, without naming internal policies; retrying will not help.
+  </Accordion>
+  <Accordion title="NotFoundError">
+    Treat the thing as absent, whether it never existed or is hidden; on deletes, treat it as success.
+  </Accordion>
+  <Accordion title="ConflictError">
+    Read `details` for the conflicting columns, explain, and reload the data before the person decides again.
+  </Accordion>
+  <Accordion title="RateLimitError">
+    Wait `retryAfter` seconds before trying again, and tell the person why the action paused.
+  </Accordion>
+  <Accordion title="ServerError">
+    Report it with the request id and offer to try again; the problem is not the person's.
+  </Accordion>
+  <Accordion title="NetworkError and TimeoutError">
+    Offer to try again when the connection returns, and check whether a write already happened before repeating it.
+  </Accordion>
+</AccordionGroup>
+
+
+## Retry behavior of each method
+
+The retry rules depend on the HTTP method a call uses, and on whether the client marks it idempotent.
+This table applies them to the client's own methods.
+
+| Method | HTTP | Retried after network failures and `502`–`504` |
+| --- | --- | --- |
+| Queries, `get`, `maybeGet`, `first`, `count`, `all` | `GET` | Yes |
+| `create`, `createMany` (each row) | `POST` | No |
+| `update` | `PATCH` | No |
+| `replace` | `PUT` | Yes |
+| `delete` | `DELETE` | Yes |
+| `storage.from(b).upload`, `uploadToSignedUrl` | `PUT` | Yes, unless the body is a stream |
+| `download*`, `list`, `listBuckets` | `GET` | Yes |
+| `remove` | `DELETE` | Yes |
+| `createSignedUrl`, `createSignedUploadUrl` | `POST`, marked idempotent | Yes |
+| `flows.run`, `routes.post`, `routes.patch` | `POST`, `PATCH` | Only with `idempotent: true` |
+| `routes.get`, `routes.put`, `routes.delete` | `GET`, `PUT`, `DELETE` | Yes |
+| `auth.signInWithPassword`, `signUp` and other auth `POST`s | `POST` | No |
+| `realtime.publish` | `POST` | No |
+| `manage()` and `admin()` reads | `GET` | Yes |
+| `manage()` and `admin()` writes | `POST`, `PATCH`, `PUT`, `DELETE` | `PUT` and `DELETE` yes; `POST` and `PATCH` no |
+
+Every row is retried after `429`, because a rate-limited request never reached a service.
+
+
+## Checking error screens
+
+Error screens are user interface, and they break like any other.
+Component tests can render them with real error objects, built the same way the client builds them:
+
+```typescript
+import { NotFoundError, ValidationError } from "@pawabase/client";
+
+const notFound = new NotFoundError({ status: 404, code: "not_found", message: "Not found", requestId: "req_test" });
+const invalid = new ValidationError({
+  status: 422,
+  code: "validation_failed",
+  message: "email: value is not a valid email",
+  issues: [{ loc: ["body", "email"], field: "email", message: "value is not a valid email" }],
+});
+```
+
+Rendering each screen with each class catches messages that overflow, missing request ids and retry buttons that do nothing.

@@ -1,0 +1,253 @@
+---
+title: "Saving, migrating, and keeping them apart"
+description: "The two actions are separate on purpose, and the sequence matters more than it usually does because one of them touches production data."
+icon: "plus"
+---
+
+The two actions are separate on purpose, and the sequence matters more than it usually does because one of them touches production data.
+
+Saving the definition writes a row to the platform database, recompiles the environment's state, and changes nothing about the tables. Running the migration is an operator-only action, audited as `resource.migrated`, and it is the only thing that changes the schema.
+
+| | Saving | Migrating |
+| --- | --- | --- |
+| Who can do it | Anyone with edit access to the environment | Operators only |
+| Touches the platform database | Yes | No |
+| Touches your data | No | Yes |
+| Audited | As a definition change | As `resource.migrated` |
+| Reversible | Yes, by saving again | No |
+
+### Adding a field to a live resource
+
+Because the two steps are separate, there is a window between them and it is worth planning for. Saving a new field compiles a model that references a column the database does not have yet. Requests against the other fields are unaffected; requests that touch the new field fail until migrate runs.
+
+The sequence that avoids surprises:
+
+| Step | What happens | What to watch |
+| --- | --- | --- |
+| Save with the new field, not `required` | Model compiles; the column does not exist | Clients can still write, and the write fails on the unknown column |
+| Migrate | `ALTER TABLE ... ADD COLUMN`, existing rows get `null` | No existing data is rewritten |
+| Mark it `required`, if it should be | Create now demands it | Existing rows are unaffected — `required` is enforced on create only |
+| Save again | New creates must supply it | Reads are unaffected either way |
+
+The reverse is the operation with no undo in the tool: removing a field from the definition. The column stays, the field stops being exposed, and getting the data back means pointing a field at the same column name again. Nothing is destroyed, but nothing is forgotten either.
+
+<Info>
+Changing a field's type, removing it, or renaming it does nothing to the database. Those are manual SQL operations in **Build → Database**, where you can see the live columns, their types and their indexes before you touch them.
+</Info>
+
+### Indexed and unique
+
+`indexed` and `unique` are field keys that affect DDL and nothing else. They are not validation rules and they do not change what a request may do.
+
+| Key | Effect at migrate | Effect on requests |
+| --- | --- | --- |
+| `indexed` | `CREATE INDEX ix_<table>_<column>` | None. It makes filters and sorts on that column cheaper |
+| `unique` | `CREATE UNIQUE INDEX`, and `UNIQUE` appended to the column definition | None. The database refuses duplicates |
+
+Two properties worth internalising:
+
+**Index names are derived.** `ix_<table>_<column>`, truncated to 60 characters. `IF NOT EXISTS` is used on sqlite and postgres, but not on mysql.
+
+**Neither exists until you migrate.** Declaring `unique: true` on a field and never running migrate gives you a field that looks protected and is not. The protection is a database object, and it is created by the migration.
+
+What `indexed` is actually for is the same thing it is for in any database: a column you filter or sort on. `customer_id` on an orders table, `status` on a job queue, `slug` on an article. Indexing every column is a real cost in write throughput and storage, and on a small table the planner will ignore the index anyway.
+
+<Note>
+If `owner_field` is set, migrate creates an index on it too. That is why owner-scoped list queries do not table-scan even though you never asked for an index on that column.
+</Note>
+
+
+## Choosing the table name against the resource name
+
+These are the two most similar-looking inputs on the form and they do different jobs, so it is worth being explicit about when to diverge.
+
+| | Resource name | Table |
+| --- | --- | --- |
+| Becomes | The URL `/rest/v1/<name>` | A table in the environment database |
+| Pattern | `^[a-z][a-z0-9_]{0,62}$` | `^[A-Za-z_][A-Za-z0-9_]{0,62}$` |
+| Fixable later | No | Yes, one field |
+| Referenced by | Relations, events, flow blocks, route policies | Nothing outside the definition |
+
+Leave **Table** blank when the table will be created by migrate from this definition — which is the case for almost every resource you will build. The stored value becomes the resource name, and there is one name to hold in your head.
+
+Set **Table** explicitly in three situations:
+
+**The table already exists.** This is the migration path for a database Pawabase did not create: point `table` at the existing table, declare the fields you want to expose, run migrate so indexes are created and anything missing is added, and enable the operations you want. The field list becomes a *view* over that table rather than a claim about all of it — a column present in the database but absent from the field list is invisible to the API.
+
+**The table name cannot be your API name.** A legacy table called `ORDERS_2019`, or one whose name you do not control because it came from another system. The resource can still be called `orders`.
+
+**You want two views of one table.** Two resources with the same `table` and different `fields` produce two different projections, each with its own policies. Occasionally the right answer for a private internal view and a public one. Be aware that they invalidate their cache tags independently, so a write through one is not a write through the other as far as caching is concerned.
+
+<Warning>
+A custom route cannot shadow a resource's routes. A route with path `/orders` or `/orders/{id}` is refused with `422` when a resource named `orders` exists, so a table-backed view and a route on the same data need different paths.
+</Warning>
+
+
+## Required, default, and nullable: the interaction
+
+Three controls in the panel combine in ways that are not obvious from any one of them, and getting the combination wrong produces a validation rule you did not intend.
+
+The rule: **a field is required on create only if `required` is true and there is no `default`.**
+
+| `required` | `default` | `nullable` | On create |
+| --- | --- | --- | --- |
+| No | No | Default (true) | Optional, and `null` is accepted |
+| No | Yes | Default (true) | Optional; the default fills it in |
+| Yes | No | Default (false) | **Must be present**, and cannot be null |
+| Yes | Yes | Default (false) | Optional — the default satisfies it |
+| Yes | No | Yes | Must be present, and may be `null` |
+| Yes | No | No | Must be present, and cannot be null |
+
+The fifth row is the one to know about. "Present but null" is a genuinely different constraint from "omitted or present", and it is the correct shape for a nullable foreign key on a row that must always reference *something, possibly nothing*.
+
+And all of it stops applying on `update`, where every field is optional and nullable is forced true. A required field is required of a create, never of a patch.
+
+<Warning>
+Defaults are applied server-side on every create — REST, a flow's `resource.*` block, Studio's record editor, all of them. They are not a client-side convenience. A field with a default will be populated in the response whether or not the caller mentioned it, and it will be populated for a flow that never thought about the field.
+</Warning>
+
+
+## A complete form, annotated
+
+Here is a full definition with the reasoning attached to each part, so the controls and their consequences can be seen together.
+
+```json
+{
+  "name": "invoices",
+  "description": "Customer invoices. Totals are computed by the issuing flow.",
+  "table": null,
+  "primary_key": "id",
+  "id_type": "integer",
+  "fields": [
+    {"name": "customer_id", "type": "uuid", "required": true, "indexed": true,
+     "description": "The customer this invoice is for."},
+    {"name": "status", "type": "string", "enum": ["draft", "issued", "paid", "void"],
+     "default": "draft", "description": "Lifecycle state. Set by routes, not by clients."},
+    {"name": "total_cents", "type": "integer", "required": true, "minimum": 0,
+     "read_only": true, "description": "Computed by the issuing flow."},
+    {"name": "due_on", "type": "date", "nullable": true},
+    {"name": "internal_note", "type": "text", "write_only": true, "max_length": 2000},
+    {"name": "line_items", "type": "array",
+     "items": {"type": "object", "fields": [
+       {"name": "sku", "type": "string", "required": true, "max_length": 64},
+       {"name": "quantity", "type": "integer", "required": true, "minimum": 1}
+     ]}}
+  ],
+  "operations": {
+    "list": {"enabled": true, "policy": "own_invoices"},
+    "get": {"enabled": true, "policy": "own_invoices"},
+    "create": {"enabled": false, "policy": null},
+    "update": {"enabled": false, "policy": null},
+    "delete": {"enabled": false, "policy": null}
+  },
+  "relations": [
+    {"name": "customer", "resource": "customers", "field": "customer_id", "type": "belongs_to"},
+    {"name": "refunds", "resource": "refunds", "field": "invoice_id", "type": "has_many"}
+  ],
+  "transformer": "invoice_summary",
+  "cache_ttl": 0,
+  "rate_limit": {},
+  "events": true,
+  "realtime": true,
+  "timestamps": true,
+  "owner_field": "user_id",
+  "tags": ["billing"]
+}
+```
+
+| Part | Why it is that way |
+| --- | --- |
+| `id_type: integer` | Invoices are created in one place, by the issuing flow. A uuid buys nothing and costs a wider key |
+| `customer_id` is `uuid`, `indexed` | The foreign key must match the type of the row it points at, and every list filters on it |
+| `status` has an `enum` and a default | The five illegal states are unrepresentable, and a draft never needs an explicit status |
+| `total_cents` is `required` **and** `read_only` | Required on create — the flow always supplies it — and impossible for a client to set |
+| `internal_note` is `write_only` | Staff write it, nobody reads it through the API |
+| `line_items` is an `array` of `object` | Nested structure validated as a field list; stored as JSON |
+| `create`/`update`/`delete` are off | Every state change goes through a route with a flow behind it |
+| `owner_field: user_id` | Drafts created in Studio still need an owner, even though clients cannot create |
+| `cache_ttl: 0` | The issuing flow invalidates on every write; a cached read here would be a lie within a second |
+| `realtime: true` | A payment screen wants the status change pushed |
+| Both relation kinds | `customer_id` is a key here; `invoice_id` is a key on `refunds` |
+
+### What the response looks like
+
+```json
+{
+  "id": 44,
+  "customer_id": "6f1c9a2e-4b7d-4a11-9c33-8e2f5b6d1a90",
+  "status": "issued",
+  "total_cents": 210000,
+  "due_on": "2026-03-01",
+  "line_items": [{"sku": "MUG-01", "quantity": 2}],
+  "created_at": "2026-02-01T09:14:00+00:00",
+  "updated_at": "2026-02-14T16:03:11+00:00"
+}
+```
+
+`internal_note` is absent because it is `write_only`. `id` and the timestamps are present because they are in the read model whether or not they are in the field list. And because the resource has a transformer named `invoice_summary`, this is in fact the transformer's shape rather than the field list's — the fields above are what the transformer chose to keep.
+
+
+## Common mistakes, and what each one costs
+
+| Mistake | What happens | Cost |
+| --- | --- | --- |
+| Enabling `create` on a resource whose invariants live in a flow | Clients write rows the flow never approved | The invariant is unenforceable, and you find out in production |
+| Enabling `delete` on anything | One call removes a row, hard | No soft delete, no confirmation, no recovery |
+| Using one policy for all five operations | Reads and writes share an access rule | Ownership semantics on a write that has no owner yet |
+| Relying on a `create` policy to prevent forged ownership | The row is created with someone else's id | Silent data-integrity bug |
+| Declaring `unique` and never migrating | Looks protected, is not | Duplicates, discovered under load |
+| Declaring `required` on a live table without a default | New creates must supply it; old rows have null | A window where the table violates its own definition |
+| Putting a transformer on a heavily filtered resource | Sort and filter address the pre-transform names | `400`s on queries that look correct |
+| Setting `cache_ttl` on a table that changes often | Hit rate collapses, evictions on every write | Slower than no cache |
+| Declaring a field you never read or filter | It is in every response, every list, every schema | A contract you cannot take back |
+| Expecting `?filter` on a JSON column | Filters cannot reach inside `json`, `array` or `object` | `400`, and no workaround short of a separate resource |
+
+<Note>
+The pattern across all of these is the same: the definition is cheap to change and cheap to promote, and every one of these mistakes is a *semantic* mismatch between what the definition says and what the product needs. The form will happily save all of them.
+</Note>
+
+
+## Frequently asked questions
+
+<AccordionGroup>
+<Accordion title="Can a resource have no fields at all?">
+Yes. The primary key always exists, and so do the timestamp columns unless you turn them off, so an empty field list still migrates into a real table. It is a reasonable starting point for a resource whose shape you have not settled: define the key, migrate, add fields, migrate again.
+</Accordion>
+<Accordion title="Does reordering fields do anything?">
+Only in the definition. Order is preserved in the field list, which is what you read in the JSON and in the generated models, but a column's position in a table has no meaning and no field's position in a response is contractual. Reorder for readability, not for effect.
+</Accordion>
+<Accordion title="Why did my enum disappear when I cleared Allowed values?">
+Because a cleared control deletes its key rather than writing an empty value — an emptied tag input produces `[]`, and `[]` is stripped. The same rule removes an emptied `pattern` and an emptied `min_length`. It is why the JSON does not accumulate empty strings.
+</Accordion>
+<Accordion title="Can I set a default on a json or array field in the form?">
+No — the panel says "Set defaults for this type in JSON view." Use the **JSON** tab. The setting survives subsequent edits in the form, because keys the form does not know are carried through untouched.
+</Accordion>
+<Accordion title="Is the field name check the same as the resource name check?">
+No. Field names use the wider SQL identifier rule `^[A-Za-z_][A-Za-z0-9_]{0,62}$`; resource names are lower-case only, `^[a-z][a-z0-9_]{0,62}$`. The narrower rule on resources exists because the name becomes a URL segment.
+</Accordion>
+<Accordion title="What does the Name field's disabled state mean?">
+That the resource exists. Renaming would break every reference by name — relations, event subscriptions, flow blocks, route policies — so it is prevented rather than supported. Create a new resource and point its `table` at the same table if you need a new URL.
+</Accordion>
+<Accordion title="Can I rename a field?">
+In the definition, yes — but migrate will not rename the column. You get the old column plus a new one, and the new field starts empty. Renaming a column is a manual operation in **Build → Database**.
+</Accordion>
+<Accordion title="Does saving the definition run the migration?">
+No. Saving writes a row to the platform database and recompiles the environment. Migrating is a separate, operator-only action, audited as `resource.migrated`, and it is the only thing that changes the schema.
+</Accordion>
+</AccordionGroup>
+
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Resources" icon="table-properties" href="/data/resources/overview" />
+  <Card title="Field types" icon="type" href="/data/field-types/overview" />
+  <Card title="Relations" icon="link" href="/data/relations/overview" />
+  <Card title="Validation" icon="check" href="/data/validation/overview" />
+  <Card title="Migrations" icon="arrow-right" href="/data/migrations/overview" />
+  <Card title="Caching" icon="database" href="/data/caching/overview" />
+  <Card title="Custom routes" icon="route" href="/data/custom-routes/overview" />
+  <Card title="Schemas" icon="code-2" href="/data/schemas/overview" />
+  <Card title="Policies" icon="shield-check" href="/policies/overview" />
+  <Card title="Transformers" icon="wand" href="/data/transformers/overview" />
+</CardGroup>

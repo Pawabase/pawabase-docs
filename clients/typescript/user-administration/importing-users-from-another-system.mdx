@@ -1,0 +1,250 @@
+---
+title: "Importing users from another system"
+description: "Moving to Pawabase from another identity system means creating accounts for existing people without knowing their passwords. The pattern is: create…"
+icon: "users"
+---
+
+Moving to Pawabase from another identity system means creating accounts for existing people without knowing their passwords.
+The pattern is: create each account without a password, keep the old system's id in `appMetadata`, and let people set a password through a reset email when they first arrive.
+
+```typescript
+import { ConflictError } from "@pawabase/client";
+
+interface LegacyUser {
+  legacy_id: string;
+  email: string;
+  name: string;
+  roles: string[];
+}
+
+export async function importUsers(people: LegacyUser[], concurrency = 4) {
+  const queue = [...people];
+  const report = { created: 0, existing: 0, failed: [] as Array<{ email: string; error: string }> };
+
+  async function worker() {
+    for (let person = queue.shift(); person; person = queue.shift()) {
+      try {
+        await a.users.create({
+          email: person.email,
+          name: person.name,
+          roles: person.roles,
+          appMetadata: { legacy_id: person.legacy_id, imported_at: new Date().toISOString() },
+        });
+        report.created += 1;
+      } catch (error) {
+        if (error instanceof ConflictError) report.existing += 1;
+        else report.failed.push({ email: person.email, error: String(error) });
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return report;
+}
+```
+
+A `409` means the email already exists in the environment, which makes the import safe to run again after a partial failure.
+Keep concurrency modest; every create counts against the key's rate limit.
+
+Records from the old system usually refer to people by the old id.
+After the import, map old ids to new ones by reading `app_metadata.legacy_id`, and update owner fields on your records with a secret-key job.
+
+Do not send a reset email to everyone at once.
+Send them when people next visit, or in batches, so a wave of emails does not look like phishing and your mail provider does not throttle you.
+
+
+## Offboarding
+
+When someone must lose access, such as an employee leaving a customer's organization, several actions together close every door.
+
+```typescript
+export async function offboard(userId: string, orgSlug: string, transferTo: string) {
+  await a.orgs.removeMember(orgSlug, userId);
+  await a.users.revokeSessions(userId);
+  const keys = await a.users.apiKeys(userId);
+  for (const key of (keys.data ?? []) as Array<{ id: string }>) await a.apiKeys.revoke(key.id);
+
+  for await (const doc of service.from("documents").eq("owner_id", userId).eq("org", orgSlug).select("id")) {
+    await service.from("documents").update(doc.id, { owner_id: transferTo });
+  }
+}
+```
+
+| Step | Why |
+| --- | --- |
+| Remove from the organization | Policies based on membership stop admitting them at their next token |
+| Revoke sessions | No refresh can extend their access |
+| Revoke personal API keys | Keys are a separate door that sessions do not close |
+| Transfer owned records | Their work stays with the organization |
+
+Whether to also disable the account depends on whether the person uses your application elsewhere, for example in another organization.
+Removing them from one organization should not lock them out of another.
+
+The owner field cannot be changed through the data API as a person, which is why the transfer uses the service client.
+
+
+## Plans and entitlements
+
+Many applications grant features by plan.
+`appMetadata` is the right place for a plan: only administrators and servers can change it, it appears in tokens as `app`, and policies can trust it.
+
+```typescript
+// in the billing webhook handler, after verifying the provider's signature
+await a.users.update(userId, { appMetadata: { ...current.app_metadata, plan: "pro", plan_renews_at: renewsAt } });
+```
+
+A policy can then admit only paying users:
+
+```json
+{ "eq": ["$auth.claims.app.plan", "pro"] }
+```
+
+The person's next token carries the new plan.
+For an immediate change, the application can call `auth.refreshSession()` after it learns the payment succeeded, for example from a realtime message on the person's channel.
+
+Never put plans in `user_metadata`.
+The person can change it with `auth.updateUser`, and a policy that trusts it lets anyone upgrade themselves.
+
+For organization plans, store the plan in the organization's `metadata` and check membership plus plan in a flow or route, since tokens carry the organization's slug and role, not its metadata.
+
+
+## Data requests and erasure
+
+People can ask what you hold about them, and ask you to delete it.
+Answering needs both the account and the records your resources hold.
+
+```typescript
+export async function exportPerson(userId: string) {
+  const [user, history] = await Promise.all([a.users.getUser(userId), a.users.history(userId)]);
+  const orders = await service.from("orders").eq("customer_id", userId).all({ maxRecords: 10_000 });
+  const tickets = await service.from("tickets").eq("user_id", userId).all({ maxRecords: 10_000 });
+  return { account: user, signInHistory: history, orders, tickets };
+}
+
+export async function erasePerson(userId: string) {
+  for await (const ticket of service.from("tickets").eq("user_id", userId).select("id")) {
+    await service.from("tickets").delete(ticket.id);
+  }
+  for await (const order of service.from("orders").eq("customer_id", userId).select("id")) {
+    await service.from("orders").update(order.id, { customer_name: "Deleted customer", customer_email: null });
+  }
+  await a.users.deleteUser(userId);
+}
+```
+
+Which records to delete and which to anonymize depends on what you must keep: orders and invoices often have legal retention periods, while support tickets and profiles usually do not.
+Write the rules down per resource, and keep the export and erasure functions next to them so they change together.
+
+Files in storage need the same treatment.
+If keys start with the user's id, a walk with `listAll({ prefix: userId + "/" })` finds them.
+
+
+## Designing roles and permissions
+
+Roles and permissions are an interface between your product's rules and your policies.
+A little structure keeps them understandable as the product grows.
+
+| Guideline | Example |
+| --- | --- |
+| Name permissions as `resource:action` | `invoices:read`, `invoices:approve` |
+| Use wildcards for whole areas | `reports:*` for everything about reports |
+| Name roles after jobs, not people or features | `accountant`, `support`, `editor` |
+| Keep environment roles for the whole application, and organization roles for membership | `support` is an environment role; `admin` of `acme` is an organization role |
+| Check permissions, not role names, in policies | `{ "permission": "invoices:approve" }` survives role changes |
+
+Policies that test permissions let you reshape roles without editing policies: move `invoices:approve` from `accountant` to `finance_lead`, and every policy follows.
+
+
+## Working with every user
+
+`users.search` pages with `limit` and `offset`.
+A loop over pages visits every account, for reports and bulk changes.
+
+<CodeGroup>
+```typescript TypeScript
+export async function* everyUser(filters: { search?: string; status?: string } = {}) {
+  const limit = 100;
+  for (let offset = 0; ; offset += limit) {
+    const page = await a.users.search({ ...filters, limit, offset });
+    const users = (page.data ?? page.users ?? []) as Array<Record<string, any>>;
+    yield* users;
+    if (users.length < limit) return;
+  }
+}
+
+let withoutMfa = 0;
+for await (const user of everyUser({ status: "no_mfa" })) withoutMfa += 1;
+console.log(`${withoutMfa} accounts have no second factor`);
+```
+
+```python Python
+def every_user(**filters):
+    limit = 100
+    offset = 0
+    while True:
+        page = a.users.search(limit=limit, offset=offset, **filters)
+        users = page.get("data") or page.get("users") or []
+        yield from users
+        if len(users) < limit:
+            return
+        offset += limit
+
+
+without_mfa = sum(1 for _ in every_user(status="no_mfa"))
+print(f"{without_mfa} accounts have no second factor")
+```
+</CodeGroup>
+
+Print one page the first time to confirm the list's field name for your installation, as the loop above allows for two.
+Changes made while the loop runs can shift pages; for bulk changes, collect ids first and change them afterwards.
+
+### Bulk role changes
+
+Granting or removing a role for many people is a loop over ids with modest concurrency, reading each person's roles before writing them:
+
+```typescript
+export async function addRoleToAll(userIds: string[], role: string) {
+  for (const id of userIds) {
+    const user = await a.users.getUser(id);
+    const roles = new Set<string>(user.roles ?? []);
+    if (roles.has(role)) continue;
+    roles.add(role);
+    await a.users.update(id, { roles: [...roles] });
+  }
+}
+```
+
+Skipping people who already have the role makes the script safe to run again.
+If many people need the same new permission, adding it to an existing role is a single call and reaches all of them at their next token.
+
+
+## Provisioning a customer organization
+
+Business products often set up an organization for each new customer: an owner, a few admins, a plan in the metadata, and invitations for the rest of the team.
+
+```typescript
+import { ConflictError } from "@pawabase/client";
+
+export async function provisionOrganization(input: {
+  slug: string;
+  name: string;
+  ownerEmail: string;
+  admins: string[];
+  invitees: string[];
+  plan: string;
+}) {
+  for (const email of [input.ownerEmail, ...input.admins]) {
+    await a.users.create({ email }).catch((error) => {
+      if (!(error instanceof ConflictError)) throw error;
+    });
+  }
+  await a.orgs.create(input.slug, input.name, { ownerEmail: input.ownerEmail, metadata: { plan: input.plan } });
+  for (const email of input.admins) await a.orgs.addMember(input.slug, { email, role: "admin" });
+  for (const email of input.invitees) {
+    await a.orgs.invite(input.slug, { email, role: "member", redirectTo: "https://app.example.com/join" });
+  }
+}
+```
+
+Creating accounts for the owner and admins, and inviting everyone else, matches who you know needs access on day one and who chooses to join.
+Accounts created without a password get a reset email from your application when the customer is ready to start.

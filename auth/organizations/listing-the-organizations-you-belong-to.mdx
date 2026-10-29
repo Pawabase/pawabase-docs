@@ -1,0 +1,197 @@
+---
+title: "Listing the organizations you belong to"
+description: "The query starts from your memberships, not from all organizations. There is no endpoint that lists every organization in an environment for an…"
+icon: "building"
+---
+
+```python
+@r.get("/orgs", tags=["organizations"], summary="Organizations I belong to")
+async def my_orgs(ctx: HttpContext):
+    user, _ = await signed_in_user(ctx)
+    rows = await Membership.filter(user=user).prefetch_related("organization")
+    return {"data": [org_view(m.organization, m.role) for m in rows]}
+```
+
+The query starts from **your memberships**, not from all organizations. There is no endpoint that lists every organization in an environment for an ordinary user — that would be a directory of your customers. Only Studio's admin route can do that ([The admin and Studio view](/auth/organizations/using-org-and-org-role-in-policies#the-admin-and-studio-view)).
+
+The shape is produced by `org_view`:
+
+```python
+def org_view(org: Organization, role: str | None = None) -> dict:
+    return {
+        "id": org.id,
+        "slug": org.slug,
+        "name": org.name,
+        "metadata": org.metadata or {},
+        "role": role,
+        "created_at": org.created_at.isoformat() if org.created_at else None,
+    }
+```
+
+So `role` here is *your* role in that organization — the same value that becomes `org_role` in a token. That is why it reads identically in both places.
+
+```bash
+curl "$GW/auth/v1/orgs" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+```json
+{
+  "data": [
+    {
+      "id": "01JX9K2M4P7Q8R3S5T6U7V8W9X",
+      "slug": "acme-hq",
+      "name": "Acme Corporation",
+      "metadata": {},
+      "role": "owner",
+      "created_at": "2026-01-14T09:12:44.318Z"
+    },
+    {
+      "id": "01JX9K2M4P7Q8R3S5T6U7V8W9Y",
+      "slug": "acme-labs",
+      "name": "Acme Labs",
+      "metadata": { "tier": "internal" },
+      "role": "viewer",
+      "created_at": "2026-02-02T16:44:01.902Z"
+    }
+  ]
+}
+```
+
+One user, two organizations, two different roles. That is the normal shape, and it is why a single `org_role` claim cannot be the whole story — it describes the *currently selected* organization only.
+
+
+## Creating an organization
+
+```python
+@r.post(
+    "/orgs", tags=["organizations"], request_model=OrgBody, summary="Create an organization"
+)
+async def create_org(ctx: HttpContext, body: OrgBody):
+    user, _ = await signed_in_user(ctx)
+    if await Organization.filter(project=user.project, env=user.env, slug=body.slug).exists():
+        raise HTTPException(status_code=409, detail="that slug is taken")
+    org = await Organization.create(
+        project=user.project,
+        env=user.env,
+        slug=body.slug,
+        name=body.name,
+        metadata=body.metadata,
+        created_by=user.id,
+    )
+    await Membership.create(organization=org, user=user, role="owner")
+    await akountz.emit(
+        user.project,
+        user.env,
+        "organization.created",
+        {"organization": org.slug, "user_id": str(user.id)},
+        actor=str(user.id),
+    )
+    return created(org_view(org, "owner"))
+```
+
+Three behaviours worth naming:
+
+<Steps>
+  <Step title="The slug is checked in your own environment">
+    The existence check is `project=user.project, env=user.env, slug=body.slug`. Getting `409 that slug is taken` means it is taken *here*, not across the installation.
+  </Step>
+  <Step title="You become `owner`, not `member`">
+    The creator's `Membership` is created with `role="owner"` unconditionally. There is no way to create an organization and join it as anything else.
+  </Step>
+  <Step title="An event is emitted">
+    `organization.created` carries `{"organization": slug, "user_id": ...}` and an `actor`. If you build reporting or downstream automation on the platform event stream, this is the signal to consume.
+  </Step>
+</Steps>
+
+`metadata` is free-form JSON stored in an `AnyJSONField`, returned verbatim by `org_view`. It is the intended home for application-specific organization attributes — plan tier, billing reference, region. It is **not** searched, indexed, or validated, so do not put anything in it that you intend to filter on in a query.
+
+```bash
+curl -X POST "$GW/auth/v1/orgs" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"slug": "acme-hq", "name": "Acme Corporation", "metadata": {"tier": "gold"}}'
+```
+
+```json
+{
+  "id": "01JX9K2M4P7Q8R3S5T6U7V8W9X",
+  "slug": "acme-hq",
+  "name": "Acme Corporation",
+  "metadata": { "tier": "gold" },
+  "role": "owner",
+  "created_at": "2026-03-01T08:00:00.000Z"
+}
+```
+
+<Info>
+`role` is `"owner"` in the creation response because it is hard-coded in `created(org_view(org, "owner"))` rather than read back from the newly created membership. The two agree by construction.
+</Info>
+
+
+## Reading one organization
+
+```python
+@r.get("/orgs/{slug}", tags=["organizations"], summary="An organization")
+async def get_org(ctx: HttpContext, slug: str):
+    user, _ = await signed_in_user(ctx)
+    org, member = await membership(user, slug)
+    return {
+        **org_view(org, member.role),
+        "members": await Membership.filter(organization=org).count(),
+        "teams": await Team.filter(organization=org).count(),
+    }
+```
+
+This is the base `org_view` plus two counts. The `role` is the *caller's* role, not a property of the organization — two members reading this endpoint get different `role` values from the same row.
+
+
+## Updating and deleting
+
+```python
+@r.patch(
+    "/orgs/{slug}",
+    tags=["organizations"],
+    request_model=OrgUpdate,
+    summary="Update an organization",
+)
+async def update_org(ctx: HttpContext, slug: str, body: OrgUpdate):
+    user, _ = await signed_in_user(ctx)
+    org, member = await membership(user, slug, manage=True)
+    if body.name is not None:
+        org.name = body.name
+    if body.metadata is not None:
+        org.metadata = body.metadata
+    await org.save()
+    return org_view(org, member.role)
+```
+
+Deletion is **owner-only**, and it is the one place `membership()` is called without `manage=True` and then checked explicitly:
+
+```python
+@r.delete(
+    "/orgs/{slug}", tags=["organizations"], summary="Delete an organization (owners only)"
+)
+async def delete_org(ctx: HttpContext, slug: str):
+    user, _ = await signed_in_user(ctx)
+    org, member = await membership(user, slug)
+    if member.role != "owner":
+        raise HTTPException(status_code=403, detail="only owners can delete an organization")
+    await org.delete()
+    await akountz.emit(
+        user.project,
+        user.env,
+        "organization.deleted",
+        {"organization": slug},
+        actor=str(user.id),
+    )
+    return no_content()
+```
+
+<Warning>
+The message here is `only owners can delete an organization`, not the generic `only owners and admins can do that` from the `manage=True` path. If you are matching on error detail strings, they differ.
+</Warning>
+
+Deleting the organization cascades at the database level: `Membership`, `Team` and `Invitation` all declare `on_delete=fields.CASCADE` against `Organization`, and `TeamMember` cascades from `Team`. Sessions are **not** affected — a user whose organization was deleted still holds a valid access token. What changes is that the next refresh reads `membership_role`, gets `None`, and collapses `org` to `null` in the new token. See [How the org claim is issued](/auth/organizations/teams#how-the-org-claim-is-issued).

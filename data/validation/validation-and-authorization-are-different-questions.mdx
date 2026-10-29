@@ -1,0 +1,250 @@
+---
+title: "Validation and authorization are different questions"
+description: "A policy is a condition over the caller, the record and the input. Validation is a check on the body's shape. They overlap in one place, the $input…"
+icon: "badge-check"
+---
+
+A policy is a condition over the caller, the record and the input. Validation is a check on the body's shape. They overlap in one place, the `$input` path in a policy, and the interaction is worth understanding.
+
+| Question | Answered by | When it runs | Status on failure |
+| --- | --- | --- | --- |
+| Is the body well formed and within the declared limits? | Validation | Before the policy gate | `422` |
+| May this kind of caller attempt this operation at all? | The policy plan (for example `authenticated`, a role, `service`) | After validation, before the handler | `401` or `403` |
+| May this caller write this value? | A policy condition on `$input` | In the handler, after the body is built | `403` |
+| May this caller touch this record? | A policy condition on `$record` | In the handler, after the record is loaded | `403`, `404` when the caller is not signed in |
+
+Everything that depends on the values in the body belongs in the third row, so the policy and the validation do not repeat each other: the field's constraints say what a legal value looks like for anyone, and the policy says what a particular caller may do with it. A quantity limit for a customer is a policy:
+
+```json
+{
+  "name": "small_qty",
+  "condition": {"lte": ["$input.qty", 10]}
+}
+```
+
+Assigned as the `create` policy of a resource, the condition is evaluated after the body passes validation. These are the real results with `qty` of 5, 50 and absent:
+
+```text
+POST /rest/v1/items  {"title": "a", "qty": 5}   ->  201
+POST /rest/v1/items  {"title": "a", "qty": 50}  ->  403  "policy 'small_qty' refused"
+POST /rest/v1/items  {"title": "a"}             ->  403  "policy 'small_qty' refused"   (qty is absent, the comparison is false)
+```
+
+Two details to notice. A refusal from an input condition is `403` even for an anonymous caller, where a refusal at the gate would have been `401`: the gate only sees what can be decided before the body is read, and `$input` conditions are decided afterwards. And an absent value makes a comparison false, so a rule that should only apply when a field is present has to say so, with `exists` or `any`, see [Conditions](/policies/conditions).
+
+<Warning>
+Do not use a policy to repeat what a field definition already says. A `maximum` on the field returns a `422` with the limit in `ctx`, which a client can show. A policy that refuses the same value returns a `403` with no detail. Use a policy for rules that vary by caller, and the field for rules that do not.
+</Warning>
+
+### Routes check the body at the gate too
+
+A custom route with `input_fields` or `input_schema` validates its body with the same compiler and the same error shape. The gate runs the plan phase before the handler reads the body, and conditions on `$input` are checked after:
+
+```text
+POST /rest/v1/echo  {"n": "3"}                  ->  200  {"n": 3, "tag": null}     (the string was converted)
+POST /rest/v1/echo  {"n": 0, "tag": "z"}        ->  422  [greater_than_equal at ["n"], literal_error at ["tag"]]
+POST /rest/v1/echo  {}                          ->  422  [missing at ["n"]]
+POST /rest/v1/echo  {"n": 1, "zzz": 1}          ->  422  [extra_forbidden at ["zzz"]]
+POST /rest/v1/echo  {bad                        ->  422  [json_invalid at ["body"]]
+```
+
+The handler receives the cleaned value: `"3"` arrived as the number `3`, and the optional `tag` is present as `null`. Only the body is validated. Path parameters and query values reach a route's handler as strings, so convert them in the flow or the function. See [Custom routes](/data/custom-routes/overview).
+
+
+## What validation cannot catch: the database
+
+Some values are fine to the field list and are refused one step later, by the database. Pawabase does not translate those refusals. They surface as `500` with the plain-text body `Internal Server Error`, which is the same body as a bug in your own code. These are the cases that were reproduced.
+
+| Situation | What you see | Why validation did not stop it |
+| --- | --- | --- |
+| A duplicate value in a `unique` field | `500` | Uniqueness is an index. The field list cannot know what other rows hold |
+| An integer that does not fit 64 bits (`2^70`) | `500` | `integer` has no built-in maximum |
+| The value `"inf"` for a `number` | `500` | The type accepts it, the column refuses it |
+| A `PATCH` or `GET` with an id of 22 digits | `500` | The id is a number that overflows the key column |
+| A filter value of the wrong type (`filter[stock]=gte.abc`) | `500` | Filter values are converted after the field is accepted |
+| A create when the table does not exist yet | `500` | Nothing checks that you ran **Create / migrate table** |
+| A create that sends a field added to the definition before the column exists | `500` | The same, for a column |
+| A value too wide for a `VARCHAR(n)` column (PostgreSQL, MySQL) | `500` | `max_length` was raised after the column was created |
+| A violation of a constraint you added by hand (a `NOT NULL`, a foreign key, a `CHECK`) | `500` | Pawabase does not read your constraints |
+| An unreachable database | `503` `database_unavailable` | The one database failure that has its own status |
+
+A `500` is the correct signal that something is wrong on the server, but for the unique case it is the wrong signal for a client, because the caller did something that can be fixed. There are two ways to give clients a better answer.
+
+**Check first.** Before creating, look for the value with a filter: `GET /rest/v1/products?filter[sku]=A-1&select=id&per_page=1`. A non-empty `data` means the value is taken. This is race-prone (two callers can both pass the check), so it improves the message and does not replace the index.
+
+**Move the write behind a custom route.** A flow can validate, check, and answer with a status you choose. This route is a verified example. The resource has only `list` enabled, so the only way to create a product is through the route:
+
+```json
+{
+  "name": "create_product",
+  "definition": {
+    "nodes": [
+      {"id": "start", "data": {"block": "trigger.http",
+        "config": {"method": "POST", "path": "/products/create"}}},
+      {"id": "valid", "data": {"block": "validate.schema",
+        "config": {"value": "{{ input.body }}", "fields": [
+          {"name": "sku", "type": "string", "required": true, "max_length": 20},
+          {"name": "title", "type": "string", "required": true, "max_length": 60}]}}},
+      {"id": "dupe", "data": {"block": "resource.list",
+        "config": {"resource": "products", "filters": {"sku": "{{ steps.valid.output.sku }}"}, "limit": 1}}},
+      {"id": "exists", "data": {"block": "control.if",
+        "config": {"condition": {"gt": ["$steps.dupe.output.total", 0]}}}},
+      {"id": "conflict", "data": {"block": "error.raise",
+        "config": {"status": 409, "message": "a product with this sku already exists", "code": "sku_taken"}}},
+      {"id": "create", "data": {"block": "resource.create",
+        "config": {"resource": "products", "data": "{{ steps.valid.output }}"}}},
+      {"id": "done", "data": {"block": "response.return",
+        "config": {"status": 201, "body": "{{ steps.create.output }}"}}}
+    ],
+    "edges": [
+      {"id": "e1", "source": "start", "target": "valid"},
+      {"id": "e2", "source": "valid", "target": "dupe"},
+      {"id": "e3", "source": "dupe", "target": "exists"},
+      {"id": "e4", "source": "exists", "target": "conflict", "sourceHandle": "true"},
+      {"id": "e5", "source": "exists", "target": "create", "sourceHandle": "false"},
+      {"id": "e6", "source": "create", "target": "done"}
+    ]
+  }
+}
+```
+
+The node positions that Studio's flow editor stores are left out for brevity. The route is saved under **Routes** with method `POST`, path `/products/create`, handler type flow, handler `create_product` and policy `authenticated`. The results from a running API:
+
+```text
+POST /rest/v1/products/create  {"sku": "A-1", "title": "Mug"}      ->  201  {"id": 1, "sku": "A-1", "title": "Mug", ...}
+POST /rest/v1/products/create  {"sku": "A-1", "title": "Other"}    ->  409  {"error": "sku_taken", "message": "a product with this sku already exists"}
+POST /rest/v1/products/create  {"sku": "", "title": "xxxxxxxx…70"}  ->  422  {"error": "invalid", "message": "validation failed", "details": [string_too_long at ["title"]]}
+POST /rest/v1/products/create  {"sku": "B", "title": "x", "bogus": 1} ->  422  {"error": "invalid", ..., "details": [extra_forbidden at ["bogus"]]}
+```
+
+The third result shows a limit of this recipe: an empty `sku` passed, because the field has no `min_length`. The route is only as strict as the field list it validates against, so give `sku` a `min_length` of 1 or a `pattern`. The envelope of the `422` also differs from the resource endpoint's: it is `{"error": "invalid", ...}` with a `details` array, not a bare array. Clients that call both the resource endpoints and a route like this one need the normalizer above.
+
+### Constraints you add by hand
+
+Anything you add to a table outside Pawabase (a `NOT NULL`, a foreign key, a `CHECK`) is enforced by the database and invisible to Pawabase. That is a legitimate way to guard data that must never be wrong, because it holds for every writer, including flows and the **Database** console. The cost is the `500`. Pair each such constraint with a field-level rule or a route-level check that gives the client a readable `422` or `409` first, so the constraint is the last line of defense and not the user interface.
+
+
+## Response validation: when a stored row does not fit
+
+The request side is half of the story. Every read response is checked as well, with a read model compiled from the same field list, and a row that fails is not skipped: it fails the response. Two rules from [Field types](/data/field-types/overview) matter here: the read model applies the same `enum`, length and range constraints as the create model, and every property in it is nullable.
+
+The failure has one body, whatever the cause:
+
+```json
+500
+{"error": "Internal Server Error", "detail": "Response validation failed"}
+```
+
+It is returned for a list when any row on that page fails, and for a get when the row fails. The body names neither the row nor the field. These are the three ways such a row comes to exist, all reproduced.
+
+| Origin of the bad row | Example | How it got there |
+| --- | --- | --- |
+| The definition changed under existing data | An `enum` of `a` and `b` was changed to `b` and `c`, and a row still holds `a` | A schema edit. Nothing re-checks stored rows |
+| A write that skipped validation | A flow or the **Records** tab stored `title` as ten characters in a field limited to five, an `enum` value that does not exist, a negative `qty` under a minimum of 0 | A trusted path, see the next section |
+| A table you did not create | A `TEXT` column mapped to an `integer` field that holds `abc` | The definition describes the column optimistically |
+
+Because the check runs over the rows selected for the page, one failing row fails the whole page, and it fails for every caller whose page contains it.
+
+### Finding the bad rows
+
+The error does not say which row, so you find it. The **Database** console is the tool, and the queries are the ones that look for what the definition forbids. For a field with `enum: ["b", "c"]`:
+
+```sql
+SELECT id, st FROM en WHERE st IS NOT NULL AND st NOT IN ('b', 'c');
+```
+
+For a length limit, a range, or a type that was mapped onto a looser column:
+
+```sql
+SELECT id FROM items WHERE length(title) > 5;
+SELECT id FROM items WHERE qty < 0;
+SELECT cust_no, price FROM legacy WHERE price GLOB '*[^0-9]*';   -- SQLite: non-numeric text in a numeric field
+```
+
+Repair them in place with an `UPDATE`, which the console runs after you tick **allow writes**. See [Database console](/data/database-console/overview). Once the rows fit, the page returns `200` again.
+
+Two details help while you diagnose. A **get** of a single row that fails tells you which id is bad, so bisecting a failing page is a few requests with `?per_page=1&page=N`. And `?select=` limits the columns that are selected, so a request that selects only fields the bad rows do not break returns `200`, which isolates the field.
+
+### Transformers and the read model
+
+A resource with a **Transformer** has no response model. The generated document omits the response schema, and the read model is not applied, so the bad-row failure above does not occur for it. The same transformer removes the documentation for the shape, so the trade is validation for a hand-maintained contract. See [Transformers](/data/transformers/overview).
+
+
+## The paths that skip validation
+
+The models run on HTTP request bodies, and nothing else is checked by them. A table can receive a row from five other places, and each of those writes without the constraints. They are trusted by design, because they are your own server-side code and operator tools. The consequence is that the field list is a promise about requests and not a promise about the table.
+
+| Path | Who uses it | Constraints checked | What to do instead |
+| --- | --- | --- | --- |
+| `resource.create` and `resource.update` in a flow | Your flows | None | Put `validate.schema` before the block, in `fail` mode (a `422`) or `branch` mode (your own response) |
+| `resource_create` and `resource_update` in a Python function | Your functions | None | Validate with the same field list first, see below |
+| The **Records** tab | Operators, in Studio | None | Use it for repair and inspection, not for loading data |
+| `POST …/records` on the Platform API | Scripts that call it | None | Use the data API with a secret key, which runs the models |
+| SQL in the **Database** console, or any direct connection | Operators, jobs, migrations of your own | None, and no cache or event side effects except cache invalidation in the console | Use `UPDATE` to repair, and run a request through the API afterward to confirm reads |
+
+### Validating inside a flow
+
+The `validate.schema` block takes a value and a field list and validates in create mode, so required fields are enforced and unknown keys are rejected. In `fail` mode it stops the run with a `422`; in `branch` mode it follows the `invalid` handle with the errors, so the flow can respond in its own shape. Both were exercised through a route:
+
+```text
+fail mode,   {"title": "waytoolong", "qty": -1}
+  ->  422  {"error": "invalid", "message": "validation failed",
+            "details": [{"type": "string_too_long", "loc": ["title"], ...},
+                        {"type": "greater_than_equal", "loc": ["qty"], ...}]}
+
+branch mode, the same body, with the invalid handle wired to a response block
+  ->  400  {"problems": [{"type": "string_too_long", "loc": ["title"], ...},
+                         {"type": "greater_than_equal", "loc": ["qty"], ...}]}
+```
+
+Use `fail` when the caller should see a `422` whose shape you do not mind, and `branch` when you need to shape the answer, for example to return the `409` in the previous section. The block's output on success is the cleaned value, so wire the next block to `steps.<id>.output`, not to the raw input: conversions the model made (a string `"3"` to the number `3`, `null` fill-ins for optional fields) are in the output and not in the input.
+
+The block takes its field list inline, and it cannot resolve a `ref` to a stored schema. A list that contains one fails the run with `500` `{"error": "block_failed", "message": "field 'home' refers to unknown schema 'Address'"}`. Paste the schema's fields into the block, as nested `object` fields, and keep the two copies in step by hand. A function's `input_fields` is validated the same way, without the schema registry, so the same limit applies. See [Schemas](/data/schemas/overview) for what a reference does and does not enforce.
+
+### Validating inside a function
+
+A Python function calls the runtime directly, and the runtime is as trusted as a flow block, so `resource_create` does not check constraints. A function can validate in two ways, and which to use depends on where the data comes from.
+
+When the data is the function's own **input**, declare `input_fields` on the decorator. The platform validates the input with the compiler before the function body runs, in create mode, and refuses a bad input with a `422` in the flow envelope: `{"error": "invalid", "message": "invalid function input", "details": [...]}`.
+
+```python
+from pawabase_core.functions import function
+
+PRODUCT = [
+    {"name": "sku", "type": "string", "required": True, "max_length": 20},
+    {"name": "title", "type": "string", "required": True, "max_length": 60},
+    {"name": "price_minor", "type": "integer", "required": True, "minimum": 0},
+]
+
+@function("import_product", policy="service", input_fields=PRODUCT)
+async def import_product(ctx):
+    # ctx.input has already been validated and converted.
+    record = await ctx.runtime.resource_create("products", ctx.input)
+    return {"id": record["id"]}
+```
+
+When the data is **derived** inside the function (read from a file, fetched from another service, assembled from several inputs), validate it explicitly with the function the API itself uses, `validate_payload`, before it reaches the runtime:
+
+```python
+from pawabase_core.schemas import validate_payload
+from pydantic import ValidationError
+
+@function("sync_catalog", policy="service")
+async def sync_catalog(ctx):
+    imported, rejected = 0, []
+    for row in await fetch_rows():          # your own code
+        try:
+            clean = validate_payload(PRODUCT, row, mode="create")
+        except ValidationError as exc:
+            rejected.append({"row": row, "errors": exc.errors(include_url=False)})
+            continue
+        await ctx.runtime.resource_create("products", clean)
+        imported += 1
+    return {"imported": imported, "rejected": rejected}
+```
+
+`validate_payload` returns the cleaned data in the form the API would have stored, so the record that reaches `resource_create` has been through the same conversions as one that came through `POST`. A loop like this one skips the rows that fail and reports them, which is usually what a sync wants and which a `POST` per row could not do cheaply. See Python extensions for registering functions.
+
+### Loading data in bulk
+
+If you need to load many rows, the REST API with a secret key is the path that validates. It is slower than SQL, and that is the point: each row runs the models, fires the event, and invalidates the cache. For one-time migrations from another system, load into a staging table with SQL, run the queries above to find rows that would fail, repair them, and only then point a resource at the table. See Migrating from Supabase and from Firebase.

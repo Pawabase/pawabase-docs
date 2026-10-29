@@ -1,0 +1,530 @@
+---
+title: "Workflows"
+description: "The services above combine into a handful of workflows that teams automate. Each one below is a complete script outline, with the reasoning for its…"
+icon: "settings"
+---
+
+The services above combine into a handful of workflows that teams automate.
+Each one below is a complete script outline, with the reasoning for its order.
+
+### A release script
+
+Releasing definitions from staging to production is a sequence where order matters: protect, move, check, and only then announce.
+
+```typescript
+import { createClient } from "@pawabase/client";
+import { manage } from "@pawabase/client/manage";
+
+const service = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" });
+const production = manage(service, "production");
+const staging = production.withEnvironment("staging");
+
+export async function release(note: string) {
+  const snapshot = await production.backups.snapshot(`pre-release-${new Date().toISOString().slice(0, 10)}`, { note });
+  await production.backups.updateSnapshot(snapshot.id, { pinned: true });
+
+  await staging.environments.promote("production");
+
+  const overview = await production.schema.overview();
+  console.log("tables compared with definitions after promotion:", JSON.stringify(overview, null, 2));
+
+  const advice = await production.observability.advisor({ minutes: 60 });
+  console.log("advisor findings:", JSON.stringify(advice, null, 2));
+
+  return { snapshotId: snapshot.id };
+}
+```
+
+| Stage | Why it comes here |
+| --- | --- |
+| Pinned snapshot | A way back exists before anything changes |
+| Promotion | Definitions move as one step, never secrets or keys |
+| Schema overview | Shows any table that lags its new definition, which `migrate` or the schema plan then addresses |
+| Advisor | Catches slow routes or missing indexes the release introduced |
+
+Run the same script against a copy first, such as a preview of production, when the release is large.
+
+### A new environment from a blueprint
+
+Products that give large customers their own environment, or that run one per region, create them from a blueprint of a reference environment.
+
+```typescript
+const reference = manage(service, "production");
+
+export async function provisionCustomer(slug: string) {
+  const blueprint = await reference.environments.blueprint();
+  await reference.environments.applyBlueprint(blueprint, [slug]);
+  const fresh = reference.withEnvironment(slug);
+  await fresh.secrets.set("PAYSTACK_SECRET", await secretFor(slug, "PAYSTACK_SECRET"));
+  const key = await fresh.keys.create("customer-app", { role: "publishable" });
+  return { environment: slug, publishableKey: key.key };
+}
+
+declare function secretFor(environment: string, name: string): Promise<string>;
+```
+
+A blueprint carries definitions, roles and settings, not data, secrets or keys.
+Each new environment gets its own secrets and keys in the same script, so it is usable as soon as provisioning ends.
+
+### Rotating secrets on a schedule
+
+Secrets can carry a rotation reminder, set with `rotateEveryDays`, which Studio and the listing show.
+A scheduled job can rotate the secrets whose source system issues new values through an API, and keep the old value available for a quick rollback.
+
+```typescript
+export async function rotate(names: string[], issueNewValue: (name: string) => Promise<string>) {
+  const listing = await production.secrets.list();
+  console.log(JSON.stringify(listing, null, 2)); // names, descriptions and reminders, never values
+  for (const name of names) {
+    await production.secrets.rotate(name, await issueNewValue(name));
+  }
+}
+```
+
+Pass the names explicitly rather than inferring them from fields of the listing, whose details vary between versions.
+Rotate in staging first when the secret has a staging counterpart, and keep `rollback(name)` at hand for the first hour after a rotation.
+
+### Responding to an incident
+
+When an attack or an outage starts, the first minutes matter.
+A small runbook script gathers the facts and takes the reversible actions.
+
+```typescript
+export async function incidentFirstResponse(suspectIp: string | null) {
+  const [errors, firewall, services] = await Promise.all([
+    production.observability.errors({ minutes: 15 }),
+    production.firewall.stats({ hours: 1 }),
+    production.health.services(),
+  ]);
+  console.log(JSON.stringify({ errors, firewall, services }, null, 2));
+
+  if (suspectIp) await production.firewall.ban(suspectIp, { seconds: 3600, reason: "incident response" });
+
+  return production.statusPage.openIncident("Elevated error rates", {
+    message: "We are investigating elevated error rates.",
+    impact: "minor",
+    components: ["api"],
+  });
+}
+```
+
+A one-hour ban is reversible and limited; widen it only with evidence from `firewall.events`.
+Opening the incident early keeps customers informed while the team works.
+
+### After a partner's outage
+
+When a webhook endpoint was down, its deliveries failed and stopped retrying.
+Once the partner is back, find and resend them.
+
+```typescript
+export async function recoverWebhooks(endpoint: string, sinceMinutes: number) {
+  const failed = await production.webhooks.deliveries({ status: "failed", endpoint, limit: 100 });
+  console.log(`failed deliveries listed: ${(failed.data ?? []).length}`);
+  const preview = await production.webhooks.redeliverMany({ endpoint, status: "failed", sinceMinutes, dryRun: true });
+  console.log("would redeliver:", preview);
+  return production.webhooks.redeliverMany({ endpoint, status: "failed", sinceMinutes });
+}
+```
+
+Confirm with the partner that their side ignores duplicates before resending large windows.
+
+### Triage of failed jobs
+
+Background jobs that exhausted their retries collect in the failed list.
+Triage means reading why, fixing the cause, then replaying what is safe.
+
+```typescript
+export async function triageFailedJobs() {
+  const failed = await production.jobs.failed();
+  for (const job of (failed.data ?? []) as Array<{ id: string; job: string; error?: string }>) {
+    console.log(job.id, job.job, job.error);
+  }
+  const preview = await production.jobs.replay({ status: "failed", sinceMinutes: 24 * 60, dryRun: true });
+  console.log("would replay:", preview);
+}
+```
+
+Replay only after the cause is fixed; replaying into the same failure fills the list again.
+
+### Definitions kept in a repository
+
+Teams that review every change keep definitions as JSON files in their repository and apply them from CI.
+An upsert helper makes applying idempotent: create what is missing, replace what exists.
+
+```typescript
+import { NotFoundError } from "@pawabase/client";
+
+type DefinitionService = {
+  getOne(name: string, options?: { branch?: string }): Promise<unknown>;
+  create(body: Record<string, unknown>, options?: { branch?: string }): Promise<unknown>;
+  replace(name: string, body: Record<string, unknown>, options?: { branch?: string }): Promise<unknown>;
+};
+
+export async function upsert(service: DefinitionService, body: Record<string, unknown> & { name: string }, branch?: string) {
+  try {
+    await service.getOne(body.name, { branch });
+    return service.replace(body.name, body, { branch });
+  } catch (error) {
+    if (error instanceof NotFoundError) return service.create(body, { branch });
+    throw error;
+  }
+}
+
+export async function applyFromRepo(defs: { policies: any[]; resources: any[]; flows: any[]; routes: any[] }, branch: string) {
+  const m = manage(service, "development");
+  for (const policy of defs.policies) await upsert(m.policies, policy, branch);
+  for (const resource of defs.resources) await upsert(m.resources, resource, branch);
+  for (const flow of defs.flows) await upsert(m.flows, flow, branch);
+  for (const route of defs.routes) await upsert(m.routes, route, branch);
+  return m.releases.commit(branch, `Applied from ${process.env.GIT_COMMIT ?? "local"}`);
+}
+```
+
+Order matters: policies before the resources that refer to them, flows before the routes that call them.
+Applying to a branch and committing a revision keeps the change reviewable in Studio before it is merged.
+
+Deleting definitions that were removed from the repository is a separate, deliberate step.
+List what exists, compare with the files, and remove the difference only after a person confirms.
+
+### Custom domains for customers
+
+White-label products serve each customer on their own domain.
+Registering the domain, showing the customer which DNS record to add, and checking until it is verified is a short loop.
+
+```typescript
+export async function addCustomerDomain(hostname: string) {
+  const added = await production.domains.add(hostname);
+  console.log("ask the customer to add this record:", JSON.stringify(added, null, 2));
+  return added;
+}
+
+export async function waitForDomain(domainId: string, attempts = 30) {
+  for (let i = 0; i < attempts; i++) {
+    const result = await production.domains.verify(domainId);
+    if ((result as { verified?: boolean; status?: string }).verified || (result as { status?: string }).status === "verified") return result;
+    await new Promise((resolve) => setTimeout(resolve, 60_000));
+  }
+  throw new Error(`Domain ${domainId} is not verified yet; DNS changes can take hours.`);
+}
+```
+
+DNS changes can take a long time to propagate.
+Run the check from a scheduled job rather than keeping a request open, and tell the customer when verification succeeds.
+The verification answer's exact fields depend on the installation; print one before relying on a field name.
+
+### A daily operations report
+
+A short daily summary of traffic, errors and slow routes helps a team notice trends before they become incidents.
+
+```typescript
+export async function dailyReport() {
+  const [overview, routes, errors, usage] = await Promise.all([
+    production.observability.overview({ range: "24h" }),
+    production.observability.routes({ minutes: 24 * 60, limit: 10 }),
+    production.observability.errors({ minutes: 24 * 60 }),
+    production.health.usage(),
+  ]);
+  return { overview, slowestRoutes: routes, errors, usage };
+}
+```
+
+Send the result to a team channel, or store it for comparison over weeks.
+`usage()` in the same report shows how close the project is to its plan limits, which is easier to act on a week early than on the day a limit is hit.
+
+### Read-only analysis with SQL
+
+Questions the data API cannot answer, such as revenue by week, can be answered with read-only SQL from a script.
+
+```typescript
+const weekly = await production.database.query(
+  "select date_trunc('week', created_at) as week, sum(total_minor) as revenue from orders where status = $1 group by 1 order by 1",
+  ["paid"],
+);
+console.log(weekly);
+```
+
+Statements are read-only unless you pass `allowWrite`, and parameters are sent separately from the SQL text, so values never need to be pasted into the statement.
+The placeholder syntax and the SQL dialect are those of the environment's database; the example is PostgreSQL.
+
+For answers your application shows to people, prefer a custom route, so the query runs under the route's policy and appears in the API's documentation.
+
+### Testing a schedule
+
+A schedule runs at its next time, which may be tomorrow.
+`schedules.run(name)` fires it now, exactly as the scheduler would, which makes it testable during development:
+
+```typescript
+const staging = manage(service, "staging");
+await staging.schedules.run("nightly-digest");
+const runs = await staging.flows.runs({ flow: "send-digest", limit: 1 });
+console.log(runs);
+```
+
+Reading the flow's latest run right after shows whether the scheduled work succeeded and what each block did.
+
+### Following an event through the system
+
+When a record change should have caused several things to happen, the events service shows which did.
+
+```typescript
+const graph = await production.events.graph();
+console.log(JSON.stringify(graph, null, 2)); // which events exist and who consumes each
+
+const recent = await production.events.list({ name: "orders.created", limit: 5 });
+for (const event of (recent.data ?? []) as Array<{ event_id?: string; id?: string }>) {
+  const id = event.event_id ?? event.id;
+  if (id) console.log(await production.events.detail(String(id)));
+}
+```
+
+`detail` lists every consumer an event reached and how each went: the flows it started, the webhooks it queued, the subscriptions it matched.
+An event with no consumers is a subscription that is missing or filtered too narrowly.
+
+### Clearing caches after a release
+
+Promotion changes definitions, and the environment's response cache is keyed by them, so most stale answers disappear on their own.
+Answers cached under keys that did not change, such as an expanded relation whose target changed shape, can linger until they expire.
+Clear them deliberately after releases that change relations or transformers:
+
+<CodeGroup>
+```typescript TypeScript
+await production.cache.invalidate({ resources: ["orders", "customers"] });
+```
+
+```python Python
+production.cache.invalidate(resources=["orders", "customers"])
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/cache/invalidate" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" -d '{"tags": [], "resources": ["orders", "customers"]}'
+```
+</CodeGroup>
+
+Clearing a whole resource's cache costs a burst of uncached reads; do it after the release, not during it.
+
+### Changing environment settings
+
+`environments.update(name, { infra, auth, settings })` changes an environment's infrastructure, sign-in settings or general settings.
+Each part is merged with what exists, so you send only what changes.
+
+```typescript
+const current = await production.environments.getOne("production");
+console.log(JSON.stringify(current, null, 2));
+await production.environments.update("production", { settings: { ...changedSettings } });
+
+declare const changedSettings: Record<string, unknown>;
+```
+
+Read the current document first and change the fields you mean to change.
+Settings differ between installations and versions, and a typo in a field name is stored without complaint.
+
+### Capacity of background work
+
+When jobs back up, the questions are how deep the queues are and whether workers are taking jobs.
+
+```typescript
+const [queues, workers, policies] = await Promise.all([production.jobs.queues(), production.jobs.workers(), production.jobs.retryPolicies()]);
+console.log({ queues, workers, policies });
+```
+
+A growing queue with active workers means work arrives faster than it is done.
+A growing queue with no workers means the workers are down.
+The retry policies explain how long failing work keeps coming back before it lands in the failed list.
+
+### Alarms worth having
+
+Most environments benefit from a few alarms from the start.
+Choose the metrics from the catalog; the table describes what each alarm should watch.
+
+| Alarm | Watches | Typical rule |
+| --- | --- | --- |
+| Server errors | The count of `5xx` answers | More than a handful in five minutes, twice in a row |
+| Slow API | A latency percentile of requests | Above your target for ten minutes |
+| Failed jobs | Jobs that exhausted retries | Any, in an hour |
+| Webhook failures | Failed deliveries | Several in an hour for one endpoint |
+| Rate limiting | `429` answers | A sustained rise, which means growth or a loop |
+
+Start with thresholds that fire rarely, then tighten them.
+An alarm that fires every day is soon ignored.
+
+### Firewall recipes
+
+Rules are tried in order, and the first match decides.
+Every recipe below starts in `simulate` mode; switch it to `enforce` after reading its events.
+
+```typescript
+await production.firewall.addRule({
+  name: "Studio-only admin routes from the office",
+  action: "block",
+  logic: "all",
+  conditions: [
+    { field: "path", op: "starts_with", value: "/rest/v1/x/admin" },
+    { field: "ip", op: "not_in_cidr", value: ["203.0.113.0/24"] },
+  ],
+  mode: "simulate",
+});
+
+await production.firewall.addRule({
+  name: "Log traffic without a user agent",
+  action: "log",
+  conditions: [{ field: "user_agent", op: "missing", value: null }],
+});
+
+const verdict = await production.firewall.test("198.51.100.7", { path: "/rest/v1/x/admin/users", method: "GET" });
+console.log(verdict);
+```
+
+| Operators | Meaning |
+| --- | --- |
+| `equals`, `not_equals` | Exact comparison |
+| `contains`, `not_contains`, `starts_with`, `ends_with` | Text comparison |
+| `glob`, `regex` | Pattern matching |
+| `in`, `not_in` | Membership in a list of values |
+| `in_cidr`, `not_in_cidr` | Membership in a list of address ranges |
+| `exists`, `missing` | Whether the field is present; these take no value |
+| `gt`, `lt` | Numeric comparison, such as on `content_length` |
+
+A rate-limit rule counts requests by `ip`, `key` or `ip_path`.
+`firewall.test` shows how a rule set treats a sample request, step by step, without sending anything.
+Use it to check a new rule against the requests you care about before enforcing.
+
+### Checking mail after a deploy
+
+Sign-in emails, invitations and flow notifications all depend on mail delivery.
+A quick check after configuration changes confirms the path works end to end.
+
+```typescript
+const config = await production.mail.config();
+console.log(config); // provider, sender and whether mail is being delivered; never the password
+await production.mail.sendTest(["ops@example.com"]);
+const log = await production.mail.log({ limit: 5 });
+console.log(log);
+```
+
+`log` shows the test message as sent, failed or suppressed.
+A suppressed status usually means the environment is configured not to deliver, which is common and correct for development environments.
+
+### Branches and releases in detail
+
+Branches let a team prepare definition changes without affecting the live environment, review them, and then make them live in one step.
+
+| Step | Call | Effect |
+| --- | --- | --- |
+| Start | `releases.createBranch("pricing-v2", { fromBranch: "main" })` | A draft copy of the definitions |
+| Change | Definition services with `{ branch: "pricing-v2" }` | Edits apply to the draft only |
+| Inspect | `releases.draft("pricing-v2")` | The branch's definitions as they stand |
+| Freeze | `releases.commit("pricing-v2", "New pricing resources")` | An immutable revision |
+| Go live, simple | `releases.merge("pricing-v2")` | The branch becomes the environment's definitions |
+| Go live, versioned | `releases.release(revisionId, "v2", "2.0.0")`, then `activate` | The revision serves `/rest/v2`; `/rest/v1` keeps its contract |
+
+A protected branch refuses merges unless forced, which suits `main` in teams that require review.
+`merge` with `force: true` overrides that protection; reserve it for emergencies and record why.
+
+A release checks compatibility between the revision and the version's previous release.
+Breaking changes, such as a removed field, are refused unless `allowBreaking` is set, which is the moment to ask whether a new API version would be kinder to existing clients.
+
+### A backup schedule
+
+Every environment with data people care about should have scheduled snapshots.
+
+<CodeGroup>
+```typescript TypeScript
+await production.backups.setSchedule({
+  enabled: true,
+  frequency: "daily",
+  hour: 3,
+  keepLast: 14,
+  keepDays: 30,
+});
+```
+
+```python Python
+production.backups.set_schedule(enabled=True, frequency="daily", hour=3, keep_last=14, keep_days=30)
+```
+
+```bash cURL
+curl -X PUT "$PAWABASE_URL/platform/v1/envs/production/backup-schedule" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"enabled": true, "frequency": "daily", "hour": 3, "weekday": 0, "keep_last": 14, "keep_days": 30, "include": []}'
+```
+</CodeGroup>
+
+`hour` is in UTC.
+Older snapshots are pruned when they exceed both the count and the age limits, except pinned ones.
+`verifySnapshot(id)` checks that a stored snapshot is intact; running it weekly from a job catches storage problems before a restore depends on them.
+
+### Giving a partner its callback URL
+
+An inbound hook is created once and its URL handed to the partner that will call it.
+Scripts that onboard partners fetch the URL instead of copying it from Studio:
+
+```typescript
+const { url } = (await production.inboundHooks.url("paystack")) as { url: string };
+console.log(`Configure Paystack to call ${url}`);
+```
+
+The URL identifies the environment and the hook; the hook's signature check decides whether a call is accepted.
+Moving a partner from staging to production means giving them the production hook's URL, not changing the staging one.
+
+### A health gate before deploys
+
+A deploy pipeline can refuse to proceed when the environment is already unhealthy, so a release is never blamed for an outage that preceded it.
+
+```typescript
+export async function assertHealthy() {
+  const services = (await production.health.services()) as { data?: Array<{ name: string; state: string }> };
+  const unhealthy = (services.data ?? []).filter((service) => service.state !== "ok" && service.state !== "healthy");
+  if (unhealthy.length) throw new Error(`Not deploying: ${unhealthy.map((s) => `${s.name}=${s.state}`).join(", ")}`);
+}
+```
+
+Print one `services()` answer to learn the state values your installation reports, and adjust the comparison to match.
+
+### Keeping the status page in step with alarms
+
+When an alarm fires, customers benefit from knowing, and the status page is where they look.
+A job that reads alarm history can open and resolve incidents to match.
+
+```typescript
+export async function syncIncidents() {
+  const history = (await production.alarms.history()) as { data?: Array<{ alarm: string; state: string; at: string }> };
+  console.log(JSON.stringify(history, null, 2));
+}
+```
+
+Automating the opening of incidents is safe; automating their wording rarely is.
+Many teams let automation open a generic incident and leave updates to a person.
+
+### Several projects
+
+A secret key belongs to one environment of one project.
+Scripts that work across projects hold one client per project environment, each with its own key:
+
+```typescript
+const projects = {
+  shop: createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.SHOP_PRODUCTION_KEY!, environment: "production" }),
+  blog: createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.BLOG_PRODUCTION_KEY!, environment: "production" }),
+};
+
+for (const [name, client] of Object.entries(projects)) {
+  console.log(name, await manage(client).health.usage());
+}
+```
+
+The gateway URL is shared by every project on an installation; the key decides which project a request reaches.
+
+### Exporting the audit trail
+
+Compliance often asks for a record of who changed what, kept longer than any one system's retention.
+
+```typescript
+import { writeFileSync } from "node:fs";
+
+export async function exportYesterdaysAudit() {
+  const since = new Date(Date.now() - 24 * 3600 * 1000);
+  const text = await production.health.exportAudit({ since, format: "jsonl" });
+  writeFileSync(`audit-${since.toISOString().slice(0, 10)}.jsonl`, text);
+}
+```
+
+Each line is one management change, including those made in Studio.
+Ship the files to storage your compliance process controls.

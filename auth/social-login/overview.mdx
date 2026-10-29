@@ -1,0 +1,234 @@
+---
+title: "Social login"
+description: "The OAuth providers Pawabase actually ships, how a returning profile is matched to an account, why an unverified provider email never joins an existing account, and how results come back in the URL fragment."
+icon: "link"
+---
+
+Social sign-in looks like the simplest thing in the authentication section: a row of buttons, a redirect to a provider, a redirect back, a session. That appearance is misleading. The moment a provider profile comes back, Pawabase has to answer one hard question — *is this person an account I already know, and if so which one?* — and that question is where the real behaviour lives. Getting it wrong does not produce an error. It produces a successful sign-in to the wrong account.
+
+This page documents the real provider set, the account-resolution decision tree in full, the verified-email rule that keeps strangers out of existing accounts, and the exact shape of what arrives back in the browser.
+
+<CardGroup cols={3}>
+  <Card title="Four providers ship" icon="key">Google, GitHub, Discord and Microsoft. There is no Apple, Facebook or LinkedIn provider in Pawabase — see the provider table before writing one into your docs.</Card>
+  <Card title="Anything else is generic" icon="cubes">An unknown name becomes a generic OAuth provider, but only if you supply authorize, token and userinfo endpoints. Missing any one is a 500.</Card>
+  <Card title="Matching is the substance" icon="git-alt">A returning profile is matched by provider subject first, and by email only when the provider says that email is verified.</Card>
+</CardGroup>
+
+## Where social login sits in the layered model
+
+Pawabase authentication is three cooperating layers, and social sign-in touches all three in a specific order. Understanding which layer does what is what stops the OAuth routes from looking arbitrary.
+
+| Layer | What social login asks of it |
+| --- | --- |
+| **Akountz** (identity) | Owns users and `Identity` rows. Exchanges the code, fetches the profile, decides which account it belongs to, starts the session. |
+| **The API** (project config) | Owns the environment's `auth.providers` block, including the client IDs and secrets. Akountz reads it; it never writes it. |
+| **Gateway / `pawabase_core`** | Verifies the bearer token afterwards, like any other request. It is not involved in the OAuth conversation at all. |
+
+Two consequences follow immediately.
+
+First, **a provider is configured per environment**, not per installation. The same Akountz can have Google enabled in `acme/production` and not in `acme/staging`, because it reads a different `providers` block for each. This follows from the tenancy rule that governs the whole section: every user, and every `Identity`, belongs to exactly one `project` + `env` pair.
+
+Second, **an OAuth callback is a browser navigation, not a context-scoped API call.** Everything else under `/auth/v1` reads `project` and `env` from the request context header. The OAuth routes cannot, because a browser following a redirect sends no context token. That is why `project` and `env` are in the path for these two routes and not the others — a genuine structural difference, not an inconsistency.
+
+<Info>
+If you have not read [Authentication](/auth/overview) yet, do that first. This page assumes the three-layer model and the per-environment tenancy rule.
+</Info>
+
+
+## The providers that actually ship
+
+Pawabase ships four providers, each backed by a class in the OAuth library. The `providers` key you write in an environment's `auth` block selects one of them by name.
+
+| Key | Class | Notes |
+| --- | --- | --- |
+| `google` | `GoogleOAuthProvider` | |
+| `github` | `GithubOAuthProvider` | |
+| `discord` | `DiscordOAuthProvider` | |
+| `microsoft` | `MicrosoftOAuthProvider` | Accepts a `tenant` setting. |
+
+<Warning>
+**There is no Apple provider, no Facebook provider and no LinkedIn provider.** A configuration naming `apple`, `facebook` or `linkedin` does not select a built-in integration — it falls through to the generic path and fails with `provider 'apple' needs authorize, token and userinfo endpoints` unless you also supply all three endpoints yourself. If you need one of those, you are configuring a generic provider by hand, not switching on something that already works.
+</Warning>
+
+Worth stating plainly, because documentation for other products lists those providers by default and a reader arriving with that expectation will lose time to a 500 that reads like a configuration typo.
+
+### Generic providers
+
+Any name that is not one of the four becomes a generic `OAuthProvider`. It speaks OAuth 2.0, or OpenID Connect when `openid` appears among the scopes.
+
+Three endpoints are mandatory, and all three must be non-empty:
+
+| Required setting | What it is |
+| --- | --- |
+| `authorize_endpoint` | Where the browser is sent to obtain consent. |
+| `token_endpoint` | Where the authorization code is traded for tokens. |
+| `userinfo_endpoint` | Where the profile is read from. |
+
+If any one is missing, the request fails with a `500` and the detail `provider 'name' needs authorize, token and userinfo endpoints`. The check happens when the provider object is built, not when the provider is contacted, so a missing endpoint fails the *first* redirect rather than the callback. That distinction is useful when reading logs: a 500 at `/authorize` is a configuration problem, whereas a failure at `/callback` is a conversation problem.
+
+A generic provider also needs whatever scopes its userinfo endpoint requires to return a usable profile. In practice that almost always means a scope that grants email access, because without one there is no email to match or create against.
+
+```json
+{
+  "providers": {
+    "gitlab": {
+      "enabled": true,
+      "client_id": "gitlab-client-id",
+      "client_secret": "secret://GITLAB_SECRET",
+      "authorize_endpoint": "https://gitlab.com/oauth/authorize",
+      "token_endpoint": "https://gitlab.com/oauth/token",
+      "userinfo_endpoint": "https://gitlab.com/api/v4/user",
+      "scopes": ["read_user"]
+    }
+  }
+}
+```
+
+<Info>
+A shipped provider may still be given the three endpoint keys, in which case they override that class's defaults. This is occasionally useful when a provider offers a regional endpoint, but it is a genuine override — a wrong value here breaks a provider that would otherwise have worked untouched.
+</Info>
+
+
+## What you may configure per provider
+
+The reason to read this table before editing anything is that most of these keys are invisible once set. There is no validation pass that tells you a key was ignored, and the failure surfaces later as a confusing symptom — a provider that 404s, or an MFA challenge that never arrives.
+
+| Setting | Default | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `True` | all | When false, the provider is not built at all. |
+| `client_id` | — | all | **Required.** Its absence hides the provider from clients. |
+| `client_secret` | `""` | all | May be a `secret://NAME` reference. |
+| `tenant` | — | `microsoft` | Passed only when set. Selects the directory. |
+| `scopes` | provider default | all | Overrides the class's default scope list. |
+| `authorize_params` | — | all | Extra query parameters on the authorize URL. |
+| `authorize_endpoint` | provider default | all | Overrides, including for shipped providers. |
+| `token_endpoint` | provider default | all | Overrides. |
+| `userinfo_endpoint` | provider default | all | Overrides. Mandatory for generic providers. |
+
+Two of these deserve more than a table row.
+
+**`client_id` is what makes a provider real.** A provider entry with credentials but no `client_id` is not merely misconfigured — it is *invisible*. The list of enabled providers is computed by filtering on the switch being on and a `client_id` being present, so a provider missing its client ID never appears in `GET /auth/v1/settings` and never appears in a client's button list. A sign-in screen built from the settings endpoint will simply not render the button.
+
+**`enabled` defaults to on, and that default is about the value, not the key.** An entry that sets no `enabled` key is treated as enabled. This is the same permissive-default pattern as the rest of the auth configuration: absence is not a decision, and the decision made is the permissive one.
+
+```json
+{
+  "providers": {
+    "google": {
+      "enabled": true,
+      "client_id": "google-client-id",
+      "client_secret": "secret://GOOGLE_SECRET"
+    },
+    "microsoft": {
+      "enabled": true,
+      "client_id": "microsoft-client-id",
+      "client_secret": "secret://MICROSOFT_SECRET",
+      "tenant": "common"
+    }
+  }
+}
+```
+
+<Warning>
+Credentials are referenced as `secret://NAME`, never pasted into the configuration. Studio's Client secret field shows the placeholder `secret://GITHUB_SECRET` for exactly this reason. See [Secrets](/studio/secrets) for how the reference resolves, and [Authentication configuration](/auth/configuration/overview) for how the block reaches the API.
+</Warning>
+
+### Microsoft and tenants
+
+`tenant` is accepted only by the Microsoft provider, and only when set — an absent `tenant` leaves the class to choose its own default. It selects which directory the login is resolved against, and the difference decides whether employees of one tenant can sign in at all.
+
+| `tenant` | Who can sign in |
+| --- | --- |
+| `common` | Accounts from any Microsoft directory. The usual choice for a public sign-in button. |
+| `organizations` | Only accounts in the directory that registered the application. |
+| `consumers` | Only personal Microsoft accounts. |
+| A directory ID | Only that one directory. |
+
+<Info>
+`tenant` is not exposed as a field in Studio's provider card. It is written in the environment's `auth` payload directly. If you need it, you are editing configuration as JSON rather than through the Configuration tab.
+</Info>
+
+## What the client is told about providers
+
+Before rendering social buttons, a client asks the environment what it offers. `GET /auth/v1/settings` is the canonical answer, and the `providers` value is a sorted list of names — not objects, not credentials, no secrets.
+
+```json
+{
+  "signup_enabled": true,
+  "email_verification_required": false,
+  "magic_link_enabled": true,
+  "mfa_enabled": true,
+  "providers": ["discord", "github", "google"],
+  "password_policy": { "kind": "basic", "min_length": 8 }
+}
+```
+
+The list is built by filtering the configured providers on exactly two conditions: the enabled switch being on, and a `client_id` being set.
+
+| Response field | Type | Where it comes from |
+| --- | --- | --- |
+| `signup_enabled` | bool | `signup_enabled` |
+| `email_verification_required` | bool | `require_email_verification` |
+| `magic_link_enabled` | bool | `magic_link_enabled` |
+| `mfa_enabled` | bool | `mfa_enabled` |
+| `providers` | list[str] | enabled providers, sorted |
+| `password_policy.kind` | str | `password_policy` |
+| `password_policy.min_length` | int | `password_min_length` |
+
+<Warning>
+Do not hardcode the provider list into a sign-in screen. Render from `providers`, and re-read it rather than caching it for the life of the app: a provider can be added to an environment without any client deployment.
+</Warning>
+
+<Info>
+Remember the config cache. Each environment's settings are cached for a short window, so a provider you just enabled in Studio can take up to ten seconds to appear in this response. A test that enables a provider and immediately reloads will intermittently show the old list. See [Authentication configuration](/auth/configuration/overview).
+</Info>
+
+
+## The two routes
+
+Social sign-in is two routes, and the second one is hidden from the OpenAPI schema because it is only ever reached by a provider redirecting a browser.
+
+| Route | Method | In the schema | Purpose |
+| --- | --- | --- | --- |
+| `/auth/v1/authorize/{project}/{env}/{provider}` | GET | yes | Starts the flow: builds the provider URL, sets the state cookie, redirects the browser. |
+| `/auth/v1/callback/{project}/{env}/{provider}` | GET | no | Finishes it: exchanges the code, resolves the account, starts the session, redirects back. |
+
+The callback URL registered with the provider is derived, not configured by hand:
+
+```text
+{public_url}/auth/v1/callback/{project}/{env}/{provider}
+```
+
+`public_url` is the environment's own setting, falling back to Akountz's installation-wide setting when the environment leaves it empty. This is the same `public_url` that magic links and the Akountz-hosted link pages use, which is why an environment that has not set it can produce OAuth redirects pointing somewhere unexpected.
+
+<Warning>
+`project` and `env` are part of the callback path, so the value registered with the provider must match the environment exactly, including which environment you meant. A provider application configured for `acme/production` cannot serve `acme/staging`, because the redirect URI differs by environment. Register one application per environment, or one application with several registered redirect URIs.
+</Warning>
+
+### What the authorize route accepts
+
+| Query parameter | Meaning |
+| --- | --- |
+| `redirect_to` | Where to land afterwards. Falls back to `site_url` when absent. |
+| `link_token` | Links the resulting identity to the current user instead of signing in. |
+
+`redirect_to` is checked against the allowlist before the redirect is issued. If it is not an allowed URL, the request is rejected with `400 redirect_to is not an allowed URL` — it is not silently ignored at this point.
+
+### What the allowlist actually allows
+
+The allowed set is the environment's `site_url` plus every entry in `redirect_urls`. A URL is permitted if it equals a base exactly, starts with the base followed by `/`, or starts with the base followed by `?`.
+
+| Base | Permitted URL | Allowed |
+| --- | --- | --- |
+| `https://app.example.com` | `https://app.example.com` | yes |
+| `https://app.example.com` | `https://app.example.com/auth/callback` | yes |
+| `https://app.example.com` | `https://app.example.com?next=/x` | yes |
+| `https://app.example.com` | `https://app.example.com.evil.test/` | no |
+| `https://app.example.com` | `https://app.example.com/` | yes |
+| — | `http://localhost:3000/callback` | only if listed in `redirect_urls` |
+
+The subdomain case is the one to internalise: because the separator must be `/` or `?`, `https://app.example.com.evil.test` cannot pass a check against `https://app.example.com`. A trailing-slash mismatch is the more common real annoyance — a base written with a trailing slash is handled, but a base written as a bare host must match at the host boundary.
+
+<Info>
+Local development is the usual reason `redirect_urls` exists. `http://localhost:3000` matches no production base, so a local callback URL has to be listed explicitly. See [Authentication configuration](/auth/configuration/overview) for how the list is edited.
+</Info>

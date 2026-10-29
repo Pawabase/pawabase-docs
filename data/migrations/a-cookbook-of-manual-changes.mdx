@@ -1,0 +1,259 @@
+---
+title: "A cookbook of manual changes"
+description: "Everything migrate refuses to do is done in the Database console, with allow writes on. These are the common ones for each dialect. Replace the table…"
+icon: "arrow-right"
+---
+
+Everything migrate refuses to do is done in the [Database console](/data/database-console/overview), with **allow writes** on. These are the common ones for each dialect. Replace the table name with the physical one if you are on the platform default.
+
+### Drop a column
+
+```sql
+-- PostgreSQL, MySQL, SQLite 3.35+
+ALTER TABLE tickets DROP COLUMN legacy_code;
+```
+
+Then remove the field from the resource, in that order. Reversing the order leaves a window where the API validates a field the table no longer has.
+
+### Rename a column
+
+```sql
+-- PostgreSQL, SQLite 3.25+
+ALTER TABLE tickets RENAME COLUMN subject TO title;
+
+-- MySQL 8
+ALTER TABLE tickets RENAME COLUMN subject TO title;
+```
+
+The definition must be changed to the new name at the same moment, or the API reads and writes a column that does not exist. If you cannot make both changes together, use [expand, then contract](/data/migrations/when-a-migration-fails-part-way#expand-then-contract) instead.
+
+### Change a column's type
+
+```sql
+-- PostgreSQL
+ALTER TABLE products ALTER COLUMN price TYPE NUMERIC(12,2) USING price::numeric;
+
+-- MySQL
+ALTER TABLE products MODIFY price DECIMAL(12,2);
+```
+
+SQLite has no equivalent, so use the [table rebuild](/data/migrations/changing-what-the-api-sees-without-changing-the-table#rebuilding-a-sqlite-table). Pawabase's `number` type is `DOUBLE PRECISION` or `REAL`, so changing a column to `NUMERIC` makes the database and definition disagree about precision. For money, an integer count of the smallest unit (`price_minor`) avoids the question.
+
+### Add a NOT NULL or a DEFAULT
+
+```sql
+-- PostgreSQL
+UPDATE tickets SET status = 'open' WHERE status IS NULL;
+ALTER TABLE tickets ALTER COLUMN status SET DEFAULT 'open';
+ALTER TABLE tickets ALTER COLUMN status SET NOT NULL;
+
+-- MySQL
+UPDATE tickets SET status = 'open' WHERE status IS NULL;
+ALTER TABLE tickets MODIFY status VARCHAR(255) NOT NULL DEFAULT 'open';
+```
+
+Backfill first. Adding `NOT NULL` to a column with `NULL`s fails.
+
+### Add a CHECK constraint that mirrors an enum
+
+```sql
+-- PostgreSQL
+ALTER TABLE tickets ADD CONSTRAINT tickets_status_check
+  CHECK (status IN ('open', 'pending', 'solved')) NOT VALID;
+ALTER TABLE tickets VALIDATE CONSTRAINT tickets_status_check;
+```
+
+`NOT VALID` then `VALIDATE` adds the constraint without blocking writes for the whole scan. Remember that when the enum changes in the resource, the constraint has to change too, and a constraint violation surfaces as a plain 500.
+
+### Add a real foreign key
+
+```sql
+ALTER TABLE tickets
+  ADD CONSTRAINT tickets_requester_fk FOREIGN KEY (requester_id) REFERENCES requesters (id)
+  ON DELETE SET NULL;
+```
+
+Pawabase never creates foreign keys, so orphans are possible by default (see [Relations](/data/relations/overview)). A key you add makes the database refuse an orphan, and deleting a parent through the API then either nulls the child or fails with a plain 500, depending on the action. Choose `ON DELETE` on purpose.
+
+### Add a composite or partial index
+
+```sql
+-- both: serve "this owner's tickets, newest first"
+CREATE INDEX ix_tickets_owner_created ON tickets (requester_id, created_at);
+
+-- PostgreSQL: index only the rows you filter on
+CREATE INDEX ix_tickets_open ON tickets (created_at) WHERE status = 'open';
+```
+
+Migrate only knows single-column indexes. Anything composite is yours to create, and migrate neither creates nor removes it.
+
+### Inspect what is there
+
+```sql
+-- PostgreSQL: columns
+SELECT column_name, data_type, is_nullable, column_default
+FROM information_schema.columns WHERE table_name = 'tickets' ORDER BY ordinal_position;
+
+-- PostgreSQL: indexes
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'tickets';
+
+-- MySQL
+SHOW CREATE TABLE tickets;
+
+-- SQLite
+SELECT sql FROM sqlite_master WHERE tbl_name = 'tickets';
+```
+
+The console rejects anything it considers a write unless **allow writes** is on. `SELECT`, `WITH`, `EXPLAIN`, `PRAGMA`, `SHOW` and `DESCRIBE` run as reads. A statement with more than one command is treated as a write and refused, as is any statement containing a forbidden keyword while allow-writes is off. Queries are limited by the environment's `query_timeout` setting (a timeout is a 504 with "the query timed out") and results are capped at 5,000 rows.
+
+
+## Statements the generator can produce
+
+A complete catalog, so that nothing in a migration response is unexpected:
+
+| Statement | When | Dialects |
+| --- | --- | --- |
+| `CREATE TABLE IF NOT EXISTS "t" (...)` | The table is missing | All |
+| `ALTER TABLE "t" ADD COLUMN "c" <type>` | The table exists and a declared column is missing, or the owner field was not declared as a field | All |
+| `CREATE INDEX IF NOT EXISTS "ix_t_c" ON "t" ("c")` | A field has `indexed`, or it is the owner field | SQLite, PostgreSQL |
+| `CREATE UNIQUE INDEX IF NOT EXISTS "ix_t_c" ON "t" ("c")` | A field has `unique` | SQLite, PostgreSQL |
+| ``CREATE INDEX `ix_t_c` ON `t` (`c`)`` | As above, without `IF NOT EXISTS` | MySQL |
+| ``CREATE UNIQUE INDEX `ix_t_c` ON `t` (`c`)`` | As above, without `IF NOT EXISTS` | MySQL |
+
+That is the full list. There is no `DROP`, no `ALTER COLUMN`, no `RENAME`, no `CHECK`, no `FOREIGN KEY`, no `DEFAULT` and no `NOT NULL` anywhere in the generator, which is why the guarantees on this page hold.
+
+Order inside one migration is: the table statement, the owner column (when it was not declared), then one statement per `indexed` or `unique` field in definition order, then the owner index.
+
+Identifiers are checked before they are quoted. A name that is not a plain identifier is refused with an error from the SQL layer, and no statement runs for it, so there is no way to smuggle SQL through a field name.
+
+
+## Troubleshooting
+
+| What you see | Cause | Fix |
+| --- | --- | --- |
+| Migrate returns `[]` | Table and columns already match, and the resource has no indexes | Nothing to do |
+| Migrate returns only `CREATE ... INDEX IF NOT EXISTS` | The table matches. The indexes are re-asserted every time | Nothing to do, on SQLite and PostgreSQL |
+| A new field is saved but a create that sends it returns a **500** | The column does not exist. You saved but did not migrate | Press **Create / migrate table** |
+| A new field is saved and a read shows it as `null` for every old row | Columns are added without a default, and defaults apply to new creates | Backfill |
+| `filter[status]=eq.new` misses old rows that look like they should match | Those rows hold `NULL`, not `new` | Backfill |
+| Migrate returns a plain **500** after a unique field was added | Duplicates exist, so the index could not be built. The columns before it were added | Find the duplicates, remove them, migrate again |
+| Migrate returns a **404** `no resource '...'` | A typo in the resource name, or a resource that has not been saved | Use the name in the resource list |
+| Everything for a resource is **404**, and Overview lists a definition with problems | A field named `id`, or a definition that does not compile | Fix the definition |
+| A **503** `database_unavailable` after changing `PAWABASE_DEFAULT_DATA_URL` | The database cannot be reached, or does not exist | Fix the URL, or create the database. See [Your database](/data/your-database/overview) |
+| Lists return a **500** right after the database URL change | The new database has no tables | Migrate every resource in it |
+| A removed field is still in responses | The column remains and reads return it | Drop the column, or use `select` or a transformer |
+| A string field rejects long values only in production | `VARCHAR(255)` on PostgreSQL and MySQL | Set `max_length` or use `text` |
+| Dates look an hour or more off in SQL | The three dialects store a datetime differently | Read through the API, or convert in the query |
+| MySQL migrate errors every time after the first | Index statements without `IF NOT EXISTS` | See [MySQL](/data/migrations/when-a-migration-fails-part-way#mysql-has-no-if-not-exists-on-indexes) |
+| Tables in the console have names you do not recognise | `pb_<hash>_<table>` on the shared PostgreSQL default | Read the `table` in a migrate response, or compute the hash |
+| Changing `type` changed nothing | Migrate never alters a column | Add a new field, copy, switch, drop |
+
+### Reading a failure without a message
+
+A migration that fails returns an HTTP 500 with the body `Internal Server Error`. It carries no SQL error. To find the cause:
+
+1. Look at the **Database** page for the table: did the columns you expected get added? That tells you how far the migration got.
+2. Take the list of statements the generator would emit (the tables above) and run them one by one in the console. The console returns a SQL failure as a **400** whose message is the database's own, in the form `ExceptionType: message`, which is the diagnosis the migrate button hid.
+3. If that is a unique index, run the duplicate query. If it is a length or a type, look at the data. If it is a permission, look at the database user's grants.
+
+
+## A reproduced incident: a unique index over duplicates
+
+This is a real sequence, run on a clean API, that shows how a migration fails and how to recover from it. Every response below is what came back.
+
+<Steps>
+  <Step title="Define and migrate a small resource">
+    A `things` resource with `code` (string) and `qty` (integer), public operations. **Create / migrate table** returned one statement:
+
+    ```json
+    {
+      "resource": "things",
+      "table": "things",
+      "statements": [
+        "CREATE TABLE IF NOT EXISTS \"things\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"code\" TEXT, \"qty\" INTEGER, \"created_at\" TEXT, \"updated_at\" TEXT)"
+      ]
+    }
+    ```
+  </Step>
+  <Step title="Write three rows, two with the same code">
+    `POST /rest/v1/things` with `{"code":"A","qty":1}`, again with `"A"`, then with `"B"`. All three answer **201**. Nothing prevented the duplicate, because nothing in the table says `code` is unique.
+  </Step>
+  <Step title="Change the definition: make code unique and add a note field">
+    The resource is saved with `"unique": true` on `code` and a new `note` string. The save succeeds. The database is unchanged.
+  </Step>
+  <Step title="Observe the window between save and migrate">
+    The API now runs the new definition against the old table:
+
+    | Request | Result |
+    | --- | --- |
+    | `POST /rest/v1/things` with `{"code":"Z","qty":1,"note":"x"}` | **500** `Internal Server Error`. The `note` column does not exist |
+    | `GET /rest/v1/things?per_page=2` | **200**. Each row shows `"note": null` |
+
+    Reads are fine and writes that send the new field fail. Writes that do **not** send it would still work.
+  </Step>
+  <Step title="Press Create / migrate table">
+    The response is a **500** with the body `Internal Server Error`. No statements are returned, because the response is the error.
+  </Step>
+  <Step title="Look at what happened">
+    A create with `note` now answers **201** and the value is stored, so `ALTER TABLE "things" ADD COLUMN "note" TEXT` was applied. The unique index was not created: the two `"A"` rows made `CREATE UNIQUE INDEX` fail. The migration is half done.
+  </Step>
+  <Step title="Recover">
+    Remove the duplicate with the console (`DELETE FROM things WHERE id = 2`), then press the button again. The table statement is gone because the table exists, the column is there, and the only statement left to run is the `CREATE UNIQUE INDEX`, which now succeeds. Creating another `"A"` fails with a plain 500 from the database.
+  </Step>
+</Steps>
+
+What generalises from it:
+
+- **The table, not the toast, tells you how far a migration got.** The error body carries nothing, so inspect the columns and indexes in **Build → Database**.
+- **A migration can be run again.** That is what makes a half-applied one recoverable.
+- **Save-then-migrate has a window**, and the window is a window of 500s for writes that use the new field.
+- **A unique violation is a 500, not a 422.** Check for existing values first if the client must report them nicely.
+
+
+## Finding a past migration in the audit log
+
+Each successful migration is an audit event. In **Operate → Audit log**, filter the action to `resource.migrated`, and each row shows who ran it, when, and the resource. The event's details hold the statements:
+
+```json
+{
+  "action": "resource.migrated",
+  "project": "acme",
+  "env": "production",
+  "target": "tickets",
+  "details": {
+    "statements": [
+      "ALTER TABLE \"tickets\" ADD COLUMN \"priority\" BIGINT",
+      "CREATE INDEX IF NOT EXISTS \"ix_tickets_status\" ON \"tickets\" (\"status\")"
+    ]
+  }
+}
+```
+
+That answers the questions that come up after an incident: when did this column appear, and who added it? It does not tell you about changes made in the **Database console** (those are a separate kind of event) or by anyone connecting to the database directly, so a column that has no `resource.migrated` event came from one of those. See [Audit log](/studio/audit-log).
+
+Because the event is written after the statements succeed, the log can show a migration as run while a **later** one failed half-way. Read the events in order for a resource, and treat a gap (a column that exists but no event that added it) as a sign of a partial migration.
+
+
+## Reading a migration response well
+
+The response is short, and each part of it answers a question.
+
+| Part | Question it answers |
+| --- | --- |
+| `resource` | Which definition was migrated |
+| `table` | The physical table the statements ran against. On the shared PostgreSQL default it carries the `pb_<hash>_` prefix, which is the name to use in the console |
+| `statements` is empty | Nothing was missing and nothing is indexed |
+| `statements` holds only `CREATE ... INDEX IF NOT EXISTS` | The table is complete. These are re-assertions |
+| `statements` starts with `CREATE TABLE` | The table did not exist. This is a first migration for the resource in this database |
+| `statements` holds `ALTER TABLE ... ADD COLUMN` | The definition was ahead of the table, and these columns were added |
+| A column appears in `ADD COLUMN` you did not expect | The `owner_field` was not declared as a field, or a field was added by someone else since your last migration |
+
+Read it every time, even when it is empty. The one habit that prevents most migration surprises is comparing the statement list with what you expected **before** moving on to the next environment.
+
+
+## Migrating several resources
+
+There is no "migrate everything" button: migration is per resource, and so is its audit event. For an environment with many resources, either press the button per resource in Studio, or loop over the API as in the release script above. Two details help:
+
+- **Order does not matter between resources**, because migrate never creates foreign keys, so one resource's table does not depend on another's.
+- **Stop at the first failure.** Each call is independent, and carrying on after a 500 leaves you with a mixed state that is harder to reason about than one failed resource.

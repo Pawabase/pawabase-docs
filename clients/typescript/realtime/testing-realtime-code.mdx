@@ -1,0 +1,248 @@
+---
+title: "Testing realtime code"
+description: "The client accepts any WebSocket implementation, which makes realtime code testable with a small fake that plays the server's part."
+icon: "radio"
+---
+
+The client accepts any WebSocket implementation, which makes realtime code testable with a small fake that plays the server's part.
+
+```typescript
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createClient, type WebSocketLike } from "@pawabase/client";
+
+class FakeSocket implements WebSocketLike {
+  static last: FakeSocket;
+  readyState = 0;
+  sent: Array<Record<string, unknown>> = [];
+  onopen: ((event: unknown) => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onclose: ((event: { code: number; reason?: string }) => void) | null = null;
+  onerror: ((event: unknown) => void) | null = null;
+
+  constructor(readonly url: string) {
+    FakeSocket.last = this;
+    queueMicrotask(() => {
+      this.readyState = 1;
+      this.receive({ type: "welcome", connection_id: "c1" });
+    });
+  }
+  send(data: string) {
+    const frame = JSON.parse(data);
+    this.sent.push(frame);
+    if (frame.type === "subscribe") this.receive({ type: "ack", ref: frame.ref, ok: true });
+  }
+  close(code = 1000) {
+    this.readyState = 3;
+    this.onclose?.({ code });
+  }
+  receive(frame: Record<string, unknown>) {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+
+test("delivers messages once, even when repeated", async () => {
+  const pawabase = createClient({
+    url: "https://api.example.test",
+    apiKey: "pb_pk_test",
+    environment: "test",
+    realtime: { webSocket: FakeSocket },
+  });
+  const room = pawabase.realtime.channel<{ text: string }>("chat:lobby");
+  const seen: string[] = [];
+  room.on("message", (message) => seen.push(message.payload.text));
+  await room.subscribe();
+
+  const message = { type: "message", id: "m1", channel: "chat:lobby", event: "message", payload: { text: "hi" }, from: "u1", sent_at: "2026-10-25T10:00:00Z" };
+  FakeSocket.last.receive(message);
+  FakeSocket.last.receive(message);
+
+  assert.deepEqual(seen, ["hi"]);
+  assert.match(FakeSocket.last.url, /\/realtime\/v1\/socket\?apikey=pb_pk_test/);
+  pawabase.dispose();
+});
+```
+
+The fake answers subscriptions with an acknowledgement and lets the test push frames.
+Extend it to answer `publish` and `history`, or to close with a chosen code to test reconnection.
+
+Rules cannot be tested this way; only the server evaluates them.
+Test rules against a development environment, with two signed-in test users checking that each can join their own channels and not the other's.
+
+
+## The frames on the wire
+
+For debugging, these are the frames the client exchanges with the server.
+Each request carries a `ref`, and the server's `ack` or `history` frame answers with the same `ref`.
+
+| Direction | `type` | Purpose |
+| --- | --- | --- |
+| Server to client | `welcome` | The connection is ready; carries `connection_id` |
+| Client to server | `subscribe` | Join a channel, with optional `presence` |
+| Client to server | `unsubscribe` | Leave a channel |
+| Client to server | `publish` | Send a message: `channel`, `event`, `payload` |
+| Client to server | `presence` | Change presence data: `channel`, `meta` |
+| Client to server | `history` | Ask for recent messages: `channel`, `limit` |
+| Client to server | `auth` | Replace the connection's token |
+| Client to server | `ping` | Keep the connection alive |
+| Server to client | `ack` | The answer to a request: `ok`, and `error` and `reason` when refused |
+| Server to client | `message` | A message on a channel |
+| Server to client | `history` | The answer to a history request |
+| Server to client | `presence_state`, `presence_diff` | Everyone present, then joins and leaves |
+| Server to client | `pong` | The answer to a ping |
+| Server to client | `channel_closed`, `token_expiring`, `token_expired`, `going_away` | Notices the TypeScript client reports through `onProtocolError` |
+
+The [protocol reference](/realtime/protocol) documents each frame's fields for clients written in other languages.
+
+
+## A collaborative document
+
+Several people editing one document need three things from realtime: who else is there, what they are changing, and a way to save the result.
+Realtime handles the first two; records handle the third.
+
+```typescript
+interface Edit { field: string; value: string; version: number }
+
+export async function openDocument(docId: string, me: { id: string; name: string }, apply: (edit: Edit, from: string | null) => void) {
+  const channel = pawabase.realtime.channel<Edit, { name: string; field?: string }>(`doc:${docId}`, { presence: { name: me.name } });
+
+  channel.onEvent("edit", (message) => {
+    if (message.from !== me.id) apply(message.payload, message.from);
+  });
+  await channel.subscribe();
+
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  return {
+    focus: (field: string) => channel.track({ name: me.name, field }),
+    edit: async (edit: Edit) => {
+      await channel.send("edit", edit);
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => void pawabase.from("documents").update(docId, { [edit.field]: edit.value }), 1500);
+    },
+    close: () => channel.unsubscribe(),
+  };
+}
+```
+
+Presence shows which field each person is in, so the interface can show "Grace is editing the title".
+Edits go out at once for the others to see, and the record is saved after a pause in typing.
+
+This last-writer-wins approach suits forms and short fields.
+Long text edited by several people at once needs a conflict-free merging library on top; realtime then carries that library's updates as payloads.
+
+
+## Progress for long work
+
+Long jobs can report progress to the person who started them through their private channel.
+
+<CodeGroup>
+```typescript TypeScript
+export async function runImport(importId: string, ownerId: string, rows: unknown[]) {
+  let lastReport = 0;
+  for (let index = 0; index < rows.length; index++) {
+    await importRow(rows[index]);
+    if (Date.now() - lastReport > 1000 || index === rows.length - 1) {
+      lastReport = Date.now();
+      await service.realtime.publish(`user:${ownerId}`, "import.progress", { import_id: importId, done: index + 1, total: rows.length });
+    }
+  }
+  await service.from("imports").update(importId, { status: "done" });
+}
+
+declare const service: import("@pawabase/client").PawabaseClient;
+declare function importRow(row: unknown): Promise<void>;
+```
+
+```python Python
+import time
+
+
+def run_import(import_id: str, owner_id: str, rows: list) -> None:
+    last_report = 0.0
+    for index, row in enumerate(rows):
+        import_row(row)
+        if time.monotonic() - last_report > 1 or index == len(rows) - 1:
+            last_report = time.monotonic()
+            service.realtime.publish(f"user:{owner_id}", "import.progress", {"import_id": import_id, "done": index + 1, "total": len(rows)})
+    service.from_("imports").update(import_id, {"status": "done"})
+```
+</CodeGroup>
+
+Reporting at most once a second keeps the messages useful without flooding the channel.
+The final status goes into the record, so a person who reconnects after the job finished still sees that it did.
+
+
+## Abuse and moderation
+
+Any channel people can publish to can be misused.
+The platform limits the damage; your rules and your application decide the rest.
+
+| Concern | What the platform does | What you can do |
+| --- | --- | --- |
+| Flooding | Refuses sends over the rate limit; closes persistent offenders with `4008` | Throttle your own sends; keep publish policies narrow |
+| Oversized messages | Refuses messages over 64 KiB and presence over 2 KiB | Validate before sending |
+| Unwanted members | Applies subscribe policies | Require a role or membership in the rule |
+| Abusive content | Nothing; it delivers payloads as sent | Send chat through a route that checks content, and publish from the server |
+| Removing a person from a channel | Re-checks subscriptions when rules change | Change their role or membership, so the rule refuses them |
+
+For public chat, publishing through a server is the strongest design: clients call a route, the flow checks and stores the message, and a secret-key publish delivers it.
+Clients then never publish directly, and the environment can turn client publishing off.
+
+
+## Realtime with a query cache
+
+Applications that use a query cache, such as TanStack Query, can let realtime tell the cache when data changed, instead of patching rows by hand.
+
+```typescript
+import { QueryClient } from "@tanstack/react-query";
+
+export function invalidateOnChanges(queryClient: QueryClient, resources: string[]) {
+  const stops = resources.map((resource) => {
+    const channel = pawabase.realtime.channel(`resource:${resource}`);
+    const stop = channel.on("message", () => void queryClient.invalidateQueries({ queryKey: [resource] }));
+    void channel.subscribe();
+    return () => {
+      stop();
+      void channel.unsubscribe();
+    };
+  });
+  return () => stops.forEach((stop) => stop());
+}
+```
+
+Invalidation refetches the affected queries, so every screen shows data that went through the same filters, sorting and policies as the first load.
+It costs a request per change, which is fine for data that changes a few times a minute and wasteful for data that changes many times a second.
+
+
+## Accessible live updates
+
+Content that changes without the person acting can be missed by people using screen readers.
+Announce important live changes in an `aria-live` region, and keep the announcements short.
+
+```tsx
+export function LiveAnnouncer({ message }: { message: string }) {
+  return (
+    <div aria-live="polite" aria-atomic="true" className="sr-only">
+      {message}
+    </div>
+  );
+}
+```
+
+Announce "3 new messages", not each message.
+Do not move keyboard focus when content arrives.
+
+
+## Moving from polling to realtime
+
+Many applications start by polling and move to realtime later.
+The move is safer in steps than all at once.
+
+| Step | Change |
+| --- | --- |
+| Keep the poll, lengthen its interval | The screen still works if realtime fails |
+| Subscribe to the resource's changes and update the screen from them | Changes appear immediately |
+| Reload on `subscribed` | Reconnects are covered |
+| Remove the poll once realtime has been reliable in production | Fewer requests |
+
+A slow poll kept as a safety net, such as once every few minutes, costs little and protects against bugs in change handling.

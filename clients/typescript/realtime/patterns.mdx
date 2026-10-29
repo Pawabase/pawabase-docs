@@ -1,0 +1,227 @@
+---
+title: "Patterns"
+description: "A chat room combines history for context, live messages, presence for the member list, and a send with an optimistic copy."
+icon: "radio"
+---
+
+### A chat room
+
+A chat room combines history for context, live messages, presence for the member list, and a send with an optimistic copy.
+
+```typescript
+import { RealtimeError } from "@pawabase/client";
+
+interface ChatMessage { text: string }
+interface Member { name: string }
+
+export async function openRoom(roomId: string, me: Member, render: (state: RoomState) => void) {
+  const state: RoomState = { messages: [], members: [], pending: new Map() };
+  const room = pawabase.realtime.channel<ChatMessage, Member>(`chat:${roomId}`, { presence: me, replay: 50 });
+
+  room.on("message", (message) => {
+    state.pending.delete(message.id);
+    if (!state.messages.some((existing) => existing.id === message.id)) state.messages.push(message);
+    render(state);
+  });
+  room.on("presence", ({ members }) => {
+    state.members = members.map((member) => member.meta);
+    render(state);
+  });
+
+  await room.subscribe();
+  state.messages = await room.history(50);
+  render(state);
+
+  return {
+    async send(text: string) {
+      try {
+        const { id } = await room.send("message", { text });
+        state.pending.set(id, text);
+      } catch (error) {
+        if (error instanceof RealtimeError && error.code === "payload_too_large") throw new Error("That message is too long.");
+        throw error;
+      }
+    },
+    close: () => room.unsubscribe(),
+  };
+}
+
+interface RoomState {
+  messages: Array<import("@pawabase/client").ChannelMessage<ChatMessage>>;
+  members: Member[];
+  pending: Map<string, string>;
+}
+```
+
+The message list is keyed by id, so a message that arrives through both history and live delivery appears once.
+For chat that must be kept permanently, also store each message as a record, and use realtime for delivery only.
+
+### A typing indicator
+
+Typing indicators send often, so throttle them, and expire them on the receiving side.
+
+```typescript
+let lastSent = 0;
+
+export function onInput(room: import("@pawabase/client").RealtimeChannel) {
+  const now = Date.now();
+  if (now - lastSent < 2000) return;
+  lastSent = now;
+  void room.send("typing", {}).catch(() => undefined);
+}
+
+const typing = new Map<string, number>();
+room.onEvent("typing", (message) => {
+  if (message.from) typing.set(message.from, Date.now());
+});
+setInterval(() => {
+  for (const [user, at] of typing) if (Date.now() - at > 4000) typing.delete(user);
+  renderTyping([...typing.keys()]);
+}, 1000);
+
+declare const room: import("@pawabase/client").RealtimeChannel;
+declare function renderTyping(users: string[]): void;
+```
+
+Sending at most every two seconds keeps the connection well under its rate limit even with many people typing.
+
+### Personal notifications
+
+A rule with the pattern `user:{{ auth.user_id }}`, subscribe `authenticated` and publish restricted to services gives each person a private inbox that only servers write to.
+
+```typescript
+export async function listenForNotifications(onNotify: (note: { title: string; href: string }) => void) {
+  const user = await pawabase.auth.getCachedUser();
+  if (!user) return () => undefined;
+  const inbox = pawabase.realtime.channel<{ title: string; href: string }>(`user:${user.id}`, { replay: 20 });
+  const stop = inbox.onEvent("notification", (message) => onNotify(message.payload));
+  await inbox.subscribe();
+  return async () => {
+    stop();
+    await inbox.unsubscribe();
+  };
+}
+```
+
+Servers and flows publish to `user:<id>` with a secret key.
+Pair the live notification with a stored record, so a person who was offline still sees it in a notification list.
+
+### Live cursors
+
+Cursors change many times a second, which is too often to send each change.
+Send positions as presence data at a steady, modest rate, and let presence deliver them.
+
+```typescript
+let pending: { x: number; y: number } | null = null;
+
+document.addEventListener("pointermove", (event) => {
+  pending = { x: event.clientX / innerWidth, y: event.clientY / innerHeight };
+});
+
+setInterval(() => {
+  if (!pending) return;
+  void doc.track({ name: me.name, cursor: pending }).catch(() => undefined);
+  pending = null;
+}, 100);
+
+doc.on("presence", ({ members }) => renderCursors(members.filter((member) => member.user_id !== me.id)));
+
+declare const doc: import("@pawabase/client").RealtimeChannel<unknown, { name: string; cursor: { x: number; y: number } }>;
+declare const me: { id: string; name: string };
+declare function renderCursors(members: unknown[]): void;
+```
+
+Positions as fractions of the window make cursors meaningful across screen sizes.
+Ten updates a second is smooth enough for cursors and stays small next to the presence size limit.
+
+### A live dashboard
+
+A dashboard of orders combines an initial load, live changes, and a reload after reconnects.
+
+```typescript
+export async function liveOrders(render: (rows: Order[]) => void) {
+  let rows: Order[] = [];
+  const load = async () => {
+    rows = (await pawabase.from("orders").eq("status", "open").order("created_at", "desc").perPage(100)).data as Order[];
+    render(rows);
+  };
+
+  const changes = pawabase.realtime.channel("resource:orders");
+  changes.on("message", (message) => {
+    const { change, record } = message.payload as { change: string; record: Order };
+    rows = rows.filter((row) => row.id !== record.id);
+    if (change !== "deleted" && record.status === "open") rows = [record, ...rows];
+    render(rows);
+  });
+  changes.on("subscribed", () => void load());
+
+  await changes.subscribe();
+  return () => changes.unsubscribe();
+}
+
+interface Order { id: string; status: string; created_at: string }
+```
+
+Loading on every `subscribed` event covers the first join and each rejoin after a reconnect.
+The list is therefore correct even after a long disconnection, which replay alone cannot guarantee.
+
+### Broadcasting from a worker
+
+A background job that finishes work tells the people waiting for it, with a secret-key client and HTTP publishing:
+
+<CodeGroup>
+```typescript TypeScript
+export async function finishExport(exportId: string, ownerId: string, fileKey: string) {
+  await service.from("exports").update(exportId, { status: "done", file_key: fileKey });
+  await service.realtime.publish(`user:${ownerId}`, "export.done", { export_id: exportId });
+}
+
+declare const service: import("@pawabase/client").PawabaseClient;
+```
+
+```python Python
+def finish_export(export_id: str, owner_id: str, file_key: str) -> None:
+    service.from_("exports").update(export_id, {"status": "done", "file_key": file_key})
+    service.realtime.publish(f"user:{owner_id}", "export.done", {"export_id": export_id})
+```
+</CodeGroup>
+
+The record update is the source of truth; the message is a nudge so the screen updates at once.
+
+
+## Realtime in React
+
+A small hook subscribes when a component mounts and unsubscribes when it unmounts.
+Because channel objects are shared by name, several components can use the same channel safely.
+
+```tsx
+import { useEffect, useState } from "react";
+import type { ChannelMessage } from "@pawabase/client";
+
+export function useChannelMessages<T>(name: string, limit = 100) {
+  const [messages, setMessages] = useState<ChannelMessage<T>[]>([]);
+
+  useEffect(() => {
+    const channel = pawabase.realtime.channel<T>(name);
+    const stop = channel.on("message", (message) => {
+      setMessages((current) => [...current.slice(-(limit - 1)), message]);
+    });
+    void channel.subscribe().catch(() => undefined);
+    return () => {
+      stop();
+      void channel.unsubscribe();
+    };
+  }, [name, limit]);
+
+  return messages;
+}
+
+export function useRealtimeStatus() {
+  const [status, setStatus] = useState(pawabase.realtime.status);
+  useEffect(() => pawabase.realtime.onStatusChange(setStatus), []);
+  return status;
+}
+```
+
+Unsubscribing in the cleanup of one component unsubscribes the shared channel for every component using it.
+When several components share a channel, keep the subscription in one place, such as a provider, and let components only listen.

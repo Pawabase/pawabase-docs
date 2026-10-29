@@ -1,0 +1,268 @@
+---
+title: "Authorization is a snapshot; authentication is not"
+description: "Worth separating, because the two fail differently."
+icon: "shield-check"
+---
+
+Worth separating, because the two fail differently.
+
+**Authentication** is checked cryptographically on every request and is always
+current as far as the signature goes. A valid signature is a valid signature.
+
+**Authorization** — roles, permissions, org membership — was read from the database
+when the token was minted. It can be up to `access_ttl` stale, and nothing
+revalidates it.
+
+| Change | When it takes effect |
+| --- | --- |
+| Disabling an account | Immediately for new sign-ins; existing tokens until expiry |
+| Revoking a session | Immediately for refresh; existing access tokens until expiry |
+| Adding or removing a role | Next refresh |
+| Changing an org membership or role | Next refresh |
+| Turning off MFA for a user | Next refresh |
+
+<Warning>
+This asymmetry bites hardest on revocation of access. Roles disappear quickly;
+account disablement does not, because a service verifying a signature has no way to
+know the account is gone. If you need immediate cut-off, revoke at the gateway or
+in your own middleware rather than relying on the auth service.
+</Warning>
+
+The practical rule: **use claims for gating, use the routes for decisions.** A
+claim is right for deciding whether to show a menu item or which variant of a screen
+to render. It is not right for deciding whether to move a large amount of money or
+grant a permission — read the current state for those.
+
+
+## What Pawabase cannot protect you from
+
+Being explicit about this is more useful than a reassuring summary.
+
+**A compromised service key is a full account.** A secret key can create, update
+and delete users, manage sessions, reset MFA and change roles. There is no
+scoping below "full access" on the auth admin routes. Treat a secret key the way
+you would treat root on a database, store it in a secret manager, and rotate it
+when someone leaves.
+
+**XSS defeats cookie and header storage alike.** An `httpOnly` cookie keeps the
+refresh token out of reach of JavaScript, but an XSS can still make authenticated
+requests as the user. The storage decision buys you one class of defence, not
+immunity.
+
+**A compromised host is game over.** If `master_key` or `jwt_master_secret`
+leaks, the derived keys can be regenerated and forged tokens minted for any
+environment. These are the two secrets that matter most, and both are checked at
+startup — services refuse to start in production while development defaults are in
+place.
+
+**Your own client bugs.** The largest single source of real auth incidents in a
+system with rotation is a client that races its own refreshes. That is not an
+attack, and no server-side control can distinguish it from theft.
+
+
+## Environment isolation as a security property
+
+The tenancy rule deserves its own treatment, because it is a containment boundary
+rather than a feature.
+
+Every user belongs to exactly one `project` + `env` pair, and that pair is part of
+every query and every token. The practical consequences:
+
+- An email address with an account in `acme/staging` has no account in
+  `acme/production`. The staging password does not work there, and there is no
+  account to attack.
+- A staging session cannot be used against production. The signing key is derived
+  per environment, and the `prj` and `env` claims are re-checked after the
+  signature verifies.
+- "Revoke every session" for a user means every session **in that environment**.
+  Other environments are untouched.
+
+<Warning>
+This containment works in one direction. A compromise of `jwt_master_secret` is
+**not** contained, because every environment's key is derived from it. Environment
+isolation reduces the blast radius of a leaked per-environment secret; it does
+nothing for the master.
+</Warning>
+
+This is why staging should be treated as a genuine separate system rather than a
+copy that shares credentials, and why promoting a database between environments
+without promoting its auth configuration produces confusing results.
+
+
+## Key rotation, and what it does and does not fix
+
+There are three secrets with different rotation properties, and conflating them
+causes real problems.
+
+| Secret | Derives | Rotating it means |
+| --- | --- | --- |
+| `internal_secret` | Context tokens, OAuth state, one-time link signatures | Unissued links and in-flight OAuth flows stop validating |
+| `jwt_master_secret` | Every environment's user-token signing key | **Every access and refresh token in every environment stops verifying** |
+| `master_key` | Sealed secrets and TOTP factors | Every stored secret and MFA factor becomes unreadable |
+
+<Warning>
+Rotating `jwt_master_secret` signs everyone out of every environment on the
+installation at once, because there is no key id in the tokens to select between
+old and new. Rotating `master_key` without a backup is worse — it permanently
+locks out every user who enrolled MFA, with no recovery path.
+</Warning>
+
+The per-environment keys themselves cannot be rotated independently, because they
+are *derived* from the master rather than stored. That is the deliberate trade:
+deterministic derivation means every service can verify a token without calling
+Akountz, at the cost of making the master the single point of rotation.
+
+<Info>
+This is also why `master_key` and `jwt_master_secret` are checked at startup in
+production. A development default for either is not a code smell to be cleaned up
+later — it is a condition the platform refuses to run in.
+</Info>
+
+
+## Data at rest
+
+Two categories of sensitive material, handled differently.
+
+**Passwords** are hashed by the platform's hashing layer, bcrypt by default with a
+fallback to `pbkdf2_sha256`. Hashes are one-way; recovering a password is not
+possible, by design.
+
+**TOTP secrets** cannot be hashed, because the authenticator app needs to reproduce
+a code from them on every use. They are therefore **encrypted** with the platform's
+secret box, keyed by `master_key`. This is the one piece of authentication state
+where secrecy depends entirely on a single key.
+
+| Material | Protection | If compromised |
+| --- | --- | --- |
+| Password hashes | Hashed, bcrypt by default | Offline guessing becomes feasible |
+| Recovery codes | SHA-256 hashed | Usable as MFA bypass without the TOTP secret |
+| TOTP secrets | Encrypted with `master_key` | MFA is bypassable |
+| One-time link tokens | Signed reference to a row | Forgery needs the internal secret |
+
+The recovery-code row is the interesting one: because those codes are stored
+hashed, a stolen database yields nothing usable on the MFA path. It is the reason
+recovery codes are not the weak link they usually are.
+
+
+## The admin surface is a full-privilege surface
+
+Every route under the auth admin base is authenticated as a service, and none of
+them are scoped. A credential that can reach them can do all of this:
+
+- Create, update and delete any user
+- Disable and re-enable accounts
+- Reset any user's MFA
+- Revoke any session, including all of them
+- Set passwords directly, bypassing the user's recovery flow
+- Grant and revoke roles and permissions
+- Export a backup containing password hashes
+
+There is no read-only key, and no per-collection scoping on these routes.
+
+<Warning>
+This is why "sign out everywhere" and "disable" are not equivalent tools. Disabling
+is the blunt one — it also revokes sessions, and it takes effect on new sign-ins
+immediately, while existing access tokens live out their remaining lifetime.
+Prefer disabling for a compromised account and revoking for a routine
+device-loss case.
+</Warning>
+
+The soft-delete behaviour is worth knowing before you use it: deleting a user
+revokes sessions, deletes their identities and factors, marks them inactive, and
+**rewrites the email to a non-routable placeholder** so the original address is
+released for re-use. The history stays attributable; the address does not.
+
+
+## Rate limiting, precisely
+
+Three buckets, all keyed by IP against the installation's Redis, and all three are
+per-IP rather than per-account. That distinction matters: a shared office NAT puts
+many legitimate users behind one address, and a determined attacker rotates
+addresses easily.
+
+| Bucket | Limit | Window | Applies to |
+| --- | --- | --- | --- |
+| `akz:auth` | 30 | 60s | `/signup` and `/token`, all three grants |
+| `akz:mfa` | 10 | 60s | MFA verify, disable and recovery-code replacement |
+| `akz:links` | 10 | 60s | The emailed one-time link flows |
+
+Two consequences worth internalising.
+
+**The `/token` bucket is shared across grants.** A client stuck in a refresh loop
+can exhaust the same 30-per-minute allowance that sign-in draws on, and you will
+see a `429` on a request you would not expect to be limited.
+
+**Per-IP plus per-account is the effective bound on guessing.** Neither mechanism
+knows about the other. A distributed attacker gets 30 attempts a minute from each
+address, and the per-account lockout is what actually stops a single account being
+grounded down — which is why the lockout counter exists at all.
+
+<Info>
+Account lockout is the only per-account control in the system. Everything else is
+per-IP, so anything that depends on rate limiting alone is bypassable by an
+attacker with addresses.
+</Info>
+
+
+## The one-time link model
+
+Emailed links are the least obvious part of the security model, because they are
+neither JWTs nor session credentials.
+
+A link token is a **signed reference to a database row**. The signature makes it
+unforgeable and time-limited; the row makes it single-use and revocable. Both
+halves are necessary — a signature alone would be replayable, and a row id alone
+would be guessable.
+
+| Purpose | Lifetime |
+| --- | --- |
+| `verify` | 24 hours |
+| `recovery` | 1 hour |
+| `magic` | 15 minutes |
+| `mfa` | 5 minutes |
+| `email_change` | 24 hours |
+| `invite` | 7 days |
+| `link` | 10 minutes |
+
+Three properties make this design safe:
+
+**Consumption is a conditional update.** The row is updated with a condition that
+it is still unused; if the update matches nothing, someone else already spent it.
+Two simultaneous clicks on the same emailed link produce one success and one
+failure, and neither double-spends.
+
+**Every failure is the same error.** Unknown, used, expired and wrong-purpose all
+produce one identical response. An attacker cannot distinguish "already clicked"
+from "never existed" — which would otherwise be an account-existence oracle.
+
+**Purpose is baked into the signing.** A token signed for `verify` does not
+validate as a `recovery` token, so a link from one flow cannot be replayed into
+another.
+
+<Warning>
+The five-minute MFA challenge is the tightest of these, and it is worth
+understanding why a wrong code does not consume it: the server peeks the token to
+find the user, verifies the code, and consumes only on success. Users get the full
+five minutes to try again, bounded instead by the lockout counter and the MFA rate
+limit.
+</Warning>
+
+
+## Where Akountz-hosted pages differ
+
+One configuration detail has a visible security consequence. The URL a message
+links to depends on whether the environment has a `site_url`:
+
+- **With `site_url`**, the link goes to your application, which completes the flow
+  by calling the API.
+- **Without one**, the link goes to Akountz's own hosted page, which completes the
+  flow server-side.
+
+So an environment with no `site_url` has Akountz rendering forms that handle
+passwords and codes directly. That is a real difference in where credentials are
+typed, and it is worth deciding deliberately rather than by omission.
+
+<Info>
+The hosted pages exist so an environment is usable before anyone has built a
+frontend. They are a starting point, not a default to keep in production.
+</Info>

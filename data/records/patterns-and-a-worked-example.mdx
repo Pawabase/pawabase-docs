@@ -1,0 +1,327 @@
+---
+title: "Patterns and a worked example"
+description: "The building blocks above combine into a handful of patterns that cover most screens. Each pattern below explains why it is built the way it is."
+icon: "table"
+---
+
+## Patterns for common screens
+
+The building blocks above combine into a handful of patterns that cover most screens.
+Each pattern below explains why it is built the way it is.
+
+### A sortable, filterable table
+
+A table screen keeps its state in the URL, so a reload or a shared link shows the same view.
+The query is rebuilt from that state on every change, which is cheap because queries are values.
+
+```typescript
+import type { Row } from "./database";
+
+interface TableState {
+  status?: "open" | "paid" | "cancelled";
+  search?: string;
+  sort: "created_at" | "total_minor";
+  direction: "asc" | "desc";
+  page: number;
+}
+
+export async function loadOrdersTable(state: TableState, signal?: AbortSignal) {
+  let query = pawabase.from("orders").query();
+  if (state.status) query = query.eq("status", state.status);
+  if (state.search) query = query.ilike("reference", `*${state.search}*`);
+  return query
+    .order(state.sort, state.direction)
+    .order("id", state.direction)
+    .page(state.page)
+    .perPage(25)
+    .withOptions({ signal });
+}
+```
+
+The `id` tie-breaker keeps pages stable when many rows share a sort value.
+The signal lets the screen cancel a request that a newer state has made irrelevant.
+
+The page count comes from `total`.
+When `total` is `null`, show "next" and "previous" without a page count, and disable "next" after an empty page.
+
+```typescript
+function pagination(result: { page: number; per_page: number; total: number | null; data: unknown[] }) {
+  if (result.total !== null) {
+    const pages = Math.max(1, Math.ceil(result.total / result.per_page));
+    return { pages, hasNext: result.page < pages };
+  }
+  return { pages: null, hasNext: result.data.length > 0 };
+}
+```
+
+### Infinite scroll
+
+Infinite scroll should not use page numbers.
+Rows arriving while the user scrolls would shift every later page, producing duplicates.
+Keyset pagination on a stable sort avoids that.
+
+```typescript
+export async function nextFeedPage(cursor: { createdAt: string; id: string } | null) {
+  let query = pawabase.from("posts").eq("status", "live").order("created_at", "desc").order("id", "desc");
+  if (cursor) query = query.lte("created_at", cursor.createdAt);
+  const page = await query.perPage(30);
+  const rows = cursor
+    ? page.data.filter((post) => post.created_at < cursor.createdAt || (post.created_at === cursor.createdAt && post.id < cursor.id))
+    : page.data;
+  const last = rows[rows.length - 1];
+  return { rows, cursor: last ? { createdAt: last.created_at, id: last.id } : cursor };
+}
+```
+
+The server filter uses `lte` on `created_at` only, because the one-filter-per-field rule prevents a compound condition.
+The client-side filter then drops the rows at the boundary that were already shown.
+This is a common shape: the server narrows, your code finishes.
+
+### A detail page from a URL
+
+An id from a URL might not exist, might belong to someone else, or might be malformed.
+All three should show the same "not found" page.
+
+```typescript
+import { NotFoundError, ValidationError } from "@pawabase/client";
+
+export async function loadOrderPage(id: string) {
+  try {
+    const order = await pawabase.from("orders").maybeGet(id, { expand: ["customer", "items"] });
+    return order ? { status: 200, order } : { status: 404 };
+  } catch (error) {
+    if (error instanceof ValidationError) return { status: 404 };
+    throw error;
+  }
+}
+```
+
+A malformed id, such as text for an integer key, can be refused before the record is looked up, which is why the example treats a validation error as "not found" too.
+Every other error is unexpected on this page and should reach your error boundary.
+
+### A search box
+
+A search box sends a request per keystroke unless you slow it down, and responses can arrive out of order.
+Debouncing reduces the requests; cancelling the previous one prevents an old answer from overwriting a newer one.
+
+```typescript
+let controller: AbortController | null = null;
+let timer: ReturnType<typeof setTimeout> | null = null;
+
+export function searchCustomers(text: string, onResults: (rows: unknown[]) => void) {
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(async () => {
+    controller?.abort();
+    controller = new AbortController();
+    if (text.trim().length < 2) return onResults([]);
+    try {
+      const page = await pawabase
+        .from("customers")
+        .ilike("name", `*${text.trim()}*`)
+        .select("id", "name", "email")
+        .perPage(10)
+        .withOptions({ signal: controller.signal });
+      onResults(page.data);
+    } catch (error) {
+      if (!(error instanceof AbortError)) throw error;
+    }
+  }, 250);
+}
+```
+
+A leading wildcard pattern cannot use an ordinary index, so `*text*` on a large table scans it.
+For large tables, search a prefix (`text*`), or add a search route that uses the database's full-text features.
+
+### Dashboard counts
+
+A dashboard often shows several counts.
+Each `count()` is a small request, and they run in parallel.
+
+```typescript
+export async function dashboardCounts() {
+  const orders = pawabase.from("orders");
+  const [open, paid, cancelled] = await Promise.all([
+    orders.eq("status", "open").count(),
+    orders.eq("status", "paid").count(),
+    orders.eq("status", "cancelled").count(),
+  ]);
+  return { open, paid, cancelled };
+}
+```
+
+If any count can hit a per-row policy, it throws `InvalidQueryError`.
+Use `Promise.allSettled` when one unknown count should not hide the others, and show "unknown" for that tile.
+
+For sums, averages and group-by counts, write a custom route; the data API counts rows but does not aggregate values.
+
+### A create and edit form
+
+A form for one record does three things with the client: load the record when editing, send only what changed, and map errors to fields.
+
+```typescript
+import { ConflictError, ValidationError } from "@pawabase/client";
+
+export async function saveProduct(id: string | null, values: Record<string, unknown>, original?: Record<string, unknown>) {
+  const products = pawabase.from("products");
+  try {
+    if (!id) return { ok: true, product: await products.create(values as never) };
+    const changed = Object.fromEntries(Object.entries(values).filter(([key, value]) => original?.[key] !== value));
+    return { ok: true, product: await products.update(id, changed as never) };
+  } catch (error) {
+    if (error instanceof ValidationError) return { ok: false, errors: error.byField() };
+    if (error instanceof ConflictError) {
+      const columns = (error.details as { columns?: string[] } | undefined)?.columns ?? [];
+      return { ok: false, errors: Object.fromEntries(columns.map((column) => [column, ["Already in use."]])) };
+    }
+    throw error;
+  }
+}
+```
+
+Sending only changed fields has a practical benefit beyond less traffic.
+Two people editing different fields of the same record no longer overwrite each other's changes.
+
+
+## A worked example from definition to screen
+
+Following one resource from its definition to a rendered list shows how each piece on this page connects to what you configure in Studio.
+
+The resource is a personal task list.
+Its definition, as the **JSON** tab of the resource editor under **Data** shows it:
+
+```json
+{
+  "name": "tasks",
+  "id_type": "ulid",
+  "fields": [
+    {"name": "title", "type": "string", "required": true, "max_length": 200},
+    {"name": "done", "type": "boolean", "default": false},
+    {"name": "due_on", "type": "date"},
+    {"name": "priority", "type": "integer", "enum": [1, 2, 3], "default": 2},
+    {"name": "project_id", "type": "string"}
+  ],
+  "operations": {
+    "list": {"enabled": true, "policy": "owner:user_id"},
+    "get": {"enabled": true, "policy": "owner:user_id"},
+    "create": {"enabled": true, "policy": "authenticated"},
+    "update": {"enabled": true, "policy": "owner:user_id"},
+    "delete": {"enabled": true, "policy": "owner:user_id"}
+  },
+  "relations": [
+    {"name": "project", "resource": "projects", "field": "project_id", "type": "belongs_to"}
+  ],
+  "owner_field": "user_id",
+  "timestamps": true,
+  "realtime": true
+}
+```
+
+A screen that lists the signed-in user's unfinished tasks, soonest due first, with each task's project:
+
+<CodeGroup>
+```typescript TypeScript
+const tasks = await pawabase
+  .from("tasks")
+  .eq("done", false)
+  .order("due_on")
+  .order("id")
+  .expand("project")
+  .perPage(50);
+```
+
+```python Python
+tasks = pb.from_("tasks").eq("done", False).order("due_on").order("id").expand("project").per_page(50).execute()
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/rest/v1/tasks" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" --data-urlencode "filter[done]=is.false" --data-urlencode "sort=due_on,id" \
+  --data-urlencode "expand=project" --data-urlencode "per_page=50"
+```
+</CodeGroup>
+
+The client sends:
+
+```text
+GET /rest/v1/tasks?filter[done]=is.false&sort=due_on,id&expand=project&per_page=50
+apikey: pb_pk_…
+authorization: Bearer eyJ…
+```
+
+The server compiles the `owner:user_id` policy into a database filter on `user_id`, adds the client's `done` filter, sorts, reads 50 rows, embeds each row's project, and answers:
+
+```json
+{
+  "data": [
+    {
+      "id": "01JB9C2W0Q3M7Y8D4E5F6G7H8J",
+      "title": "Send the quarterly report",
+      "done": false,
+      "due_on": "2026-10-27",
+      "priority": 1,
+      "project_id": "01JB8Z3T6K9QX2V3B4N5M6P7Q8",
+      "user_id": "u_7",
+      "created_at": "2026-10-20T08:14:03.512Z",
+      "updated_at": "2026-10-20T08:14:03.512Z",
+      "project": { "id": "01JB8Z3T6K9QX2V3B4N5M6P7Q8", "name": "Finance" }
+    }
+  ],
+  "page": 1,
+  "per_page": 50,
+  "total": 1
+}
+```
+
+`total` is a number because the owner policy was pushed into the database.
+Had the policy compared two fields of the row, `total` would be `null`.
+
+Marking the task done is a single-field patch:
+
+<CodeGroup>
+```typescript TypeScript
+await pawabase.from("tasks").update("01JB9C2W0Q3M7Y8D4E5F6G7H8J", { done: true });
+```
+
+```python Python
+pb.from_("tasks").update("01JB9C2W0Q3M7Y8D4E5F6G7H8J", {"done": True})
+```
+
+```bash cURL
+curl -X PATCH "$PAWABASE_URL/rest/v1/tasks/01JB9C2W0Q3M7Y8D4E5F6G7H8J" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"done": true}'
+```
+</CodeGroup>
+
+The server loads the task, checks `owner:user_id` against it, writes `done`, updates `updated_at`, publishes `tasks.updated` to subscribers of the resource's events, and sends the change on the `resource:tasks` channel to every subscriber who may read that task.
+
+
+## Keeping a list fresh with realtime
+
+A resource with realtime turned on publishes every create, update and delete on the channel `resource:<name>`, checked per subscriber against the resource's read policy.
+Combining a query with that channel keeps a screen current without polling.
+
+```typescript
+const orders = pawabase.from("orders");
+let rows = (await orders.eq("status", "open").order("created_at", "desc").perPage(50)).data;
+
+const channel = pawabase.realtime.channel("resource:orders");
+channel.on("message", (message) => {
+  const { change, record } = message.payload as { change: "created" | "updated" | "deleted"; record: { id: string; status: string } };
+  if (change === "deleted" || record.status !== "open") {
+    rows = rows.filter((row) => row.id !== record.id);
+  } else if (change === "created") {
+    rows = [record as never, ...rows];
+  } else {
+    rows = rows.map((row) => (row.id === record.id ? (record as never) : row));
+  }
+  render(rows);
+});
+await channel.subscribe();
+
+declare function render(rows: unknown[]): void;
+```
+
+Realtime tells you about changes; it does not apply your query's filters for you.
+Re-check each changed record against the screen's filters, as the example does with `status`.
+
+After a reconnect, reload the query.
+Messages sent while the socket was down are not delivered unless the channel was created with `replay`, and even then only up to the history limit.
+See [Realtime](/clients/typescript/realtime/overview).

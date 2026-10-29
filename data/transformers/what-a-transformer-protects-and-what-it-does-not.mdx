@@ -1,0 +1,228 @@
+---
+title: "What a transformer protects, and what it does not"
+description: "The most common mistake with transformers is to treat omit as access control. It is a presentation step, and the places it does not apply are as…"
+icon: "wand"
+---
+
+The most common mistake with transformers is to treat `omit` as access control. It is a **presentation** step, and the places it does not apply are as important as the places it does.
+
+### Where a hidden field can still be reached
+
+| Path | Does the transformer hide the field? |
+| --- | --- |
+| `GET /rest/v1/<resource>` and `/<id>` | **Yes** |
+| The 201 and 200 bodies of `POST` and `PATCH` | **Yes** |
+| `?expand=` of this resource from another | **Yes**, by this resource's transformer |
+| **A filter** on the hidden field | **No.** A caller can filter by it, and the rows returned reveal it |
+| **Events** (`posts.created` and so on) | **No.** The payload carries the raw record |
+| **Webhooks** | **No.** They deliver events |
+| **Realtime** broadcasts of the resource | **No.** The raw record is published |
+| **The Records tab and the Database console** | **No.** Operators see raw rows |
+| **A flow's `resource.*` blocks** | **No.** The transformer runs in the data plane's response path, and flows read through the store as trusted code |
+| **A column you did not declare** | Returned unless `omit`ted. A resource returns the whole row |
+
+Read the fourth row twice. It is the one that most often defeats the intention.
+
+### Filters can read what responses hide
+
+A resource `vault` has a transformer that omits `secret` and `cost`. Responses never contain them. But filters accept any stored column, and a filter's result is a yes or no about the value:
+
+```http
+GET /rest/v1/vault?filter[secret]=like.bravo-k*
+```
+
+If a row comes back, its hidden `secret` starts with `bravo-k`. A caller can extend the prefix one character at a time, or binary search a number with `gt` and `lt`, and recover the value with a few dozen requests. This was run: `filter[secret]=like.b*` returned the `b` row, `like.bravo-k*` narrowed it, `eq.charlie` matched exactly, and `filter[cost]=gte.5` and `gte.9` separated the numeric rows. Every response omitted the field throughout.
+
+The same applies when the field is `write_only`: that flag stops the value being **documented**, not being **returned** or **filtered**. See [Filtering](/data/filtering/offering-the-right-operators-for-each-field-type#filters-can-read-what-responses-hide).
+
+If a value must be unreadable, do not put it in a resource a caller can filter. Options, strongest first:
+
+1. **Keep it out of this table.** Put the secret in a separate resource with a policy that only the owner and operators pass, and keep the public resource free of it.
+2. **Gate the list operation** with a policy that only trusted callers pass, so untrusted callers cannot filter at all.
+3. **Hash it.** Store only a hash, so a prefix search reveals nothing useful.
+4. **Accept the limit**, if the value is low sensitivity, and use the transformer for tidiness only.
+
+### Events, webhooks and realtime carry the raw record
+
+When a resource emits events, the payload is the stored record, before any transformer:
+
+```json
+{
+  "resource": "posts",
+  "change": "created",
+  "record": { "id": 1, "title": "Hello", "secret": "s3", "author_id": "a1", "price_cents": 4900 }
+}
+```
+
+A subscription, a webhook endpoint or a realtime subscriber that receives it sees `secret`, `author_id` and every other column, **in snake case**, whatever the resource's transformer says. If a field is hidden from API readers because it is sensitive, then:
+
+- **Turn off events** for that resource (**Emit events** in the resource's Behaviour section) if nothing needs them.
+- **Turn off realtime** (**Broadcast changes**) if the field is sensitive. Realtime pushes the raw record to anyone allowed to subscribe to the channel.
+- **Shape in a flow.** A flow triggered by the event can build a safe payload with `transform.map` and send **that** on, instead of handing the raw event to a webhook.
+
+See [Resource events](/data/resource-events/overview).
+
+### Deny lists and allow lists
+
+| | `omit` | `pick` |
+| --- | --- | --- |
+| Lists | What to **remove** | What to **keep** |
+| A new column later | **Returned** | **Not returned** |
+| Failure mode | A field you forgot leaks | A field you forgot is missing |
+| Better for | Removing one or two known fields | A public shape that must stay stable |
+
+For anything public, prefer `pick`. A leak is worse than a missing field, and a missing field is noticed in testing, whereas a leaked one is not. A column added to the table by a migration, a flow or a colleague appears in an `omit`-only response without anyone deciding it should.
+
+A combined use: `pick` the public fields, and also `omit` the ones that must never be exposed. If someone later adds one to `pick`, the `omit` still removes it, since `omit` runs first.
+
+```json
+{
+  "omit": ["secret", "cost", "internal_note"],
+  "pick": ["id", "title", "price_cents", "created_at"]
+}
+```
+
+### What `write_only` does instead
+
+A field flag and a transformer are different tools:
+
+| | What it does | What it does not do |
+| --- | --- | --- |
+| `write_only` on a field | Accepted on write, and kept out of the generated API documentation | Keep the value out of **responses** or **filters**. A `write_only` field was returned on every read, and filterable, until a transformer or `select` removed it |
+| `read_only` on a field | Refuses the field on write | Hide it |
+| `omit` in a transformer | Removes the key from this resource's responses | Hide it from filters, events, webhooks or realtime |
+
+Use the transformer to hide, and the flag to document intent. See [Field types](/data/field-types/overview).
+
+
+## Transformers and the cache
+
+When a resource has a cache time (`cache_ttl`), the cached response is the **shaped** one. Two things follow, both observed:
+
+**A transformer change is immediate.** Saving a stored transformer bumps the environment's version, and cache keys include it, so the next request misses and rebuilds with the new shape. No stale shape survives an edit.
+
+**A cached copy is a copy.** On a hit, the body is the stored shaped JSON, and a value computed at build time is **not recomputed**. A `set` of `{{ now }}` on a cached resource showed the same instant on the second request, as it should, but formatted differently:
+
+```text
+miss:  "served": "2026-10-01T21:49:18.535995+00:00"
+hit:   "served": "2026-10-01 21:49:18.535995+00:00"
+```
+
+The hit has a space where the miss has a `T`. The cached copy had been turned to text by a plain string conversion. If a client parses that field strictly, a cached resource will occasionally hand it the other form. Avoid datetimes in `set` on a cached resource, or format them to text in the template with `| str` and accept one form, or normalise on the client.
+
+Because the cache key includes the caller's identity, a template that reads `auth` is safe to cache: each identity has its own entry. See [Caching](/data/caching/overview).
+
+
+## Transformers and promotion
+
+A stored transformer is a definition like any other. **Promote** copies it by name, as an upsert: a transformer changed in the source overwrites the target's, and one deleted in the source stays in the target.
+
+| Concern | What to do |
+| --- | --- |
+| A resource promoted without its transformer | Include `transformers` in the promote, or the target's resource points at a name that does not exist and every read of it is a `500` |
+| A transformer promoted before its resource | Harmless. It is unused until a resource refers to it |
+| A Python transformer | Not promoted. It lives in your code directory, so deploy the code to each environment |
+| An inline transformer | Travels with its resource |
+
+The first row is the one that bites. A promote that carries `resources` and not `transformers` can break a target environment completely. When in doubt, promote everything, which is the default when `include` is omitted. See [Environments and promotion](/studio/environments-and-promotion).
+
+
+## Designing a public shape
+
+The decisions, in the order to make them.
+
+<Steps>
+  <Step title="Decide who reads it">
+    A transformer shapes for **every** reader of the resource. If admins and anonymous visitors need different shapes, use two stored transformers on two routes or two resources, or branch on `auth` in a `set` template, or use a custom route.
+  </Step>
+  <Step title="Pick, do not omit">
+    List the fields a reader needs. Use `pick`. Add `omit` as a second line of defence for the ones that must never leave.
+  </Step>
+  <Step title="Add computed fields with set">
+    A link, a label, a flag derived from the record or the caller. Keep templates to columns the caller always receives (see the `select` caveat).
+  </Step>
+  <Step title="Rename only for a reason">
+    A rename makes the response differ from the filter and sort names. Rename when an external contract demands it.
+  </Step>
+  <Step title="Choose one key case, and say so">
+    `camel` for JavaScript clients, `snake` otherwise. Remember the list envelope keeps its own names.
+  </Step>
+  <Step title="Check the other doors">
+    Events, realtime, filters, the console. Decide for each whether the raw field is acceptable there.
+  </Step>
+</Steps>
+
+
+## Recipes
+
+### A public user
+
+```json
+{
+  "name": "public_user",
+  "definition": {
+    "omit": ["password_hash", "email", "phone"],
+    "rename": { "created_at": "joined" },
+    "case": "camel"
+  }
+}
+```
+
+This is the starting example Studio offers. A user row comes back as `{ "id": 7, "displayName": "Maya", "joined": "..." }`, with no hash, email or phone.
+
+### A stable public shape with `pick`
+
+```json
+{
+  "name": "public_product",
+  "definition": {
+    "pick": ["id", "sku", "title", "price_minor", "currency", "tags"],
+    "set": { "url": "https://shop.example.com/p/{{ record.sku | lower }}" },
+    "case": "camel"
+  }
+}
+```
+
+New columns do not appear until someone adds them to `pick`. `url` is added after `pick`, so it need not be listed.
+
+### Different shapes for different readers
+
+A declarative transformer applies **one** shape to every reader of the resource, because `omit` and `pick` cannot depend on the caller. Two ways to serve two audiences:
+
+- **Two routes**, one open and one for staff, each with its own transformer and its own policy. A custom route returns the same data from a flow. See [Custom routes](/data/custom-routes/overview).
+- **A Python transformer** that checks `context["auth"]` and returns a different dict. See the next recipe.
+
+### Showing a value only to its owner
+
+A `set` can reveal a field to the owner by comparing identities in a Python transformer:
+
+```python
+@transformer("own-or-public")
+async def own_or_public(record, context):
+    visible = {k: v for k, v in record.items() if k not in {"email", "phone"}}
+    if record.get("owner_id") == context["auth"]["user_id"]:
+        visible["email"] = record["email"]
+    return visible
+```
+
+The declarative steps cannot make a key present for some callers and absent for others, so a Python transformer is the tool for that.
+
+### An absolute URL for a stored file
+
+```json
+{ "set": { "avatar_url": "https://cdn.example.com/{{ record.avatar_key }}" } }
+```
+
+Keep the key in the table and build the URL in the response, so a change of CDN is one transformer edit and no data migration.
+
+### A flag derived from the caller
+
+```json
+{ "set": { "mine": "{{ auth.user_id }}" } }
+```
+
+`mine` carries the caller's id on every record, so a client can compare it to `author_id`. For a boolean, use a Python transformer. A template can fetch values and format them, and it cannot compare two of them.
+
+### Consistent output for a client generator
+
+If an SDK generator needs a fixed shape, `pick` the fields, `case` the keys, and keep the transformer's output the contract. Test it (see below), because a transformer response has no schema in the OpenAPI document.

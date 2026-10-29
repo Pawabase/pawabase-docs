@@ -1,0 +1,239 @@
+---
+title: "A worked design: refunding an order"
+description: "A shop wants a refund action that only finance staff may take, that validates the amount, that records the refund, and that tells the client clearly…"
+icon: "route"
+---
+
+A shop wants a **refund** action that only finance staff may take, that validates the amount, that records the refund, and that tells the client clearly what happened.
+
+**The pieces.**
+
+| Piece | Choice |
+| --- | --- |
+| Endpoint | `POST /orders/{id}/refund` |
+| Who | A stored policy `finance_only`: `{"in": ["finance", "$auth.roles"]}` |
+| Body | `input_fields`: `amount_cents` (integer, required, minimum 1) and `reason` (string, required, max 200) |
+| Handler | A flow, `refund_order` |
+| Limits | A rate limit of 20 per minute |
+| Cache | None. A `POST` is never cached |
+
+**The route.**
+
+```json
+{
+  "method": "POST",
+  "path": "/orders/{id}/refund",
+  "name": "Refund an order",
+  "handler_type": "flow",
+  "handler": "refund_order",
+  "policy": "finance_only",
+  "input_fields": [
+    { "name": "amount_cents", "type": "integer", "required": true, "minimum": 1 },
+    { "name": "reason", "type": "string", "required": true, "max_length": 200 }
+  ],
+  "rate_limit": { "limit": 20, "window": 60 }
+}
+```
+
+**The flow, in outline.**
+
+1. `trigger.http`, `POST`, `/orders/{id}/refund`.
+2. `resource.get` the order by `{{ input.params.id }}`. If it does not exist, an `error.raise` with status `404` and code `order_not_found`.
+3. A condition that the amount does not exceed what is left to refund. If it does, an `error.raise` with status `409` and code `refund_exceeds_total`.
+4. `resource.create` a `refunds` record with the order id, the amount, the reason and the caller (`{{ auth.user_id }}` is available to flows through the run's auth).
+5. `resource.update` the order's `status`.
+6. `response.return` with status `201` and the refund as the body.
+
+**What each part guarantees.**
+
+| Concern | Handled by | Outcome |
+| --- | --- | --- |
+| A customer calls it | The policy | `403`, `policy 'finance_only' refused`. Signed out, `401` |
+| A bad amount | `input_fields` | `422`, a bare list naming `amount_cents` |
+| A missing field | `input_fields` | `422`, `Field required` |
+| An unknown extra field | `input_fields` | `422`, `Extra inputs are not permitted` |
+| An order that does not exist | The flow | `404`, `{"error": "order_not_found", ...}` |
+| A refund over the balance | The flow | `409`, `{"error": "refund_exceeds_total", ...}` |
+| A burst of calls | The rate limit | `429` with `retry-after` |
+| Who refunded what, and when | The `refunds` record and the audit trail of the resource | Recorded |
+
+**What it does not guarantee.**
+
+- **Atomicity.** Creating the refund and updating the order are two steps. If the second fails, the first stands. Use `db.transaction` for steps that must succeed together.
+- **Idempotency.** Calling it twice refunds twice. Add an idempotency key to the body, store it, and refuse a repeat.
+- **Hidden fields.** The flow returns whatever it puts in `response.return`. Build the body from the fields the client may see.
+
+
+## Designing a route well
+
+| Principle | In practice |
+| --- | --- |
+| **Name routes for what they do** | `POST /orders/{id}/refund`, not `POST /doRefund`. Resource-like nouns and a verb at the end |
+| **Use the right method** | `GET` for reads (and caching), `POST` for actions, `PUT` and `PATCH` for replacement and change, `DELETE` for removal |
+| **Declare the body** | `input_fields` for strict shapes. Without a model the route accepts anything |
+| **Make the policy explicit** | The default is `authenticated`, which may be broader than you intend. Name a policy |
+| **Rate-limit anything that costs** | Mail, payments, exports, SQL searches |
+| **Return a clear status** | `201` for creation, `202` for accepted work, `409` for a conflict, with an `error` code clients can switch on |
+| **Keep handlers small** | A flow that calls a function for the hard part, a function that does not know about HTTP |
+| **Version by path** | `/v2/orders/{id}/refund` for a breaking change, with the old one left in place |
+| **Keep routes out of resource space** | Use a sub-path (`/orders/{id}/refund`), never the resource's own path |
+
+
+## Testing a route
+
+A route is an HTTP endpoint, so a test is a request. Cover the three outcomes for each route: **who may**, **what is accepted**, and **what happens**.
+
+```python
+def test_refund_requires_finance(api, customer, finance):
+    path = "/rest/v1/orders/7/refund"
+    body = {"amount_cents": 500, "reason": "damaged"}
+
+    assert api.post(path, json=body).status_code == 401                         # signed out
+    assert api.post(path, json=body, auth=customer).status_code == 403           # wrong role
+    assert api.post(path, json=body, auth=finance).status_code in (200, 201)     # allowed
+
+
+def test_refund_validates_the_body(api, finance):
+    path = "/rest/v1/orders/7/refund"
+    for body in ({}, {"amount_cents": 0, "reason": "x"}, {"amount_cents": 5, "reason": "x", "extra": 1}):
+        response = api.post(path, json=body, auth=finance)
+        assert response.status_code == 422
+        assert isinstance(response.json(), list)        # a bare list, from input_fields
+
+
+def test_refund_reports_a_missing_order(api, finance):
+    response = api.post("/rest/v1/orders/999999/refund", json={"amount_cents": 5, "reason": "x"}, auth=finance)
+    assert response.status_code == 404
+    assert response.json()["error"] == "order_not_found"
+
+
+def test_refund_is_rate_limited(api, finance):
+    codes = [api.post("/rest/v1/orders/7/refund", json={"amount_cents": 1, "reason": "x"}, auth=finance).status_code
+             for _ in range(25)]
+    assert 429 in codes
+```
+
+Add to it:
+
+- **A signed-out request with an invalid body.** It answers `422`, not `401`, because validation runs first. Decide whether that matters for the route.
+- **A key without `routes:invoke`.** It must answer `403`.
+- **The disabled route.** After turning **Enabled** off, the router's `404`.
+- **The flow's absence.** Delete the flow in a scratch environment and confirm the route answers `500`, `missing_flow`, so you know what that looks like.
+
+Test against a **development** environment, and promote only when the suite passes.
+
+
+## Seeing a route in Studio
+
+Route calls are ordinary requests in **Observability**. Search the request list by path (`/orders/` finds every refund call). Open a request to see its trace: the HTTP request with its caller and notes (including the handler that ran, as `flow:<name>` or `function:<name>`), and below it the **Flow runs** the request started, each with its status, input, output and a step-by-step trace. For a route that fails, the flow's failed step is the place to look.
+
+The **API Explorer** lists the environment's documented operations, routes included, and can try them with your operator credentials. A route that is missing from it is disabled, was not saved, or failed to compile: check the Overview for definitions with problems.
+
+### What the Overview reports
+
+The Overview lists **definitions with problems**. For routes, it names a route that cannot be served, for example:
+
+```text
+route GET /later: shadows a resource route
+```
+
+Read the list after saving a route or a resource. It is the only place a silently shadowed route is reported.
+
+
+## What a function can do: the runtime
+
+A function's `ctx.runtime` is the same set of capabilities that flow blocks use. It is what makes a function more than "Python in a request": it can reach the platform without any client or credential of its own.
+
+| Area | Methods |
+| --- | --- |
+| **Resources** | `resource_list(resource, filters=, sort=, limit=, offset=)`, `resource_get(resource, id)`, `resource_create(resource, data)`, `resource_update(resource, id, data)`, `resource_delete(resource, id)` |
+| **SQL** | `db_query(sql, params)` for reads, `db_transaction(operations)` for several writes that succeed or fail together |
+| **Cache** | `cache_get`, `cache_set`, `cache_delete`, `cache_invalidate(tags)` |
+| **Events and queues** | `emit(name, payload)`, `dispatch_flow(flow, input, delay=, queue=)`, `call_flow(flow, input)`, `dispatch_function(function, input, delay=, queue=)`, `call_function(name, input)` |
+| **Realtime** | `publish(channel, event, payload)` |
+| **Storage** | `storage_put`, `storage_read`, `storage_signed_url`, `storage_delete` |
+| **Mail** | `send_mail(to, subject, text=, html=, template=, data=)` |
+| **Outbound HTTP** | `http_request(method, url, headers=, json=, params=, timeout=, retries=)`, `webhook_send(event, payload)` |
+| **Platform** | `secret(name)`, `identity_user(user_id)`, `check_policy(ref, context)`, `log(level, message, data)`, `metric(name, value, tags)` |
+
+A resource write through the runtime is a **trusted** write: it skips the resource's policy, and it runs the after-write step, so the resource's cache is cleared and its events and realtime updates are published. It does not run a transformer.
+
+### A function, run
+
+A bulk import of people, behind `POST /people/bulk-import`. The function was loaded from `code/acme/functions/imp.py`, the route was `handler_type: "function"`, and the `people` resource had a unique `email` and a cache time of 60.
+
+```python
+from pawabase_core.functions import function
+
+
+@function(
+    "bulk-import",
+    policy="public",
+    input_fields=[
+        {"name": "rows", "type": "array", "items": {"type": "object", "fields": [
+            {"name": "name", "type": "string", "required": True},
+            {"name": "email", "type": "email", "required": True},
+        ]}}
+    ],
+)
+async def bulk_import(ctx):
+    created, failed = [], []
+    for index, row in enumerate(ctx.input["rows"]):
+        try:
+            record = await ctx.runtime.resource_create("people", row)
+            created.append(record["id"])
+        except Exception as exc:
+            failed.append({"index": index, "error": f"{type(exc).__name__}: {exc}"})
+    total = await ctx.runtime.db_query("SELECT COUNT(*) AS n FROM people")
+    ctx.log("imported", count=len(created))
+    return {"created": created, "failed": failed, "total": total[0]["n"]}
+```
+
+Called with three rows, the third repeating the second row's email:
+
+```json
+{
+  "created": [1, 2],
+  "failed": [{ "index": 2, "error": "IntegrityError: UNIQUE constraint failed: people.email" }],
+  "total": 2
+}
+```
+
+The answer is the function's return value, **unwrapped**. Three properties of this design are the reason to use a function here:
+
+| Property | Why it matters |
+| --- | --- |
+| **The unique violation is catchable.** Through the REST API it is a plain `500`. Through the runtime it is an exception your code can catch and report per row | One bad row does not stop the import, and the client learns which row failed and why |
+| **Nested input validation** | A row missing its email answers `422` with `loc: ["rows", 0, "email"]`, before the function runs |
+| **The cache was handled for you** | A list cached before the import showed both new people straight after, because each create cleared the resource's entries. An explicit `cache_invalidate` after the loop removed nothing, since there was nothing left |
+
+The input validation, for the same function:
+
+| Body | Answer |
+| --- | --- |
+| `{"rows": [{"name": "A"}]}` | `422`, `{"error": "invalid", "message": "invalid function input", "details": [{"type": "missing", "loc": ["rows", 0, "email"], "msg": "Field required", ...}]}` |
+| `{"rows": "x"}` | `422`, the same shape, with a `list_type` detail: `Input should be a valid list` |
+
+### Reading a secret
+
+`await ctx.runtime.secret("MY_SECRET")` returns the secret's value, and `None` if it does not exist. In the run, a secret of twelve characters came back as twelve. Use it for provider keys and shared tokens, and never put a secret in the function's source.
+
+### Logging
+
+`ctx.log("imported", count=3)` adds a line to the invocation, and `runtime.log(level, message, data)` writes a user log, which appears under **User logs** in the request trace. Log what happened, not what was sent: bodies often contain personal data.
+
+
+## Calling work that should not block the request
+
+A route that has to answer quickly can hand work to a queue:
+
+| Need | Method |
+| --- | --- |
+| Run a flow later, or in the background | `dispatch_flow(flow, input, delay=60, queue="mail")` |
+| Run another function in the background | `dispatch_function(function, input, delay=0)` |
+| Run a flow now and use its result | `call_flow(flow, input)` |
+| Run another function now and use its result | `call_function(name, input)` |
+
+Both `dispatch_*` methods return a job id. A function that dispatches and returns `{"queued": true}` answers fast, while the work runs in a worker. In a development install with the inline worker the work may run in the same process, so test queue behavior against a real worker before relying on it. See [Jobs and failures](/studio/jobs-and-failures).
+
+A function that dispatches work and answers `200` cannot answer `202`. If the route must say `202`, use a flow with `response.return`, which can start the same background work and set the status.

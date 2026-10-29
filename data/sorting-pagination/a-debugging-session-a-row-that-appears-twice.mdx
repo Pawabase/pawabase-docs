@@ -1,0 +1,291 @@
+---
+title: "A debugging session: a row that appears twice"
+description: "A support report: 'the orders list shows the same order on pages 1 and 2'. The screen reads newest first, three at a time, and the report comes from…"
+icon: "sort"
+---
+
+A support report: "the orders list shows the same order on pages 1 and 2". The screen reads newest first, three at a time, and the report comes from a busy shop. This is the investigation, using only what this page describes.
+
+**First, confirm it is the data and not the client.** Reproducing the two requests by hand, with the same parameters, shows whether the API returns the row twice:
+
+```text
+GET /rest/v1/orders?per_page=3&page=1&sort=-id&select=id    ->  ids 8, 7, 6
+GET /rest/v1/orders?per_page=3&page=2&sort=-id&select=id    ->  ids 5, 4, 3
+```
+
+Both pages are clean when nothing changes between them. The report says it happens sometimes, which suggests timing.
+
+**Second, ask what changes between two page requests.** A shop receives orders continuously. With one new order arriving between the two requests, the same two requests return:
+
+```text
+GET /rest/v1/orders?per_page=3&page=1&sort=-id&select=id    ->  ids 8, 7, 6
+(order 9 is created)
+GET /rest/v1/orders?per_page=3&page=2&sort=-id&select=id    ->  ids 6, 5, 4
+```
+
+Row 6 is on both pages. The new row took position 1, so everything moved down by one, and the boundary between page 1 and page 2 now falls one row earlier. That is offset paging doing what it does, and no request was wrong.
+
+**Third, decide whether it matters and what to change.** For a screen that a person reads, a row repeating across a page boundary is usually acceptable, and a client that de-duplicates by id hides it. For a job that processes every order exactly once, it is a bug, and the fix is to page by the key, which the new row cannot disturb:
+
+```text
+GET /rest/v1/orders?per_page=3&sort=-id                    ->  ids 8, 7, 6
+(order 9 is created)
+GET /rest/v1/orders?per_page=3&sort=-id&filter[id]=lt.6    ->  ids 5, 4, 3
+```
+
+The second request starts after row 6, wherever row 6 now sits, so it returns 5, 4, 3 and nothing repeats. The new order is not in this walk, and the next walk will have it. The investigation took three questions: does the API return it twice with nothing changing, what changes in between, and does the consumer need exactly-once or only roughly-once. The answer to the third decides whether to leave the code alone.
+
+
+## Choosing defaults for a resource
+
+The author of a resource decides what a list does when the caller says nothing, and the defaults they leave are the ones most clients live with.
+
+| Decision | Recommendation |
+| --- | --- |
+| The default order | The key, which is cheap, stable and deterministic. Leave it, and have clients ask for `-id` or `-created_at` |
+| The primary key type | Auto-increment where creation order is useful. UUID where ids must not be guessable, and expect to sort by `created_at` |
+| Index for "newest first" | `sort=-id` needs none. `sort=-created_at` needs an index on `created_at`, created by hand |
+| Fields clients sort by | Mark `indexed` on each one a screen sorts by |
+| The list policy | A pushdown-able one (an equality on the owner field) wherever the resource may be large |
+| Cache time | A few seconds for a hot list, so repeated page 1 requests are served without a query |
+| The resource's **Description** | Name the sortable fields and say to end the sort in `id` |
+
+A note in the description is worth the line. The generated reference documents `sort` as "Comma-separated fields; prefix with - for descending" and does not list which fields are indexed or that ties are unordered, and a developer integrating against it has no other way to learn.
+
+
+## What to remember
+
+- A page is `(page - 1) × per_page` rows skipped and `per_page` taken, evaluated fresh on every request. Nothing about it is stable.
+- `per_page` is 1 to 200, defaults to 20, and a bad value is a `422`. A page past the end is an empty `200` with the real `total`.
+- With no `sort`, the order is the key ascending. A `sort` orders only the fields it names, so end it in the key.
+- A list runs two statements, so `total` costs a count. It is `null` when a per-row policy applies.
+- A per-row policy makes pages short or empty, removes the count, and breaks when `select` omits the columns it reads.
+- Writes between requests make offset paging repeat or skip rows. Keyset paging, `sort=id` with `filter[id]=gt.<last>`, does not.
+- An unindexed sort pays its full cost on every page, and deep offsets make it worse. `created_at` is not indexed by default, so `sort=-id` is the cheap way to ask for the newest.
+- `expand` children are capped at 200 per request across the page, silently.
+- Repeated `sort` parameters keep the last one, so join lists with commas, and parameter names are case-sensitive.
+- A very large `page` overflows into a `500`. Clamp it.
+
+
+## Related reading
+
+- [Filtering](/data/filtering/overview) for the conditions that narrow rows before they are sorted and cut, and for keyset paging's `gt` and `lt` filters.
+- [Relations](/data/relations/overview) for `expand` and the cap on children.
+- [Caching](/data/caching/overview) for how pages are cached and cleared.
+- [Policies](/policies/overview) and [Pushdown](/policies/pushdown) for which list conditions the database can apply.
+- [Database console](/data/database-console/overview) for `EXPLAIN` and for adding the index a sort needs.
+- [Field types](/data/field-types/overview) for how each type compares and sorts.
+- [REST conventions](/reference/rest-conventions) for the envelope as seen from a client.
+
+
+## A catalog of requests and results
+
+A table of requests with the rows each returned is the quickest way to check a client's understanding, and to regression-test your own. Eight rows, shown as `id (grp, v)`: 1 (b, 3), 2 (a, 1), 3 (null, 2), 4 (b, 1), 5 (a, 3), 6 (null, 5), 7 (c, 2), 8 (a, 2). The columns are the ids in the order returned, and `total`.
+
+| Request | Ids returned | `total` |
+| --- | --- | --- |
+| *(none)* | 1, 2, 3, 4, 5, 6, 7, 8 | 8 |
+| `sort=v` | 2, 4, 3, 7, 8, 1, 5, 6 | 8 |
+| `sort=-v` | 6, 1, 5, 3, 7, 8, 2, 4 | 8 |
+| `sort=v,id` | 2, 4, 3, 7, 8, 1, 5, 6 | 8 |
+| `sort=-v,-id` | 6, 5, 1, 8, 7, 3, 4, 2 | 8 |
+| `sort=grp,v` | 3, 6, 2, 8, 5, 4, 1, 7 | 8 |
+| `sort=grp,-v,id` | 6, 3, 5, 8, 2, 1, 4, 7 | 8 |
+| `sort=-grp,id` | 7, 1, 4, 2, 5, 8, 3, 6 | 8 |
+| `per_page=5` | 1, 2, 3, 4, 5 | 8 |
+| `per_page=5&page=2` | 6, 7, 8 | 8 |
+| `per_page=5&page=2&sort=-id` | 3, 2, 1 | 8 |
+| `filter[v]=gte.2&sort=-v,id` | 6, 1, 5, 3, 7, 8 | 6 |
+| `filter[grp]=is.null&sort=id` | 3, 6 | 2 |
+| `filter[grp]=in.a,b&sort=v,id&per_page=4&page=1` | 2, 4, 8, 1 | 5 |
+| `filter[grp]=in.a,b&sort=v,id&per_page=4&page=2` | 5 | 5 |
+| `filter[v]=gt.10` | *(none)* | 0 |
+| `sort=id&per_page=2&filter[id]=gt.6` | 7, 8 | 2 |
+| `sort=-id&per_page=2&filter[id]=lt.3` | 2, 1 | 2 |
+
+Read down a few of them. `sort=v` and `sort=v,id` returned the same order here, because SQLite breaks ties in key order, and that is exactly why the missing `id` goes unnoticed on SQLite and bites on another database. `sort=grp,v` puts the two unset `grp` rows first, with `NULL` ahead of every letter, and `sort=-grp,id` puts them last. The filtered rows have a `total` that counts the matches, not the table, and the last two requests are keyset pages whose `total` is the number of rows left after the bound.
+
+
+## Operator endpoints in Studio's bridge
+
+Studio's own **Records** tab and the **Database** page read through operator endpoints, which page differently from the data API. They are useful to know when you script against the Platform API.
+
+| Endpoint | Paging | Default and limit |
+| --- | --- | --- |
+| `GET …/resources/{name}/records` | `page`, `per_page`, `sort`, filters | `per_page` defaults to 50 and is capped at 200. Studio's **Records** tab asks for 20 |
+| `GET …/database/tables/{table}/rows` | `limit`, `offset` | `limit` defaults to 50 and is capped at 500 |
+| `POST …/database/query` | Whatever the SQL says | The result is cut at 5,000 rows and reports `truncated` |
+
+The records endpoint is the data layer's list with operator rights: it returns `{"data", "page", "per_page", "total"}`, accepts the same `filter[...]` and `sort` syntax, and does not apply the resource's policy. The table-rows endpoint is raw SQL paging with a bigger cap, and has no filters or sorting. Neither adds anything to the data API's rules, and both are subject to the same cost of an unindexed sort.
+
+
+## A design case: an audit table that will reach millions of rows
+
+An `audit_events` resource records who did what. It starts small, the admin screen lists it newest first with a filter on the actor, and in a year it holds several million rows. These are the decisions that keep that screen fast, in the order the table grows into them.
+
+**At first nothing needs doing.** The key is the default order, `sort=-id` is newest first, and a filter on `actor` uses its index if the field was marked `indexed`. Every request is in single-digit milliseconds, which is the state in which the problems below stay invisible.
+
+**The first problem is the sort column.** Someone adds a date range filter and a "sort by time" control, and `sort=-created_at` appears. `created_at` is not indexed, and the first page now sorts the whole table. The fix is a single statement from the **Database** console:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_audit_events_created_at ON audit_events (created_at);
+```
+
+**The second problem is the combination.** The admin filters by actor and sorts by time, and two single-column indexes cannot serve both: the plan uses the actor index and then sorts that actor's rows. For a prolific actor that is a large sort. A composite index serves the combination:
+
+```sql
+CREATE INDEX IF NOT EXISTS ix_audit_events_actor_created ON audit_events (actor, created_at);
+```
+
+**The third problem is the count.** The footer shows "1–20 of 4,812,339", and the count of a broad filter is a pass over millions of index entries on every request. Show a count only when a filter makes it small, or drop the exact number for "20 shown" and a next button. A count of the whole table is not worth showing.
+
+**The fourth problem is the last page.** Someone adds a "last page" button, and offset 4,800,000 on a sorted column is slow. Remove the button, or implement "last page" as `sort=id` descending, `per_page=20`, with the rows reversed on the client. Keyset paging needs no last-page jump.
+
+**The fifth is the export.** The compliance team wants everything for a quarter. It is a keyset walk by key with a server key and a date filter, written to a bucket by a scheduled flow, and it never touches offset paging:
+
+```text
+GET /rest/v1/audit_events?sort=id&per_page=200&filter[created_at]=gte.2026-07-01&filter[id]=gt.<last>
+```
+
+A range with both ends is the two-sided case that the filter syntax cannot write for one field, so the export bounds the quarter's start with `created_at` and detects its end in the client, by stopping when a row's `created_at` passes the quarter end. Since ids grow with time, that stop is reached once, and the walk ends.
+
+**The last is retention.** A table that only grows eventually needs old rows removed or moved. A scheduled flow that deletes rows older than the retention period in batches keeps the table, and so every index, from growing without bound. See [Schedules](/jobs/schedules).
+
+Each step is a response to a measurable symptom, and none needed a change to Pawabase. They needed the right index, the right paging method, and a screen that does not promise a count it cannot afford, which is what the rest of this page describes.
+
+
+## A checklist before you ship a list screen
+
+Run through these before a list goes in front of users. Each one maps to a behavior verified earlier on this page.
+
+1. **Is the sort column indexed?** The key always is. `created_at` is not. If the screen sorts by anything else, check that the column has `indexed` on, or create the index in the **Database** console.
+2. **Is the order total?** If the sort column can hold equal values, add `id` as the last key (`sort=-created_at,-id`) so that rows never swap between pages.
+3. **Does the screen need an exact count?** If not, ignore `total`. If the resource has a residual policy, `total` is `null` anyway, so the screen must not depend on it.
+4. **Does a user reach deep pages?** If they can, switch to keyset paging with `filter[id]=lt.<last>`. Offset cost grows with the page number, and offsets repeat rows under concurrent inserts.
+5. **Is `per_page` bounded in the client?** The server clamps it, but a screen that asks for an absurd page size should be corrected where it is written.
+6. **Does `select` keep the policy's columns?** A residual policy that reads `owner_id` breaks when `select` omits it. Keep the column in `select` or let the policy's field default stay.
+7. **Does the screen expand a `has_many`?** The 200-child cap is shared by the whole page. A page of 50 parents with 10 children each is fine; 50 parents with 20 each loses rows silently.
+8. **Do you handle an empty page that is not the end?** With a residual policy, an empty page does not prove the list has ended. Continue until a short page or a null cursor says so.
+
+A list that passes all eight needs nothing more from this page. A list that fails one has a known fix, listed above.
+
+
+## Reading a paging response defensively
+
+A client that reads a page should assume as little as the response guarantees. Four habits cover it:
+
+- **Treat `total` as optional.** It can be `null`, so any arithmetic on it needs a guard. A screen that computes a page count from `total` should hide the page count when it is `null`.
+- **Stop on a short page, not on an empty one.** A page shorter than `per_page` ends the list for resources without a residual policy. For resources with one, keep going until the server returns a cursor-less short page twice, or switch to keyset paging.
+- **Never reuse an offset across a mutation.** After a create or delete, restart from page 1, or the page boundary has moved under the reader.
+- **Send an explicit `sort` every time.** The default order is the key order today, and an explicit sort documents that the screen depends on it.
+
+These habits cost a few lines in the client and remove the whole class of "the list showed a row twice" reports.
+
+A short example of the first two together:
+
+```js
+const page = await res.json()
+const hasMore = page.total == null ? page.items.length > 0 : page.page * page.per_page < page.total
+```
+
+
+## Behavior reference
+
+| Behavior | Detail |
+| --- | --- |
+| Default order | The primary key, ascending |
+| Sort syntax | Comma-separated fields, `-` prefix for descending, empty terms ignored |
+| Sortable fields | Declared fields, the key, timestamps (when on), the owner field |
+| Sort ties | Order is the database's, so end the sort in the key |
+| Repeated `sort` parameter | The last one wins |
+| Parameter names | Case-sensitive, a misspelled name is silently ignored |
+| `per_page` | Default 20, minimum 1, maximum 200, integer |
+| `page` | Default 1, minimum 1, integer, past the end returns an empty page |
+| `total` | Rows matching filters and pushed-down policy, `null` for a residual policy |
+| Statements per list | Two: the page and the count (the count is skipped for a residual policy) |
+| Envelope | `data`, `page`, `per_page`, `total`. No links, no cursor, no `has_more` |
+| Offset cost | Cheap on the key or an indexed sort, proportional to the offset on an unindexed sort |
+| Keyset | `sort=id` with `filter[id]=gt.<last>`, one bound, no composite cursors |
+| Flows | `resource.list` takes `limit` (capped at 200) and `offset`, equality filters only |
+| `expand` | Children limited to 200 per request across the page |
+| Cache | One entry per distinct parameter set, order of parameters irrelevant, any write clears all |
+| Overflowing page | `page` above about `9 × 10^18 ÷ per_page` returns `500` |
+
+
+## Troubleshooting paging
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| The same row appears on two pages | Rows were inserted between requests, or the sort has ties | End the sort in the key, de-duplicate by key, or page by key |
+| A row is never shown | Rows were deleted between requests, or a boundary fell in a run of ties | The same |
+| The first page is empty and later pages have rows | A residual policy refused the rows of the first page | Page by key, or change the policy to one that pushes down |
+| `total` is `null` | A residual policy | Expected. Do not show "of N" |
+| The last page is slow | An offset on an unindexed sort | Index the sorted column, or page by key |
+| Page 1 is slow on a large table | The sort is on an unindexed column such as `created_at` | Index it, or sort by `-id` |
+| The list is empty only when `select` is used | A residual policy needs a column the selection dropped | Include the policy's columns in `select` |
+| `422` on `per_page` | Above 200, below 1, or not an integer | Clamp on the client |
+| `500` on a very large `page` | An overflowing offset | Clamp `page` to the last page |
+| Different order in production than in development | Collation and `NULL` placement differ by database | End sorts in the key, give fields defaults, test on the production database |
+| `expand` returns fewer children than exist | The 200-row cap across the page | Lower `per_page`, or page the children separately |
+| A keyset walk repeats a row | The cursor column is not unique | Use the key as the cursor |
+
+
+## Questions that come up
+
+<AccordionGroup>
+  <Accordion title="Why is my last page slow?">
+    An offset of N makes the database produce and discard N rows. When the order comes from an index (the key, or an indexed field) that is cheap, and when it must be computed (an unindexed sort) the cost grows with the offset. Sort by an indexed field, or page by key.
+  </Accordion>
+  <Accordion title="Can I get more than 200 rows in one request?">
+    No. `per_page` is capped at 200. Page through, with keyset paging for a full export.
+  </Accordion>
+  <Accordion title="Why did the same row appear on two pages?">
+    Rows were inserted between your requests and pushed it across the boundary, or two rows tied on the sort fields and the database ordered them differently each time. De-duplicate by key, end the sort with the key, or page by key.
+  </Accordion>
+  <Accordion title="Why is total null?">
+    The list policy has a condition that cannot be turned into SQL, so it is checked row by row and the database's count would be wrong. See the section on per-row policies.
+  </Accordion>
+  <Accordion title="Why is the first page empty when there are rows?">
+    A per-row policy removed every row that the database returned for that page. Later pages may have rows. Page by key, or change the policy so the database can apply it.
+  </Accordion>
+  <Accordion title="How do I get the last page?">
+    Compute it from `total`: `Math.ceil(total / per_page)`. A sort descending on the same field gives the same rows in reverse, which is a way to get the "last" few without an offset: `sort=-id&per_page=20`.
+  </Accordion>
+  <Accordion title="Can I sort by a related resource's field?">
+    No. `sort` takes the resource's own fields. Sort by a field you copy onto the resource, or use a route.
+  </Accordion>
+  <Accordion title="Can I sort case-insensitively?">
+    Not directly. The order is the database's collation. A stored lowercase copy of the field (`name_lower`) sorts case-insensitively on every database.
+  </Accordion>
+  <Accordion title="Is the sort stable between requests?">
+    Only if it ends in a unique field. Without one, rows that tie may swap places between requests.
+  </Accordion>
+  <Accordion title="Do cached pages change when I write?">
+    Every write clears every cached list for the resource. A page is then recomputed on its next request.
+  </Accordion>
+</AccordionGroup>
+
+
+## Terms used on this page
+
+| Term | Meaning here |
+| --- | --- |
+| Page | A slice of the sorted, filtered rows: `per_page` rows after skipping `(page - 1) × per_page` |
+| Offset paging | Paging by skipping a number of rows, which is what `page` does |
+| Keyset paging | Paging by "after this key", with a filter on the key and a sort on the key |
+| Total | The count of rows matching the filters, `null` when a per-row policy applies |
+| Residual | A policy condition checked per row after the query, which can empty a page |
+| Tie | Two rows equal on every sort field, whose relative order the database does not promise |
+| Cursor | The value, usually the last key seen, that marks where the next page starts |
+
+<CardGroup cols={3}>
+  <Card title="Filtering" icon="filter" href="/data/filtering/overview">
+    The `filter[...]` parameters that narrow the rows before they are sorted and cut into pages.
+  </Card>
+  <Card title="Caching" icon="clock" href="/data/caching/overview">
+    How each page is cached, and why every write clears all of them.
+  </Card>
+  <Card title="Relations" icon="link" href="/data/relations/overview">
+    `expand` and its cap on children, which is a limit on a different kind of page.
+  </Card>
+</CardGroup>

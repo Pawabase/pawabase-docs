@@ -1,0 +1,198 @@
+---
+title: "Multi-factor authentication"
+description: "How Pawabase stores TOTP factors and recovery codes, how a session moves from aal1 to aal2, and why recovery codes are hashed and shown exactly once."
+icon: "shield-halved"
+---
+
+Multi-factor authentication in Pawabase is TOTP and nothing else: an authenticator app, and a set of recovery codes for when the phone is gone. There is no SMS factor, no push approval, and no email second factor. If you are designing an enrolment flow, the entire surface you need to build is a secret, a QR code, one verification code, and ten recovery codes.
+
+The mechanism is small. The parts that surprise people are the storage decisions — the TOTP secret is encrypted at rest rather than hashed, because you must be able to recompute a code from it, while recovery codes are hashed and therefore unrecoverable — and the fact that recovery codes are shown once and never again.
+
+<CardGroup cols={3}>
+  <Card title="Two real models" icon="database">`MfaFactor` holds the TOTP factor. `RecoveryCode` holds the single-use fallback codes. There is no `MFARecoveryCode` model.</Card>
+  <Card title="Stored hashed, not encrypted" icon="lock">Recovery codes are SHA-256 hashed at rest. The raw code is returned once at generation and cannot be recovered afterwards — not by you, not by an administrator.</Card>
+  <Card title="aal1 to aal2" icon="arrow-up">The default assurance level is `aal1`. A completed MFA challenge issues tokens at `aal2`, and the claim rides along with every request.</Card>
+</CardGroup>
+
+## Where MFA sits in the layered model
+
+MFA is entirely inside the identity layer, with one exception: the resulting assurance level is carried in the token so other services can read it without asking anyone.
+
+| Layer | What MFA asks of it |
+| --- | --- |
+| **Akountz** (identity) | Stores factors and recovery codes. Verifies codes. Issues `aal2` tokens. Owns `akz_mfa_factors` and `akz_recovery_codes`. |
+| **The API** (project config) | Owns one switch: `mfa_enabled`, which decides whether enrolment is permitted. |
+| **Gateway / `pawabase_core`** | Verifies the token, including the `aal` claim. Enforces nothing about MFA itself. |
+
+The consequence worth knowing before you design anything: **the `aal` claim is the entire interface between MFA and the rest of the system.** A service that wants to require a second factor reads one claim and needs no call back to Akountz. See [Auth in policies](/auth/auth-in-policies/overview).
+
+MFA state belongs to an account in one `project` + `env` pair, exactly like everything else. A user who enrolled an authenticator in staging has to enrol again in production. There is no cross-environment sharing of factors.
+
+<Info>
+If you have not read [Authentication](/auth/overview), read it first. This page assumes the layered model and the per-environment tenancy rule.
+
+## The two models, and what is not there
+
+MFA has exactly two pieces of storage. Both are real models with real tables, and naming them correctly matters because everything else on this page refers to them.
+
+| Model | Table | What one row is |
+| --- | --- | --- |
+| `MfaFactor` | `akz_mfa_factors` | One second factor for one user. Currently only TOTP. |
+| `RecoveryCode` | `akz_recovery_codes` | One single-use fallback code for one user. |
+
+**There is no `MFARecoveryCode` model.** If you are following documentation or a schema dump that names one, it is describing something that does not exist. The recovery codes live in `RecoveryCode`, alongside nothing else — the table holds one kind of thing.
+
+### The factor
+
+| Field | Type | What it holds |
+| --- | --- | --- |
+| `id` | ULID | The factor's identifier. |
+| `user` | FK | The owning account. Deleting the user deletes the factor. |
+| `kind` | str | `"totp"`. |
+| `secret_ciphertext` | text | The shared secret, **encrypted** with the platform secret box. |
+| `confirmed_at` | datetime or null | Set once a code has been verified. Null means unconfirmed. |
+| `last_used_step` | int | The last accepted time step, for replay protection. |
+| `friendly_name` | str | Defaults to `"Authenticator app"`. |
+
+<Warning>
+The TOTP secret is encrypted, not hashed. That is not an inconsistency with the recovery codes — it is a requirement of the algorithm. Verifying a TOTP code means recomputing it from the secret, so the secret must be recoverable. A hashed secret could confirm nothing.
+</Warning>
+
+The `confirmed_at` column is what makes enrolment two-phase, and it is the field to understand first. A factor created by the enrolment endpoint is **unconfirmed**: it exists, it has a secret, but it does not count. It stops the account from having MFA until the user proves they can produce a code, which means a user who abandons enrolment halfway does not end up locked out of their own account.
+
+### The recovery code
+
+| Field | Type | What it holds |
+| --- | --- | --- |
+| `id` | ULID | The row's identifier. |
+| `user` | FK | The owning account. |
+| `code_hash` | str | SHA-256 of the normalised code. Indexed for lookup. |
+| `used_at` | datetime or null | Set when the code is spent. Null means unused. |
+
+**Recovery codes are stored hashed, and only hashed.** The raw code exists exactly once, in the response to the call that generated it, and is never written anywhere in a form that could be read back. This is the standard argument for one-way hashing on a low-entropy secret: anyone who can read the table learns nothing, because the codes have far too little randomness to brute-force backwards from a hash — each one is five bytes of it.
+
+There is a deliberate asymmetry with the TOTP secret, and it is worth being able to explain it in one sentence: **a recovery code is verified by comparing a hash, so it never needs to be recoverable; a TOTP secret is used to compute a code, so it must be.**
+### The boolean flag
+
+The user's `mfa_enabled` field is the switch everything reads. It is set when enrolment is confirmed and cleared when MFA is turned off, and it is what the sign-in flow checks to decide whether to challenge.
+
+| Source of truth | Used for |
+| --- | --- |
+| `AuthUser.mfa_enabled` | Whether to challenge at sign-in, and what `/mfa` reports. |
+| A confirmed `MfaFactor` row | The actual secret used to verify codes. |
+| Unused `RecoveryCode` rows | How many fallbacks remain. |
+
+These are kept in step by the code rather than by a database constraint, so it is worth knowing which one to trust when they disagree. `mfa_enabled` is what the sign-in path branches on. If a confirmed factor exists but the flag is false, the user is not challenged — which is the state an administrator's MFA reset leaves behind.
+
+
+## How codes are generated and verified
+
+### The recovery code format
+
+Recovery codes are generated in a specific format that determines how they are hashed, and therefore what your user interface must accept.
+
+Each code is produced by taking five bytes of randomness, rendering them as ten hexadecimal characters, and splitting that in half with a hyphen:
+
+```text
+a3f9c2e1d4  ->  a3f9c-2e1d4
+```
+
+Ten of these are created each time. The count is fixed, and regenerating replaces the whole set rather than adding to it.
+
+### The hash, and why the format matters
+
+Before hashing, the code is normalised: the hyphen is removed, whitespace is stripped from each end, and the result is lowercased. Only then is it hashed with SHA-256.
+
+That normalisation is the reason the format is forgiving. Because the hyphen is stripped before hashing, `A3F9C-2E1D4`, `a3f9c2e1d4` and `a3f9c-2E1D4` all hash to the same value. A user who types their recovery code from an email, from a password manager, or from a handwritten note, in whatever case and with whatever spacing, gets a match.
+
+<Warning>
+Only the hyphen and case are normalised. Anything else the user types — a missing character, a space in the middle, a wrong code — produces a different hash and fails. There is no fuzzy matching and no partial credit.
+</Warning>
+
+### Verifying a TOTP code
+
+The check is stricter than the usual comparison, and the reason is a specific attack.
+
+TOTP codes are time-based: the current 30-second window produces one code, and it stays valid for the whole window. Anyone who sees a code — over a shoulder, in a screenshot, in a log — could replay it until the window rolls over. To prevent that, the last accepted time step is recorded on the factor, and any step at or below it is refused.
+
+The verification accepts a small amount of clock drift, checking the previous, current and next windows, and comparing against the secret using a constant-time comparison. When a code matches, the accepted step is written immediately.
+
+| Aspect | Behaviour |
+| --- | --- |
+| Code length | Six digits. Non-digits fail immediately. |
+| Windows accepted | Previous, current, next — about 30 seconds of drift either way. |
+| Replay | The same code cannot be accepted twice, even within its window. |
+| Comparison | Constant-time. |
+| On success | The accepted step is saved before the request returns. |
+
+<Info>
+The replay protection is why a user who taps "verify" twice on a slow connection can be told their code is wrong on the second attempt. The first attempt consumed it. Waiting for the next code is the correct response, and it is not a bug.
+</Info>
+
+### Which factor is used
+
+Only one confirmed factor counts. When verifying, the newest confirmed factor for the user is taken — the first one found among the confirmed rows.
+
+There is room for more than one factor per user in the model, but nothing in the current flow creates a second one, so in practice an account has either one confirmed TOTP factor or none.
+
+<Info>
+Calling enrolment again deletes any unconfirmed factor first, so a user who starts enrolment twice does not accumulate junk rows. Only one pending factor can exist at a time.
+</Info>
+
+## The assurance level, and how a session is elevated
+
+This is the part that matters most for anything downstream of sign-in.
+
+Every session carries an **assurance level**, written as a claim in its tokens. `aal1` is the default: something was verified, but only one thing. `aal2` means a second factor was presented. There is no `aal3`.
+
+| Level | How it is reached |
+| --- | --- |
+| `aal1` | Password, magic link, social sign-in, email verification — any single-factor sign-in. |
+| `aal2` | A sign-in that completed an MFA challenge, or enrolment on a live session. |
+
+Two different paths lead to `aal2`, and the difference matters when you are reasoning about a session you are already holding.
+
+### Elevation at sign-in
+
+This is the ordinary path. The user submits credentials, the system recognises that MFA is required, and instead of issuing tokens it issues a **challenge**. The user then supplies a code, and only then is the session created — at `aal2`, because the second factor has now been presented.
+
+At no point does a session exist at `aal1` and then get upgraded. The `aal1` attempt produces no session at all. This is the safer shape: there is no window in which a partially-authenticated session is usable.
+
+### Elevation of a live session
+
+The second path happens when a signed-in user enrols an authenticator app. Confirming enrolment marks the account as having MFA, and the **current session is elevated to `aal2`** in place.
+
+This is the one case where a session changes level after it exists. It happens because the user has just proven they hold a second factor — they produced a valid code to confirm enrolment — so the session's assurance is updated to reflect that proof.
+
+<Warning>
+Elevating a session does not change access tokens that already exist. It updates the stored session, so newly issued tokens carry `aal2`. A client still holding a pre-elevation token continues to present `aal1` until it refreshes. If a policy requires `aal2`, plan for the client to refresh.
+</Warning>
+
+### The claim, and who reads it
+
+The assurance level rides in the token as `aal`, so every service that verifies a token can act on it without calling Akountz.
+
+```json
+{
+  "claims": {
+    "sub": "01HQ8X4M2K9P7R3T6V0YB5ZCNDA",
+    "prj": "acme",
+    "env": "production",
+    "typ": "access",
+    "aal": "aal2",
+    "sid": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6"
+  }
+}
+```
+
+| Consumer | How it uses `aal` |
+| --- | --- |
+| `GET /auth/v1/user` | Reports the current session's level. |
+| `GET /auth/v1/mfa` | Reports it alongside the enabled flag. |
+| A policy | Can require `aal2` for an operation. See [Auth in policies](/auth/auth-in-policies/overview). |
+| Studio | The session's recorded level, alongside its method. |
+
+<Info>
+Because `aal` is a claim rather than a lookup, requiring a second factor is a policy decision rather than a code change. See [Auth in policies](/auth/auth-in-policies/overview) for how to require it.
+</Info>
+</Info>

@@ -1,0 +1,140 @@
+---
+title: "Memberships"
+description: "Any member can see the full list, including email addresses. There is no paginated member list and no filtering — for an organization of a few…"
+icon: "building"
+---
+
+### Listing members
+
+```python
+@r.get("/orgs/{slug}/members", tags=["organizations"], summary="Members")
+async def members(ctx: HttpContext, slug: str):
+    user, _ = await signed_in_user(ctx)
+    org, _ = await membership(user, slug)
+    rows = await Membership.filter(organization=org).prefetch_related("user")
+    return {
+        "data": [
+            {
+                "user_id": str(m.user.id),
+                "email": m.user.email,
+                "name": m.user.name,
+                "role": m.role,
+            }
+            for m in rows
+        ]
+    }
+```
+
+Any member can see the full list, including email addresses. There is no paginated member list and no filtering — for an organization of a few hundred people this is a large response. If you need pagination or filtering, model membership in your own resource and write a policy for it:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    {
+      "in": [
+        "$auth.user_id",
+        "$record.member_ids"
+      ]
+    }
+  ]
+}
+```
+
+The important thing is that the org machinery and your row-level policy are independent: Akountz answers "is this user a member of this organization", your policy answers "may this user touch this particular row".
+
+### Changing a role
+
+```python
+@r.put(
+    "/orgs/{slug}/members/{user_id}",
+    tags=["organizations"],
+    request_model=RoleBody,
+    summary="Change a member's role",
+)
+async def set_role(ctx: HttpContext, slug: str, user_id: str, body: RoleBody):
+    user_id = user_id.upper()  # ULIDs are case-insensitive
+    user, _ = await signed_in_user(ctx)
+    org, me = await membership(user, slug, manage=True)
+    _check_role(body.role)
+    target = await Membership.get_or_none(organization=org, user_id=user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="not a member")
+    if (body.role == "owner" or target.role == "owner") and me.role != "owner":
+        raise HTTPException(status_code=403, detail="only owners can grant or remove ownership")
+    if (
+        target.role == "owner"
+        and body.role != "owner"
+        and await Membership.filter(organization=org, role="owner").count() <= 1
+    ):
+        raise HTTPException(status_code=409, detail="an organization keeps at least one owner")
+    target.role = body.role
+    await target.save(update_fields=["role"])
+    return {"user_id": str(user_id), "role": body.role}
+```
+
+Four rules, in the order they are checked:
+
+1. The caller must be a manager (`manage=True`).
+2. The role must be in `ORG_ROLES`, else `422`.
+3. Touching the `owner` role in **either** direction requires the *caller* to be an owner. An `admin` cannot promote anyone to `owner`, and an `admin` cannot demote an existing owner — both get `403 only owners can grant or remove ownership`.
+4. An organization keeps at least one owner. Demoting the last owner is `409 an organization keeps at least one owner`.
+
+<Warning>
+`user_id = user_id.upper()` appears here and on every other route that takes a user id in the path. ULIDs are case-insensitive in routing but stored uppercase, so a lowercase id in the URL would otherwise miss the row and produce a misleading `404 not a member`.
+</Warning>
+
+The `PUT` is idempotent for the same role — setting a member to the role they already hold succeeds and returns the same body.
+
+```bash
+curl -X PUT "$GW/auth/v1/orgs/acme-hq/members/01JX9K2M4P7Q8R3S5T6U7V8W9X" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $OWNER_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"role": "admin"}'
+```
+
+```json
+{ "user_id": "01JX9K2M4P7Q8R3S5T6U7V8W9X", "role": "admin" }
+```
+
+### Removing a member, or leaving
+
+```python
+@r.delete(
+    "/orgs/{slug}/members/{user_id}",
+    tags=["organizations"],
+    summary="Remove a member (or leave)",
+)
+async def remove_member(ctx: HttpContext, slug: str, user_id: str):
+    user_id = user_id.upper()  # ULIDs are case-insensitive
+    user, _ = await signed_in_user(ctx)
+    org, me = await membership(user, slug)
+    if user_id != user.id and me.role not in MANAGERS:
+        raise HTTPException(status_code=403, detail="only owners and admins can remove members")
+    target = await Membership.get_or_none(organization=org, user_id=user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="not a member")
+    if (
+        target.role == "owner"
+        and await Membership.filter(organization=org, role="owner").count() <= 1
+    ):
+        raise HTTPException(status_code=409, detail="an organization keeps at least one owner")
+    await target.delete()
+    await TeamMember.filter(team__organization=org, user_id=user_id).delete()
+    return no_content()
+```
+
+This route calls `membership(user, slug)` **without** `manage=True`, then applies the manager check itself with a different message: `only owners and admins can remove members`. The distinction is deliberate — a `member` or `viewer` can remove *themselves*, which is how "leave organization" works, but cannot remove anyone else.
+
+Removing a member also removes them from **every team in that organization**, across all teams at once:
+
+```python
+await TeamMember.filter(team__organization=org, user_id=user_id).delete()
+```
+
+That is a join across the team foreign key. There is no way to keep someone on a team after removing them from the organization, and no warning is emitted about the team removals — only a `204` comes back.
+
+<Info>
+Removing the last owner is refused here too, with the same `409`. Combined with the role-change rule, this means **an organization can never reach zero owners through the API**. The only way to end up with none is to delete the organization.
+</Info>

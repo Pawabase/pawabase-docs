@@ -1,0 +1,241 @@
+---
+title: "Recipes"
+description: "For the read policy, write the literal:"
+icon: "code"
+---
+
+### Public reads, authenticated writes
+
+For the read policy, write the literal:
+
+```json
+true
+```
+
+For the write policy:
+
+```json
+{ "authenticated": true }
+```
+
+There is no need to wrap `true` in an `any`, and doing so adds nothing.
+
+### The owner, or anyone with a permission
+
+```json
+{ "any": [
+  { "owner": true },
+  { "permission": "posts.manage_any" }
+] }
+```
+
+`{ "owner": true }` already expands to `{"all": [{"authenticated": true}, {"eq": ["$record.owner_id", "$auth.user_id"]}]}`, so this grants nothing to anonymous callers.
+
+### Organization administrators, scoped to their organization
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "not_in": ["$auth.org", [null, ""]] },
+    { "in": ["$auth.org_role", ["owner", "admin"]] },
+    { "eq": ["$record.org_slug", "$auth.org"] }
+  ]
+}
+```
+
+The `not_in` is not decoration: without it a de-scoped session produces `$record.org_slug = null`, which matches nothing in SQL. Being explicit documents the intent, and `not_in` is the right operator because `exists` reads more clearly as "set" while `not_in` also excludes the empty string.
+
+### Second-factor-only operations
+
+```json
+"mfa"
+```
+
+or, with an org check as well:
+
+```json
+{
+  "all": [
+    { "aal": "aal2" },
+    { "in": ["$auth.org_role", ["owner", "admin"]] }
+  ]
+}
+```
+
+### Admin-controlled feature flags
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "eq": ["$auth.claims.app.beta", true] }
+  ]
+}
+```
+
+`beta` must be written to `app_metadata` by an administrator. If it lives in `user_metadata`, the user can set it themselves through `PATCH /auth/v1/user`.
+
+### Support staff, distinguished from end users
+
+```json
+{
+  "all": [
+    { "eq": ["$auth.kind", "operator"] },
+    { "starts_with": ["$auth.email", "support@"] }
+  ]
+}
+```
+
+The `kind` check is the load-bearing one: it says the caller arrived as an operator or service credential, not that their email happens to look right. Prefer it wherever you can.
+
+### Time-bounded access
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "gt": ["now", "$auth.claims.meta.access_until"] }
+  ]
+}
+```
+
+This one deliberately uses `meta` — the expiry is the *user's own* deadline, so letting them move it later is at worst self-serving and never grants a role they lack. Do not put the entitlement itself in `meta`.
+
+### Drafts visible only to their author
+
+```json
+{
+  "any": [
+    { "owner": true },
+    {
+      "all": [
+        { "eq": ["$record.status", "published"] },
+        { "authenticated": true }
+      ]
+    }
+  ]
+}
+```
+
+### Refusing a method
+
+There is no method-negation shorthand, but `ne` does it:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "ne": ["$request.method", "DELETE"] }
+  ]
+}
+```
+
+### A stored policy
+
+Policies are data, so they can be stored per project and referenced by name. `policy_from_definition` validates on the way in:
+
+```python
+def policy_from_definition(name: str, definition: Mapping[str, Any]) -> Policy:
+    """Build a :class:`Policy` from its stored form, validating it."""
+    condition = definition.get("condition", definition.get("rules", True))
+    validate_condition(condition)
+    return Policy(name=name, condition=condition, description=definition.get("description", ""))
+```
+
+A stored policy looks like this, and `rules` is accepted as an alias for `condition`:
+
+```json
+{
+  "name": "org-editor",
+  "description": "Editors and above inside the selected organization.",
+  "condition": {
+    "all": [
+      { "authenticated": true },
+      { "in": ["$auth.org_role", ["owner", "admin", "member"]] },
+      { "eq": ["$record.org_slug", "$auth.org"] }
+    ]
+  }
+}
+```
+
+Referenced from a resource as the string `"org-editor"`.
+
+<Warning>
+`definition.get("condition", definition.get("rules", True))` defaults to **`True`** when neither key is present. A malformed stored definition with no condition is an unconditional allow, not an error. Always write `condition` explicitly.
+</Warning>
+
+
+## The staleness rule
+
+Everything in `$auth` is a snapshot of the token. Nothing is re-read at policy time. The token is minted with:
+
+```python
+roles=await rbac.roles_of(user),
+permissions=await rbac.permissions_of(user),
+org=org,
+org_role=org_role,
+```
+
+and those four calls happen exactly once, when the access token is minted.
+
+The consequences, stated plainly:
+
+| You change | Reaches policies when |
+| --- | --- |
+| A user's RBAC role or permissions | Next token mint — a refresh, or a new sign-in |
+| An organization membership role | Next token mint, same reason |
+| An organization's `name` or `metadata` | Immediately — it is read from the database, not the token |
+| A row's fields | Immediately — `$record` is the live row |
+| `$auth.claims.app` / `$auth.claims.meta` | Next token mint |
+| The environment's `auth` config | Akountz's cache TTL, not the token |
+
+The window is `access_ttl` seconds — 900 by default. There is no token version counter, no claim-invalidation list, and no way to force re-issue except a refresh.
+
+<Warning>
+This is why a role revocation is not instant. If you demote someone from `admin` to `member`, `{"eq": ["$auth.org_role", "admin"]}` keeps allowing them until their access token expires. If the revocation must be immediate, revoke the session — `POST /auth/v1/logout` with `{"scope": "global"}` — which makes the refresh fail with `401 invalid refresh token`.
+</Warning>
+
+
+## What does not exist
+
+A list of things this page has been asked about that are not in the engine.
+
+<AccordionGroup>
+  <Accordion title="There is no TOML policy syntax">
+    Configuration is JSON throughout — the environment's `auth` block, stored policy definitions, and conditions. There is no `[policy]` table, no `expression = "..."` key, and no parser for one.
+  </Accordion>
+  <Accordion title="There is no expression string at all">
+    A condition is JSON data. There is no `&&`, `||`, `!`, `==`, `!=`, `contains` operator-as-word, or parentheses to balance. `{"all": [...]}` is the conjunction.
+  </Accordion>
+  <Accordion title="There are no functions">
+    No `lower()`, `upper()`, `len()`, `now()` call, `concat()`, or date arithmetic. String comparison is exact and case-sensitive; `matches` with a regex is the only text manipulation available. The magic `now` *path* exists, but it is not a function you call with arguments.
+  </Accordion>
+  <Accordion title="There are no variables">
+    No `let`, no bindings, no parameter substitution. A condition is one literal tree. The `"role:admin"` reference syntax is the closest thing, and it only builds a single shorthand.
+  </Accordion>
+  <Accordion title="There is no permission function inside a condition">
+    The principal object has a Python method for checking a permission, but it is not callable from JSON. In a condition, use the `permission` shorthand, which additionally accepts the `"*"` wildcard.
+  </Accordion>
+  <Accordion title="There is no `$auth.operator`">
+    The nearest real fields are `$auth.kind` (`user`, `operator`, `service`, `anonymous`) and `$credential.is_service`. There is no boolean `operator` flag in the auth context.
+  </Accordion>
+  <Accordion title="There is no `$auth.org` object">
+    `$auth.org` is the slug string or `null`. `$auth.org.slug` does not exist and resolves to `None`.
+  </Accordion>
+  <Accordion title="There is no `$auth.claims.user`">
+    The metadata claim is `meta`. `$auth.claims.app` is the admin-controlled one.
+  </Accordion>
+  <Accordion title="There is no minimum-AAL configuration directive">
+    AAL is checked with the `aal` shorthand or the `"mfa"` policy name. No configuration key sets a minimum assurance level for an environment or an organization — `mfa_enabled` controls whether users *may* enrol a second factor, not what a policy demands.
+  </Accordion>
+  <Accordion title="There is no `force` flag, and no override event">
+    No `force: true`, no `policy.override` event, no override audit log. Service credentials bypass policies structurally, in `check`, not through a flag you can set on a request.
+  </Accordion>
+  <Accordion title="There is no role hierarchy">
+    `$auth.roles` is a flat list. There is no inheritance between roles. Write the alternation yourself with `any`, or use permissions, which are flat strings too.
+  </Accordion>
+  <Accordion title="There is no shorthand cache">
+    `_shorthand` and `resolve_ref` are called on every evaluation. Expansion is cheap and happens fresh each time — there is no memoisation layer to reason about or invalidate.
+  </Accordion>
+</AccordionGroup>

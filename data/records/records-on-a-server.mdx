@@ -1,0 +1,186 @@
+---
+title: "Records on a server"
+description: "Server code reads and writes records with the same methods, but the identity behind the request changes what the server does."
+icon: "table"
+---
+
+## Records in server code
+
+Server code reads and writes records with the same methods, but the identity behind the request changes what the server does.
+
+| Identity | Policies | Owner field on create | Typical use |
+| --- | --- | --- | --- |
+| A user, through `asUser(token)` with a publishable key | Applied | Set to that user | Server rendering, API proxies |
+| A secret key | Bypassed | Not set; send it yourself | Jobs, imports, administrative fixes |
+
+With a secret key, nothing stops a write that a user could never make.
+That is the point of the key, and also its risk.
+Keep secret-key record code small, in clearly named modules, and set fields such as the owner explicitly:
+
+<CodeGroup>
+```typescript TypeScript
+await service.from("tasks").create({ title: "Welcome! Start here.", user_id: newUserId });
+```
+
+```python Python
+service.from_("tasks").create({"title": "Welcome! Start here.", "user_id": new_user_id})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/tasks" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"title": "Welcome! Start here.", "user_id": "u_7"}'
+```
+</CodeGroup>
+
+A backfill over a large table combines keyset walking with modest concurrency.
+The loop below sets a default priority on every task that has none, 200 at a time, five updates in flight:
+
+```typescript
+async function backfillPriority() {
+  const tasks = service.from("tasks");
+  let after = "";
+  let changed = 0;
+  for (;;) {
+    const page = await tasks.gt("id", after).order("id").select("id", "priority").perPage(200);
+    if (page.data.length === 0) break;
+    const pending = page.data.filter((task) => task.priority === null);
+    for (let i = 0; i < pending.length; i += 5) {
+      await Promise.all(pending.slice(i, i + 5).map((task) => tasks.update(task.id, { priority: 2 })));
+    }
+    changed += pending.length;
+    after = page.data[page.data.length - 1].id;
+  }
+  return changed;
+}
+```
+
+Each update emits an event and a realtime change, if the resource has them on.
+For very large backfills, consider whether downstream flows and webhooks should see every change, and pause them first if they should not.
+
+
+## Cancelling and limiting time
+
+Every terminal operation can be cancelled with an `AbortSignal`, and given a timeout.
+
+```typescript
+import { AbortError } from "@pawabase/client";
+
+const controller = new AbortController();
+const query = orders.eq("status", "open").withOptions({ signal: controller.signal, timeoutMs: 5000 });
+
+setTimeout(() => controller.abort(), 1000);
+
+try {
+  await query.perPage(50);
+} catch (error) {
+  if (error instanceof AbortError) console.log("cancelled");
+}
+```
+
+`withOptions` is part of the query, so the options travel with it through `first()`, `count()` and the iteration helpers.
+Cancelling a walk stops it between pages and rejects the pending request.
+
+
+## What the client sends
+
+For reference, here is the wire form of each query method.
+You see these parameters in the network panel and in **Project → Activity**.
+
+| Client | Query parameter |
+| --- | --- |
+| `eq("status", "open")` | `filter[status]=eq.open` |
+| `eq("done", false)` | `filter[done]=is.false` |
+| `eq("note", null)` | `filter[note]=is.null` |
+| `gte("total_minor", 100)` | `filter[total_minor]=gte.100` |
+| `lt("created_at", date)` | `filter[created_at]=lt.2026-10-01T00:00:00.000Z` |
+| `like("sku", "A*")` | `filter[sku]=like.A*` |
+| `in("status", ["a", "b"])` | `filter[status]=in.a,b` |
+| `notIn("id", [1, 2])` | `filter[id]=nin.1,2` |
+| `is("archived_at", null)` | `filter[archived_at]=is.null` |
+| `isNot("archived_at", null)` | `filter[archived_at]=isnot.null` |
+| `order("created_at", "desc").order("id")` | `sort=-created_at,id` |
+| `select("id", "title")` | `select=id,title` |
+| `expand("author", "tags")` | `expand=author,tags` |
+| `page(2)` | `page=2` |
+| `perPage(50)` | `per_page=50` |
+
+The [REST conventions](/reference/rest-conventions) page documents the same parameters for clients in other languages.
+
+
+## Rate limits and key scopes
+
+A resource can have its own rate limit, in addition to the environment's.
+When a list or a walk exceeds it, the server answers `429`, and the client waits for `Retry-After` and repeats.
+A walk over a large table can therefore slow down rather than fail, which is usually what you want; set `maxRecords` or a smaller scope if it is not.
+
+API keys can be restricted with scopes.
+Records use two:
+
+| Scope | Allows |
+| --- | --- |
+| `resource:read` | `list` and `get` |
+| `resource:write` | `create`, `update` and `delete` |
+
+A key with only `resource:read` gets `403` from the gateway on every write, before any policy runs.
+That is a useful setting for a reporting service: even a bug cannot change data.
+
+
+## Resources with a transformer
+
+A resource can have a transformer, which reshapes each record on the way out: hiding fields, masking values, renaming or computing fields.
+When a resource has one, two things change for client code.
+
+The response shape is the transformer's output, not the table's columns.
+The generated row type becomes an open object, `{ [column: string]: unknown }`, because the generator cannot know what the transformer produces.
+Type the rows yourself from the transformer's documented output.
+
+Filters and sorting still work on the table's columns, because they run before the transformer.
+You can filter on a field the transformer hides; you cannot read it back.
+
+```typescript
+interface InvoiceSummary {
+  id: number;
+  number: string;
+  amount_display: string;
+  status: string;
+}
+
+const invoices = pawabase.resource<InvoiceSummary>("invoices");
+const page = await invoices.eq("status", "unpaid").order("due_on").perPage(20);
+```
+
+See [Transformers](/data/transformers/overview) for how they are defined.
+
+
+## Server-side caching and your queries
+
+A resource can have a response cache, configured in Studio on the resource.
+When it does, list and get answers are cached on the server for the configured time, keyed by the full query string and the caller.
+
+| Fact | Consequence for client code |
+| --- | --- |
+| The key includes every query parameter | Equivalent queries written differently are cached separately; keep query building consistent. |
+| A write to the resource clears its cached answers | Your own writes are visible on your next read. |
+| A change to a related resource does not clear an `expand` | An expanded `customer` can be stale for up to the cache time after the customer changes. |
+| The cache is per process unless the installation uses Redis | Several server processes can briefly answer differently. |
+
+If a screen must show related data fresh, fetch the related record directly instead of expanding it, or keep the resource's cache short.
+See [Caching](/data/caching/overview) for configuration.
+
+
+## Performance
+
+Most list requests are fast, and the ones that are not usually share a cause.
+
+| Cause | Symptom | Fix |
+| --- | --- | --- |
+| Filtering or sorting on a field without an index | Lists slow down as the table grows | Mark the field `indexed` in the resource's **JSON** tab, then migrate |
+| A leading wildcard in `like` or `ilike` | Search is slow on large tables | Search a prefix, or add a search route |
+| Wide rows on list screens | Large responses, slow on mobile | `select` only the columns the screen shows |
+| `count()` per row in a loop | Many requests | Count once with a filter, or store a counter |
+| A request per row to fetch a related record | Many requests | `expand` the relation |
+| `all()` on a large table | Memory and time grow without bound | Walk with `pages()`, or set `maxRecords` |
+| A per-row policy on a large table | Short pages and many requests to fill a screen | Make the policy pushable so the database filters |
+
+The management module can list a resource's indexes and show which ones exist, if you want to check from code; see [Environment management](/clients/typescript/management/overview).
+In Studio, the **Data** section shows indexes on each table.

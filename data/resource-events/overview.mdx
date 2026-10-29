@@ -1,0 +1,252 @@
+---
+title: "Resource events"
+description: "What a resource write publishes, what the event contains, who can consume it (flows, subscriptions, webhooks, realtime), what guarantees it carries and where it leaks."
+icon: "zap"
+---
+
+## The mental model: a write announces itself
+
+Every time Pawabase writes a row through a resource, it does three things after the write has succeeded:
+
+1. **Clears the resource's cache entries** (see [Caching](/data/caching/overview)).
+2. **Publishes an event**, named after the resource and the change, if the resource's **Emit events** switch is on.
+3. **Broadcasts the change to realtime subscribers**, if the resource's **Broadcast changes** switch is on.
+
+The event goes onto an event bus. An **event processor** reads it, records it, and routes it to everything that has asked to hear about it: flows triggered by it, **event subscriptions**, and **webhook endpoints**. Each of those runs from a queue, so a slow consumer never delays the others, and each retries on its own.
+
+```text
+write succeeds ──► after-write step ──┬─► cache tag cleared
+                                      ├─► event "orders.created" ──► bus ──► event processor
+                                      │                                         ├─► flows (Resource change / Event triggers)
+                                      │                                         ├─► subscriptions (flow, function, realtime)
+                                      │                                         └─► webhook endpoints (signed HTTP)
+                                      └─► realtime channel "resource:orders"
+```
+
+That is the whole mechanism. Resource events are not a separate feature you configure resource by resource. They are what makes the rest of the platform (automation, integrations, live UIs) react to data, and they are ordinary platform events, like `user.created` or `file.uploaded`, with a name, a payload and a log.
+
+Everything on this page was run against a real Pawabase API: resources were written through the API, the Records tab and flows, events were read back from the event log, and subscriptions and webhooks were created and observed. Where the behavior is read from code and not run, it says so.
+
+
+## What publishes an event, and what does not
+
+| Write | Event? | Notes |
+| --- | --- | --- |
+| `POST`, `PATCH`, `DELETE` through `/rest/v1` | **Yes** | Actor is the signed-in user |
+| The **Records** tab in Studio | **Yes** | Actor is `studio`, and there is no request id |
+| A flow's `resource.create`, `resource.update`, `resource.delete` | **Yes** | Actor is the caller that started the flow |
+| A function's `ctx.runtime.resource_*` | **Yes** | The runtime goes through the same after-write step |
+| A write inside `db.transaction` | Yes, **after the transaction commits** | The block's effects are announced once, after the commit |
+| A **console** write (SQL) | **No.** It only clears caches and is audited | Observed: an `INSERT` in the SQL window produced no event |
+| A change made with SQL elsewhere | **No** | Pawabase is never told |
+| A **migration** | **No** | |
+| A write that **fails validation** (`422`) | **No** | Nothing was written, so nothing is announced |
+| A write on a resource with **Emit events** off | **No** | Observed: a resource with events off produced none |
+
+Two consequences. **A change made in the console or in SQL is invisible to every consumer**, so a webhook never hears about a bulk repair done that way, which is sometimes what you want. And **a consumer that must know about every change must be fed by writes that go through Pawabase**.
+
+
+## The event's name
+
+An event is named **`<resource>.<change>`**, where `<resource>` is the resource's name and `<change>` is `created`, `updated` or `deleted`:
+
+```text
+orders.created
+orders.updated
+orders.deleted
+```
+
+<Warning>
+The Events page's filter box suggests the name `resource.todos.created`, and some older documents show names like that. Pawabase does **not** prefix resource events with `resource.`. The name that was recorded for a `todos` resource was `todos.created`. Match on `todos.created` or `todos.*`.
+</Warning>
+
+Patterns use shell-style wildcards on the whole name:
+
+| Pattern | Matches |
+| --- | --- |
+| `orders.created` | Exactly that |
+| `orders.*` | Every change to `orders` |
+| `*.created` | Every creation, of every resource |
+| `*` | Every event of every kind, including `user.created`, `file.uploaded` and custom ones |
+
+
+## What an event contains
+
+The stored event, as the Events tab and the API return it, newest first:
+
+```json
+{
+  "name": "todos.created",
+  "source": "api",
+  "actor": "u-1",
+  "request_id": "6b77620d-40fe-4cd7-aae5-0b33d5af25d6",
+  "payload": {
+    "resource": "todos",
+    "change": "created",
+    "record": {
+      "id": 1,
+      "title": "one",
+      "done": null,
+      "created_at": "2026-10-01T22:13:35.494214+00:00",
+      "updated_at": "2026-10-01T22:13:35.494214+00:00"
+    }
+  },
+  "consumers": [
+    { "type": "flow", "target": "on_todo", "status": "queued", "ref": "38bfb037c8cd4cd7b6de38debecfafbf" }
+  ]
+}
+```
+
+And the full envelope, which is what a consumer receives:
+
+```json
+{
+  "name": "todos.created",
+  "project": "acme",
+  "env": "development",
+  "payload": { "resource": "todos", "change": "created", "record": { "id": 1, "title": "one" } },
+  "source": "api",
+  "actor": "u-1",
+  "id": "5977bd30d884497ea0df5f629a28e7c9",
+  "occurred_at": "2026-10-01T22:13:35.494214+00:00",
+  "request_id": "6b77620d-40fe-4cd7-aae5-0b33d5af25d6",
+  "release_id": null,
+  "api_version": null
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | `<resource>.<change>` |
+| `project`, `env` | Where it happened |
+| `payload` | `{"resource", "change", "record"}`, described next |
+| `source` | The service that published it. `api` for resource events |
+| `actor` | Who caused it: the signed-in user's id for an API write, `studio` for the Records tab. Empty for a caller with no user |
+| `id` | A unique id. The event log uses it to process an event only once |
+| `occurred_at` | When it was published, as an ISO 8601 UTC time |
+| `request_id` | The request that caused it, so it can be found in **Observability**. `null` for the Records tab |
+| `release_id`, `api_version` | The release that was serving when the write happened, or `null` when the live definitions were |
+
+The `payload` is the same for every resource event:
+
+| Key | Value |
+| --- | --- |
+| `resource` | The resource's name |
+| `change` | `created`, `updated` or `deleted` |
+| `record` | The row, as a plain JSON object |
+
+<Warning>
+An earlier version of this page showed an envelope with `event`, `published_at` and `correlation_id`, and a payload that was the bare record. Those names are not what Pawabase sends. The envelope fields are the ones in the table above, and the record is under `payload.record`.
+</Warning>
+
+### The record, for each change
+
+| Change | `record` is |
+| --- | --- |
+| `created` | The row as stored, with its key, defaults filled in and timestamps |
+| `updated` | The **whole row after the update**, not only the fields that changed |
+| `deleted` | The row **as it was just before it was deleted**, including its last update |
+
+For an `updated` event there is no "before" value: the event does not say which fields changed. A consumer that needs to know compares the record with what it last saw, or reads a `changed` field you maintain yourself.
+
+A `deleted` record is the **last** state. In a run, a todo that had been marked done and then deleted arrived with `"done": true` and its latest `updated_at`.
+
+### The record is the raw row
+
+This is the part that matters for security. The record in an event is the row **as the database holds it**, and none of the response-shaping the API applies reaches it:
+
+| Applied to API responses | Applied to an event's record |
+| --- | --- |
+| A [transformer's](/data/transformers/overview) `omit`, `pick`, `set` and `rename` | **No** |
+| `write_only` on a field | **No** |
+| `select` | **No** |
+| A related row's `expand` | No (nothing is expanded) |
+| Undeclared columns being returned | They are in the record too |
+
+This was run on a `vault` resource that declared a `secret` field as `write_only` and had a transformer that omitted `secret`. The create response had no `secret`:
+
+```json
+{ "id": 1, "label": "a", "created_at": "...", "updated_at": "..." }
+```
+
+and the event's record had it:
+
+```json
+{
+  "resource": "vault",
+  "change": "created",
+  "record": { "id": 1, "label": "a", "secret": "hunter2", "created_at": "...", "updated_at": "..." }
+}
+```
+
+So **everything that receives resource events receives the hidden fields**: subscriptions, flows, webhook endpoints, and realtime subscribers (when **Broadcast changes** is on). If a field is hidden from API readers because it is sensitive, it must also be kept out of the event, which means one of:
+
+| Option | How |
+| --- | --- |
+| Do not store it in this resource | Put the secret in a separate resource that has events off |
+| Turn **Emit events** off | For a resource that no consumer needs |
+| Turn **Broadcast changes** off | Realtime pushes the raw record to subscribers |
+| Shape the event in a flow | A flow on the event uses `transform.map` to build a safe payload, and **that** is what goes to the webhook. Do not subscribe the webhook to the raw event |
+
+See [What a transformer protects](/data/transformers/what-a-transformer-protects-and-what-it-does-not#what-a-transformer-protects-and-what-it-does-not).
+
+
+## Seeing events: Events & runs
+
+Open **Events & runs** under the environment's navigation. The page is described as *Everything that happened: events on the bus, the flows they started, webhooks delivered and mail sent.* It has five tabs:
+
+| Tab | Shows |
+| --- | --- |
+| **Events** | Every event, newest first, refreshed every five seconds. Columns **Event**, **Source**, **Actor**, **Payload** and **When**. A filter box above takes an **exact** event name. Empty: *No events yet.* |
+| **Event map** | One row per event name, with its **Producers**, the event and its **Consumers**. Empty: *No producers or consumers defined yet.* |
+| **Flow runs** | Each flow run, with **Flow**, **Status**, **Trigger**, **Duration**, **Error** and **When**. A status filter offers *every status*, *succeeded*, *failed* and *running* |
+| **Webhook deliveries** | Each delivery, with **Endpoint**, **Event**, **Status**, **HTTP**, **Attempts** and **When**. Empty: *No deliveries yet.* |
+| **Mail** | A **Send a test message** box (an address and **Send**, toast *Test message queued*) and a **Mail log** with **To**, **Subject**, **Template**, **Status**, **Error** and **When**. Empty: *Nothing sent yet.* |
+
+Click a row for a **Details** window with the full record. (In the version of Studio this page was written against, opening an **event** row asked the API for the event by its numeric row id, and the API only accepts the event's own `event_id`, so the window could fail to open with *no such event*. If it does, read the event from the list's own columns, or from the API by `event_id`.) For an event it is the stored event, including the **consumers** it was routed to and the state of each:
+
+```json
+"consumers": [
+  { "type": "flow", "target": "on_todo", "status": "queued", "ref": "38bfb037c8cd4cd7b6de38debecfafbf" },
+  { "type": "realtime", "target": "alerts:x", "status": "failed", "error": "..." },
+  { "type": "webhook", "target": "endpoints", "status": "queued" }
+]
+```
+
+The `status` of a consumer is `queued` for a flow, a function or a webhook (the work is on a queue), `done` for a realtime publication that succeeded, and `failed` with an `error` when handing the work over itself failed. A `queued` flow then has its own run in **Flow runs**, and a `queued` webhook has deliveries in **Webhook deliveries**. An event with no consumers has an empty list, which is normal for an event nobody listens to.
+
+### The event map
+
+The **Event map** also lists **platform** events you did not create, such as `user.created`, `file.uploaded` and `session.revoked`, with the service that produces each (`service:akountz`, `service:storage`). A subscription or webhook for those appears as a consumer. Your resource events appear with the producer `service:api`.
+
+### Emitting a test event
+
+The **Emit test event** button opens **Emit an event**, with a **Name** (default `custom.test`) and a **Payload** (JSON, default `{"hello": "world"}`). **Emit** publishes it, and the toast says *Event emitted*. It goes through the same bus and the same routing as a real event, so it is the quickest way to test a subscription or a webhook without writing a record. Its `actor` is `studio` and its `source` is the same as a resource event's.
+
+Through the API:
+
+```http
+POST /platform/v1/projects/acme/envs/development/events
+```
+
+```json
+{ "name": "custom.test", "payload": { "kind": "x", "hello": "world" } }
+```
+
+```json
+{ "event_id": "5977bd30d884497ea0df5f629a28e7c9" }
+```
+
+Because a custom event carries any payload, a test event for a **resource** subscription needs the same shape as a real one: name it `todos.created` and give the payload `{"resource": "todos", "change": "created", "record": {...}}`, or the consumer's templates will not find what they read.
+
+
+## Who can listen
+
+There are four kinds of consumer, and they can be combined freely. Every one is routed from the same event, independently.
+
+| Consumer | What it does | Configured in |
+| --- | --- | --- |
+| **A flow with an event trigger** | Runs the flow, with the event as input | The flow itself |
+| **An event subscription** | Runs a flow or a function, or broadcasts to a realtime channel, optionally only when a condition holds | **Event subscriptions** |
+| **A webhook endpoint** | Sends the event to an external URL, signed, with retries | **Webhooks** |
+| **Realtime subscribers** | Receive the change on the channel `resource:<name>` | The resource's **Broadcast changes** switch |

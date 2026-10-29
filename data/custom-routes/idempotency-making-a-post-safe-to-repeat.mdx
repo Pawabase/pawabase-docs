@@ -1,0 +1,240 @@
+---
+title: "Idempotency: making a POST safe to repeat"
+description: "Networks retry. A route that creates something, or moves money, should give the same answer when it is called twice with the same intent."
+icon: "route"
+---
+
+Networks retry. A route that creates something, or moves money, should give the same answer when it is called twice with the same intent.
+
+A pattern with a flow or function and one extra resource:
+
+1. The client sends an **idempotency key** in the body (`"key": "order-7-refund-1"`).
+2. A resource `idempotency_keys` holds `key` (unique) and `response` (json).
+3. The handler first looks up the key. If it exists, it **returns the stored response**.
+4. Otherwise it does the work, stores the key and the response, and returns it.
+
+In a function:
+
+```python
+@function("refund", policy="authenticated")
+async def refund(ctx):
+    key = ctx.input["key"]
+    found = await ctx.runtime.resource_list("idempotency_keys", filters={"key": key}, limit=1)
+    if found["data"]:
+        return found["data"][0]["response"]
+
+    result = await do_the_refund(ctx)             # your logic
+    try:
+        await ctx.runtime.resource_create("idempotency_keys", {"key": key, "response": result})
+    except Exception:
+        # two requests raced: the unique index let one win. Return what it stored
+        found = await ctx.runtime.resource_list("idempotency_keys", filters={"key": key}, limit=1)
+        return found["data"][0]["response"]
+    return result
+```
+
+The unique constraint on `key` is what makes it safe: two simultaneous requests cannot both store the key, and the loser returns the winner's answer. It is a pattern, not a platform feature, and the `do_the_refund` work still needs to be safe to have started twice, because both racers may reach it before either stores the key. Where that matters, store the key **first**, in a transaction with the work.
+
+
+## Extension routers
+
+Besides routes defined as data, a project can mount a **plain Sillo router** from code, in `code/<project>/routes.py`:
+
+```python
+from sillo import Router
+
+router = Router(prefix="/billing")
+
+@router.get("/ping")
+async def ping(ctx):
+    return {"pong": True}
+```
+
+It is loaded with the project's other code, and it is the way to write an endpoint that needs everything a web framework offers: streaming, file responses, custom middleware. It is **not** a stored definition: it is not shown in Studio's Routes page, it is not promoted, it has no policy, rate limit or cache setting from Pawabase, and you are responsible for authentication in it. Reach for it only when a route backed by a flow or a function cannot do the job. This section follows the description on the Code page and was not exercised in the runs above, so test an extension router in a development environment before you rely on it.
+
+
+## Creating a route in Studio, start to finish
+
+The whole job for a flow-backed route, in the order the screens appear.
+
+<Steps>
+  <Step title="Create the flow">
+    Open **Flows** and create a flow whose first block is **HTTP trigger** (`trigger.http`). Set its method and path to the ones the route will use, for example `POST` and `/orders/{id}/refund`. Add the blocks that do the work, and end with a **Return response** block (`response.return`) when the status or headers matter. Save it.
+  </Step>
+  <Step title="Open Routes and create the route">
+    In **Build → Routes**, create a new route. The sheet is titled **New route**.
+  </Step>
+  <Step title="Fill in the endpoint">
+    Choose the **method**, type the **path** after the fixed `/rest/v1` prefix (placeholder `/checkout`), and optionally a **Name** and **Description** for the documentation. Leave **Enabled** on.
+  </Step>
+  <Step title="Choose the handler">
+    Under **Handler**, leave **Type** on **Flow** and pick your flow from the select. If there are no flows yet, the field says *No flows yet; type a name.* and you can type the name of one you are about to create.
+  </Step>
+  <Step title="Set who may call it">
+    Under **Access**, choose a policy. Leaving it empty means **authenticated**, which is not public. Pick `public` only when you mean it.
+  </Step>
+  <Step title="Describe the request">
+    Under **Request & response**, set **Request body** to **Define fields** and add the fields with their rules, or **Use a schema** and choose one (remembering that required fields are not enforced that way). **Anything** accepts any body.
+  </Step>
+  <Step title="Add the limits">
+    Under **Limits**, turn on **Rate limit** where the route costs something, and set **Cache responses** only for a `GET` route that tolerates a short delay.
+  </Step>
+  <Step title="Save, then check the Overview">
+    The footer's primary button creates the route. Open **Overview** and confirm that no definition is reported with a problem, in particular a route that **shadows a resource route**.
+  </Step>
+  <Step title="Call it">
+    Call it from the **API Explorer** with your operator credentials, or from a client with a key that carries `routes:invoke`. Open **Observability** to see the request and the flow run it started.
+  </Step>
+</Steps>
+
+If the footer's hint says *Choose a handler.* the route cannot be saved yet. If the path is invalid, the save is refused with the message `path must look like /orders/{id}/pay`, and a name that is already taken for that method answers with `route already exists`.
+
+
+## Route definitions by archetype
+
+Concrete definitions to compare with your own. Each is the body you would send to the routes endpoint.
+
+### An action on one record
+
+```json
+{
+  "method": "POST",
+  "path": "/orders/{id}/cancel",
+  "name": "Cancel an order",
+  "handler_type": "flow",
+  "handler": "cancel_order",
+  "policy": "own_orders",
+  "input_fields": [{ "name": "reason", "type": "string", "max_length": 200 }],
+  "rate_limit": { "limit": 10, "window": 60 }
+}
+```
+
+A fixed verb at the end of an id path, an owner-scoped policy, an optional reason, and a limit that tolerates a retry or two.
+
+### A read-only report
+
+```json
+{
+  "method": "GET",
+  "path": "/reports/revenue",
+  "name": "Revenue by status",
+  "handler_type": "flow",
+  "handler": "revenue_report",
+  "policy": "finance_only",
+  "cache_ttl": 30,
+  "tags": ["reports"]
+}
+```
+
+`GET`, so it can be cached, with a short time because a report built from other resources is not cleared by writes.
+
+### A public, rate-limited lookup
+
+```json
+{
+  "method": "GET",
+  "path": "/stock/{sku}",
+  "name": "Stock level",
+  "handler_type": "flow",
+  "handler": "stock_level",
+  "policy": "public",
+  "rate_limit": { "limit": 120, "window": 60 },
+  "cache_ttl": 10
+}
+```
+
+A public endpoint with a rate limit and a short cache. The cache key includes the `sku`, so each product has its own entry.
+
+### A server-to-server endpoint
+
+```json
+{
+  "method": "POST",
+  "path": "/internal/sync",
+  "name": "Sync from the ERP",
+  "handler_type": "function",
+  "handler": "erp-sync",
+  "policy": "service",
+  "input_fields": [{ "name": "since", "type": "datetime", "required": true }]
+}
+```
+
+Only a service credential passes the policy, so a browser key or a user token is refused. The function runs a long job, so it has a generous `timeout` in its own definition.
+
+### A route kept off while it is built
+
+```json
+{
+  "method": "POST",
+  "path": "/beta/export",
+  "handler": "export_everything",
+  "policy": "deny",
+  "enabled": false
+}
+```
+
+A route can be saved disabled, with a policy that refuses everyone, so that nothing reaches it while the flow is finished. Both settings guard it: **Enabled** off answers `404`, and if someone enables it early, `deny` still refuses.
+
+
+## Reading the route's own definition
+
+A saved route comes back with every field, which makes the list a convenient inventory:
+
+```json
+{
+  "id": 7,
+  "name": "Cancel an order",
+  "description": "",
+  "method": "POST",
+  "path": "/orders/{id}/cancel",
+  "policy": "own_orders",
+  "input_fields": [{ "name": "reason", "type": "string", "max_length": 200 }],
+  "input_schema": null,
+  "response_schema": null,
+  "transformer": null,
+  "handler_type": "flow",
+  "handler": "cancel_order",
+  "rate_limit": { "limit": 10, "window": 60 },
+  "cache_ttl": 0,
+  "tags": [],
+  "enabled": true
+}
+```
+
+Fetching the routes of each environment and comparing them is how you check that **production's routes match staging's**. The comparison is by method and path, which is also the key a promote uses to decide what to overwrite.
+
+
+## A security review of a route
+
+A route runs code on behalf of a caller. Before one goes public, walk the same checklist every time. Each item below comes from something that was run.
+
+| Question | What was observed | What to do |
+| --- | --- | --- |
+| **Is the policy what I meant?** | Omitting the policy gives `authenticated`. `public` has to be written | Name the policy explicitly. Read it back in the route's sheet |
+| **Does the policy fail closed?** | A condition on `$input` for a `GET` refused everyone. A comparison with a missing value is false | Test with the field present, missing and wrong |
+| **Who can learn the body's shape?** | Validation runs **before** the policy, so a signed-out caller gets a `422` naming the fields | Accept it for documented APIs. Otherwise keep the route behind a gateway rule |
+| **Does the function have a policy that routes bypass?** | A function with policy `deny` returned its result through a `public` route | Put the restriction on the **route**. Treat the function's policy as the policy of its direct door only |
+| **Does a flow also have a direct door?** | A flow with a `trigger.http` that has no path is callable at `/flows/v1/<name>` | Give that trigger a policy, or give it a path |
+| **Does `response_schema` limit the response?** | No. Extra keys were returned, defaults were not applied | Build the body in the flow, or use a transformer with `pick` |
+| **Does `input_schema` require fields?** | No. `required` was not enforced, only constraints like `minimum` | Use `input_fields`, or check in the flow |
+| **Does an unvalidated route accept anything?** | Any JSON, including lists and strings, and invalid JSON as `null` | Declare a model |
+| **Can the query be injected?** | A SQL block with a parameter treated `a' OR '1'='1` as data | Always use parameters. Never join text |
+| **Does the SQL respect policies?** | No. A flow's SQL reads the raw table | Select only what the caller may see, and set the route's policy to match |
+| **Can a cached answer outlive the policy?** | The route's cache lookup is before the full policy check, and the key has identity and role only | Cache only routes whose policy is about the caller |
+| **Does the rate limit cover failures?** | Failed requests counted, and the limit is per caller | Choose a limit above your clients' retries |
+| **Can a key reach it?** | A key without `routes:invoke` was refused with `403` | Issue keys with the scopes they need |
+| **Is it reachable by the wrong key type?** | A `service` policy refuses user tokens and publishable keys | Use it for server-to-server endpoints |
+| **What do errors reveal?** | A function that raises returns a plain `500`, with no message | Good. Do not add messages that leak internals |
+
+### The doors a route opens
+
+A route is one door. The things it calls may have others:
+
+```text
+route  ─────► flow  ◄───── /flows/v1/<name>      (only if the trigger has no path)
+route  ─────► function ◄── /functions/v1/<name>  (its own policy)
+route  ─────► resource blocks ─── no policy, trusted
+route  ─────► SQL block ───────── no policy, raw table
+```
+
+Review them as a set. A flow behind a locked route that is also open at `/flows/v1` is open.

@@ -1,0 +1,347 @@
+---
+title: "Invitations"
+description: "An invitation is two things stored side by side:"
+icon: "building"
+---
+
+An invitation is two things stored side by side:
+
+1. a **signed, single-use, expiring token** issued by `app/links.py`, which is what the recipient actually receives, and
+2. an **`Invitation` row**, which is what makes the invitation listable, revocable, and auditable.
+
+This split matters because the token alone cannot be listed and the row alone cannot be delivered.
+
+### The token half
+
+`links.issue` creates a `OneTimeToken` row and returns a signed string that carries only that row's id:
+
+```python
+LIFETIMES = {
+    "verify": 24 * 3600,
+    "recovery": 3600,
+    "magic": 900,
+    "invite": 7 * 24 * 3600,
+    "mfa": 300,
+    "email_change": 24 * 3600,
+    "link": 600,
+}
+```
+
+```python
+async def issue(
+    akountz: Akountz,
+    config: AuthConfig,
+    purpose: str,
+    *,
+    user: AuthUser | None = None,
+    email: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> str:
+    lifetime = LIFETIMES[purpose]
+    row = await OneTimeToken.create(
+        id=new_ulid(),
+        project=config.project,
+        env=config.env,
+        purpose=purpose,
+        user=user,
+        email=email or (user.email if user else None),
+        data=data or {},
+        expires_at=datetime.now(UTC) + timedelta(seconds=lifetime),
+    )
+    return akountz.serializer(config.project, config.env, purpose).dumps({"id": row.id})
+```
+
+An invitation token therefore lives for **seven days**. The signature makes it unforgeable and time-limited; the row makes it single-use and revocable.
+
+`links.consume` enforces both, and collapses every failure mode into one indistinguishable `400`:
+
+```python
+async def consume(
+    akountz: Akountz, config: AuthConfig, purpose: str, token: str, *, peek: bool = False
+) -> OneTimeToken:
+    """Verify and use up a token. Every failure is the same 400."""
+    invalid = HTTPException(status_code=400, detail="the link is invalid or has expired")
+    try:
+        payload = akountz.serializer(config.project, config.env, purpose).loads(
+            token, max_age=LIFETIMES[purpose]
+        )
+    except (BadSignature, ValueError, TypeError) as exc:
+        raise invalid from exc
+    row = (
+        await OneTimeToken.filter(
+            id=str(payload.get("id", "")), project=config.project, env=config.env, purpose=purpose
+        )
+        .prefetch_related("user")
+        .first()
+    )
+    if row is None or row.used_at is not None or row.expires_at <= datetime.now(UTC):
+        raise invalid
+    if not peek:
+        updated = await OneTimeToken.filter(id=row.id, used_at=None).update(
+            used_at=datetime.now(UTC)
+        )
+        if not updated:  # a concurrent request used it first
+            raise invalid
+    return row
+```
+
+<Info>
+A `peek=True` consume verifies and loads without marking the token used. The accept route peeks first to check the invitation's state, then consumes for real. That is why accepting the same link twice in a race produces a clean `400` rather than a partial membership.
+</Info>
+
+The delivery URL depends on whether `site_url` is set:
+
+```python
+def link(config: AuthConfig, kind: str, token: str, redirect_to: str | None = None) -> str:
+    query = {"token": token, "type": kind}
+    if redirect_to:
+        query["redirect_to"] = redirect_to
+    if config.site_url:
+        return f"{config.site_url.rstrip('/')}/auth/callback?{urlencode(query)}"
+    base = (config.public_url or "").rstrip("/")
+    return f"{base}/auth/v1/links/{config.project}/{config.env}/{kind}?{urlencode(query)}"
+```
+
+With a `site_url`, the link points at **your** application, which is expected to complete the flow against the API. Without one, it points at Akountz's own link page. `redirect_to` is validated against the allowlist before it is ever placed in the URL.
+
+### The row half
+
+```python
+@r.post(
+    "/orgs/{slug}/invitations",
+    tags=["organizations"],
+    request_model=InviteBody,
+    summary="Invite someone by email",
+)
+async def invite(ctx: HttpContext, slug: str, body: InviteBody):
+    user, _ = await signed_in_user(ctx)
+    org, _ = await membership(user, slug, manage=True)
+    _check_role(body.role)
+    config = await load_config(akountz, user.project, user.env)
+    email = normalise_email(body.email)
+    existing = await find_by_email(user.project, user.env, email)
+    if existing and await Membership.filter(organization=org, user=existing).exists():
+        raise HTTPException(status_code=409, detail="already a member")
+    token = await links.issue(
+        akountz, config, "invite", email=email, data={"organization": org.id, "role": body.role}
+    )
+    row_id = akountz.serializer(config.project, config.env, "invite").loads(token)["id"]
+    invitation = await Invitation.create(
+        organization=org,
+        email=email,
+        role=body.role,
+        token_id=row_id,
+        invited_by=user.id,
+        expires_at=datetime.now(UTC) + timedelta(days=7),
+    )
+    await akountz.emit(
+        user.project,
+        user.env,
+        "invitation.created",
+        {"organization": slug, "email": email, "role": body.role},
+        actor=str(user.id),
+    )
+    return created(
+        {
+            "id": invitation.id,
+            "email": email,
+            "role": body.role,
+            "expires_at": invitation.expires_at.isoformat(),
+        }
+    )
+```
+
+The route also sends the email, with `organization` and `role` as template variables:
+
+```python
+await emails.send(
+    akountz,
+    config,
+    "invite",
+    email,
+    link=links.link(config, "invite", token, body.redirect_to),
+    organization=org.name,
+    role=body.role,
+)
+```
+
+whose default template is:
+
+```python
+"subject": "You are invited to {organization} on {project}",
+"text": "You have been invited to join {organization} as {role}.\n\nAccept the invitation here:\n\n{link}",
+```
+
+Things to notice:
+
+- **The 409 check is against current membership, not against pending invitations.** Inviting someone who is already a member fails; inviting someone with a pending invitation succeeds and creates a second, independent invitation.
+- **`email` is normalised** through `normalise_email` (strip, lowercase, validate, 255 max) before anything else, so the later address comparison is exact.
+- **`token_id` is the `OneTimeToken` row id**, recovered by unsigning the token that was just issued. This is the join between the two halves, and it is how revoking one invalidates the other.
+- **Both expiry clocks are set to seven days** — `links.LIFETIMES["invite"]` and `expires_at` on the row. They agree, so you never have to reason about which wins.
+- **The token is never returned in the response.** The `201` body has the invitation `id`, the email, the role and the expiry — enough to identify and revoke the invitation, not enough to accept it.
+
+```bash
+curl -X POST "$GW/auth/v1/orgs/acme-hq/invitations" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $OWNER_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "dana@example.com", "role": "member"}'
+```
+
+```json
+{
+  "id": "01JXBC3N5Q7R9S2T4U6V8W0X1Y",
+  "email": "dana@example.com",
+  "role": "member",
+  "expires_at": "2026-03-08T11:20:00.000Z"
+}
+```
+
+### Listing pending invitations
+
+```python
+@r.get("/orgs/{slug}/invitations", tags=["organizations"], summary="Pending invitations")
+async def invitations(ctx: HttpContext, slug: str):
+    user, _ = await signed_in_user(ctx)
+    org, _ = await membership(user, slug, manage=True)
+    rows = await Invitation.filter(
+        organization=org, accepted_at=None, revoked_at=None, expires_at__gt=datetime.now(UTC)
+    )
+    return {
+        "data": [
+            {
+                "id": i.id,
+                "email": i.email,
+                "role": i.role,
+                "expires_at": i.expires_at.isoformat(),
+            }
+            for i in rows
+        ]
+    }
+```
+
+"Pending" is defined entirely by the query: not accepted, not revoked, not expired. Accepted and revoked invitations simply drop out of this list rather than appearing with a status. There is no endpoint that returns the full invitation history for an organization.
+
+<Warning>
+Listing invitations requires a manager. A plain `member` or `viewer` gets `403 only owners and admins can do that` here, even though they can list members. Invitation state is treated as management information.
+</Warning>
+
+### Revoking
+
+```python
+@r.delete(
+    "/orgs/{slug}/invitations/{invitation_id}",
+    tags=["organizations"],
+    summary="Revoke an invitation",
+)
+async def revoke_invitation(ctx: HttpContext, slug: str, invitation_id: str):
+    invitation_id = invitation_id.upper()  # ULIDs are case-insensitive
+    user, _ = await signed_in_user(ctx)
+    org, _ = await membership(user, slug, manage=True)
+    updated = await Invitation.filter(
+        id=invitation_id, organization=org, accepted_at=None
+    ).update(revoked_at=datetime.now(UTC))
+    if not updated:
+        raise HTTPException(status_code=404, detail="no such invitation")
+    return no_content()
+```
+
+Revocation sets `revoked_at` on the row and nothing else. It does **not** delete the `OneTimeToken` row and does **not** consume the signed token. The accept route re-checks `revoked_at=None` on the `Invitation`, so a revoked link fails there even though the token itself is still cryptographically valid and unexpired.
+
+Two consequences follow:
+
+- An already-accepted invitation cannot be revoked: the filter requires `accepted_at=None`, so the update matches nothing and you get `404 no such invitation`.
+- Revoking and then re-inviting the same address is completely fine. The new invitation is a new token and a new row; the revoked one has no bearing on it.
+
+### Accepting
+
+```python
+@r.post(
+    "/invitations/accept",
+    tags=["organizations"],
+    request_model=AcceptBody,
+    summary="Accept an invitation",
+)
+async def accept(ctx: HttpContext, body: AcceptBody):
+    user, _ = await signed_in_user(ctx)
+    config = await load_config(akountz, user.project, user.env)
+    row = await links.consume(akountz, config, "invite", body.token, peek=True)
+    invitation = (
+        await Invitation.filter(token_id=row.id, revoked_at=None, accepted_at=None)
+        .prefetch_related("organization")
+        .first()
+    )
+    if invitation is None:
+        raise HTTPException(status_code=400, detail="the invitation is no longer valid")
+    if invitation.email != user.email:
+        raise HTTPException(
+            status_code=403, detail="this invitation was sent to another address"
+        )
+    await links.consume(akountz, config, "invite", body.token)
+    await upsert(
+        Membership,
+        organization=invitation.organization,
+        user=user,
+        defaults={"role": invitation.role},
+    )
+    invitation.accepted_at = datetime.now(UTC)
+    await invitation.save(update_fields=["accepted_at"])
+    await akountz.emit(
+        user.project,
+        user.env,
+        "invitation.accepted",
+        {"organization": invitation.organization.slug, "user_id": str(user.id)},
+        actor=str(user.id),
+    )
+    return org_view(invitation.organization, invitation.role)
+```
+
+The order of operations is the whole design:
+
+<Steps>
+  <Step title="Signed in, but not yet a member">
+    `signed_in_user` is required. You must have an account in *this* environment before you can accept an invitation — the accept route creates a `Membership`, and a `Membership` needs a user. Inviting an address with no account is fine; the recipient signs up first, then accepts.
+  </Step>
+  <Step title="Peek the token">
+    `peek=True` verifies the signature, the seven-day age limit, the environment and the purpose, without consuming it.
+  </Step>
+  <Step title="Find a live invitation row">
+    `token_id=row.id`, `revoked_at=None`, `accepted_at=None`. Any failure here is `400 the invitation is no longer valid` — deliberately the same message whether it was revoked, already accepted, or never existed.
+  </Step>
+  <Step title="Check the address matches exactly">
+    `invitation.email != user.email` is `403 this invitation was sent to another address`. Both sides are normalised lowercase, so this is an exact string comparison. A user with two accounts in one environment cannot accept with the wrong one.
+  </Step>
+  <Step title="Consume the token for real">
+    Now `used_at` is stamped. A concurrent second acceptance loses here and gets `400 the link is invalid or has expired`.
+  </Step>
+  <Step title="Upsert the membership">
+    `upsert(Membership, ..., defaults={"role": invitation.role})`. Because `unique_together` is `(organization, user)`, re-accepting updates the existing row's role rather than failing on a duplicate.
+  </Step>
+</Steps>
+
+<Warning>
+The response is an `org_view`, so it carries `role` — the role the invitation promised, not necessarily the role that ended up in the database if a concurrent request changed it. In practice that race is vanishingly rare, but the `org_view(invitation.organization, invitation.role)` argument is the invitation's role, read from the row you just loaded.
+</Warning>
+
+```bash
+curl -X POST "$GW/auth/v1/invitations/accept" \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $DANA_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"token": "Im9uZXktc2lnbmF0dXJl..."}'
+```
+
+```json
+{
+  "id": "01JX9K2M4P7Q8R3S5T6U7V8W9X",
+  "slug": "acme-hq",
+  "name": "Acme Corporation",
+  "metadata": {},
+  "role": "member",
+  "created_at": "2026-01-14T09:12:44.318Z"
+}
+```
+
+<Info>
+Accepting an invitation does **not** switch the current session to that organization. It creates the membership and returns the organization view. To get `org`/`org_role` claims for it, you must refresh with `org` named — see [Switching the active organization](/auth/organizations/switching-the-active-organization#switching-the-active-organization).
+</Info>

@@ -1,0 +1,251 @@
+---
+title: "Caching for custom routes"
+description: "A route can have its own cachettl, in the Limits section of its sheet, with the same label and hint as a resource's. It uses the same stores and the…"
+icon: "clock"
+---
+
+A route can have its own `cache_ttl`, in the **Limits** section of its sheet, with the same label and hint as a resource's. It uses the same stores and the same expiry. It differs in four ways, all observed.
+
+| | Resource | Custom route |
+| --- | --- | --- |
+| Which requests are cached | `list` and `get` | **`GET` routes only.** A `cache_ttl` on a `POST`, `PUT`, `PATCH` or `DELETE` route is accepted when you save and has no effect |
+| What a write clears | Entries tagged with the resource | **Nothing.** Route entries carry no tags, so no resource write clears them |
+| What is in the key | Identity, role, query (list) or id and `expand` (get) | Identity, role, and the **whole request**: path parameters, query and body |
+| What is stored | The shaped body | The body, the status and the headers, for any status below 400 |
+
+The second row is the one that matters. A route that reads resources is only as fresh as its time. This was run: a `GET /count` route with a cache time of 60, backed by a flow that lists the `things` resource.
+
+| Step | Answer |
+| --- | --- |
+| `GET /rest/v1/count?who=a` as `u-1` | One item in `seen`. Cached |
+| `POST /rest/v1/things` (a write through the API) | Created |
+| `GET /rest/v1/count?who=a` as `u-1` again | **Still one item.** Served from the entry |
+| `GET /rest/v1/count?who=b` as `u-1` | Two items. A different query is a different key |
+| `GET /rest/v1/count?who=a` as `u-2` | Two items. A different user is a different key |
+| `GET /rest/v1/count?who=a` with no credential | `401`. The gate refused before any lookup |
+
+The write to `things` cleared `things` entries and never touched the route's. Until the route's time ran out, readers of the same query saw the old count.
+
+So for a route:
+
+- **Use a short time**, matched to how stale a summary may be (5 to 30 seconds for a dashboard).
+- **Invalidate by hand** only works on resource tags, so it does not clear route entries. A definition save (which changes the key prefix) does.
+- **Prefer caching the resources** it reads, whose entries a write clears, over caching the route that combines them, when freshness matters.
+
+### Where the lookup happens in a route
+
+For a resource, the policy gate runs and then the cache is read. For a route, the **plan-time** gate runs first (the part of the policy that does not depend on the body), then the cache is read, and the **full** policy check (with the body available as `$input`) runs after, only on a miss. Because a `GET` route has no body, the full check adds nothing for conditions that depend only on `$auth`. But a cached answer is returned before any condition that depends on the request's body or on state outside the gate is evaluated a second time. Keep the policy of a cached route to conditions on the caller.
+
+
+## Caching in flows
+
+Flows have their own cache blocks, with a key prefix of their own (`user:`) so a flow's keys cannot collide with a resource's. They are not tagged to resources either. See [Flows](/flows/overview).
+
+
+## The cache and the browser
+
+Pawabase's cache is **server-side only**. It does not tell browsers, proxies or CDNs to keep anything. A cached and an uncached `GET /rest/v1/...` answer carry the same headers, and none of them is a caching header. This was checked on a cached list:
+
+| Header | Present? |
+| --- | --- |
+| `Cache-Control` | No |
+| `ETag` | No |
+| `Last-Modified` | No |
+| `Age` | No |
+| `Vary` | No |
+| `X-Cache` | No |
+
+Two consequences:
+
+- **A CDN in front of the gateway will not cache these responses by default**, and it should not be asked to without care. A shared edge cache that keyed on the URL alone would serve one caller's response to another, since the entry depends on the `apikey` header and the `Authorization` header, neither of which a URL contains. If you want edge caching for a public resource, configure the CDN to key on the headers that matter, or put a route behind the CDN that is safe to share.
+- **A browser will reload every time.** Each page load is a request to Pawabase, which may be answered from its cache. The saving is on your database, not on the network.
+
+If you need client-side caching, do it in the application (a data-fetching library's cache, `stale-while-revalidate` in the client), where you can decide freshness per screen.
+
+### Rate limits still apply to cached reads
+
+A resource's rate limit is checked **before** the cache. A cache hit costs the caller one request from their allowance exactly as a miss does. This was run with a limit of 3 per 60 seconds on a cached resource: the third request was refused, though an entry existed.
+
+```json
+{ "error": "rate_limit_exceeded", "message": "Too many requests." }
+```
+
+with the headers:
+
+```text
+retry-after: 20
+x-ratelimit-limit: 3
+x-ratelimit-remaining: 0
+```
+
+Allowance is counted per resource, across reads and writes, so a write counts too. A cache lowers the cost of a request to your database. It does not lower the number of requests a caller may make. See [Rate limits and CORS](/reference/rate-limits-and-cors).
+
+
+## Putting numbers on it
+
+Caching decisions are easier with arithmetic. These examples use round numbers so the reasoning is visible.
+
+### Example 1: a public catalogue
+
+- 200 requests per second to `GET /rest/v1/products?...`, from anonymous shoppers.
+- About 30 distinct queries account for nearly all of them (a few sort orders, a few pages, a few categories).
+- Staff change a product 20 times an hour through the API.
+- `cache_ttl` is 300.
+
+Writes arrive every three minutes on average. After each, the 30 entries are rebuilt: 30 database queries. Between writes, almost all 200 requests per second hit.
+
+| | Without the cache | With the cache |
+| --- | --- | --- |
+| Database queries per hour | 720,000 | About 600 (30 rebuilds, 20 times) plus the occasional expiry |
+| Hit rate | | About 99.9% |
+
+This is the favourable case, and it is common for catalogues, public content and settings.
+
+### Example 2: a per-user list
+
+- 5,000 signed-in users. Each reloads their own list about once a minute.
+- Entries are per user, so each is read once a minute.
+- `cache_ttl` is 30.
+
+An entry is read at most twice in its 30 seconds. About half the requests hit. The saving is real but modest, and it costs 5,000 entries.
+
+| `cache_ttl` | Approximate hit rate | Entries held |
+| --- | --- | --- |
+| 10 | Low, 10% | Up to 5,000 |
+| 30 | About 50% | 5,000 |
+| 60 | About 50% to 80% | 5,000 |
+
+Past 60 seconds, a longer time adds little, because the user's own writes clear their entry anyway.
+
+### Example 3: a write-heavy resource
+
+- 5 writes per second to `events`, 20 reads per second of one popular query.
+- `cache_ttl` is 60.
+
+Every write clears every entry. With a write every 200 ms, an entry rarely survives long enough for a second reader. The hit rate is close to zero, and the cache adds a lookup to every request. Leave it at `0`.
+
+### Example 4: tracking parameters
+
+A catalogue page's data request carries the page's query string, `?utm_campaign=...&gclid=...`. There are 10,000 distinct `gclid` values a day, so 10,000 distinct keys for what is one query. The hit rate falls from 99% to under 1%, and the cache holds 10,000 near-identical entries. Stripping the unknown parameters in the client restores it.
+
+### How big is an entry
+
+An entry is the JSON body of one response. A page of 20 records with ten small fields is a few kilobytes. Estimate memory as:
+
+```text
+entries × average body size
+```
+
+A public resource with 30 queries and 4 KB bodies holds about 120 KB. A per-user resource with 5,000 users and a 10 KB list each holds about 50 MB. A table with large text or JSON fields, and `per_page=200`, can make one entry hundreds of kilobytes, so cap page sizes on cached resources.
+
+
+## Testing the cache
+
+A cache that is not tested is a rumour. These tests cover the rules above and run against a development environment.
+
+```python
+import time
+
+
+def read(api, path, **kw):
+    response = api.get(path, **kw)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_write_through_api_is_visible_immediately(api):
+    created = api.post("/rest/v1/posts", json={"title": "v1"}).json()
+    before = read(api, "/rest/v1/posts")
+    api.patch(f"/rest/v1/posts/{created['id']}", json={"title": "v2"})
+    after = read(api, "/rest/v1/posts")
+    assert [row["title"] for row in after["data"]] == ["v2"]
+
+
+def test_each_parameter_is_its_own_entry(api, console):
+    read(api, "/rest/v1/posts?_=1")                  # cache an entry
+    console.run("WITH x AS (SELECT 1)\nUPDATE posts SET title = 'sql'")   # a change that clears nothing
+    assert read(api, "/rest/v1/posts?_=1")["data"][0]["title"] != "sql"    # still the cached copy
+    assert read(api, "/rest/v1/posts?_=2")["data"][0]["title"] == "sql"    # a fresh key
+
+
+def test_invalidate_makes_sql_changes_visible(api, operator):
+    read(api, "/rest/v1/posts")
+    operator.post("/cache/invalidate", json={"resources": ["posts"]})
+    assert read(api, "/rest/v1/posts")
+
+
+def test_ttl_expires(api, console):
+    read(api, "/rest/v1/posts")
+    console.run("WITH x AS (SELECT 1)\nUPDATE posts SET title = 'late'")
+    time.sleep(cache_ttl + 0.5)
+    assert read(api, "/rest/v1/posts")["data"][0]["title"] == "late"
+
+
+def test_users_do_not_share_entries(api_as):
+    a = api_as("u-1").get("/rest/v1/tickets").json()
+    b = api_as("u-2").get("/rest/v1/tickets").json()
+    assert not {row["id"] for row in a["data"]} & {row["id"] for row in b["data"]}
+```
+
+The second and fourth tests use a deliberately unrecognised console statement to change data without clearing the cache. That is the only way, short of another process, to prove a stale entry, and it is exactly the case you want to understand.
+
+
+## Operating checklist
+
+| When | Do |
+| --- | --- |
+| **Before launch** | Set `PAWABASE_REDIS_URL` if there is more than one API process. Set Redis eviction. Rate-limit public cached resources |
+| **After deploying a definition change** | Expect a cold cache. Watch database load for a minute |
+| **After a bulk SQL change** | Invalidate the resources it touched |
+| **After a restore** | Invalidate everything you cache, or save a definition |
+| **When a user reports stale data** | Ask how the data was changed. If through the API, check `MemoryCache` and replicas. If not, invalidate |
+| **When load rises** | Look for parameters that fragment the key, and for writes that clear too often |
+| **Quarterly** | Review each cached resource: do reads still outnumber writes? |
+
+
+## How this page differs from earlier ones
+
+Earlier versions of this page described a few behaviors that do not match what the platform does. They are listed so that you can recognise advice you may have seen:
+
+| Earlier claim | What actually happens |
+| --- | --- |
+| "Invalidation propagates across API instances" | Only with Redis. With the in-process cache each instance clears only its own entries |
+| "There is no manual invalidation hook" | There is: **Invalidate** on the Observability page's Cache card, and `POST .../cache/invalidate` |
+| "Changing a transformer does not invalidate the cache, so old shapes can be served" | A transformer edit is a definition save, which changes every key. The old shape is never served again |
+| "A definition save does not clear cached bodies" | It makes every earlier entry unreachable, which has the same effect for readers |
+| "Entries are cleared by every write, so related data stays fresh" | A cached `expand` is **not** cleared when the related resource changes |
+| "No max entries, so there is nothing to worry about" | There is no cap, so growth is yours to bound, and anyone can mint entries with parameters |
+
+
+## What you can rely on: consistency by configuration
+
+"Is my reader going to see my write?" has a different answer for each way of running Pawabase. This table is the whole story.
+
+| Setup | A write through the API is visible to the next read of the **same resource** | A write through the API to a **related** resource is visible in an `expand` | A change made with SQL elsewhere is visible |
+| --- | --- | --- | --- |
+| **Cache off** (`cache_ttl` 0) | Yes | Yes | Yes |
+| **`MemoryCache`, one API process** | Yes | No, until the parent's entry expires or is cleared | No, until expiry or invalidate |
+| **`MemoryCache`, several API processes** | **Only on the process that handled the write**. Others up to `cache_ttl` late | No | No |
+| **`RedisCache`** | Yes, on every process | No | No |
+| **Console write** the classifier recognised | Yes (clears every resource) | Yes | Yes, it is a write through Pawabase |
+| **Console write** the classifier did not recognise | No | No | No |
+| **A definition save** | Yes, everything is cold | Yes | Yes |
+
+Read it as three rules:
+
+1. **Through Pawabase, same resource:** fresh, if the cache is shared.
+2. **Through Pawabase, related resource inside an `expand`:** stale until the parent's entry is rebuilt.
+3. **Not through Pawabase:** stale until you say so or the time runs out.
+
+### What the cache never does
+
+| It never | So |
+| --- | --- |
+| Serves one caller's entry to another | Safe for private data |
+| Skips the policy gate | A refused caller stays refused |
+| Serves an error | Only successes are stored |
+| Serves an entry from before a definition save | The version is in the key |
+| Serves an entry past its time | Hard expiry |
+| Serves an entry for another environment or project | They are in the key |
+
+These are the guarantees to build on. Everything in the table above is where the guarantees stop.

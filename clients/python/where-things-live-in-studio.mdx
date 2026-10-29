@@ -1,0 +1,250 @@
+---
+title: "Where things live in Studio"
+description: "Every PawabaseError carries requestid, the gateway's x-request-id. Searching for it under Project → Activity shows the request's logs, its database…"
+icon: "python"
+---
+
+| You are working with | Studio |
+| --- | --- |
+| Resources and their fields | **Data** |
+| The exact request and response shapes | **Data → API Explorer** |
+| Policies | **Access → Policies** |
+| Keys | **Access → API keys** |
+| Users, roles, organizations | **Access → Users & auth** |
+| Flows and routes | **Logic → Flows**, **Logic → Routes** |
+| Buckets | **Services → Storage** |
+| Channels | **Services → Realtime** |
+| A request that failed | **Project → Activity**, by request id |
+
+Every `PawabaseError` carries `request_id`, the gateway's `x-request-id`.
+Searching for it under **Project → Activity** shows the request's logs, its database calls, and for server errors the traceback.
+
+
+## The same call without the client
+
+Seeing one call written with plain `httpx` shows what the client takes care of.
+
+<CodeGroup>
+```typescript TypeScript
+const page = await pawabase.from("orders").eq("status", "open").order("created_at", "desc").expand("customer").perPage(20);
+```
+
+```python Python
+page = pb.from_("orders").eq("status", "open").order("-created_at").expand("customer").per_page(20).execute()
+```
+
+```bash cURL
+curl -G "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" --data-urlencode "filter[status]=eq.open" \
+  --data-urlencode "sort=-created_at" --data-urlencode "expand=customer" --data-urlencode "per_page=20"
+```
+</CodeGroup>
+
+```python
+import httpx
+
+def list_open_orders(access_token: str | None) -> dict:
+    headers = {"apikey": "pb_pk_live_…", "x-environment": "production"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    response = httpx.get(
+        "https://api.example.com/rest/v1/orders",
+        params={"filter[status]": "eq.open", "sort": "-created_at", "expand": "customer", "per_page": "20"},
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+```
+
+The hand-written version works, and [REST conventions](/reference/rest-conventions) documents every parameter.
+What it leaves out is everything around the request:
+
+| Concern | Plain `httpx` | `pawabase` |
+| --- | --- | --- |
+| An expired access token | `401`; you refresh and repeat | Renewed before sending, or once after a `401` |
+| A `429` from the gateway | An exception | Waits for `Retry-After`, then repeats |
+| A `503` during a deploy | An exception | Repeated for reads |
+| The error body | One of several shapes | One exception class per status, with `code`, `message`, `request_id` |
+| `eq.false` on a boolean | Matches the wrong rows | Sent as `is.false` |
+| A second filter on one field | The first is dropped silently | `QueryError` before sending |
+| Dates and decimals in bodies | `TypeError` from the JSON encoder | Converted to ISO strings and text |
+
+
+## Configuring each environment
+
+Read the URL, key and environment name from configuration, never from source code.
+Name them consistently so every service and script in a project reads the same variables.
+
+| Variable | Holds |
+| --- | --- |
+| `PAWABASE_URL` | The gateway origin |
+| `PAWABASE_ENV` | The environment name |
+| `PAWABASE_PUBLISHABLE_KEY` | A `pb_pk_…` key, for acting as people |
+| `PAWABASE_SECRET_KEY` | A `pb_sk_…` key, for system work |
+
+A small settings module keeps the rest of the code free of configuration details:
+
+```python
+# app/pawabase_client.py
+import os
+from functools import lru_cache
+
+from pawabase import AsyncPawabase, Pawabase
+
+
+def _required(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"{name} must be set")
+    return value
+
+
+@lru_cache
+def base() -> Pawabase:
+    """One publishable-key client per process, for acting as people."""
+    return Pawabase(_required("PAWABASE_URL"), _required("PAWABASE_PUBLISHABLE_KEY"), environment=_required("PAWABASE_ENV"))
+
+
+@lru_cache
+def service() -> Pawabase:
+    """One secret-key client per process, for system work."""
+    return Pawabase(_required("PAWABASE_URL"), _required("PAWABASE_SECRET_KEY"), environment=_required("PAWABASE_ENV"))
+```
+
+Requiring `PAWABASE_ENV` instead of falling back to the client's `"development"` default turns a missing setting into a startup error rather than a script that quietly changes the wrong environment.
+
+With `pydantic-settings`, the same configuration is validated and typed:
+
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PawabaseSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="PAWABASE_")
+
+    url: str
+    env: str
+    publishable_key: str
+    secret_key: str | None = None
+
+
+settings = PawabaseSettings()
+```
+
+In Django, keep the values in `settings.py`, read from the environment there, and build clients from `django.conf.settings`.
+
+
+## Four application shapes
+
+### A web application acting for its users
+
+```text
+browser ──cookie or bearer token──▶ your Python server ──(pb_pk_ + user token)──▶ gateway
+```
+
+The server holds one publishable-key client and makes a per-request view with each person's token.
+Policies apply to everything the server reads and writes for that person.
+
+```python
+from fastapi import Depends, FastAPI, Header
+
+from pawabase import AsyncPawabase
+
+app = FastAPI()
+base = AsyncPawabase(PAWABASE_URL, PUBLISHABLE_KEY, environment=PAWABASE_ENV)
+
+
+def pawabase_for(authorization: str | None = Header(default=None)):
+    token = authorization.removeprefix("Bearer ") if authorization else None
+    return base.as_user(token) if token else base
+
+
+@app.get("/orders")
+async def orders(pb=Depends(pawabase_for)):
+    page = await pb.from_("orders").order("-created_at").per_page(20).execute()
+    return page.raw
+```
+
+`page.raw` is the response body as the server sent it, which is convenient to pass through an API unchanged.
+
+### A worker with no user
+
+```text
+scheduler or queue ──▶ worker ──(pb_sk_)──▶ gateway
+```
+
+<CodeGroup>
+```typescript TypeScript
+const service = createClient({ url, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" });
+const cutoff = new Date(Date.now() - 24 * 3600 * 1000);
+for await (const cart of service.from("carts").eq("status", "open").lt("updated_at", cutoff)) {
+  await service.from("carts").update(cart.id, { status: "abandoned" });
+}
+```
+
+```python Python
+from datetime import UTC, datetime, timedelta
+
+from pawabase import Pawabase
+
+with Pawabase(PAWABASE_URL, SECRET_KEY, environment="production") as pb:
+    cutoff = datetime.now(UTC) - timedelta(days=1)
+    for cart in pb.from_("carts").eq("status", "open").lt("updated_at", cutoff).iterate(max_records=5000):
+        pb.from_("carts").update(cart["id"], {"status": "abandoned"})
+```
+</CodeGroup>
+
+Much of what workers do can instead be a [flow](/flows/overview) on a [schedule](/jobs/schedules), which runs inside Pawabase with its own run history.
+A worker earns its place when it needs Python libraries a flow cannot reach.
+
+### A command-line tool people sign in to
+
+```python
+from getpass import getpass
+from pathlib import Path
+
+from pawabase import FileSessionStore, Pawabase
+
+pb = Pawabase(
+    PAWABASE_URL,
+    PUBLISHABLE_KEY,
+    environment="production",
+    session_store=FileSessionStore(Path.home() / ".config" / "mytool" / "session.json"),
+)
+
+if pb.auth.session is None:
+    pb.auth.sign_in_with_password(email=input("Email: "), password=getpass("Password: "))
+print("Signed in as", pb.auth.user["email"])
+```
+
+`FileSessionStore` writes the session to a file readable only by its owner, so the person stays signed in between runs.
+A publishable key is right here: the tool acts for the person, under their policies.
+
+### A notebook or data script
+
+```python
+pb = Pawabase(PAWABASE_URL, READ_ONLY_SECRET_KEY, environment="production")
+rows = pb.from_("orders").eq("status", "paid").select("id", "total_minor", "created_at").all(max_records=50_000)
+
+import pandas as pd
+frame = pd.DataFrame(rows)
+```
+
+Notebooks get shared and copied.
+Use a key restricted to reads, with **Allowed routes** limited to `GET` requests and an expiry, so a leaked notebook cannot change anything for long.
+
+
+## What a policy sees about your client
+
+| Context value | Publishable key, no user | Publishable key with `as_user(token)` or a session | Secret key |
+| --- | --- | --- | --- |
+| `$auth.authenticated` | `false` | `true` | `false` |
+| `$auth.kind` | `anonymous` | `user` | `service` |
+| `$auth.user_id` | empty | the person's id | empty |
+| `$auth.roles` | `[]` | the person's roles | `[]` |
+| `$credential.role` | `anon` | `anon` | `service` |
+| `$credential.is_service` | `false` | `false` | `true` |
+
+The default policy on resource operations, routes and flows is `authenticated`, so anonymous calls are refused until you choose otherwise.
+A secret key is not a signed-in person: policies that test `$auth.user_id` never see one, because secret keys bypass policies entirely.
+See [the policy context](/policies/context).

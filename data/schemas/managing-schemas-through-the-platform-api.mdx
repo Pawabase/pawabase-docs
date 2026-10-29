@@ -1,0 +1,266 @@
+---
+title: "Managing schemas through the Platform API"
+description: "Everything the Schemas page does can be done from a script, which is how you keep schemas in a repository and apply them from CI. The requests go to…"
+icon: "code-2"
+---
+
+Everything the **Schemas** page does can be done from a script, which is how you keep schemas in a repository and apply them from CI. The requests go to Studio's bridge, with the session cookie and the XSRF token that the `curl` examples elsewhere in these docs use:
+
+```bash
+# Create a schema
+curl -X POST "$STUDIO/studio/api/platform/projects/acme/envs/development/schemas" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{
+    "name": "Address",
+    "description": "A postal address",
+    "fields": [
+      {"name": "street", "type": "string", "max_length": 120},
+      {"name": "city", "type": "string", "max_length": 80},
+      {"name": "country", "type": "string", "min_length": 2, "max_length": 2, "pattern": "^[A-Z]{2}$"}
+    ]
+  }'
+
+# Read it back
+curl "$STUDIO/studio/api/platform/projects/acme/envs/development/schemas/Address" -b cookies.txt
+
+# Replace it (the whole definition)
+curl -X PUT "$STUDIO/studio/api/platform/projects/acme/envs/development/schemas/Address" \
+  -H "content-type: application/json" -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt \
+  -d '{"name": "Address", "fields": [ ... ]}'
+
+# Delete it (no check for users of the schema)
+curl -X DELETE "$STUDIO/studio/api/platform/projects/acme/envs/development/schemas/Address" \
+  -H "X-XSRF-TOKEN: $XSRF" -b cookies.txt
+```
+
+A create answers `201` with the stored definition, and the same name again answers `409` with `schema already exists`. A body that fails the name pattern or a field check answers `422`. These are the same checks the sheet's **Save changes** triggers, and the messages Studio shows in its error toast are the messages these calls return.
+
+### A check to run in CI
+
+If schemas live in a repository, a short script that loads them and runs the two checks from the testing section fails the build before a cycle or a dangling reference reaches an environment:
+
+```python
+import json, sys, pathlib
+
+schemas = {}
+for path in pathlib.Path("definitions/schemas").glob("*.json"):
+    definition = json.loads(path.read_text())
+    schemas[definition["name"]] = definition["fields"]
+
+resources = [json.loads(p.read_text()) for p in pathlib.Path("definitions/resources").glob("*.json")]
+
+problems = []
+if (cycle := find_cycle(schemas)):
+    problems.append("schema cycle: " + " -> ".join(cycle))
+problems += [f"dangling reference: {item}" for item in dangling(schemas, resources)]
+
+if problems:
+    print("\n".join(problems))
+    sys.exit(1)
+```
+
+It does not replace running the definitions in a development environment, since it knows nothing about stored rows, but it catches the failure with the largest blast radius at the cheapest point.
+
+
+## Schemas next to the other definitions
+
+Schemas are one of several definition kinds that describe what an API accepts and returns, and they are easy to confuse with their neighbors.
+
+| Definition | What it describes | Applied to |
+| --- | --- | --- |
+| Schema | The shape of a JSON value | Fields of resources, route bodies, route responses (documentation) |
+| Resource | A table, its fields, its operations and their policies | Rows at `/rest/v1/<name>` |
+| Transformer | How a record is reshaped on the way out (omit, pick, set, rename, case) | Responses of a resource or route |
+| Policy | Who may do something, as a condition on the caller, the record and the input | Operations, routes, buckets, channels |
+| Route | A custom endpoint and what runs behind it | `/rest/v1/<path>` |
+
+A schema answers "what may this value look like", a policy answers "who may send it", and a transformer answers "what does the reader see". Putting a rule in the wrong one is the usual design mistake, and the rows of the behavior table above are mostly cases of expecting a schema to do the work of a policy.
+
+## Schema, inline object, `json` or a resource
+
+Four ways to represent a nested structure exist, and they differ in what they validate and in what you can do with the data afterwards.
+
+| | Reusable schema (`ref`) | Inline `object` | `json` | A related resource |
+| --- | --- | --- | --- | --- |
+| Reused across resources | Yes | No, copy the definition | Not applicable | Yes, by relation |
+| Validates the shape | Types, constraints, allowed keys | Everything, including `required` and defaults | Nothing | Everything, as a resource |
+| `required` and defaults inside | Not enforced | Enforced | Not applicable | Enforced |
+| One definition to change | Yes | No | Not applicable | Yes |
+| Documented in the API reference | A named component | A component named after the parent | As "any" | As its own endpoints |
+| Filterable by inner value | No | No | No | Yes, it has columns |
+| Stored | One JSON column | One JSON column | One JSON column | Its own table |
+| Best for | Small repeated groups where constraints matter more than presence | A shape used once, with required keys | Opaque data you store and return | Anything you query, sort, count or link |
+
+A decision follows from three questions. If you will query by what is inside, it is a resource. If you will not, but the shape is used once and has keys that must be present, it is an inline `object`. If the same shape appears in several places and its constraints (not its required keys) are what matter, it is a schema. If you do not know or do not care what is inside, it is `json`.
+
+
+## `read_only` and `write_only` in a schema
+
+These two keys are covered on [Field types](/data/field-types/overview) for a resource's own fields. In a schema, they do less.
+
+| Key | On a resource's own field | On a field inside a referenced schema |
+| --- | --- | --- |
+| `read_only` | Left out of create and update, so clients cannot write it | **Not applied.** A nested `stamp` marked `read_only` accepted `"client-set"` and stored it |
+| `write_only` | Left out of the API document, but still returned at runtime | **Not applied.** A nested `secret` marked `write_only` was returned in the response |
+
+Neither key can be used to protect a nested value. A nested value that clients must not set has to be enforced with a policy that compares `$input` with the stored record, or set by a route. A nested value that clients must not see has to be removed with a transformer's `omit`, which works on top-level fields, so nested secrets belong in a top-level `write_only`-and-omitted field instead, see [Transformers](/data/transformers/overview).
+
+Remember that even at the top level, `write_only` documents and does not hide. The page on field types explains the gap, and the same warning applies here: a column that is not in the definition, or is marked `write_only`, is still returned by the API unless a transformer, or `?select=`, removes it.
+
+
+## A walkthrough: one address schema, three resources
+
+The patterns above are easier to judge against a concrete build. This one defines five small schemas and uses them in a `stores` resource, and every request and response shown was run.
+
+### Creating the schemas
+
+In **Build**, **Schemas**, **New schema**, each schema is a name and a field list. The five used here:
+
+| Schema | Description | Fields |
+| --- | --- | --- |
+| `Money` | An amount in the smallest currency unit | `amount_minor` (integer, minimum 0), `currency` (string, enum `USD`, `EUR`, `GBP`, `NGN`) |
+| `Address` | A postal address | `street`, `city`, `region` (strings, up to 120, 80 and 80 characters), `postcode` (string, up to 16), `country` (string, exactly two characters, pattern `^[A-Z]{2}$`) |
+| `GeoPoint` | WGS84 coordinates | `lat` (number, from -90 to 90), `lng` (number, from -180 to 180) |
+| `ContactMethod` | One way to reach a person | `kind` (string, enum `email`, `phone`, `whatsapp`), `value` (string, up to 120) |
+| `AuditStamp` | Who and when | `by` (string, up to 128), `at` (datetime) |
+
+None of them uses `required`, for the reason given earlier: it is inert inside a reference. They carry their limits as constraints, which do apply.
+
+### Using them in a resource
+
+In **Resources**, **New resource**, the **Fields** section takes a field per row. A field of type **Schema reference** shows a **Schema** menu in **More options**, listing the five schemas by name. The `stores` resource below has a required reference to `Address`, optional references to `GeoPoint`, `Money` and `AuditStamp`, and a list of `ContactMethod` references with an empty default:
+
+```json
+{
+  "name": "stores",
+  "description": "Pickup locations",
+  "fields": [
+    {"name": "name", "type": "string", "required": true, "max_length": 80},
+    {"name": "address", "type": "ref", "schema": "Address", "required": true},
+    {"name": "location", "type": "ref", "schema": "GeoPoint"},
+    {"name": "delivery_fee", "type": "ref", "schema": "Money"},
+    {"name": "contacts", "type": "array", "items": {"type": "ref", "schema": "ContactMethod"}, "default": []},
+    {"name": "updated_by", "type": "ref", "schema": "AuditStamp"}
+  ]
+}
+```
+
+Only `name` and `address` are required. After **Create / migrate table**, a complete record is accepted and filled out:
+
+```json
+POST /rest/v1/stores
+{
+  "name": "Lekki",
+  "address": {"street": "12 Admiralty Way", "city": "Lagos", "country": "NG"},
+  "location": {"lat": 6.44, "lng": 3.47},
+  "delivery_fee": {"amount_minor": 50000, "currency": "NGN"},
+  "contacts": [{"kind": "phone", "value": "+2348000000000"}],
+  "updated_by": {"by": "maya@acme.co", "at": "2026-10-01T09:30:00Z"}
+}
+
+201
+{
+  "id": 1, "name": "Lekki",
+  "address": {"street": "12 Admiralty Way", "city": "Lagos", "region": null, "postcode": null, "country": "NG"},
+  "location": {"lat": 6.44, "lng": 3.47},
+  "delivery_fee": {"amount_minor": 50000, "currency": "NGN"},
+  "contacts": [{"kind": "phone", "value": "+2348000000000"}],
+  "updated_by": {"by": "maya@acme.co", "at": "2026-10-01T09:30:00Z"},
+  "created_at": "2026-10-01T20:48:44.627413+00:00", "updated_at": "2026-10-01T20:48:44.627413+00:00"
+}
+```
+
+Note `region` and `postcode` in `address`: they were not sent, and they appear as `null`, because a nested value is filled to the full shape of its schema. Note also that `updated_by.at` came back as `2026-10-01T09:30:00Z`, exactly as sent: values inside a JSON column are stored as JSON, so a `datetime` nested in a schema is validated as a timestamp and returned as the text that was stored, not normalized the way a top-level `datetime` field is.
+
+### What a bad request looks like
+
+A body that breaks a rule in each of four of the nested values:
+
+```json
+POST /rest/v1/stores
+{
+  "name": "X",
+  "address": {"country": "nigeria"},
+  "location": {"lat": 99, "lng": 3},
+  "delivery_fee": {"amount_minor": -5, "currency": "XXX"},
+  "contacts": [{"kind": "fax", "value": "1"}]
+}
+
+422
+[
+  {"type": "string_too_long",     "loc": ["address", "country"],            "ctx": {"max_length": 2}},
+  {"type": "less_than_equal",     "loc": ["location", "lat"],               "ctx": {"le": 90.0}},
+  {"type": "greater_than_equal",  "loc": ["delivery_fee", "amount_minor"],  "ctx": {"ge": 0}},
+  {"type": "literal_error",       "loc": ["delivery_fee", "currency"],      "ctx": {"expected": "'USD', 'EUR', 'GBP' or 'NGN'"}},
+  {"type": "literal_error",       "loc": ["contacts", 0, "kind"],           "ctx": {"expected": "'email', 'phone' or 'whatsapp'"}}
+]
+```
+
+Every problem carries the full path through the reference, and the list entries carry an index. Because the paths do not name the schema, a client handles an error in `address.country` the same way whether `address` is a reference or an inline object.
+
+### Using the same schema elsewhere
+
+The point of the exercise is that `Address` can now appear in a second resource, and in a third, with no copying:
+
+```json
+{"name": "customers", "fields": [
+  {"name": "name", "type": "string", "required": true},
+  {"name": "billing", "type": "ref", "schema": "Address"},
+  {"name": "shipping", "type": "ref", "schema": "Address"}
+]}
+```
+
+A change to `Address` (a new optional `landmark` field, a longer `street`) reaches `stores` and `customers` together on the next request. The same holds in reverse for a mistake. The cost of that reach is the subject of the section on changing a schema in use.
+
+
+## How a schema appears in the API document
+
+The generated reference, in **API Explorer** and on the public docs page, lists each schema once as a component, and every resource that uses it points at that component. For the `stores` resource, the request schema for `POST` is:
+
+```json
+{
+  "title": "StoresCreate",
+  "required": ["name", "address"],
+  "type": "object",
+  "properties": {
+    "name": {"title": "Name", "maxLength": 80, "type": "string"},
+    "address": {"$ref": "#/components/schemas/Address"},
+    "location": {"anyOf": [{"$ref": "#/components/schemas/GeoPoint"}, {"type": "null"}]},
+    "delivery_fee": {"anyOf": [{"$ref": "#/components/schemas/Money"}, {"type": "null"}]},
+    "contacts": {
+      "title": "Contacts",
+      "anyOf": [{"type": "array", "items": {"$ref": "#/components/schemas/ContactMethod"}}, {"type": "null"}],
+      "default": []
+    },
+    "updated_by": {"anyOf": [{"$ref": "#/components/schemas/AuditStamp"}, {"type": "null"}]}
+  },
+  "additionalProperties": false
+}
+```
+
+The `required` list names `name` and `address`, the fields of the resource itself, and says nothing about `street` or `city` inside `Address`, in line with the behavior described above. The components available in the document for this environment are `Address`, `AuditStamp`, `ContactMethod`, `GeoPoint`, `Money`, the resource's response schema `Stores`, and the shared error item `ValidationErrorItem`. An inline `object` field produces components named after the parent resource instead (`PeopleInline`, `PeopleCreateInline` and `PeopleUpdateInline` for an inline field called `inline` on `people`), one per mode, which is how an inline object's `required` can differ between create and update in the document.
+
+Two practical points follow. A client generator reading the document produces one type per schema, shared by every resource that uses it, which is the same economy as on the server. And because every property in a schema component is nullable and nothing is required, generated client types for a schema have all-optional properties. Add your own required-ness in the client when a value is conceptually mandatory.
+
+
+## Schemas in flows and functions
+
+Flows and functions are where a reference does not reach. Both have places that accept a field list, and neither can look a schema up by name.
+
+| Place | Takes | Can it use a `ref` to a stored schema |
+| --- | --- | --- |
+| A resource's `fields` | A field list | Yes |
+| A route's `input_fields` | A field list | Yes |
+| A route's `input_schema` and `response_schema` | A schema name | Yes, by name |
+| A flow's `validate.schema` block | A field list in its config | **No** |
+| A function's `input_fields` | A field list in the decorator | **No**, by the same code path |
+
+A `validate.schema` block given a field whose type is `ref` fails the run, and the failure is a `500`:
+
+```text
+fields: [{"name": "home", "type": "ref", "schema": "Address"}]
+POST /rest/v1/vs  {"home": {"city": "x"}}
+  ->  500  {"error": "block_failed", "message": "field 'home' refers to unknown schema 'Address'"}
+```
+
+To validate a nested shape inside a flow, write the nested fields inline, as an `object`, in the block's config. That duplicates the definition, and the duplicate will not follow the schema when it changes, so keep the two next to each other in your notes and review them together. A flow that receives its data from a route with `input_fields` or from a resource operation has already been validated at the edge, and needs the block only for data that arrives some other way.

@@ -1,0 +1,254 @@
+---
+title: "Testing a transformer"
+description: "A transformer is a pure function of a record and a context, so the test is a request:"
+icon: "wand"
+---
+
+A transformer is a pure function of a record and a context, so the test is a request:
+
+<Steps>
+  <Step title="Create a representative record">
+    Include every column, including the ones that must not leave, and a null.
+  </Step>
+  <Step title="Read it through each door">
+    The list, the get, the create response, an `?expand=` from a parent, and a `?select=` of a few columns.
+  </Step>
+  <Step title="Assert the absence of hidden fields">
+    The test that matters most is the negative one: `secret` is not in any body.
+  </Step>
+  <Step title="Add a column and read again">
+    Add a new column in a development environment and check it. With `pick` it is absent. With `omit` it is present. That tells you which kind of list you wrote.
+  </Step>
+  <Step title="Try the caller variations">
+    Anonymous, signed in, an admin. If a template reads `auth`, the output should differ as intended.
+  </Step>
+  <Step title="Try the filter door">
+    Send `?filter[secret]=like.a*` and see whether the response reveals anything.
+  </Step>
+</Steps>
+
+A short script:
+
+```python
+def test_public_shape(api):
+    row = api.post("/rest/v1/posts", json={"title": "Hello", "secret": "s3", "author_id": "a1"}).json()
+    for body in (
+        api.get(f"/rest/v1/posts/{row['id']}").json(),
+        api.get("/rest/v1/posts").json()["data"][0],
+        row,
+    ):
+        assert "secret" not in body
+        assert "authorRef" in body and "author_id" not in body
+        assert body["url"].endswith(f"/posts/{row['id']}")
+```
+
+
+## Case conversion in detail
+
+`case` is simple, and a few of its edges are worth knowing before you point it at a table you did not design. These conversions were run on a set of awkward key names.
+
+### To camel case
+
+| Key | Becomes |
+| --- | --- |
+| `created_at` | `createdAt` |
+| `price_cents` | `priceCents` |
+| `x1_y2` | `x1Y2` |
+| `a_1` | `a1` |
+| `already_Camel` | `alreadyCamel` |
+| `snake_UPPER` | `snakeUPPER` |
+| `a__b` | `a_B` |
+| `_private` | `Private` |
+| `__x` | `_X` |
+| `_id` | `Id` |
+| `trailing_` | `trailing_` |
+| `id`, `url2`, `ID` | unchanged |
+| `camelCase`, `PascalCase`, `userID`, `HTTPStatus` | unchanged |
+| `with-dash`, `with space` | unchanged |
+
+What to take from it:
+
+- **Only underscores trigger a change.** A key that is already camel or Pascal case, or that has dashes or spaces, is left as it is.
+- **A leading underscore is consumed.** `_private` becomes `Private`, which is no longer the name a client would guess. Avoid leading underscores in field names if you use camel case.
+- **Digits can swallow the underscore.** `a_1` becomes `a1`, and `x1_y2` becomes `x1Y2`.
+- **A double underscore** keeps one: `a__b` becomes `a_B`.
+
+### To snake case
+
+| Key | Becomes |
+| --- | --- |
+| `camelCase` | `camel_case` |
+| `PascalCase` | `pascal_case` |
+| `userID` | `user_id` |
+| `HTTPStatus` | `http_status` |
+| `already_Camel` | `already_camel` |
+| `snake_UPPER` | `snake_upper` |
+| `created_at`, `price_cents`, `x1_y2`, `url2`, `a_1` | unchanged |
+| `with-dash`, `with space` | unchanged |
+| `ÅngströmValue` | `ångström_value` |
+
+Runs of capitals become one word, so `HTTPStatus` is `http_status` and `userID` is `user_id`.
+
+### Two keys can collapse into one, silently
+
+Both conversions can map two different keys to the same name. The later one wins and the earlier **disappears**, with no error:
+
+```json
+{ "a_b": 1, "aB": 2 }
+```
+
+With `"case": "camel"` this becomes `{ "aB": 2 }`, and with `"case": "snake"` it becomes `{ "a_b": 2 }`. One value was lost either way. It cannot happen when every field of a resource follows one convention, which is why mixed-convention tables are the ones to check. A `set` key can collide with a column in the same way.
+
+<Warning>
+Before you add `case` to an existing resource, list its columns and check that no two differ only by convention. The silent loss is easy to miss, because every record still looks well formed.
+</Warning>
+
+### Only the top level
+
+`case` converts the keys of the record, and **not** the keys inside values. A JSON field keeps whatever keys it holds:
+
+```json
+{ "n": { "inner_key": 1 } }
+```
+
+stays exactly that with `"case": "camel"`.
+
+
+## The order of a request
+
+A transformer sits at one point in a longer path. Knowing where tells you what it can and cannot see.
+
+| Order | Stage | Effect on the transformer |
+| --- | --- | --- |
+| 1 | Credential and scope | Decides the caller. Its result is in `auth` and `credential` |
+| 2 | Body validation (writes) | Not related to the transformer |
+| 3 | Policy gate | Decides whether the caller may read at all |
+| 4 | Query: filters, sort, page, **select** | The record the transformer receives has only the selected columns |
+| 5 | The row is read | |
+| 6 | **Expand** | Related rows are attached, each shaped by **its** resource's transformer |
+| 7 | **This resource's transformer** | Omit, pick, set, rename, case |
+| 8 | Cache write (when `cache_ttl` is set) | The shaped output is stored |
+| 9 | Response | |
+
+Two consequences:
+
+- **`set` can read an expanded relation**, because the relation was attached at step 6, before the transformer ran at step 7. See the example below.
+- **A transformer never sees rows the policy removed**, and cannot be used to filter rows. See [Policies](/policies/overview).
+
+### Reading an expanded relation in `set`
+
+A `posts` resource with a `belongs_to` relation `author`, and this inline transformer:
+
+```json
+{
+  "set": {
+    "by": "{{ record.author.full_name }}",
+    "nm": "Author: {{ record.author.full_name }}"
+  }
+}
+```
+
+Without `expand`, the relation is not on the record, so both values are empty:
+
+```http
+GET /rest/v1/posts/1
+```
+
+```json
+{ "id": 1, "title": "T", "author_id": 1, "by": null, "nm": "Author: " }
+```
+
+With `?expand=author`, they are filled in, and the `author` object is also in the response:
+
+```http
+GET /rest/v1/posts/1?expand=author
+```
+
+```json
+{
+  "id": 1, "title": "T", "author_id": 1,
+  "author": { "id": 1, "full_name": "Maya Obi" },
+  "by": "Maya Obi",
+  "nm": "Author: Maya Obi"
+}
+```
+
+(The timestamps are left out above.) Two things to note. A transformer whose output depends on a relation gives a different answer for a client that forgets `expand`, so make the value tolerant of `null`, or use `| default:`. And `set` can lift a value out of an expanded row, while an `omit: ["author"]` removes the object itself, which is how a response can show `by` without exposing the whole author.
+
+
+## Transformers on custom routes
+
+A custom route has its own optional **Transformer** field, under **Request & response** in the route's sheet. It works the same way, with these differences:
+
+| | Resource | Route |
+| --- | --- | --- |
+| What it shapes | Every list, get, create and update of the resource | The result of the route's flow or function |
+| What the context's `record` is | The row | Whatever the handler returned, for a single object |
+| A list | Applied to each item | Applied to each item when the handler returns a list |
+| Response schema | Dropped | **Dropped** as well: a route with a transformer has no response schema in OpenAPI |
+| Cache | Stores the shaped output | Stores the shaped output, for `GET` routes with a cache time |
+| Errors | A bad definition is a `500` | The same |
+
+The route's transformer is applied to the handler's result before the response is built. Check what your flow returns on its **error** paths too, with the transformer attached, so that an `omit` or a `case` does not reshape an error body your client depends on.
+
+
+## Transformers in flows
+
+A flow can apply a transformer to any value with the **Transform** block (`transform.map`), which takes two settings:
+
+| Setting | Meaning |
+| --- | --- |
+| `value` | The data to shape. A record or a list of records |
+| `transformer` | An inline definition, or the **name** of a stored or Python transformer |
+
+The template context for `set` is the **flow's state** (the trigger, step outputs and so on) instead of the request, so a template reads `{{ steps.fetch.output.id }}` where a resource transformer reads `{{ record.id }}`. The same five steps, in the same order.
+
+This is the way to build a safe payload for a webhook from an event, since the event carries the raw record:
+
+```text
+trigger: posts.created
+  └─ transform.map   value = {{ trigger.record }}   transformer = public_post
+      └─ http.request   body = {{ steps.shape.output }}
+```
+
+The webhook then receives the shaped record, with `secret` removed. Pair this with turning off the raw delivery. See [Data blocks](/flows/data-blocks/overview) and [Resource events](/data/resource-events/overview).
+
+
+## A worked design: a mobile API
+
+A team serves a mobile app and a web admin from one set of resources. The app wants camel case, a small payload and stable names. The admin wants everything.
+
+**The resource**, `products`, has columns `id`, `sku`, `title`, `description`, `price_minor`, `currency`, `stock`, `cost_minor`, `supplier_id`, `internal_note`, `created_at`, `updated_at`.
+
+**Step 1: a stored transformer for the app.**
+
+```json
+{
+  "name": "app_product",
+  "definition": {
+    "pick": ["id", "sku", "title", "description", "price_minor", "currency", "stock"],
+    "set": {
+      "url": "https://shop.example.com/p/{{ record.sku | lower }}",
+      "in_stock": "{{ record.stock | int }}"
+    },
+    "rename": { "price_minor": "price" },
+    "case": "camel"
+  }
+}
+```
+
+The app receives `id`, `sku`, `title`, `description`, `currency`, `stock`, `url`, `inStock` and `price`. `cost_minor`, `supplier_id` and `internal_note` are not on the allow list, so they are absent, and so would be any column added later.
+
+**Step 2: the resource uses it.** `products` has `"transformer": "app_product"`, and its `list` and `get` operations are public.
+
+**Step 3: the admin needs the raw shape.** The admin is a different consumer of the same resource, and a resource has one transformer. So the admin does not read `/rest/v1/products`. It reads a **route**, `GET /rest/v1/admin/products`, gated by an admin policy, backed by a flow that lists products, and with **no transformer**, or a different stored one (`admin_product`) that only adds a margin:
+
+```json
+{ "name": "admin_product", "definition": { "set": { "margin_note": "{{ record.price_minor }}" } } }
+```
+
+**Step 4: close the other doors.** `cost_minor` is sensitive, and the app can still filter on it (`?filter[cost_minor]=gte.500`). The fix is the one from earlier: the public resource does not hold the cost. Margins live in a separate `product_costs` resource that only admins can read, joined by `product_id`. The transformer stays a convenience, and the data is where it belongs.
+
+**Step 5: events.** `products` emits events for the admin flows. The payload carries the raw record, `cost_minor` included. Since the only subscribers are internal flows, that is acceptable, and the **Broadcast changes** switch stays off so nothing pushes the raw record to clients.
+
+**What the design shows.** The transformer did one job, which was shaping for the app. The sensitive value was handled by where it lives, the admin shape by a route, and the raw-event risk by what subscribes. No single mechanism was asked to be a security boundary.

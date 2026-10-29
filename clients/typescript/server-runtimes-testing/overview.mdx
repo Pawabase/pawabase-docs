@@ -1,0 +1,164 @@
+---
+title: "Servers and testing"
+description: "How to run the TypeScript client on servers, in serverless and edge runtimes and inside web frameworks, how to act for each request's user safely, and how to test code that uses Pawabase at every level from unit tests to end-to-end runs."
+icon: "server"
+---
+
+The client runs anywhere `fetch` runs: Node, Bun, Deno, serverless functions, edge workers and the server half of web frameworks.
+On a server, one question shapes everything: whose identity does each request carry?
+
+This page explains how to answer that question in each kind of server code, how the common frameworks fit, what changes in serverless and edge runtimes, and how to test code that uses Pawabase, from unit tests with no network to end-to-end runs against a real environment.
+
+## The mental model
+
+A browser client serves one person.
+A server serves many people at once, plus itself.
+Mixing those identities up is the most serious mistake server code can make with a backend client.
+
+| Server code acts as | Client | Policies |
+| --- | --- | --- |
+| The person who sent the request | A publishable-key base client, and `base.asUser(token)` per request | Applied, exactly as in their browser |
+| Nobody in particular: the system | A secret-key client | Bypassed |
+| A person, for a privileged step your code has checked | Both: `asUser` to read what they may see, the secret-key client for the step | Applied, then deliberately bypassed |
+
+```text
+request from Ada ──▶ your server ──▶ base.asUser(ada's token) ──▶ Pawabase sees Ada
+request from Bob ──▶ your server ──▶ base.asUser(bob's token) ──▶ Pawabase sees Bob
+nightly job      ──▶ your server ──▶ service (secret key)      ──▶ Pawabase sees the system
+```
+
+The base client is created once per process.
+`asUser` returns a light, stateless client for one request: it holds that person's token, keeps no session, runs no timers, and is discarded when the request ends.
+
+
+## Clients on a server
+
+### The base client
+
+Create one base client per process, at module scope, with a publishable key:
+
+<CodeGroup>
+```typescript TypeScript
+// server/pawabase.ts
+import { createClient } from "@pawabase/client";
+import type { Database } from "./database";
+
+export const base = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  environment: process.env.PAWABASE_ENV,
+});
+```
+
+```python Python
+# server/pawabase.py
+import os
+
+from pawabase import AsyncPawabase
+
+base = AsyncPawabase(
+    os.environ["PAWABASE_URL"],
+    os.environ["PAWABASE_PUBLISHABLE_KEY"],
+    environment=os.environ["PAWABASE_ENV"],
+)
+```
+</CodeGroup>
+
+A publishable key on a server is correct whenever the server acts for people.
+It means a bug in your server cannot read or write more than the person could from their own browser.
+
+### Per-request clients
+
+`base.asUser(token)` gives each request a client that acts as its person:
+
+<CodeGroup>
+```typescript TypeScript
+export function pawabaseFor(accessToken: string | null) {
+  return accessToken ? base.asUser(accessToken) : base;
+}
+```
+
+```python Python
+def pawabase_for(access_token: str | None):
+    return base.as_user(access_token) if access_token else base
+```
+
+```bash cURL
+curl "$PAWABASE_URL/rest/v1/orders" -H "apikey: $PAWABASE_PUBLISHABLE_KEY" -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+</CodeGroup>
+
+| Property of an `asUser` client | Value |
+| --- | --- |
+| Options | Copied from the base client |
+| Token | The one you passed, or the value of a function you passed, read before each request |
+| Session storage | Memory, empty |
+| Automatic refresh | Off; a `401` is thrown |
+| Realtime socket | Opens without a user token |
+| Cost to create | A few objects; no network, no timers |
+
+Never share an `asUser` client between requests, and never store one in module scope.
+It holds one person's token; reusing it would let another request act as that person.
+
+### The service client
+
+Work that acts for the system uses a secret key, in a module only server code imports:
+
+<CodeGroup>
+```typescript TypeScript
+// server/pawabase-service.ts
+import "server-only";
+import { createClient } from "@pawabase/client";
+import type { Database } from "./database";
+
+export const service = createClient<Database>({
+  url: process.env.PAWABASE_URL!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  environment: process.env.PAWABASE_ENV,
+});
+```
+
+```python Python
+# server/pawabase_service.py: imported only by server code
+import os
+
+from pawabase import AsyncPawabase
+
+service = AsyncPawabase(os.environ["PAWABASE_URL"], os.environ["PAWABASE_SECRET_KEY"], environment=os.environ["PAWABASE_ENV"])
+```
+</CodeGroup>
+
+Keep service-client code small and named for what it does, such as `issueRefund` or `nightlyCleanup`, so reviewers can see every place that bypasses policies.
+
+### A privileged step after your own check
+
+Some actions need more authority than the person has, after a check only your server can make.
+Use both clients: the person's to confirm what they may see, the service client for the step.
+
+<CodeGroup>
+```typescript TypeScript
+export async function refundOrder(accessToken: string, orderId: string) {
+  const asPerson = base.asUser(accessToken);
+  const order = await asPerson.from("orders").get(orderId);
+  if (order.status !== "paid") throw new Error("Only paid orders can be refunded.");
+  const user = await asPerson.auth.getUser();
+  if (!user.roles.includes("support")) throw new Error("Only support staff can refund.");
+  return service.routes.post(`orders/${orderId}/refund`, { by: user.id });
+}
+```
+
+```python Python
+async def refund_order(access_token: str, order_id: str):
+    as_person = base.as_user(access_token)
+    order = await as_person.from_("orders").get(order_id)
+    if order["status"] != "paid":
+        raise ValueError("Only paid orders can be refunded.")
+    user = await as_person.auth.get_user()
+    if "support" not in user["roles"]:
+        raise PermissionError("Only support staff can refund.")
+    return await service.routes.post(f"orders/{order_id}/refund", {"by": user["id"]})
+```
+</CodeGroup>
+
+Reading the order as the person proves they may see it; a `NotFoundError` there ends the action before anything privileged happens.
+Often the same rule can live in a flow with `policy.check`, which keeps it in one place for every client; use server code when the check needs something only your server knows.

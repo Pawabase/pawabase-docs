@@ -1,0 +1,252 @@
+---
+title: "Patterns for auth screens"
+description: "A sign-in form has more outcomes than success and failure. Handling each one with its own message is the difference between a form people trust and…"
+icon: "key-round"
+---
+
+### A sign-in form that handles every answer
+
+A sign-in form has more outcomes than success and failure.
+Handling each one with its own message is the difference between a form people trust and one that sends them to support.
+
+```typescript
+import { AuthenticationError, PermissionError, RateLimitError, ValidationError } from "@pawabase/client";
+
+type SignInOutcome =
+  | { kind: "done" }
+  | { kind: "mfa"; factors: string[]; verify: (code: string) => Promise<unknown>; mfaToken: string }
+  | { kind: "error"; message: string; action?: "resend-verification" };
+
+export async function submitSignIn(email: string, password: string): Promise<SignInOutcome> {
+  try {
+    const result = await pawabase.auth.signInWithPassword({ email, password });
+    if (result.status === "signed_in") return { kind: "done" };
+    if (result.factors.includes("email") && !result.factors.includes("totp")) {
+      await pawabase.auth.mfa.challenge(result.mfaToken);
+    }
+    return { kind: "mfa", factors: result.factors, verify: result.verify, mfaToken: result.mfaToken };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { kind: "error", message: "The email or password is wrong." };
+    if (error instanceof RateLimitError) return { kind: "error", message: "Too many attempts. Wait a few minutes and try again." };
+    if (error instanceof PermissionError && /confirm your email/i.test(error.message)) {
+      return { kind: "error", message: "Confirm your email address first.", action: "resend-verification" };
+    }
+    if (error instanceof PermissionError) return { kind: "error", message: "This account is not available. Contact support." };
+    if (error instanceof ValidationError) return { kind: "error", message: "Enter a valid email address." };
+    throw error;
+  }
+}
+```
+
+Keep the wrong-credentials message the same for an unknown email and a wrong password.
+Different messages tell an attacker which addresses have accounts.
+
+### A second-factor prompt
+
+The prompt accepts a six-digit code or a recovery code, and offers to send an emailed code when the account has the email factor.
+
+```typescript
+export async function submitCode(outcome: Extract<SignInOutcome, { kind: "mfa" }>, code: string) {
+  const cleaned = code.replace(/\s+/g, "");
+  try {
+    await outcome.verify(cleaned);
+    return { ok: true as const };
+  } catch (error) {
+    if (error instanceof AuthenticationError) return { ok: false as const, message: "That code did not work. Try again." };
+    if (error instanceof RateLimitError) return { ok: false as const, message: "Too many attempts. The account is locked for a while." };
+    throw error;
+  }
+}
+
+export function resendEmailCode(outcome: Extract<SignInOutcome, { kind: "mfa" }>) {
+  return pawabase.auth.mfa.challenge(outcome.mfaToken);
+}
+```
+
+Failed codes count toward the same lockout as failed passwords.
+Say so near the input, so people reach for a recovery code before they lock themselves out.
+
+### One callback page for every emailed link
+
+Magic links, email confirmations and password resets all arrive at `{site_url}/auth/callback` with a `token` and a `type`.
+One page can handle all three.
+
+```typescript
+export async function handleAuthCallback(search: string) {
+  const params = new URLSearchParams(search);
+  const token = params.get("token");
+  const type = params.get("type");
+  const next = params.get("redirect_to") ?? "/app";
+  if (!token) return { route: "/sign-in" };
+
+  switch (type) {
+    case "magic": {
+      const result = await pawabase.auth.verifyMagicLink(token);
+      return result.status === "signed_in" ? { route: next } : { route: "/sign-in/mfa", pending: result };
+    }
+    case "verify":
+      await pawabase.auth.verifyEmail(token);
+      return { route: next };
+    case "recovery":
+      return { route: `/reset-password?token=${encodeURIComponent(token)}` };
+    default:
+      return { route: "/sign-in" };
+  }
+}
+```
+
+Only follow `redirect_to` values you recognize.
+The auth service checks it against the allowed redirect URLs when it sends the email, but the query string of the callback page can be edited by anyone.
+
+Tokens in emailed links are single-use and expire.
+A second visit to the same link fails; show "this link has already been used or has expired" with a way to request a new one.
+
+### A social sign-in return page
+
+When `detectSessionInUrl` is on, the client reads the fragment by itself.
+The return page only needs to wait for the result and react to the cases that are not a plain sign-in.
+
+```typescript
+const { unsubscribe } = pawabase.auth.onAuthStateChange((event, session) => {
+  if (event === "SIGNED_IN" && session) navigate("/app");
+});
+
+const hash = new URLSearchParams(location.hash.slice(1));
+if (hash.get("error")) showError(`Sign-in failed: ${hash.get("error")}`);
+if (hash.get("mfa_required")) navigate(`/sign-in/mfa?token=${encodeURIComponent(hash.get("mfa_token") ?? "")}`);
+```
+
+Read the fragment before the client cleans it if you need the error text, or call `getSessionFromUrl()` yourself with `detectSessionInUrl: false` to get the full result object.
+
+### An account security screen
+
+A security screen shows the factors, the sessions and the recent activity, and lets the person act on each.
+
+```typescript
+export async function loadSecurityScreen() {
+  const [user, mfa, sessions, history, keys] = await Promise.all([
+    pawabase.auth.getUser(),
+    pawabase.auth.mfa.status(),
+    pawabase.auth.sessions.list(),
+    pawabase.auth.sessions.history(),
+    pawabase.auth.apiKeys.list(),
+  ]);
+  return {
+    email: user.email,
+    identities: user.identities,
+    mfa,
+    sessions: sessions.sort((a, b) => Number(b.current) - Number(a.current)),
+    recentFailures: history.filter((event) => !event.success).slice(0, 10),
+    keys,
+  };
+}
+
+export const signOutEverywhereElse = () => pawabase.auth.signOut({ scope: "others" });
+```
+
+Recent failed sign-ins are worth showing.
+A person who sees attempts they did not make is the earliest warning you can get that an account is targeted.
+
+### Role-aware navigation
+
+Roles come with the user, and the session carries its assurance level.
+Use them to decide what to show, while policies decide what is allowed.
+
+```typescript
+export function navigationFor(user: { roles: string[] }, session: { org_role: string | null }, aal: string | null) {
+  return {
+    showAdmin: user.roles.includes("admin"),
+    showBilling: session.org_role === "owner" || session.org_role === "admin",
+    showPayouts: aal === "aal2",
+  };
+}
+```
+
+A hidden button is a courtesy, not protection.
+Every action behind it must still be refused by a policy for people who should not perform it.
+
+### An invitation landing page
+
+An invitation link may be opened by someone who is signed in, signed out, or signed in as somebody else.
+The landing page keeps the token across sign-in and only accepts once the right person is present.
+
+```typescript
+const PENDING = "pending-invitation";
+
+export async function onInvitationLink(token: string) {
+  sessionStorage.setItem(PENDING, token);
+  const user = await pawabase.auth.getCachedUser();
+  if (!user) return navigate("/sign-in?next=/join");
+  return acceptPendingInvitation();
+}
+
+export async function acceptPendingInvitation() {
+  const token = sessionStorage.getItem(PENDING);
+  if (!token) return navigate("/app");
+  try {
+    const accepted = (await pawabase.auth.orgs.acceptInvitation(token)) as { org?: string; slug?: string };
+    sessionStorage.removeItem(PENDING);
+    const slug = accepted.slug ?? accepted.org;
+    if (slug) await pawabase.auth.switchOrg(slug);
+    navigate("/app");
+  } catch (error) {
+    sessionStorage.removeItem(PENDING);
+    showError("This invitation is no longer valid, or it was sent to a different email address.");
+  }
+}
+
+declare function navigate(path: string): void;
+declare function showError(message: string): void;
+```
+
+Call `acceptPendingInvitation()` after every sign-in, so a person who had to sign in or sign up first still joins.
+The shape of the accept response is read defensively here because it is not part of the client's types.
+
+### A required second-factor setup screen
+
+When the environment requires MFA and the person has no factor, the sign-in result holds an MFA token and the person must enroll before receiving a session.
+
+```typescript
+export async function beginRequiredSetup(mfaToken: string) {
+  const setup = (await pawabase.auth.mfa.startSetup({ mfaToken, method: "totp" })) as { otpauth_uri?: string; secret?: string };
+  return { qr: setup.otpauth_uri, secret: setup.secret };
+}
+
+export async function finishRequiredSetup(mfaToken: string, code: string) {
+  const done = (await pawabase.auth.mfa.completeSetup({ mfaToken, code })) as {
+    access_token?: string;
+    refresh_token?: string;
+    recovery_codes?: string[];
+  };
+  if (done.access_token && done.refresh_token) {
+    await pawabase.auth.setSession({ access_token: done.access_token, refresh_token: done.refresh_token });
+  }
+  return done.recovery_codes ?? [];
+}
+```
+
+Show the recovery codes before navigating into the app, and require an explicit "I have saved them" action.
+This is the only moment those codes can be shown without regenerating them.
+If the person loses them anyway, `mfa.regenerateRecoveryCodes(code)` issues a new set and invalidates the old one, which needs a working authenticator.
+Without one, an administrator must reset the person's second factors.
+
+
+## Where the tokens live, and what that means
+
+In a browser, the default store is `localStorage`.
+Any script running on your origin can read it, including a script injected through a cross-site scripting bug.
+That is the trade-off of keeping a session in the browser, and it is the same for every browser-based client.
+
+| Option | Script on the page can read tokens | Survives reload | Effort |
+| --- | --- | --- | --- |
+| `localStorage` (default) | Yes | Yes | None |
+| `sessionStorage` | Yes | Per tab | An adapter |
+| Memory only (`persistSession: false`) | Yes, while the page is open | No | One option |
+| HTTP-only cookies managed by your server | No | Yes | A server and the cookie handlers above |
+
+For most applications, the default plus a strict Content Security Policy is a sound choice.
+For applications that hold sensitive data, keep tokens in HTTP-only cookies and let the server act with `asUser`.
+
+Two habits reduce the damage of a leaked access token whichever store you use.
+Keep access tokens short-lived, which the default 15 minutes does.
+And require `aal2` in policies for the most sensitive operations, so a stolen first-factor session cannot perform them.

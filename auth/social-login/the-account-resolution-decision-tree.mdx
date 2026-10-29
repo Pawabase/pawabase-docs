@@ -1,0 +1,219 @@
+---
+title: "The account-resolution decision tree"
+description: "This is the core of social sign-in, and the part worth reading twice."
+icon: "link"
+---
+
+This is the core of social sign-in, and the part worth reading twice.
+
+The callback receives a verified profile from the provider. That profile is not a user. It carries a provider name, a stable subject identifier, and whatever else the provider chose to expose. Turning it into a Pawabase account is the callback's job, and it resolves in a fixed order. Every branch below either lands on a user or produces a specific error code.
+
+| Branch | Condition | Result |
+| --- | --- | --- |
+| 1 | `link_token` present in state | Consume it; the identity is attached to *that* user's account. |
+| 2 | An `Identity` exists for `(project, env, provider, subject)` | Sign in as the user that identity belongs to. |
+| 3 | No identity, and `profile.email_verified` is true, and an account holds that email | Sign in as that account, creating the identity. |
+| 4 | No identity and no match | Create an account, if the environment allows it. |
+| 5 | The resolved user is disabled | Refuse, with `account_disabled`. |
+
+The branches are sequential, and each is skipped when its condition does not hold. Walking them as prose:
+
+**A linking ticket wins first.** If the state carries a link token, the flow is not signing anyone in — it is attaching a provider to an account that is already signed in. The ticket is consumed, and the user it names becomes the account. If an identity for that provider and subject already exists and belongs to a *different* user, the request fails with `identity_already_linked`. This guard is what stops one person from claiming an identity that another account already holds.
+
+**Otherwise the identity is the lookup key.** The callback looks up `Identity` by the four-part key `(project, env, provider, subject)` — the environment matters, so a Google sign-in in staging and the same Google account in production produce two independent `Identity` rows and two independent Pawabase accounts. That is the tenancy rule applied to social login.
+
+**Only then does email come into it, and only when the provider says it is verified.** If no identity matched, and the profile carries an email that the provider marked verified, Pawabase looks for an existing account holding that address and attaches the identity to it.
+
+**Otherwise an account is created** — subject to the environment's rules, each of which can refuse. Creation requires sign-up to be enabled and an email to be present.
+
+**And finally, a resolved user who is disabled is refused**, regardless of which branch found them.
+### Why the verified-email rule is the security line
+
+Branch 3 is guarded by `profile.email_verified` being true, and this single condition is what stops an unverified provider email from silently attaching itself to somebody else's account.
+
+The reasoning is about who controls the address, not about the address itself. Many providers will hand back whatever email a profile claims, and plenty of profiles claim an address the person has not proven they own. If an unverified address could join an existing account, then anyone who could set `email` on a profile at a permissive provider could walk into any Pawabase account that address belonged to. No password, no second factor, no interaction with the real owner.
+
+So the rule is: **an unverified address never attaches a new identity to an existing account.** It is not a weaker path; it is not a path.
+
+What happens instead depends on whether an account already holds that address, which is where the error codes diverge:
+
+| Situation at branch 4 | Result |
+| --- | --- |
+| No account holds the email | A new account is created. Unverified, unless the provider said otherwise. |
+| An account already holds the email | `email_unverified_conflict` — refused. |
+| The profile has no email at all | `email_required` — refused. |
+| Sign-up is disabled in this environment | `signup_disabled` — refused. |
+
+<Warning>
+The refusal here is deliberate and correct. A user who already has an account with that email will occasionally try to "just sign in with Google" and be refused with `email_unverified_conflict`. The fix is to sign in with a password or magic link first and link the provider from the signed-in account, not to relax the check. See [Linking a provider to an existing account](#linking-a-provider-to-an-existing-account) below.
+</Warning>
+
+Note also what `email_verified` *false* means at the provider boundary: it conflates "the provider says this address is unverified" with "the provider did not say anything about it". A provider that omits the claim entirely reports false, and Pawabase treats it the same way. That is the correct default, and it is why adding a new provider that does not expose a verification claim can appear to work for new users while silently failing to match returning ones.
+
+### How the account is created
+
+When an account does have to be created, a few details of that creation are worth knowing:
+
+| Aspect | What happens |
+| --- | --- |
+| Password | None. The account gets an unusable password. |
+| Username | Derived from the provider's username or the email local part, with collisions resolved. |
+| Name | The provider's display name, or empty. |
+| Verification | Set immediately if the provider verified the email; otherwise unverified. |
+| Avatar | The provider's avatar URL is stored on the account. |
+
+The unusable password is not an oversight. An account created through social sign-in has no password, and password sign-in cannot succeed against it until someone sets one. This is also the normal state for an account an administrator created in Studio. See [Managing users](/auth/managing-users/overview).
+
+<Info>
+The username is derived by stripping every character outside `a-z0-9_.-` from the provider's username or the email's local part, truncating to 40 characters, falling back to `user`. On collision, a random number is appended. The result is deterministic enough to be predictable, which is worth remembering if you treat usernames as meaningful — they are generated, not chosen.
+</Info>
+
+## Linking a provider to an existing account
+
+Linking is the flow for someone who already has a Pawabase account and wants to add social sign-in to it. The callback handles it through the same decision tree, but branch 1 takes precedence, so the account is never chosen by email.
+
+The signed-in user asks for a URL, passing the provider name and optionally a `redirect_to`:
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/identities/link?provider=google" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+The response is a single URL the browser is sent to:
+
+```json
+{
+  "url": "https://auth.example.com/auth/v1/authorize/acme/production/google?link_token=..."
+}
+```
+
+The ticket in that URL is a one-time token with the `link` purpose. When the callback comes back carrying it, the token is consumed and the identity is attached to the user the ticket names. A provider whose subject already belongs to a different account produces `identity_already_linked`.
+
+A successful link does not start a session — that would be wrong, since the person is already signed in. The browser is redirected with `#linked=<provider>` instead, or receives `{"linked": "google"}` as a plain response if there is no redirect target.
+
+### Unlinking
+
+An identity is removed with its id. Ids are ULIDs and are matched case-insensitively, so a lowercased id from a client works unchanged.
+
+```bash
+curl -X DELETE "https://api.example.com/auth/v1/identities/01HQ8X4M2K9P7R3T6V0YB5ZCNDA" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+| Condition | Result |
+| --- | --- |
+| The identity belongs to another user, or does not exist | `404 no such identity` |
+| The user has no usable password and this is their only identity | `409 set a password before removing your only sign-in method` |
+| Otherwise | Removed. `204` with no body. |
+
+That 409 is a lockout guard, not a strictness quirk. An account whose only sign-in method is a social identity and which has no password would be unreachable if the identity were removed, so the request is refused. The escape is to set a password first, which the account can do through password recovery.
+
+
+## Results come back in the fragment
+
+Once the callback resolves the account, the browser has to be delivered a session — or told why it did not get one. Both travel in the **URL fragment**, the part after `#`.
+
+```text
+https://app.example.com/auth/callback#access_token=...&refresh_token=...&expires_in=900&token_type=bearer
+```
+
+The reason is worth understanding, because it determines what your client code has to do. A fragment is not sent to any server. When the browser lands on `https://app.example.com/auth/callback#access_token=...`, the request that reaches your server contains only the part before the `#`. The token never appears in that request line, which means it cannot be written to an access log, cannot land in a proxy log along the way, and cannot be picked up by a referrer header on a subsequent navigation.
+
+Query parameters have none of those protections. `?access_token=...` would be recorded in your web server's access log, in every intermediary's log, and potentially in a `Referer` header. The fragment is used deliberately for that reason, not because it is convenient.
+
+<Info>
+The consequence for your code: the tokens are **not** available to server-side rendering on the first request. Your `/auth/callback` page must read `window.location.hash` in the browser, parse it, store it, and then clean the URL. This is inherent to the design, not an oversight to work around with a query parameter.
+</Info>
+### What arrives on success
+
+Only four keys are put into the fragment. The session's `session_id`, its `org`, its `org_role` and the user record are not among them.
+
+| Fragment key | Meaning |
+| --- | --- |
+| `access_token` | The bearer token. |
+| `refresh_token` | The rotation token. |
+| `expires_in` | Seconds until the access token expires. |
+| `token_type` | Always `bearer`. |
+
+Because `session_id` is absent, a client that starts from a social sign-in does not learn the session id from the redirect. `GET /auth/v1/user` reports it, and so does `GET /auth/v1/sessions`, both of which mark the current session. See [Tokens and sessions](/auth/tokens-and-sessions).
+
+### What arrives on failure
+
+A failure that has somewhere to go becomes a redirect carrying a single key:
+
+```text
+https://app.example.com/auth/callback#error=signup_disabled
+```
+
+With no redirect target, the same failure is raised as `400 sign-in failed: <code>` instead. So the code is identical either way; only the delivery differs. A client should read `error` from the fragment, and a server-side caller should read `detail` from the 400.
+
+### The error codes
+
+These are the real codes, from both the OAuth library's failures and the callback's own decisions.
+
+| Code | Meaning | Where it comes from |
+| --- | --- | --- |
+| `denied` | The person declined consent at the provider. | Provider returned `access_denied`. |
+| `provider_error` | The provider refused for some other reason. | Provider returned an error. |
+| `state_mismatch` | The callback could not be tied to a redirect this server started. | Missing, forged or mismatched state cookie. |
+| `state_expired` | The state was valid but too old. | The consent screen was left open. |
+| `exchange_failed` | The authorization code could not be traded for a token. | Stale code, or a redirect URI mismatch. |
+| `profile_failed` | A token was obtained but the profile could not be read. | Userinfo rejected the token, or no subject claim. |
+| `provider_misconfigured` | The provider object cannot support the requested step. | A programming error, not a user-facing condition. |
+| `signup_disabled` | No matching account and sign-up is off. | Account creation. |
+| `email_required` | No matching account and the profile has no email. | Account creation. |
+| `email_unverified_conflict` | No matching account, and an existing account holds that unverified email. | Account creation. |
+| `account_disabled` | The resolved account is disabled. | Account resolution. |
+| `identity_already_linked` | A linking ticket named an identity already owned by another user. | Linking. |
+
+`denied` and `state_expired` are the two you will see most, and neither is a fault. A person who closes the consent tab and a person who left it open overnight produce these, and both are best answered with "try again" rather than an error page.
+
+<Warning>
+Do not show the raw code to a person. The codes exist so your client can branch on them; each maps to copy you write. `account_disabled` in particular is an administrative state, and rendering the code as an error message tells a user something they should not be told about an account they cannot see.
+</Warning>
+
+<Warning>
+The local-development case is worth calling out, because the failure is silent. Running the authorize flow over plain `http://localhost` means the state cookie is set without the `secure` attribute, and some browsers will then refuse to return it on the provider's cross-site redirect back. Every callback fails as `state_mismatch`, and the reason is not in the code you control. Terminate TLS locally, or use a tunnel, rather than debugging the state handling.
+</Warning>
+
+
+## MFA after a social sign-in
+
+If the resolved account has MFA enrolled and the environment allows MFA, the callback does not issue a session. It issues an MFA challenge and redirects with that instead.
+
+```text
+https://app.example.com/auth/callback#mfa_required=true&mfa_token=...
+```
+
+The account has been identified; only the second factor is outstanding. From the client's side this is the same two-step shape as password sign-in returning `mfa_required`, and the completion call is the same endpoint:
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/token" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"grant_type": "mfa", "mfa_token": "...", "code": "123456"}'
+```
+
+The session that comes back is issued at `aal2` and records its method as `oauth:<provider>`. So in the session list you can tell a social sign-in from a password one, and see which provider was used. See [Multi-factor authentication](/auth/mfa/overview) for the full elevation path.
+
+<Warning>
+The fragment for the MFA challenge carries a `mfa_token`, not an access token. A client whose callback page assumes `access_token` is always present will store `undefined` and look like a mysterious auth failure. Branch on `mfa_required` first.
+</Warning>
+
+## Events emitted
+
+Social sign-in emits through the same event system as every other auth path, so a webhook or event consumer sees it without special handling.
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `identity.linked` | An `Identity` row is created for a user. | `user_id`, `provider` |
+| `identity.unlinked` | An identity is removed. | `user_id`, `provider` |
+| `user.created` | An account was created by the callback. | `user_id`, `email`, `method` (`oauth:<provider>`) |
+| `user.signed_in` | A session was started. | `user_id`, `method` |
+| `mfa_required` is not an event | — | The MFA branch issues a challenge without starting a session. |
+
+`user.created` is emitted only when the callback created the account. Signing in an existing account through a provider emits `identity.linked` the first time that provider is used and nothing account-level afterwards — which is the behaviour to expect when reconciling a user list against a billing system.
+
+See [Events](/events/overview) for delivery and [Sign-in activity](/auth/social-login/what-studio-shows#what-studio-shows) for the audit trail.

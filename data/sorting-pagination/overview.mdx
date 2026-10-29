@@ -1,0 +1,262 @@
+---
+title: "Sorting and pagination"
+description: "How a list request is ordered and cut into pages: the sort syntax, page and per_page, what total means, why paging can repeat or skip rows, what it costs, and how to page by key instead."
+icon: "sort"
+---
+
+## The mental model: an ordered list, cut into numbered slices
+
+A resource list can be long, so the data API never returns all of it. It returns one **page**: a slice of the rows that match the request, in an order the request chose. Three parameters decide the slice, and a fourth value in the response says how big the whole set was.
+
+| Parameter or value | What it controls | Default | Limits |
+| --- | --- | --- | --- |
+| `sort` | The order of the matching rows | The key, ascending | Field names, comma-separated, `-` for descending |
+| `per_page` | How many rows are in a page | `20` | From `1` to `200` |
+| `page` | Which slice, counting from `1` | `1` | `1` or more |
+| `total` in the response | How many rows matched, across all pages | Computed | `null` when a per-row policy applies |
+
+A page is not a position in a stable list. It is "skip `(page - 1) × per_page` rows, then take `per_page`", evaluated again on every request against whatever the table holds at that moment. That one fact explains most of what goes wrong with paging: rows can repeat across pages, a deep page can cost a lot, and an empty page does not always mean the end. The rest of this page works through each of those with the requests and numbers that show them.
+
+<Note>
+Everything here was run against a Pawabase API. Timings come from an in-process SQLite database on a laptop with 200,000 rows, so treat them as relative, and expect other databases to differ in the details and agree in the shape. The page on [Filtering](/data/filtering/overview) covers the `filter[...]` parameters that narrow the rows before they are sorted and cut.
+</Note>
+
+
+## The response
+
+Every list request answers with the same envelope:
+
+```json
+GET /rest/v1/rows?per_page=3&page=2&sort=-id
+
+{
+  "data": [ {...}, {...}, {...} ],
+  "page": 2,
+  "per_page": 3,
+  "total": 8
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `data` | The rows of this page, at most `per_page` of them. Empty when `page` is past the end |
+| `page` | The page that was served, echoing the request, or `1` by default |
+| `per_page` | The page size that was used |
+| `total` | The number of rows that match the filters, across all pages. `null` when a per-row policy makes the database's count unreliable |
+
+There is no `next` link, no `has_more` flag and no cursor in the envelope. A client works out whether another page exists from `page`, `per_page` and `total`: another page exists when `page × per_page < total`. When `total` is `null`, that arithmetic is not available, and the section on per-row policies explains what to do instead.
+
+
+## `sort`
+
+### The syntax
+
+`sort` is a comma-separated list of field names. A leading `-` means descending, and a bare name means ascending:
+
+```text
+sort=price                 ascending by price
+sort=-created_at           newest first
+sort=status,-created_at    by status, then newest first within each status
+```
+
+Fields are applied left to right as `ORDER BY` terms, so the first is the primary order and each later field breaks ties among the rows the earlier ones left equal. These results come from eight rows with a text `grp` (two of them unset) and an integer `v`:
+
+| Request | Order of rows (as `id, grp, v`) |
+| --- | --- |
+| `sort=grp` | 3 (null), 6 (null), 2 a, 5 a, 8 a, 1 b, 4 b, 7 c |
+| `sort=-grp` | 7 c, 1 b, 4 b, 2 a, 5 a, 8 a, 3 (null), 6 (null) |
+| `sort=grp,-v` | 6 (null, 5), 3 (null, 2), 5 a 3, 8 a 2, 2 a 1, 1 b 3, 4 b 1, 7 c 2 |
+
+The third row shows the tiebreak working: within each group the rows are ordered by `v` descending.
+
+### Which fields can be sorted
+
+Any field the resource declares, its primary key, `created_at` and `updated_at` (when timestamps are on) and its **Owner field**. A name that is none of those is refused:
+
+```text
+GET /rest/v1/rows?sort=nope   ->  400  {"error": "bad_request", "message": "cannot sort on unknown field 'nope'"}
+GET /rest/v1/rows?sort=-     ->  400  "cannot sort on unknown field ''"
+```
+
+A field of a structured type (`json`, `array`, `object`, `ref`) can be named, and sorting by it compares the stored text, which has no useful meaning.
+
+### Forgiving details
+
+The parser is lenient about punctuation, and each leniency was tested:
+
+| Input | Result |
+| --- | --- |
+| `sort=` (empty) | Ignored, the default order |
+| `sort=id,` or `sort=id,,v` | Empty pieces are ignored |
+| `sort=-id,-id` | Accepted, the repeated term is harmless |
+| `sort=+v` or `sort=%2Bv` | Ascending. A literal `+` is also the `%2B` form, and either way the plus is dropped |
+| `sort=v&sort=-v` | The parameter was sent twice and **the last one wins**, so descending |
+| `SORT=v` | Ignored. Parameter names are case-sensitive, so the default order is used |
+
+The last two are the ones that cause quiet bugs: a client that appends a `sort` to a URL that already has one changes nothing about the first, and a misspelled parameter name is not an error. Set `sort` once, in lowercase, and check that the order you asked for is the order you got.
+
+### The default order
+
+When no `sort` is given, rows are ordered by the primary key, ascending. That is a deliberate choice, since it gives a stable order for plain paging, and it is also the cheapest order for the database to produce. Two practical consequences: a plain `GET /rest/v1/things` returns the oldest rows first for an auto-increment key, and a UUID key sorts as text, which has no relation to creation time. If a list should show the newest first, say `sort=-created_at` or, for an auto-increment key, `sort=-id`.
+
+### Ties
+
+When two rows are equal on every sort field, the database may return them in any order, and the order can differ between runs and between pages. SQLite happened to return ties in key order, and PostgreSQL and MySQL do not promise one. A page boundary that falls in the middle of a run of ties can therefore repeat a row or skip one. The fix is to end every `sort` with a field that is unique, which is the key:
+
+```text
+sort=status,-created_at,id        a total order: no two rows are equal
+```
+
+Add `id` (or whatever the primary key is called) as the last term whenever the other fields are not unique. It costs nothing in the common case and removes a class of paging bugs that are hard to reproduce.
+
+### `NULL` placement
+
+Where unset values go is the database's choice, and the three databases differ. On SQLite, `NULL` came first in an ascending sort and last in a descending one, as the table above shows. MySQL does the same. PostgreSQL does the opposite, placing `NULL` last in ascending order and first in descending. Pawabase adds no `NULLS FIRST` or `NULLS LAST` clause. If a screen depends on where unset values appear, give the field a default so it is never `NULL`, or filter with `isnot.null` before sorting.
+
+| Sort | SQLite | MySQL | PostgreSQL |
+| --- | --- | --- | --- |
+| `sort=grp` (ascending) | `NULL` first | `NULL` first | `NULL` last |
+| `sort=-grp` (descending) | `NULL` last | `NULL` last | `NULL` first |
+
+### Text, numbers and time
+
+The comparison follows the column's type. Numbers sort numerically, dates sort chronologically, and text sorts by the database's collation. On SQLite text is compared by bytes, so uppercase letters sort before lowercase ones (`B` before `a`). On PostgreSQL and MySQL the collation usually sorts case-insensitively and by locale. A `datetime` sorts chronologically on PostgreSQL and MySQL. On SQLite it sorts as text, which is chronological only while every value uses the same offset, so write timestamps in UTC. See [Field types](/data/field-types/overview) for how each type is stored.
+
+
+## `page` and `per_page`
+
+### Defaults and limits
+
+`per_page` defaults to `20` and cannot exceed `200`. `page` starts at `1`. Both are checked as query parameters, before the resource's own handler, and a value outside the range is a `422` with the framework's `detail` envelope, not a `400`:
+
+| Request | Result |
+| --- | --- |
+| `per_page=200` | `200`, up to two hundred rows |
+| `per_page=201` | `422`, "Input should be less than or equal to 200" |
+| `per_page=0` | `422`, "Input should be greater than or equal to 1" |
+| `per_page=2.5`, `per_page=abc`, `per_page=` | `422`, "Input should be a valid integer" |
+| `page=0`, `page=-1` | `422`, "Input should be greater than or equal to 1" |
+| `page=1.0` | `200`, accepted as `1` |
+| `page=2.5`, `page=`, `page=abc` | `422` |
+| `PAGE=2` | Ignored. The names are case-sensitive, so page 1 is served |
+| `page=99` (past the end) | `200` with an empty `data` and the real `total` |
+
+The shape of the `422` is the one for typed query parameters: `{"detail": [{"loc": ["query", "per_page"], "msg": "...", "type": "...", "input": "201"}]}`, which differs from the bare array that a bad request body returns. See [Validation](/data/validation/overview) for every error shape. The ceiling of 200 is a platform limit and is not configurable per resource.
+
+### A page past the end is not an error
+
+Asking for a page that does not exist returns `200`, an empty `data`, and the true `total`:
+
+```text
+GET /rest/v1/rows?per_page=5&page=41   ->  200  {"data": [], "page": 41, "per_page": 5, "total": 200}
+```
+
+That is useful: the response itself says how big the set is, so a client that overshot can recompute the last page. It also means an empty page is not a signal on its own. With an exact `total`, an empty page past the end means "done". With a per-row policy it can mean something else, as described below.
+
+
+## `total`
+
+### What it counts
+
+`total` is the number of rows that match the request's filters, and the policy's conditions, across every page. It does not depend on `page`, `per_page` or `sort`. A request for the fortieth page of 200 rows says `total: 200`, the same as the first.
+
+```text
+GET /rest/v1/things?filter[qty]=gte.150&per_page=1   ->  total: 51,  data: [one row]
+GET /rest/v1/things?filter[qty]=lt.0&per_page=1      ->  total: 0,   data: []
+```
+
+The second line is the standard way to get a count without the rows: ask for one row and read `total`.
+
+### How it is computed
+
+Every list request runs two statements. One fetches the page with `LIMIT` and `OFFSET`. The other counts the matching rows with the same `WHERE` clause. Both were captured for a request with two filters and a policy condition:
+
+```text
+SELECT "title","stock","id" FROM "products"
+  WHERE "status"=? AND "stock">=? AND "owner_id"=?
+  ORDER BY "created_at" DESC LIMIT ? OFFSET ?
+
+SELECT COUNT(*) "total" FROM "products"
+  WHERE "status"=? AND "stock">=? AND "owner_id"=?
+```
+
+A client cannot switch the count off, so every list pays for it. On a small table it is invisible. On a very large one, counting rows that match a non-indexed filter can cost as much as the page itself, which is one reason to filter on indexed fields, see [Filtering](/data/filtering/overview).
+
+### When it is `null`
+
+A policy condition that cannot be turned into SQL is checked row by row after the page is fetched, and then the database's count is no longer the count of rows the caller may see. In that case Pawabase does not report one, and `total` is `null`:
+
+```json
+{"data": [ ... ], "page": 2, "per_page": 2, "total": null}
+```
+
+Clients must handle a `null` `total`, and the next section explains why that is more than a display issue.
+
+
+## Paging with a per-row policy
+
+Most list policies are decided in SQL. An `owner` policy becomes `"owner_id" = ?` in the `WHERE` clause, the database does the filtering, and paging behaves exactly as described so far. A policy that needs the row itself, such as `{"gt": ["$record.qty", 2]}` or an `any` of two different tests, is a **residual**: the database cannot apply it, so Pawabase reads a page and then removes the rows the policy refuses. That order of events changes what a page means.
+
+With a resource of seven rows whose list policy refuses rows with `qty` of 2 or less, these were the results:
+
+```text
+GET /rest/v1/bigs                      ->  200  total: null   rows b3 b4 b5 b6 b7
+GET /rest/v1/bigs?per_page=2&page=1    ->  200  total: null   data: []             <- rows 1 and 2 were read, then refused
+GET /rest/v1/bigs?per_page=2&page=2    ->  200  total: null   rows b3 b4
+```
+
+The first page is **empty**, and more rows exist. The page was filled with rows 1 and 2 by the database, and then both were removed. The second page holds rows 3 and 4, and the page after it would hold 5 and 6. A page can also be **short**, with some rows removed and others kept.
+
+| Effect | What it means for a client |
+| --- | --- |
+| `total` is `null` | The "page X of N" arithmetic is unavailable |
+| A page can be empty or short while more rows exist | An empty page is not the end |
+| The rows a caller sees per page vary | Pages are not the size `per_page` says |
+| `select` changes the result | A residual policy reads only the **selected** columns of each row. Leave out a column it reads and it can drop every row, **or let rows through that it should have refused**. See [SQL pushdown](/policies/pushdown#a-select-can-walk-around-a-residual) |
+
+### A residual walk, page by page
+
+The same seven-row resource, read two at a time with a policy that refuses rows with `qty` of 2 or less. `select=title,qty` is included so the policy can see the column it reads. The rows are `b1` to `b7`, with `qty` equal to their number:
+
+| Request | `data` | `total` |
+| --- | --- | --- |
+| `page=1` | empty | `null` |
+| `page=2` | `b3`, `b4` | `null` |
+| `page=3` | `b5`, `b6` | `null` |
+| `page=4` | `b7` | `null` |
+| `page=5` | empty | `null` |
+
+The page that is empty at the start and the page that is empty at the end look the same. A client that stops at the first empty page reads nothing, and a client that stops at the first short page reads four rows. The only correct rule here is one that tolerates empty pages in the middle and decides to stop some other way: a bounded run of them, or keyset paging from a known key.
+
+### Paging safely when `total` is `null`
+
+An empty page cannot be the stopping rule, and a short page cannot either. Two rules work:
+
+**Stop when the database has no more rows, not when the caller has no more visible rows.** The only signal that the table is exhausted is that a request returned **no rows from the database**, and the response does not say. The practical stand-in is to continue until a fixed number of consecutive empty pages, or to move to keyset paging, which skips the problem:
+
+```text
+GET /rest/v1/bigs?sort=id&per_page=50&filter[id]=gt.<last id seen>
+```
+
+With a key filter the next request starts after the last row the caller saw, so a stretch of refused rows is skipped over by the key and not by the page number. If the next page is empty, there may still be rows after a gap of refused ones, so keep going from the highest **key the database returned**. The response does not expose that key for refused rows, which is the limitation: a client can only advance past rows it has seen. For a large table with a sparse residual policy, the clean answer is to change the policy to one the database can apply (for example by adding an equality condition), or to list through a route that runs the query itself.
+
+A reasonable rule for the common case of a small residual set is a bounded loop:
+
+```typescript
+export async function fetchAll(url: (page: number) => string, maxEmpty = 3) {
+  const rows: any[] = [];
+  let empty = 0;
+  for (let page = 1; empty < maxEmpty; page++) {
+    const res = await fetch(url(page), { headers: { apikey: KEY } });
+    const body = await res.json();
+    if (body.total !== null && rows.length >= body.total) break;     // exact total: stop at it
+    if (body.data.length === 0) { empty++; continue; }
+    empty = 0;
+    rows.push(...body.data);
+    if (body.total !== null && page * body.per_page >= body.total) break;
+  }
+  return rows;
+}
+```
+
+This stops at the exact total when there is one, and otherwise after three empty pages in a row, which tolerates a gap. It is a heuristic. If a gap of refused rows can be longer than three pages, raise `maxEmpty`, or fix the policy.

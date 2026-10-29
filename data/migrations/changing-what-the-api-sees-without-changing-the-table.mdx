@@ -1,0 +1,242 @@
+---
+title: "Changing what the API sees without changing the table"
+description: "Because the API reads and writes through the resource, and the migration only adds, some changes take effect without any migration at all:"
+icon: "arrow-right"
+---
+
+Because the API reads and writes through the resource, and the migration only adds, some changes take effect without any migration at all:
+
+| Change | Needs a migrate? | Effect |
+| --- | --- | --- |
+| Rename a field's `description`, `example` | No | Documentation only |
+| Change a field's `min_length`, `max_length`, `pattern`, `minimum`, `maximum` | No | Validation on the next create or update. Existing rows are not rechecked |
+| Change `required`, `nullable`, `read_only`, `write_only`, `default` | No | The API's behavior, from the next request |
+| Add a field | **Yes** | Without the column, a create that sends the field fails with a plain 500, and a read returns `null` for it |
+| Add `indexed` or `unique` | **Yes** | The index does not exist until you migrate |
+| Remove a field | No | The column stays; reads still return it |
+| Change a field's `type` | Not by migrate | The column keeps its old type |
+| Change `table` | **Yes**, and it points at a new table | The old table is untouched |
+
+The row to memorise is the third one from the top: **validation rules are API-only**. They change instantly, and they never reach the database, which is why the API is the only place they are enforced. See [Validation](/data/validation/overview).
+
+
+## Using Studio to migrate
+
+Everything above is reachable from one place. Open **Build → Resources**, click a resource (or **New resource**), and the sheet has these tabs and buttons:
+
+| Part of the sheet | What it does |
+| --- | --- |
+| **Configure** tab | The form: name, table, key, timestamps, owner field, fields |
+| **Records** tab (existing resources) | Reads and writes rows. The empty state says *No records (or the table does not exist yet — use Create / migrate table).* |
+| **JSON** tab | The definition exactly as stored. Section **Definition JSON**: *Exactly what is stored. Changes here show up in the form.* |
+| **Create / migrate table** button | `POST .../migrate`. Toast **Table migrated**, and the result JSON appears in the sheet |
+| **Save changes** | Stores the definition. Does not migrate |
+| **Delete** | Confirms with `Delete NAME? This cannot be undone.` and removes the definition only |
+
+<Warning>
+The field editor in the form has **no `unique` or `indexed` toggle**. It has Required, Nullable, Read only and Write only, and the detail fields. `unique` and `indexed` are set on the **JSON** tab. Studio carries the keys through untouched when you edit other things in the form, so you can set them once in JSON and keep editing in the form.
+</Warning>
+
+To make a field indexed, open the JSON tab, find the field and add `"indexed": true`:
+
+```json
+{
+  "name": "status",
+  "type": "string",
+  "max_length": 20,
+  "indexed": true
+}
+```
+
+Then press **Save changes** and **Create / migrate table**. The result shows the `CREATE INDEX` statement. Saving alone does nothing to the database, and a common mistake is to save and assume the index exists.
+
+### The two-press rule
+
+Every structural change is two presses, in this order:
+
+1. **Save changes**: the definition now says what you want.
+2. **Create / migrate table**: the database now matches.
+
+Between the two presses the API runs against a table that does not have the column yet. For a new field that is a short window in which a create that includes the field returns a 500. In a development environment it does not matter. In production, see [the safe sequence](/data/migrations/when-a-migration-fails-part-way#a-safe-sequence-for-production).
+
+
+## Adding a field to a table that has rows
+
+Add a nullable `priority` integer to `tickets`, which already has rows, save and migrate. The statements are:
+
+```json
+[
+  "ALTER TABLE \"tickets\" ADD COLUMN \"priority\" INTEGER",
+  "CREATE INDEX IF NOT EXISTS \"ix_tickets_status\" ON \"tickets\" (\"status\")",
+  "CREATE INDEX IF NOT EXISTS \"ix_tickets_requester_id\" ON \"tickets\" (\"requester_id\")"
+]
+```
+
+The column is added with no `NOT NULL` and no `DEFAULT`, so existing rows get `NULL`. That is true even when the field is `required` and even when it has a `default`. Specifically:
+
+| Field setting | Existing rows | New creates |
+| --- | --- | --- |
+| Nothing special | `NULL` | Value sent, or `NULL` |
+| `required: true` | `NULL` | Must send a value, or a 422 |
+| `default: 3` | `NULL` | `3` when the create omits the field |
+| `required: true` and `default: 3` | `NULL` | `3` when the create omits the field |
+
+The row that causes surprise is the `default` row. A default is applied at the API when a record is **created**, so it never reaches existing rows. After adding `status` with `default: "new"` to a table with 40 rows, a read shows `"status": null` for those 40, a `PATCH` of another field does not fill it in, and `filter[status]=eq.new` matches **only** the rows created after the change. Both facts were observed on a real table.
+
+The fix is a backfill, and Pawabase does not do it for you:
+
+```sql
+UPDATE tickets SET status = 'new' WHERE status IS NULL;
+```
+
+Run that in the [Database console](/data/database-console/overview) with **allow writes** on, or loop through the rows with `PATCH`. The console runs it as one statement, and the result reads *N row(s) affected.* A loop through the API is slower, but it runs validation, policies, events and the cache invalidation for every row, which a console write also triggers as a whole through the resource tags (see [Caching](/data/caching/overview)).
+
+### Required fields and old rows
+
+`required` is enforced on **create** requests only. It is never applied to rows already in the table, and it never becomes `NOT NULL`. So after you add `priority` as required, the table can hold rows with no priority forever, and a `GET` returns them without complaint. If your application assumes every row has one, run the backfill. There is no database setting to lean on.
+
+There is a second place where the guarantee is missing: **Studio's Records tab, flows and functions skip validation entirely**, as described on [Validation](/data/validation/overview). A required field can be missing from a row written by any of those, with no error. A `NOT NULL` constraint would catch it. Pawabase does not add one, so if you want the database to refuse the row, add the constraint yourself once the backfill is done:
+
+```sql
+-- PostgreSQL
+ALTER TABLE tickets ALTER COLUMN priority SET NOT NULL;
+ALTER TABLE tickets ALTER COLUMN priority SET DEFAULT 3;
+
+-- MySQL
+ALTER TABLE tickets MODIFY priority BIGINT NOT NULL DEFAULT 3;
+```
+
+SQLite cannot add `NOT NULL` to an existing column. It requires rebuilding the table, which is covered in [changing a type on SQLite](#changing-a-columns-type).
+
+<Tip>
+A database constraint that Pawabase does not know about is safe to add, and migrate will not undo it, since migrate never alters or drops anything. The cost is that the constraint's error surfaces as a plain 500 from the API, not a 422, so only add it where a 500 is the right answer for a row that should never exist.
+</Tip>
+
+
+## What a removed field leaves behind
+
+Remove a field from a resource and save. Nothing in the database changes, and the API changes in one specific way: the API stops validating and documenting the field. It does **not** stop returning it.
+
+Reads use `SELECT *` and the response model accepts extra columns, so a column that is in the table comes back in the response whether or not the resource declares it. This was observed for removed fields and for table columns that were never declared:
+
+```http
+GET /rest/v1/tickets/12
+```
+
+```json
+{
+  "id": 12,
+  "title": "Printer is offline",
+  "status": "open",
+  "legacy_code": "A-77"
+}
+```
+
+`legacy_code` was removed from the resource and is still returned. That has two consequences you need to plan for:
+
+1. **A removed field is not a hidden field.** If you removed it because it should not be exposed, the removal did not do that. Use `select` in the request (consumers can still ask for everything), or a [transformer](/data/transformers/overview) with `omit`, which is applied to every record a consumer receives.
+2. **A removed column is readable but no longer part of the resource's documented shape**, which is the confusing half-state: it appears in responses, but not in the API Explorer and not in the validation rules.
+
+To remove a column for real, drop it in the console and then remove it from the resource, in that order, or the API briefly validates a field the table no longer has:
+
+```sql
+ALTER TABLE tickets DROP COLUMN legacy_code;
+```
+
+SQLite supports `DROP COLUMN` from version 3.35. Older versions require rebuilding the table.
+
+
+## Changing a column's type
+
+Changing a field's `type` in the definition and migrating does nothing to the column. Nothing is read, nothing is converted and no statement is emitted. The definition and the column then disagree, and what that looks like depends on the dialect and the change.
+
+| Change | SQLite | PostgreSQL / MySQL |
+| --- | --- | --- |
+| `integer` → `number` | Works. SQLite is loosely typed, and the column's `INTEGER` affinity stores reals fine | Column stays `BIGINT`. Values with fractions are rounded or rejected by the database |
+| `string` → `text` | Works | Column stays `VARCHAR(n)`. Long values are rejected |
+| `string` → `integer` | Old strings that are not numbers fail to read, with a response validation 500 | Same |
+| `integer` → `string` | Works, values come back as numbers until rewritten | Same |
+| `json` → `string` | Old rows hold JSON text and read back as that text | PostgreSQL's `JSONB` column rejects non-JSON values |
+
+The honest way to change a type is to add a new field, copy, switch and drop:
+
+1. Add `price_cents` (integer) next to `price` (number) and migrate.
+2. Backfill: `UPDATE products SET price_cents = CAST(ROUND(price * 100) AS INTEGER);`
+3. Change clients to read and write `price_cents`.
+4. Remove `price` from the resource, then drop the column.
+
+Every step is reversible until the last, and the data never sits in a state where a read can fail.
+
+### Rebuilding a SQLite table
+
+SQLite can add columns and (from 3.35) drop them, but it cannot change a column's type or constraint in place. The standard method is to build the new table, copy, drop and rename. In the console, with **allow writes**:
+
+```sql
+CREATE TABLE products_new (
+  "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+  "sku" TEXT UNIQUE,
+  "price_cents" INTEGER NOT NULL DEFAULT 0,
+  "created_at" TEXT,
+  "updated_at" TEXT
+);
+INSERT INTO products_new (id, sku, price_cents, created_at, updated_at)
+  SELECT id, sku, CAST(ROUND(price * 100) AS INTEGER), created_at, updated_at FROM products;
+DROP TABLE products;
+ALTER TABLE products_new RENAME TO products;
+```
+
+The console refuses multiple statements in one call (it treats them as a write and requires `allow_write`, and a multi-statement body is rejected), so run them one at a time. Indexes belong to the dropped table, so migrate afterward and Pawabase re-creates the ones the resource declares.
+
+
+## Mapping a resource onto a table you already have
+
+A table that already exists, created by another system or by hand, can be exposed without migrating it at all. In the resource, set:
+
+| Setting | Value |
+| --- | --- |
+| **Table** | The existing table's name |
+| **Primary key** | The existing key column |
+| **Timestamps** | **Off**, unless the table has `created_at` and `updated_at` |
+| **Fields** | The columns you want validated and documented |
+
+Then press **Create / migrate table**, or do not. If you do, the migration compares the declared columns with what exists and adds only the **missing** ones. Existing columns are never touched. If everything matches it returns an empty `statements` list, as `legacy_customers` did above.
+
+Two behaviors to know before you expose a legacy table:
+
+- **Every column is returned, declared or not.** Responses include the whole row. If a legacy table has a `password_hash` column and you only declared `name` and `email`, the hash is still in the response. Use a transformer with `omit` or `pick`, and consumers' `select`, to control the output. See [Transformers](/data/transformers/overview).
+- **Declared columns that do not exist are a trap.** Declare `nickname` on a table that has no such column, do not migrate, and creates that send it return a 500. Migrating adds the column to the legacy table, which may not be what the owner of that table wants.
+
+<Warning>
+If you do press migrate on a legacy table, read the statements it returns first. Pressing it against a production legacy table from a development habit is the way a column appears in a table another team owns.
+</Warning>
+
+### A field called `id` fails the resource
+
+Declaring a field named `id` collides with the key. The resource fails to compile, all of its routes answer 404, and the problem is listed in the Overview under definitions with problems. Rename the field, or set the primary key to the column you meant.
+
+### Special names
+
+| Name | Result |
+| --- | --- |
+| SQL reserved words (`order`, `group`, `select`, `page`) | Work. Identifiers are quoted in every statement |
+| Mixed case (`Name`) | Works |
+| A declared `created_at` with `timestamps` on | The two collide. The value you send is stored as sent, with no error. Turn `timestamps` off, or rename the field |
+
+
+## What each dialect does with values
+
+The database is not the only place types are decided. Pawabase encodes values going in, and the encoding differs, which matters when you read the data directly or change database later.
+
+| Type | SQLite | PostgreSQL | MySQL |
+| --- | --- | --- | --- |
+| `boolean` | `1` or `0` | `true` or `false` | `true` or `false` |
+| `datetime` | ISO string, **offset kept**: `2026-10-01T10:00:00+02:00` | `timestamptz`, instant preserved | Converted to **naive UTC**: `10:00+02:00` is stored as `08:00` |
+| `date` | ISO string | `date` | `date` |
+| `uuid` | String | `uuid` | String in `CHAR(36)` |
+| `json`, `array`, `object` | JSON text, as `json.dumps` | `jsonb` | `JSON` |
+
+So the same `datetime` is stored three different ways. Reading through the API is consistent, because decoding is symmetrical. Reading through SQL directly is not: a SQLite query returns a string with an offset, a MySQL query returns a bare time that is implicitly UTC, and a PostgreSQL query returns an instant that the client library formats in its own zone.
+
+<Note>
+A sort on a SQLite `datetime` is a text sort. It orders correctly when every value has the same offset, and it can mis-order values written with different offsets, because `10:00+02:00` sorts after `09:30+00:00` as text though it is earlier in time. Send datetimes in UTC, with `Z`, if you sort on them in SQLite.
+</Note>

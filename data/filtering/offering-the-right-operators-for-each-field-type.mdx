@@ -1,0 +1,264 @@
+---
+title: "Offering the right operators for each field type"
+description: "A UI that lets people build filters should offer each field the operators that make sense for its type and nothing else, which keeps users away from…"
+icon: "filter"
+---
+
+A UI that lets people build filters should offer each field the operators that make sense for its type and nothing else, which keeps users away from the `500` cases. This table is the mapping to use when generating such a UI from a resource's fields.
+
+| Field type | Offer | Value input | Avoid |
+| --- | --- | --- | --- |
+| `string`, `text` | `eq`, `neq`, `ilike` (contains, starts with), `in`, `is.null` | A text box. Escape nothing, but warn that `_` and `%` act as wildcards | `gt` and `lt` unless sorting by text is meaningful |
+| `email`, `url` | `eq`, `ilike`, `is.null` | A text box | Ranges |
+| `integer` | `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `is.null` | A number input that allows whole numbers only | `like`, a fractional value |
+| `number` | `eq`, `gt`, `gte`, `lt`, `lte`, `is.null` | A number input | `eq` for computed floats, which rarely match exactly |
+| `boolean` | `is.true`, `is.false`, `is.null` | A three-way toggle | `eq`, which is wrong |
+| `date` | `eq`, `gt`, `gte`, `lt`, `lte`, `is.null` | A date picker producing `YYYY-MM-DD` | A time component |
+| `datetime` | `gt`, `gte`, `lt`, `lte`, `is.null` | A picker producing UTC with `Z`, or a date | `eq`, which needs the exact instant |
+| `uuid` | `eq`, `in`, `is.null` | A text box, lowercased and trimmed | Ranges, `like` |
+| `json`, `array`, `object`, `ref` | `is.null`, `isnot.null` | None | Everything else |
+| The key | `eq`, `in`, `gt`, `lt` | As for its type | |
+| `created_at`, `updated_at` | `gt`, `gte`, `lt`, `lte` | A picker | `eq` |
+
+One filter per field is the rule the UI should enforce too: when a user sets a second condition on a field, either replace the first or explain that a range needs another approach.
+
+### Validating a value before it is sent
+
+The server converts values and fails with `500`, so a client that wants to show a message does the same conversion first. A small validator keyed by field type:
+
+```typescript
+type FieldType = "string" | "text" | "email" | "url" | "integer" | "number" | "boolean"
+               | "date" | "datetime" | "uuid";
+
+const INTEGER = /^\s*[+-]?\d+\s*$/;
+const NUMBER  = /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/;
+const DATE    = /^\d{4}-\d{2}-\d{2}$/;
+const UUID    = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Returns an error message, or null when the server will be able to convert the value. */
+export function checkValue(type: FieldType, op: string, raw: string): string | null {
+  if (op === "is" || op === "isnot") {
+    return ["null", "true", "false"].includes(raw) ? null : "Use null, true or false.";
+  }
+  const parts = op === "in" || op === "nin" ? raw.split(",") : [raw];
+  if (parts.some((p) => p.trim() === "") && type !== "string" && type !== "text") {
+    return "A value is empty.";
+  }
+  for (const p of parts) {
+    switch (type) {
+      case "integer":  if (!INTEGER.test(p)) return `"${p}" is not a whole number.`; break;
+      case "number":   if (!NUMBER.test(p))  return `"${p}" is not a number.`; break;
+      case "date":     if (!DATE.test(p))    return `"${p}" is not a date like 2026-03-01.`; break;
+      case "datetime": if (Number.isNaN(Date.parse(p))) return `"${p}" is not a date or timestamp.`; break;
+      case "uuid":     if (!UUID.test(p))    return "Use a lowercase UUID with hyphens."; break;
+      case "boolean":  return "Use is.true or is.false for booleans.";
+    }
+  }
+  if ((op === "like" || op === "ilike") && ["integer", "number", "boolean", "uuid"].includes(type)) {
+    return "Pattern matching is for text fields.";
+  }
+  return null;
+}
+```
+
+It rejects the inputs that were `500` in testing (an empty or non-numeric integer, a timestamp for a date, an empty list element) and the boolean `eq` that returns the wrong rows. It does not check the number's range or that a date exists (`2026-02-30` passes the pattern and the database decides). Treat it as a guard against the common mistakes and keep the server's behavior in mind for the rest.
+
+
+## Filters can read what responses hide
+
+A filter is evaluated in the database against the stored column, and the response is shaped afterward. So a field that a response never shows can still be used in a filter, and the result of the filter tells the caller something about the hidden value. This was tried with a resource whose transformer omits `secret` and `cost`, and whose `cost` field is marked `write_only`:
+
+```text
+GET /rest/v1/vault                              ->  rows with label, tier, id and timestamps. No secret, no cost
+GET /rest/v1/vault?filter[secret]=like.b*       ->  the row whose secret starts with "b"
+GET /rest/v1/vault?filter[secret]=like.bravo-k* ->  the same row: one more character confirmed
+GET /rest/v1/vault?filter[secret]=eq.charlie    ->  the row whose secret is exactly "charlie"
+GET /rest/v1/vault?filter[cost]=gte.5           ->  the row whose cost is at least 5
+GET /rest/v1/vault?filter[cost]=gte.9           ->  the same row
+GET /rest/v1/vault?filter[cost]=gt.9            ->  no rows: so the cost is exactly 9
+```
+
+A caller who may list the resource can recover a hidden value one character, or one binary decision, at a time. The calls are cheap and the number of them is small, so rate limits slow this down and do not prevent it.
+
+| Hiding mechanism | Stops the value appearing in the response | Stops filtering on it |
+| --- | --- | --- |
+| Not declaring the field | No: an undeclared column is still returned | Yes, an undeclared field is `400` "cannot filter on unknown field" |
+| `write_only` on the field | No, the runtime still returns it | No |
+| A transformer's `omit` or `pick` | Yes | **No** |
+| `select` chosen by the client | Yes, for that request | **No**, the client can filter on anything |
+| A policy that denies the list operation | Yes, the caller gets nothing | Yes, the caller cannot list |
+
+The only reliable controls are the ones that stop the **list operation itself** for callers who must not learn the value, and ones that keep the value out of the table. For a column that a caller must never infer:
+
+- Do not enable `list` on a resource that holds it for callers who should not know it. Filtering applies only to list requests, so a resource with only `get` enabled cannot be probed this way (a caller who has the id can read the record, subject to its policy).
+- Use a list policy that limits each caller to rows they own, so a filter can only learn about their own data. Pushed-down policy conditions are applied with `AND` to every filter.
+- Store a **hash** of a secret you only need to compare, and compare in a route or a flow with a server credential.
+- Put the sensitive columns in a second resource, joined by key, with its own stricter policy and no `list`.
+
+See [Policies](/policies/overview) for list and get conditions, and [Transformers](/data/transformers/overview) for what a transformer does and does not hide.
+
+
+## A regression list for filters
+
+Each row is a request and the result it produced, on a resource with an integer `qty`, a number `price`, text `name` and `note`, a text `status` that can be `NULL`, and an `owner_id`. Re-run it against your own resource whenever you change a field, because several rows depend on a column's type.
+
+| Request | Result |
+| --- | --- |
+| `filter[qty]=3` | `qty = 3` |
+| `filter[qty]=eq.3` | The same |
+| `filter[qty]=gte.5` | `qty >= 5` |
+| `filter[qty]=in.1,2` | Rows with qty 1 or 2 |
+| `filter[qty]=nin.1,2,3` | Rows with qty outside the list |
+| `filter[qty]=in. 1 , 2 ` | Works, spaces tolerated |
+| `filter[qty]=in.1,2,,3` | `500` |
+| `filter[qty]=in.` | `500` |
+| `filter[qty]=gte.abc` | `500` |
+| `filter[qty]=1.0` | `500` |
+| `filter[qty]=GTE.3` | `500`, the operator is case-sensitive |
+| `filter%5Bqty%5D=gte.5` | Works, brackets may be encoded |
+| `filter[qty]=gte.2&filter[qty]=lte.4` | Only `lte.4` applies |
+| `filter[qty]=gte.2&filter[price]=lte.4` | Both apply |
+| `filter[price]=2.5` | `price = 2.5` |
+| `filter[price]=1.50` | Matches `1.5` |
+| `filter[name]=Apple` | Case-sensitive on SQLite |
+| `filter[name]=like.a*` | Names starting with `a` |
+| `filter[name]=like.ap%25` | Names starting with `ap` |
+| `filter[name]=like.%25e` | Names ending in `e` |
+| `filter[name]=ilike.APPLE` | Matches regardless of case |
+| `filter[note]=like.a_c` | `_` is a wildcard: matches `abc` as well as `a_c` |
+| `filter[note]=like.100%25` | `%` is a wildcard: matches more than `100%` |
+| `filter[note]=in.a,b` | Looks for `a` or `b`, not the text `a,b` |
+| `filter[note]=eq.a,b` | The text `a,b` |
+| `filter[note]=eq.` | Rows whose note is the empty string |
+| `filter[status]=neq.live` | Excludes `NULL` rows |
+| `filter[status]=nin.live` | Excludes `NULL` rows |
+| `filter[status]=is.null` | Only `NULL` rows |
+| `filter[status]=isnot.null` | Rows with a status |
+| `filter[status]=is.maybe` | `400` |
+| `filter[active]=false` | Returns the **true** rows |
+| `filter[active]=is.false` | Returns the false rows |
+| `filter[released]=gte.2026-03-01` | Works on a date field |
+| `filter[released]=eq.2026-01-01T00:00:00` | `500` |
+| `filter[created_at]=gte.2026-03-01` | Works, from the start of the day |
+| `filter[id]=gte.5` | Works on the key |
+| `filter[nope]=1` | `400`, unknown field |
+| `filter[meta]={"k":1}` | No rows, a JSON column never matches |
+| `filter[meta]=is.null` | Rows where it is unset |
+| Five filters on five fields | All applied together |
+
+
+## Testing filters
+
+Filters are easy to get subtly wrong and hard to see when they are, because the wrong ones return `200`. A small suite that exercises each operator against known rows, and the traps above, is worth keeping:
+
+```python
+import os
+import httpx
+import pytest
+
+BASE = os.environ["PAWABASE_URL"]
+KEY = os.environ["PAWABASE_SECRET_KEY"]            # a server key, so policies do not hide rows
+HEADERS = {"apikey": KEY, "Content-Type": "application/json"}
+URL = f"{BASE}/rest/v1/things"
+
+
+def names(query: str) -> list[str]:
+    r = httpx.get(f"{URL}?{query}&select=name&sort=id&per_page=200", headers=HEADERS)
+    assert r.status_code == 200, r.text
+    return [row["name"] for row in r.json()["data"]]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def rows():
+    created = []
+    for i, (name, qty, active) in enumerate([("apple", 1, True), ("apricot", 2, False),
+                                              ("banana", 3, None), ("cherry", 4, True)], start=1):
+        body = {"name": name, "qty": qty}
+        if active is not None:
+            body["active"] = active
+        created.append(httpx.post(URL, json=body, headers=HEADERS).json()["id"])
+    yield created
+    for row_id in created:
+        httpx.delete(f"{URL}/{row_id}", headers=HEADERS)
+
+
+def test_comparison():
+    assert names("filter[qty]=gte.3") == ["banana", "cherry"]
+
+
+def test_list_operators():
+    assert names("filter[qty]=in.1,4") == ["apple", "cherry"]
+    assert names("filter[qty]=nin.1,4") == ["apricot", "banana"]
+
+
+def test_like_wildcards():
+    assert names("filter[name]=like.ap*") == ["apple", "apricot"]
+
+
+def test_null_rows_are_excluded_by_neq():
+    # banana has no active value: neq must not return it.
+    assert "banana" not in names("filter[active]=isnot.true")
+
+
+def test_boolean_filters_use_is():
+    assert names("filter[active]=is.true") == ["apple", "cherry"]
+    assert names("filter[active]=is.false") == ["apricot"]
+
+
+def test_a_repeated_field_keeps_only_the_last():
+    # Documents the limitation: the lower bound is dropped.
+    assert names("filter[qty]=gte.3&filter[qty]=lte.2") == ["apple", "apricot"]
+
+
+def test_unknown_field_is_a_400():
+    r = httpx.get(f"{URL}?filter[nope]=1", headers=HEADERS)
+    assert r.status_code == 400
+    assert r.json()["error"] == "bad_request"
+
+
+def test_bad_value_is_a_500_today():
+    # Documents a behavior you would prefer to be a 400. If it changes, this fails.
+    assert httpx.get(f"{URL}?filter[qty]=gte.abc", headers=HEADERS).status_code == 500
+```
+
+The tests named for a limitation document it. When a later version of Pawabase changes the behavior, the test fails, and the failure is the cue to update both the test and your code.
+
+
+## Designing a resource to be filtered
+
+The questions to ask about a field are about the queries you expect, and the answers affect the definition.
+
+| Question | If yes |
+| --- | --- |
+| Will clients filter by this field with `eq` or `in`? | Mark it `indexed`, or `unique` if it is a natural key |
+| Will clients filter a range on it? | Mark it `indexed`, and plan for one bound per request |
+| Will clients need both bounds of a range? | Store a derived field, or provide a route |
+| Is the field a boolean that clients filter on? | Tell them to use `is.true` and `is.false`, and give it a `default` so `NULL` does not appear |
+| Can the field be `NULL`, and do clients filter with `neq`? | Give it a `default`, or accept that unset rows are excluded |
+| Will clients search text? | Use `ilike` with a trailing wildcard, and accept a scan, or move search elsewhere |
+| Is the field sensitive? | Make sure no caller who may list can filter on it, see above |
+| Does the field hold a list or an object? | It cannot be filtered. Use a related resource |
+| Will the resource carry a per-row policy? | Expect `total` to be `null` and empty pages, and see that `select` includes the policy's fields |
+
+A good rule is that every field a UI offers a control for needs either an index or a very small table.
+
+
+## Coming from Supabase or PostgREST
+
+Pawabase's operator names will look familiar to anyone who has used PostgREST, the engine behind Supabase's REST API, and the resemblance is useful and partial.
+
+| | PostgREST | Pawabase |
+| --- | --- | --- |
+| Filter syntax | `?status=eq.live` | `?filter[status]=eq.live` |
+| Operators | `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `is`, and more | `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `nin`, `is`, `isnot` |
+| `in` list | `in.(a,b)` | `in.a,b` |
+| Negation | `not.eq.x`, `not.in.(…)` | `neq`, `nin`, `isnot` as separate operators |
+| `or` and `and` groups | `or=(a.eq.1,b.eq.2)` | Not available |
+| Two bounds on one column | `?age=gte.18&age=lte.65` works | Does not work, only the last applies |
+| Pattern wildcard | `*` | `*` and `%` |
+| Filtering inside JSON | `col->>key=eq.x`, `cs`, `cd` | Not available |
+| Full-text search | `fts`, `plfts` | Not available |
+| Related-table filters | `?select=*,posts(*)&posts.status=eq.live` | Not available. Related rows are attached after filtering |
+| Row security | Postgres row-level security | A policy per operation, applied to every list |
+
+A migration from Supabase therefore needs three changes to every filtered query: wrap the column in `filter[...]`, change the `in` syntax, and rework any `or`, JSON, full-text or related-table filter, typically into a route. See Migrating from Supabase and the concept map.

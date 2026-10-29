@@ -1,0 +1,259 @@
+---
+title: "Work that takes longer than a request"
+description: "Some actions take longer than a person should wait on a spinner: generating a large report, importing a file, calling a slow partner API. Do not…"
+icon: "workflow"
+---
+
+Some actions take longer than a person should wait on a spinner: generating a large report, importing a file, calling a slow partner API.
+Do not stretch the client's timeout to cover them.
+Instead, split the action into "start" and "check".
+
+```text
+client ──POST /rest/v1/reports──▶ route flow
+                                   │ create a reports record with status "queued"
+                                   │ emit an event or queue a job to do the work
+                                   ◀── 202 { id, status: "queued" }
+client watches the reports record (realtime or polling)
+                                   job updates status: "running" → "done" + file key
+client downloads the result through a signed URL
+```
+
+The start call returns quickly with `202 Accepted` and the id of a record that tracks the work:
+
+<CodeGroup>
+```typescript TypeScript
+const started = await pawabase.routes.post<{ id: string; status: string }>("reports", { month: "2026-09" });
+```
+
+```python Python
+started = pb.routes.post("reports", {"month": "2026-09"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/rest/v1/reports" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"month": "2026-09"}'   # 202 {"id": "…", "status": "queued"}
+```
+</CodeGroup>
+
+The screen then follows the record.
+With realtime on for the resource, it gets each status change as it happens:
+
+```typescript
+const channel = pawabase.realtime.channel("resource:reports");
+channel.on("message", async (message) => {
+  const { record } = message.payload as { record: { id: string; status: string; file_key?: string } };
+  if (record.id !== started.id) return;
+  setStatus(record.status);
+  if (record.status === "done" && record.file_key) {
+    const { url } = await pawabase.storage.from("reports").createSignedUrl(record.file_key, { expiresIn: 300 });
+    showDownload(url);
+    await channel.unsubscribe();
+  }
+});
+await channel.subscribe();
+```
+
+Without realtime, poll the record with a growing interval:
+
+```typescript
+async function waitForReport(id: string, signal: AbortSignal) {
+  for (let delay = 1000; ; delay = Math.min(delay * 1.5, 10_000)) {
+    const report = await pawabase.from("reports").get(id, { signal });
+    if (report.status === "done" || report.status === "failed") return report;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+}
+```
+
+This pattern survives reloads and closed tabs: the record holds the state, and any screen that opens later can show it.
+It also makes failures visible, because the job writes `failed` and a reason instead of a request timing out silently.
+
+
+## A typed layer over your routes
+
+Route paths and answer shapes scattered across components drift apart from the flows that serve them.
+A small module that names each action, types its input and answer, and validates the answer at runtime keeps them together.
+
+```typescript
+import { z } from "zod";
+
+const Order = z.object({ id: z.string(), status: z.enum(["open", "paid", "cancelled"]), total_minor: z.number() });
+const PayOrderAnswer = z.object({ paid: z.literal(true), order: Order });
+const Quote = z.object({ total_minor: z.number(), currency: z.string(), discount_minor: z.number() });
+
+export const api = {
+  async payOrder(orderId: string) {
+    return PayOrderAnswer.parse(await pawabase.routes.post(`orders/${orderId}/pay`));
+  },
+  async quoteCart(cartId: string, coupon?: string) {
+    const body = await pawabase.flows.run<{ data: unknown }>("quote-cart", { cart_id: cartId, coupon });
+    return Quote.parse(body.data);
+  },
+  async searchProducts(text: string, signal?: AbortSignal) {
+    return z.array(z.object({ id: z.string(), name: z.string() })).parse(
+      await pawabase.routes.get("products/search", { query: { q: text }, signal }),
+    );
+  },
+};
+```
+
+Runtime validation turns a changed flow into a clear error at the boundary, instead of an `undefined` deep inside a component.
+Resource types do not describe custom routes, so this layer is the place to describe route shapes.
+
+
+## Calling flows and routes from a server
+
+Server code calls flows and routes with the same methods.
+What changes is the identity the flow runs with.
+
+| Server client | What the flow sees | Use when |
+| --- | --- | --- |
+| `base.asUser(token)` with a publishable key | `$auth` is the person; `$credential.is_service` is false | The server acts for a person: rendering, proxying |
+| A secret-key client | No person; `$credential.is_service` is true | A job or integration acts for the system |
+
+A trigger or route policy of `authenticated` admits both: a signed-in person, or a service credential.
+Inside the flow, resource blocks run with service rights either way; the difference is what `$auth` and `$credential` contain, and therefore what the flow's own `policy.check` and `auth.require` blocks decide.
+
+Keep that in mind when one flow serves both kinds of caller.
+A flow that creates a record "for the caller" has no caller to assign when a secret key calls it.
+Either give it the person's id explicitly in the input for service calls, checked by a policy that only admits services to that branch, or keep separate flows for the two cases.
+
+
+## Making actions safe to repeat
+
+People double-click.
+Networks drop responses after the server has done the work.
+An action that charges money or sends messages should be safe when it arrives twice.
+
+The server has no general idempotency-key mechanism, but a unique field gives you one.
+Have the client generate an id for the attempt, and have the flow record it in a resource where the field is unique:
+
+<CodeGroup>
+```typescript TypeScript
+import { ConflictError, NetworkError } from "@pawabase/client";
+
+export async function placeOrder(cartId: string) {
+  const attemptId = crypto.randomUUID();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await pawabase.routes.post("orders", { cart_id: cartId, attempt_id: attemptId }, { idempotent: true });
+    } catch (error) {
+      if (error instanceof ConflictError) return pawabase.from("orders").eq("attempt_id", attemptId).single();
+      if (!(error instanceof NetworkError) || attempt === 2) throw error;
+    }
+  }
+}
+```
+
+```python Python
+import uuid
+
+from pawabase import ConflictError, NetworkError
+
+
+def place_order(cart_id: str):
+    attempt_id = str(uuid.uuid4())
+    for attempt in range(3):
+        try:
+            return pb.routes.post("orders", {"cart_id": cart_id, "attempt_id": attempt_id})
+        except ConflictError:
+            return pb.from_("orders").eq("attempt_id", attempt_id).single()
+        except NetworkError:
+            if attempt == 2:
+                raise
+```
+</CodeGroup>
+
+The flow creates the order with `attempt_id` set, and the resource declares `attempt_id` unique.
+A repeated request with the same `attempt_id` fails with `409` at the database, before any second charge, and the client reads the order the first request created.
+
+With that guarantee in the flow, marking the call `idempotent` is honest, and the client's own retries become safe as well.
+
+
+## Calling flows from React
+
+In React applications, server actions are mutations: they change data and then the screen should reflect the change.
+TanStack Query's `useMutation` fits flows and routes well.
+
+```tsx
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { ApiError } from "@pawabase/client";
+
+export function PayButton({ orderId }: { orderId: string }) {
+  const queryClient = useQueryClient();
+  const pay = useMutation({
+    mutationFn: () => pawabase.routes.post(`orders/${orderId}/pay`),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["orders"] }),
+  });
+
+  return (
+    <>
+      <button disabled={pay.isPending} onClick={() => pay.mutate()}>
+        {pay.isPending ? "Paying…" : "Pay"}
+      </button>
+      {pay.error instanceof ApiError && <p role="alert">{pay.error.message}</p>}
+    </>
+  );
+}
+```
+
+Disabling the button while the mutation is pending removes the most common source of double submissions.
+The unique-field technique above handles the rest.
+
+
+## Validation errors from routes
+
+A route with an input schema validates the body before its flow runs.
+An invalid body answers `422` with a list of issues, one per field, in the same shape as resource validation.
+The client raises `ValidationError`, whose helpers map issues to form fields:
+
+<CodeGroup>
+```typescript TypeScript
+import { ValidationError } from "@pawabase/client";
+
+export async function submitContactForm(values: { name: string; email: string; message: string }) {
+  try {
+    await pawabase.routes.post("contact", values);
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return { ok: false, fields: error.byField() };
+    }
+    throw error;
+  }
+}
+```
+
+```python Python
+from pawabase import ValidationError
+
+
+def submit_contact_form(values: dict):
+    try:
+        pb.routes.post("contact", values)
+        return {"ok": True}
+    except ValidationError as error:
+        issues = error.detail if isinstance(error.detail, list) else []
+        fields: dict[str, list[str]] = {}
+        for issue in issues:
+            field = ".".join(str(part) for part in issue.get("loc", []) if part not in ("body", "query", "path"))
+            fields.setdefault(field, []).append(issue.get("msg", "is invalid"))
+        return {"ok": False, "fields": fields}
+```
+
+```bash cURL
+curl -i -X POST "$PAWABASE_URL/rest/v1/contact" -H "apikey: $PAWABASE_KEY" -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{"name": "", "email": "x"}'
+# 422 [{"type": "missing", "loc": ["body", "message"], "msg": "Field required"}, …]
+```
+</CodeGroup>
+
+| Helper | Returns |
+| --- | --- |
+| `error.issues` | Every issue: `loc`, `field`, `message`, and the `type` and `input` when the server sent them |
+| `error.fieldError("email")` | The first message for one field, or `undefined` |
+| `error.byField()` | `{ email: ["…"], name: ["…"] }` |
+
+A flow can also validate inside its graph and raise its own `422` with `error.raise`.
+When it puts per-field problems in `details` as a list with field names, the client treats them as validation issues too; otherwise the code and message are what you get.
+
+A route's input schema does not enforce `required` for every shape, and a route without a schema passes the body to the flow unvalidated.
+Validate what matters inside the flow as well, especially values that reach money or permissions.

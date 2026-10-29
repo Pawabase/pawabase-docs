@@ -1,0 +1,149 @@
+---
+title: "When the session changes"
+description: "The realtime connection carries the person's access token, and it follows the session as it changes."
+icon: "radio"
+---
+
+The realtime connection carries the person's access token, and it follows the session as it changes.
+
+| Session change | What happens on the connection |
+| --- | --- |
+| The token is refreshed | The client sends the new token over the open socket; no reconnect |
+| The person signs in | The new token is sent; channels that need a signed-in person can now be joined |
+| The person signs out | The client sends an empty token; the connection continues as anonymous |
+| The token expires without a refresh | The server treats the connection as anonymous and sends `token_expired` |
+
+When a connection becomes anonymous, by sign-out or expiry, the server re-checks its subscriptions and closes the ones that required a person, sending `channel_closed` for each.
+
+The server also sends `token_expiring` shortly before a connection's token runs out.
+The client's own refresh timer normally refreshes earlier than that, so the warning passes unnoticed.
+
+The TypeScript client reports `token_expiring`, `token_expired`, `channel_closed` and `going_away` frames through `onProtocolError`, because it does not yet have events for them.
+Log them, and react to `channel_closed` and `token_expired` if your screens depend on channels that need a signed-in person:
+
+```typescript
+const pawabase = createClient({
+  url,
+  apiKey,
+  environment: "production",
+  realtime: {
+    onProtocolError: (detail) => {
+      if (detail.includes("channel_closed") || detail.includes("token_expired")) refreshLiveScreens();
+      else console.debug("realtime:", detail);
+    },
+  },
+});
+
+declare function refreshLiveScreens(): void;
+```
+
+A stateless client, created with `accessToken` or `asUser`, opens its socket without a person's token.
+Server code that needs a person's live channels should adopt the session with `auth.setSession` on a normal client instead.
+
+
+## Realtime over HTTP
+
+Three operations work over plain HTTP, without a socket, from browsers and servers alike:
+
+| Method | Request | Returns |
+| --- | --- | --- |
+| `realtime.publish(channel, event, payload)` | `POST /realtime/v1/publish` | `{ id, channel, event }` |
+| `realtime.presence(channel)` | `GET /realtime/v1/channels/<channel>/presence` | The members present now |
+| `realtime.history(channel, limit)` | `GET /realtime/v1/channels/<channel>/history?limit=` | Recent messages, oldest first |
+
+The same rules apply as on the socket: publishing needs the publish policy, presence and history need the subscribe policy.
+
+Publishing over HTTP is how servers send realtime messages.
+With a secret key, the message's `from` is `"server"`, and the publish is allowed whatever the channel's rule says: service credentials bypass channel policies, the environment's switch for client publishing, and the restriction on `resource:` channels.
+That makes the secret key the right tool for server-sent notifications, and a key to keep on servers only.
+
+<CodeGroup>
+```typescript TypeScript
+const service = createClient({ url, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" });
+
+await service.realtime.publish(`user:${userId}`, "notification", {
+  title: "Your export is ready",
+  href: `/exports/${exportId}`,
+});
+```
+
+```python Python
+service = Pawabase(url, os.environ["PAWABASE_SECRET_KEY"], environment="production")
+
+service.realtime.publish(f"user:{user_id}", "notification", {"title": "Your export is ready", "href": f"/exports/{export_id}"})
+```
+
+```bash cURL
+curl -X POST "$PAWABASE_URL/realtime/v1/publish" -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"channel": "user:u_7", "event": "notification", "payload": {"title": "Your export is ready"}}'
+```
+</CodeGroup>
+
+HTTP publishing uses the client's normal retry rules: `POST` is not repeated after a network failure, because the message may have been delivered.
+
+
+## Limits
+
+| Limit | Default | When exceeded |
+| --- | --- | --- |
+| Message size, including payload | 64 KiB | The send is refused with `payload_too_large` |
+| Presence data per member | 2 KiB | The presence update is refused with `payload_too_large` |
+| Channels per connection | 100 | The subscribe is refused |
+| Connections per person | 20 | The connection is closed with `4429` |
+| History per channel | The rule's `history`, at most 1000 | Older messages are discarded |
+| Messages per connection per second | An installation setting | Sends are refused with `rate_limited`; persistent flooding closes the connection with `4008` |
+| Messages and channels per project | The plan's limits | Refused with a quota message |
+
+Installations can change these defaults.
+The numbers above are what a default installation uses.
+
+
+## Errors
+
+Refusals and failures on the socket reach your code as `RealtimeError`, with a `code` naming what happened.
+
+| `code` | Meaning |
+| --- | --- |
+| `forbidden` | A rule refused the subscribe, publish or presence update; the message says why |
+| `payload_too_large` | The message or presence data is over its limit |
+| `rate_limited` | The connection is sending too fast |
+| `invalid_token` | A token sent over the socket was refused |
+| `capacity` | A connection or channel limit was reached |
+| `unavailable` | The server could not complete the request |
+| `ack_timeout` | No acknowledgement within `ackTimeoutMs` |
+| `not_connected` | The connection is not open and did not open in time |
+| `connect_timeout` | A new connection was not welcomed within `connectTimeoutMs` |
+| `closed`, `closed_<code>` | The connection closed while a request was pending, or before it opened |
+| `send_failed` | The socket refused to send |
+
+The HTTP methods raise the usual HTTP errors instead: `AuthenticationError`, `PermissionError`, `RateLimitError` and so on.
+
+
+## Delivery guarantees
+
+Knowing what realtime promises, and what it does not, prevents designs that fail under load.
+
+| Property | Guarantee |
+| --- | --- |
+| Live delivery | At most once, to subscribers connected at the time |
+| Order | Messages on one channel are delivered to a subscriber in the order the server accepted them |
+| Duplicates | The client removes duplicates by message id, including between replay and live delivery |
+| Missed messages | Not redelivered, except through history and `replay` within the channel's history length |
+| Durability | In memory, unless the rule's kind is `durable` |
+| Acknowledgement of a send | The server accepted the message; not that anyone received it |
+
+Use realtime for what benefits from immediacy and tolerates gaps: chat, presence, notifications, live dashboards.
+Keep the source of truth in records, and treat realtime as the fast path to the screen.
+
+### Refusal messages
+
+A `forbidden` refusal carries a message that says which check failed:
+
+| Message | Cause |
+| --- | --- |
+| `this channel belongs to someone else` | A templated rule, such as `user:{{ auth.user_id }}`, governs the channel, and its rendered name is not this caller's |
+| `resource change channels are server-published` | A client tried to publish to a `resource:` channel |
+| `clients may not publish in this environment` | The environment allows only servers to publish |
+| `presence is off for this channel` | The rule turns presence off |
+| `invalid channel name` or `invalid event name` | The name uses characters outside the allowed set |
+| A policy's own reason | The rule's subscribe or publish policy refused |

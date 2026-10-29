@@ -1,0 +1,247 @@
+---
+title: "Where the sign-in refusal sits"
+description: "The check lives on the password branch of the token endpoint, after the account is found, the password is verified, and the account is confirmed…"
+icon: "mail-check"
+---
+
+The check lives on the password branch of the token endpoint, after the account is found, the password is verified, and the account is confirmed enabled:
+
+```text
+find the account by email
+  → refuse if it is locked
+  → refuse if the password is wrong
+  → refuse if it is disabled
+  → refuse if verification is required and the address is unverified
+  → issue an MFA challenge, or start a session
+```
+
+Its position in that sequence is what makes the error so unhelpful in isolation. Someone who typed the right password gets a `403` that mentions email rather than credentials, and concludes the address is broken.
+
+| Order consequence | What it means in practice |
+| --- | --- |
+| The lockout check comes first. | An unverified person can be locked out, and a reset will clear it. |
+| The password check comes second. | A wrong password on an unverified account reports the password, not the verification. |
+| The disabled check comes third. | A disabled account reports that, not the verification. |
+| The verification check comes last. | It only appears once everything else is correct. |
+
+<Note>
+Because it comes last, the verification refusal is the *most* accurate message a person can receive about their own sign-in. Every other state masks itself behind a less specific one.
+</Note>
+
+### Where else an address gets verified
+
+Five other flows can stamp `email_verified_at` without going through a `verify` token. Knowing which is which prevents a support conversation that goes in circles.
+
+| Flow | Does it verify the address? | Why |
+| --- | --- | --- |
+| Magic link redemption | Yes, if not already verified. | Receiving the mail is proof of control. |
+| Social sign-in creating an account | Yes, when the provider asserts `email_verified`. | The provider performed the check. |
+| Social sign-in matching an existing account | No. | The address is used for matching, not trusted. |
+| A change of address, confirmed | Yes, on the **new** address. | The old address's stamp does not carry over. |
+| Studio's **Verify email** | Yes. | An operator asserted it. |
+
+### Magic links
+
+A magic link arriving in the inbox proves the same thing a verification link does, so redemption stamps the address. There is one important ordering detail: the MFA check happens **after** the stamp.
+
+```text
+consume the magic token
+  → refuse a disabled account
+  → stamp email_verified_at if it is null
+  → if the account has MFA and the environment allows it, return an MFA challenge
+  → otherwise start the session
+```
+
+That ordering has a visible consequence. A person with MFA enabled who redeems a magic link in an environment requiring verification gets their address verified by the magic link itself, and then faces the second factor. They do not need to find the separate confirmation mail.
+
+### Social sign-in
+
+When a provider creates a new account, the account is created verified if and only if the provider's profile says the email is verified. When the provider's email is unverified and an account already exists with that address, sign-in is refused rather than merged — the person gets an error code in the URL fragment.
+
+When a provider email **is** verified and matches an existing account, that identity is attached to the existing account. This is the one place an external assertion of address ownership is trusted to bind two records together, and it is why the rule in the source is that only a *verified* provider email may do it.
+
+<Warning>
+If your provider does not return an `email_verified` flag, no account created through it will be pre-verified, and your `require_email_verification` setting will still apply to those people. Check your provider's profile mapping before assuming social sign-in bypasses verification.
+</Warning>
+
+### Changing an address
+
+A signed-in person who sends a new address in `PATCH /auth/v1/user` does not change it immediately. The route issues an `email_change` token and mails the **new** address; the account keeps the old one until that token is confirmed. Confirming stamps the new address as verified in the same write.
+
+```json
+{ "email": "ada@newdomain.test" }
+```
+
+```json
+{ "changed": true, "email": "ada@newdomain.test" }
+```
+
+If the new address already belongs to someone else, confirmation is refused with `409 that email is in use`.
+
+
+## Enforcing it in your application
+
+Verification produces a boolean on the user object and a claim on the access token. What it does **not** do is stop anyone from reading or writing your data.
+
+Nothing in the system refuses a request because the caller's address is unverified. If you need that, you write it as a policy.
+
+### Reading the state in a policy
+
+`$auth` carries the verified claims. For verification, the useful pair is `$auth.email` and the user record.
+
+| Path | What it holds |
+| --- | --- |
+| `$auth.authenticated` | `true` for any signed-in caller. |
+| `$auth.email` | The address the token was issued for. |
+| `$auth.roles`, `$auth.permissions` | Read at issue time. |
+| `$auth.aal` | `aal1` or `aal2`. |
+| `$record.owner_id` | The owner column on a resource, for an ownership check. |
+
+Because the token only carries the address and not the verification stamp, gating on verification is most naturally done against your own profile data:
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    { "ne": ["$record.email_verified", true] }
+  ]
+}
+```
+
+Conditions are plain JSON. There is no expression language to learn and nothing to compile — see [Policy conditions](/policies/conditions) for the operator vocabulary and [Enforcement points](/policies/enforcement-points) for where a policy attaches.
+
+<Warning>
+The claim snapshot matters. `roles` and `perms` are read when the token is issued, so a change to someone's roles lands on their next refresh, not on their next request. If you gate on a role, expect up to one access-token lifetime of lag. See [Roles and permissions](/auth/roles-and-permissions/overview).
+</Warning>
+
+### Keeping the client honest
+
+A useful client-side rule, once you have `/auth/v1/user` working:
+
+```text
+if the response has email_verified == false
+  → send the person to a "check your inbox" screen
+  → offer a resend that calls /auth/v1/verify/request
+  → do not let them into the application
+```
+
+Two things that client must not do: treat `email_verified` from a cached profile as authoritative for a request that matters, and treat a successful resend as proof that a message was delivered. The response says `sent`, not `delivered`, and it says it in every case.
+
+
+## What goes wrong
+
+Each of these is a real behaviour of the system, not a hypothetical.
+
+### The link says it is invalid and it was just sent
+
+Almost always the environment. A `verify` token is bound to the `project` and `env` it was issued in, and redemption looks the row up on both. If the page you opened is calling `/auth/v1/verify` with the context for a different environment, the row is not found and you get the same `400` as for a forged token.
+
+The second cause is a consumed token. If the page loaded once, redeemed, and then the person refreshed and clicked again, the second attempt fails. This is the single-use property working.
+
+The third is a rotated signing secret. If Akountz's `internal_secret` changed since the message was sent, every outstanding token fails at once.
+
+| Symptom | Most likely cause | Check |
+| --- | --- | --- |
+| `400 the link is invalid or has expired` immediately | Wrong environment on the redeeming request. | Compare `prj`/`env` in the context with the environment the mail came from. |
+| The same, on a second click | The token was already consumed. | Expected. Issue a new one. |
+| The same, for every link at once | The signing secret was rotated. | Check Akountz's recent configuration changes. |
+| The same, after 24 hours | The lifetime expired. | Expected. Issue a new one. |
+
+### Sign-up returns a session but nobody receives a message
+
+That is what `require_email_verification: false` does. It sends nothing at all. The account exists and is usable immediately.
+
+### Sign-up returns `session: null` and nobody receives a message
+
+Something failed after the account was created. The most common cause is the environment's mail configuration, which lives in the API rather than in Akountz — see [Mail](/mail/overview). Check that the environment can send, and check its logs.
+
+<Warning>
+An account is created before the message is sent. If delivery fails, the account still exists and is still unverified. Retrying sign-up with the same address returns `409 an account with this email already exists`. Use `/auth/v1/verify/request` to retry delivery — do not delete and recreate the account.
+</Warning>
+
+### The person verified but cannot sign in
+
+Verification succeeded and the sign-in failed for another reason. Check the **Sign-in activity** tab's Result column, which distinguishes them:
+
+| Result | Meaning |
+| --- | --- |
+| `wrong password` | The account was created by social sign-in or magic link and has no usable password. Set one through a recovery link. |
+| `locked` | Ten failures reached the threshold. It clears after 15 minutes or with **Enable** in Studio. |
+| `disabled` | An administrator disabled it. **Enable** reverses it. |
+| `unknown email` | The address has no account in *this* environment. They signed up somewhere else. |
+
+### Changing the setting appears to do nothing for ten seconds
+
+That is the configuration cache, not a bug. `config_ttl` defaults to 10 seconds and applies per environment, keyed as `authcfg:{project}:{env}`.
+
+### The link opens a page I do not recognise
+
+`site_url` is empty, so the link went to Akountz's hosted page. Set **Site URL** under **Configuration → URLs** — its placeholder is `https://app.example.com` — and the links will point at your application instead.
+
+### The full set of reasons a link flow fails
+
+One error covers every failure, which makes the diagnostic table above the practical tool. Across all purposes, the redemption path can only fail these ways:
+
+| Failure | Status | Detail |
+| --- | --- | --- |
+| Signature does not verify | 400 | `the link is invalid or has expired` |
+| Signature older than the purpose's lifetime | 400 | the same |
+| No row for this id in this environment | 400 | the same |
+| Row already has `used_at` | 400 | the same |
+| Row's `expires_at` has passed | 400 | the same |
+| A concurrent request consumed it first | 400 | the same |
+| Token missing or too short in the body | 422 | Schema validation on `token`. |
+
+The `422` is the only distinguishable one, and it means your client sent something malformed rather than something stale.
+
+<Info>
+Because every failure is the same 400, you cannot build a support tool that tells someone "this link expired at 14:32". If you need that, subscribe to the identity events and record issuance on your side.
+</Info>
+
+### Requesting a message for an address that does not exist
+
+The response says `sent: true`. Nothing is sent, nothing is created, and no event is emitted. This is correct and deliberate, but it does mean a typo in an email form produces a message to nobody and an interface that looks like it worked.
+
+The only honest fix on your side is to make the person confirm what they typed before you tell them anything.
+
+
+## How this interacts with the rest of the system
+
+### Sessions and tokens
+
+Verification issues a session through the normal path, so it participates in everything sessions do: rotation on refresh, `session_id` for targeted sign-out, theft detection across the token family, and the `Signed out everywhere` action in Studio. Nothing about a verified session is special.
+
+### Rate limits
+
+Three separate budgets apply to a verification attempt, and they are easy to confuse:
+
+| Budget | Limit | Key | Applies to |
+| --- | --- | --- | --- |
+| Sign-in and sign-up | 30 per 60s | `akz:auth` | `POST /auth/v1/signup`, `POST /auth/v1/token` |
+| Link requests | 10 per 60s | `akz:links` | `POST /auth/v1/verify/request`, `POST /auth/v1/recover`, `POST /auth/v1/magic-link` |
+| MFA | 10 per 60s | `akz:mfa` | the `/auth/v1/mfa/*` routes |
+
+Note that `POST /auth/v1/verify` — the redemption — carries no rate-limit middleware of its own. It is protected by the token being unforgeable and single-use, not by a counter.
+
+### Environments and promotion
+
+Verification state is per environment, because the accounts themselves are. Promoting a database from staging to production brings the users with it, and their verification state comes along. What does not come along is the configuration: `require_email_verification` lives in the environment's `auth` block, which you set per environment. See [Environments and promotion](/studio/environments-and-promotion).
+
+### Backups
+
+An environment's backup includes users with their verification timestamps, so a restore into a fresh environment produces accounts that are already verified. Restoring into an environment where those addresses already hold unverified accounts is a conflict worth checking before you restore. See [Backup and restore](/studio/backups).
+
+### Events
+
+Verification can emit four events, and it is worth having the full list in one place because three of them come from shared code paths.
+
+| Event | Emitted when | Actor |
+| --- | --- | --- |
+| `user.created` | Sign-up created the account. | The new user. |
+| `user.verified` | An address was confirmed for the first time. | The user. |
+| `user.signed_in` | The session started. | The user. |
+| `session.reuse_detected` | A consumed refresh token was replayed. | The user. |
+
+### Audit
+
+Verification itself is not in the audit log; the identity activity that records it is `akz_login_events`. Sign-up is recorded as a `sign_in` with method `email_verification` when the session starts, and the `user.verified` event carries the timestamp for anyone consuming events. See [Audit log](/studio/audit-log) for what the two systems each record.

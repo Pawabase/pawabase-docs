@@ -1,0 +1,285 @@
+---
+title: "Auth in policies"
+description: "What authentication puts into a policy condition — the real $auth and $credential context, the exact JSON operators, and how roles, permissions, org, aal and meta/app claims behave when a policy is evaluated."
+icon: "code"
+---
+
+Authentication and authorization are two separate stages of every Pawabase request. Authentication decides **who is calling**; a policy decides **what they may do**. This page is about the seam between them: what the first stage hands to the second, and how to write conditions against it.
+
+<Note>
+Policies are **JSON**, not TOML and not an expression language. A condition is a JSON object with exactly one key. There is no `&&`, no `==`, no `expression = "..."` key, and no permission-checking function inside a condition. If a page tells you otherwise, that page is describing a system that does not exist.
+</Note>
+
+<CardGroup cols={3}>
+  <Card title="Conditions are JSON" icon="file-code">`{"all": [{"authenticated": true}, {"eq": [...]}]}`. One operator per object, operands are arrays.</Card>
+  <Card title="$auth is a snapshot" icon="camera">It is built from verified token claims. Nothing is fetched at policy time, so a claim change waits for a refresh.</Card>
+  <Card title="No hidden helpers" icon="ban">No functions, no variables, no `lower()`. When a rule needs code, it is a Python policy.</Card>
+</CardGroup>
+
+## The two stages
+
+A request reaches a policy having already passed through a backend. `ProjectUserBackend` verifies the bearer token, and Sillo resolves it into a `Principal` on the request context:
+
+```python
+async def authenticate(self, ctx) -> AuthResult:
+    token = _bearer(ctx.headers)
+    if not token:
+        return _FAIL
+    try:
+        claims = verify_user_token(
+            token, self.master_secret, project=PLATFORM_PROJECT, env=PLATFORM_ENV
+        )
+    except TokenInvalid:
+        return _FAIL
+    return AuthResult(
+        success=True, identity=encode_identity("user", claims), scope="user"
+    )
+```
+
+`verify_user_token` is strict about the environment:
+
+```python
+def verify_user_token(token: str, master: str, *, project: str, env: str) -> dict[str, Any]:
+    """Verify a user access token for *project*/*env*. Raises :class:`TokenInvalid`."""
+    claims = _decode(token, derive_env_secret(master, project, env), audience=USER_AUDIENCE)
+    if claims.get("typ") != "access":
+        raise TokenInvalid("not an access token")
+    if claims.get("prj") != project or claims.get("env") != env:
+        raise TokenInvalid("token belongs to another environment")
+    return claims
+```
+
+The claims that come back are packed into a string the framework carries around, and `Principal.load_user` turns them back into an object:
+
+```python
+PRINCIPAL_PREFIX = "pawabase:"
+
+
+def encode_identity(kind: str, claims: dict[str, Any]) -> str:
+    """Pack verified claims into the identity string a backend returns."""
+    return PRINCIPAL_PREFIX + json.dumps({"kind": kind, "claims": claims}, default=str)
+```
+
+```python
+@classmethod
+async def load_user(cls, identity: str) -> Principal | None:
+    if not identity.startswith(PRINCIPAL_PREFIX):
+        return None
+    data = json.loads(identity[len(PRINCIPAL_PREFIX) :])
+    return cls(data["kind"], data["claims"])
+```
+
+The key property, stated in the module's own docstring:
+
+> The claims are already verified, so nothing is fetched.
+
+That single sentence explains every staleness question you will ever have about `$auth`. A policy does not call Akountz, does not read `akz_memberships`, and does not know what happened to a user's role thirty seconds ago. It knows what the token said when the token was minted.
+
+### The three kinds of principal
+
+`kind` is set by whichever backend authenticated the request:
+
+| `kind` | Set by | What it means |
+| --- | --- | --- |
+| `user` | `ProjectUserBackend` | One of your application's end users, in this environment |
+| `operator` | `OperatorBackend`, or `ServiceBackend` with a `sub` | A Studio operator acting through the console |
+| `service` | `ServiceBackend` without a `sub` | Another Pawabase service, or your server holding the secret key |
+
+`ServiceBackend` decides between the last two on one field:
+
+```python
+claims = verify_service_token(token, self.secret, audience=self.audience)
+kind = "operator" if claims.get("sub") else "service"
+if kind == "service":
+    claims.setdefault("roles", ["admin"])
+return AuthResult(success=True, identity=encode_identity(kind, claims), scope=kind)
+```
+
+Note the `setdefault`. A service principal is given `roles: ["admin"]` automatically, and the principal's Python-side permission check has a matching special case: for a `service` or `operator` principal that holds the `admin` role, it returns `True` for any permission without consulting the `perms` list at all. For every other principal it falls through to `permission in perms or "*" in perms`.
+
+<Warning>
+`has_permission` is a **Python convenience on the principal object**. It is not a policy operator. There is no `{"has_permission": "..."}` condition and no `permission()` function in the JSON language. The JSON equivalent is the `permission` shorthand, documented below.
+</Warning>
+
+
+## The evaluation context
+
+`build_policy_context` assembles everything a condition can read. Seven keys, no more:
+
+```python
+def build_policy_context(
+    ctx: Any,
+    *,
+    record: Mapping[str, Any] | None = None,
+    input: Any = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Assemble the full evaluation context for a request."""
+    platform = current_context(ctx)
+    context: dict[str, Any] = {
+        "auth": policy_auth(_safe_user(ctx)),
+        "credential": credential_context(ctx),
+        "request": request_context(ctx),
+        "project": platform.project if platform else None,
+        "env": platform.env if platform else None,
+        "record": dict(record) if record is not None else None,
+        "input": input,
+    }
+    if extra:
+        context.update(extra)
+    return context
+```
+
+| Path | Contents |
+| --- | --- |
+| `$auth` | Who is calling — see below |
+| `$credential` | The API key's role, scopes, and whether it is a service |
+| `$request` | `method`, `path`, `ip`, `params`, `query` |
+| `$project` | The project slug |
+| `$env` | The environment name |
+| `$record` | The row being read or written, on a single-record operation |
+| `$input` | The submitted body or arguments |
+
+### `$auth`
+
+From `Principal.as_policy_context`:
+
+```python
+def as_policy_context(self) -> dict[str, Any]:
+    """What policies see under ``auth``."""
+    return {
+        "authenticated": True,
+        "kind": self.kind,
+        "user_id": self.identity,
+        "email": self.email,
+        "roles": self.roles,
+        "permissions": self.permissions,
+        "org": self.org,
+        "org_role": self.claims.get("org_role"),
+        "aal": self.claims.get("aal"),
+        "session_id": self.claims.get("sid"),
+        "claims": self.claims,
+    }
+```
+
+| Path | Type | Source |
+| --- | --- | --- |
+| `$auth.authenticated` | boolean | Always `true` for a `Principal` |
+| `$auth.kind` | string | `user`, `operator` or `service` |
+| `$auth.user_id` | string | The `sub` claim — a ULID |
+| `$auth.email` | string or null | The `email` claim |
+| `$auth.roles` | array of strings | The `roles` claim, environment-scoped, prefix-stripped |
+| `$auth.permissions` | array of strings | The `perms` claim, direct plus via groups |
+| `$auth.org` | string or null | The organization **slug** — not an object |
+| `$auth.org_role` | string or null | `owner`, `admin`, `member`, `viewer`, or null |
+| `$auth.aal` | string | `aal1`, or `aal2` after MFA |
+| `$auth.session_id` | string | The `sid` claim — the token family |
+| `$auth.claims` | object | The entire verified claim set |
+
+<Warning>
+`$auth.org` is a **slug string**. There is no `$auth.org.slug`, no `$auth.org.name`, no `$auth.org.id`. A condition written as `{"eq": ["$auth.org.slug", "acme-hq"]}` resolves the left operand to `None` and refuses. Compare the slug directly: `{"eq": ["$auth.org", "acme-hq"]}`.
+</Warning>
+
+### The anonymous context
+
+When nothing authenticated the request, `policy_auth` substitutes a fixed dictionary rather than `None`:
+
+```python
+ANONYMOUS_POLICY_CONTEXT: dict[str, Any] = {
+    "authenticated": False,
+    "kind": "anonymous",
+    "user_id": None,
+    "email": None,
+    "roles": [],
+    "permissions": [],
+    "org": None,
+    "org_role": None,
+    "aal": None,
+    "session_id": None,
+    "claims": {},
+}
+
+
+def policy_auth(user: Any) -> dict[str, Any]:
+    """The ``auth`` policy context for whatever is on ``ctx.user``."""
+    if isinstance(user, Principal):
+        return user.as_policy_context()
+    return dict(ANONYMOUS_POLICY_CONTEXT)
+```
+
+This is why `{"authenticated": true}` is a meaningful, necessary condition: every field exists on every request, so a policy never crashes on a missing key. `dict(...)` is a shallow copy, so a caller mutating the result cannot corrupt the module-level default.
+
+### `$credential`
+
+```python
+def credential_context(ctx: Any) -> dict[str, Any]:
+    """What policies see under ``credential``: the API key's role and scopes."""
+    platform = current_context(ctx)
+    user = _safe_user(ctx)
+    kind = getattr(user, "kind", None)
+    if platform is None:
+        return {
+            "role": kind or "none",
+            "is_service": kind in ("service", "operator"),
+            "scopes": [],
+            "key_id": None,
+        }
+    return {
+        "role": platform.role,
+        "is_service": platform.is_service or kind in ("service", "operator"),
+        "scopes": list(platform.scopes),
+        "key_id": platform.key_id,
+    }
+```
+
+| Path | Type | Meaning |
+| --- | --- | --- |
+| `$credential.role` | string | `anon`, `service` or `operator` |
+| `$credential.is_service` | boolean | Whether this credential bypasses policies |
+| `$credential.scopes` | array of strings | Scopes the API key grants |
+| `$credential.key_id` | string or null | Which key was presented |
+
+Note that `is_service` is true for **operators** as well as services, and that the `PlatformContext` role and the principal `kind` are OR'd together. A request is "service" if either layer says so.
+
+When the gateway resolved the key, its role comes from `PlatformContext`:
+
+```python
+@property
+def is_service(self) -> bool:
+    """Whether this credential bypasses policies."""
+    return self.role in ("service", "operator")
+```
+
+### `$request`
+
+```python
+def request_context(ctx: Any) -> dict[str, Any]:
+    """What policies see under ``request``."""
+    client = getattr(ctx, "client", None)
+    return {
+        "method": ctx.scope.get("method"),
+        "path": ctx.scope.get("path"),
+        "ip": getattr(client, "host", None) if client else None,
+        "params": dict(ctx.path_params) if hasattr(ctx, "path_params") else {},
+        "query": dict(ctx.query_params) if hasattr(ctx, "query_params") else {},
+    }
+```
+
+| Path | Meaning |
+| --- | --- |
+| `$request.method` | `GET`, `POST`, … |
+| `$request.path` | The request path |
+| `$request.ip` | The client address, if known |
+| `$request.params` | Path parameters, as a mapping |
+| `$request.query` | Query parameters, as a mapping |
+
+`$request.ip` is the transport-level address. It is not the `x-forwarded-for` value Akountz records in `akz_login_events`, which prefers the forwarded header:
+
+```python
+def client_info(ctx: Any) -> tuple[str | None, str | None]:
+    forwarded = ctx.headers.get("x-forwarded-for")
+    ip = forwarded.split(",")[0].strip() if forwarded else (ctx.client.host if ctx.client else None)
+    return ip, (ctx.headers.get("user-agent") or "")[:500]
+```
+
+If you are restricting by IP in a policy, remember that behind the gateway this is the gateway's address unless the client connects directly. Prefer an explicit claim or a rate limit over an IP condition.

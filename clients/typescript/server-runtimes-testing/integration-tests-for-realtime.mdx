@@ -1,0 +1,311 @@
+---
+title: "Integration tests for realtime"
+description: "Channel rules can only be tested against a real environment. Two signed-in test people, each with a client and a WebSocket, check that private…"
+icon: "server"
+---
+
+Channel rules can only be tested against a real environment.
+Two signed-in test people, each with a client and a WebSocket, check that private channels stay private:
+
+```typescript
+import WebSocket from "ws";
+import { RealtimeError, type WebSocketConstructor } from "@pawabase/client";
+
+test("a person cannot join another person's channel", async () => {
+  const ws = { realtime: { webSocket: WebSocket as unknown as WebSocketConstructor } };
+  const ada = await person("ada", [], ws);
+  const bob = await person("bob", [], ws);
+  try {
+    await ada.client.realtime.channel(`user:${ada.id}`).subscribe();
+    const refused = await bob.client.realtime.channel(`user:${ada.id}`).subscribe().then(() => null, (error) => error);
+    assert.ok(refused instanceof RealtimeError);
+    assert.equal(refused.code, "forbidden");
+  } finally {
+    await Promise.all([forget(ada), forget(bob)]);
+  }
+});
+
+declare function person(label: string, roles: string[], options: object): Promise<{ id: string; client: import("@pawabase/client").PawabaseClient }>;
+declare function forget(p: { client: { dispose(): void } }): Promise<void>;
+```
+
+On Node 22 and later the global `WebSocket` works and the `ws` option can be dropped.
+`dispose()` in `forget` closes each person's socket, which lets the test runner exit.
+
+
+## A request's path through your server
+
+```text
+browser ──cookie pb-access──▶ your server
+                               │ middleware: access cookie missing? refresh with pb-refresh, set new cookies
+                               │ handler: pawabase = base.asUser(access token)
+                               │          await pawabase.from("orders")…     ──▶ gateway ──▶ Pawabase (as the person)
+                               │          await service.routes.post(…)       ──▶ gateway ──▶ Pawabase (as the system), only after checks
+                               │ render with the results
+                               ▼
+browser ◀── HTML, set-cookie (when refreshed)
+```
+
+Each arrow into Pawabase carries exactly one identity, chosen by which client made the call.
+Reading the handler's code, you can tell which identity each line uses, which is what makes the arrangement reviewable.
+
+
+## Server rendering or browser calls
+
+Some data can be fetched on the server while rendering or in the browser after the page loads.
+The choice affects speed, caching and how sessions are handled.
+
+| Consideration | Fetch on the server | Fetch in the browser |
+| --- | --- | --- |
+| First paint | Data is in the first HTML | A loading state first |
+| Session | Cookie on the server | Session in the browser client |
+| Realtime | Not possible during rendering | Natural |
+| Caching per person | Your server must key caches by person | The browser holds its own data |
+| Request count to Pawabase | One per page render | One per visit, then updates |
+
+Many applications do both: the server renders the first view with `asUser`, and the browser takes over with realtime and its own client.
+That works when the browser and the server agree on who owns the session, as described above.
+
+
+## Readiness checks
+
+Services that depend on Pawabase can include it in their readiness probe, so an orchestrator does not send traffic to an instance that cannot reach it.
+
+```typescript
+app.get("/ready", async (_req, res) => {
+  try {
+    const status = await base.status();
+    res.status(status.ok ? 200 : 503).json({ pawabase: status.ok });
+  } catch {
+    res.status(503).json({ pawabase: false });
+  }
+});
+```
+
+`status()` needs no person and no policy, only an accepted key, so it tests exactly "can this instance reach Pawabase".
+Keep it out of liveness probes: a Pawabase outage should stop traffic to the instance, not restart it.
+
+
+## Performance on servers
+
+| Practice | Effect |
+| --- | --- |
+| One base client per process | Connection reuse; no repeated setup |
+| `asUser` per request | A few objects per request; no network, no timers |
+| Parallel independent calls | Page time is the slowest call, not the sum |
+| `select` the columns a page needs | Smaller answers, faster serialization |
+| No per-request realtime connections | Sockets belong in browsers |
+| Timeouts below your platform's limit | Clean errors instead of killed requests |
+
+Creating a full client per request, instead of `asUser`, works but repeats setup work and, in browsers' absence, creates refresh machinery nobody uses.
+It is the most common avoidable cost in server code.
+
+
+## Common mistakes
+
+| Mistake | Consequence | Fix |
+| --- | --- | --- |
+| A secret key for everything on the server | Policies never apply; one bug exposes everyone's data | `asUser` with a publishable key for per-person work |
+| An `asUser` client stored in module scope | Requests act as whoever was stored | Create per request |
+| Browser and server both refreshing | Sessions end at random | One session owner |
+| Caching per-person pages globally | People see each other's data | Cache per person, or not at all |
+| Tests against production | Real data changed by tests | A test or preview environment |
+| Clients not disposed in tests | Hanging test runs | Dispose in `afterEach` |
+| One key for browsers, servers and CI | One budget for all traffic | Separate keys |
+
+
+## Scripts and one-off tasks
+
+One-off scripts, such as a data fix or a migration of records between fields, run with a secret key and change real data.
+A few habits keep them safe.
+
+```typescript
+#!/usr/bin/env node
+import { createClient } from "@pawabase/client";
+
+const dryRun = !process.argv.includes("--apply");
+const environment = process.env.PAWABASE_ENV!;
+const service = createClient({ url: process.env.PAWABASE_URL!, apiKey: process.env.PAWABASE_SECRET_KEY!, environment });
+
+let changed = 0;
+for await (const customer of service.from("customers").is("country", null).select("id", "phone")) {
+  const country = String(customer.phone ?? "").startsWith("+233") ? "GH" : null;
+  if (!country) continue;
+  changed += 1;
+  if (!dryRun) await service.from("customers").update(customer.id, { country });
+}
+console.log(`${dryRun ? "Would change" : "Changed"} ${changed} customers in ${environment}.`);
+service.dispose();
+```
+
+| Habit | Why |
+| --- | --- |
+| A dry run by default, with an explicit flag to apply | The first run shows what would change |
+| The environment printed in the output | Running against the wrong environment becomes obvious |
+| Absolute writes, selected by a condition the write removes | Running twice changes nothing more |
+| A snapshot before large changes | `manage().backups.snapshot(…)` gives a way back |
+
+
+## A testing checklist
+
+| Check | Why |
+| --- | --- |
+| Query building and error mapping have unit tests with a fake server | Cheap, fast and precise |
+| Screens are tested with real answer and error shapes | Rendering bugs are caught before users see them |
+| Each resource's access rules have a matrix of integration tests | Policies are only tested against the server |
+| Private channels are tested with two people | Channel rules are only tested against the server |
+| Integration tests use their own environment and keys | Tests do not disturb people or production |
+| Every test cleans up, and a sweep catches the rest | The environment stays usable |
+| A few end-to-end tests cover sign-in, a core action and a live update | The pieces work together |
+
+
+## What to watch on servers
+
+| Metric | From | Tells you |
+| --- | --- | --- |
+| Pawabase request duration by route | `onResponse` | Which calls slow pages down |
+| Retries by reason | `onRetry` | Whether the installation is struggling or limits are close |
+| `401` rate after refresh | `onError` | Sessions ending unexpectedly |
+| `429` rate by key | `onResponse` | How close each key is to its budget |
+| Errors by class | `onError` | Regressions after releases |
+
+
+## What the browser sends your server
+
+When the browser owns the session and calls your own API, it must send the person's access token, and your server must pass it on unchanged.
+
+```typescript
+// in the browser
+const token = await pawabase.auth.getAccessToken();
+const response = await fetch("/api/orders", { headers: token ? { authorization: `Bearer ${token}` } : {} });
+```
+
+`getAccessToken()` refreshes first when the token is about to expire, so the server receives a token that is valid for at least the refresh margin.
+Your server then builds `base.asUser(token)` from the header.
+
+| Practice | Why |
+| --- | --- |
+| Send the access token only, never the refresh token | The server does not need to refresh, and should not be able to |
+| Use the `authorization` header, not a query parameter | Query strings end up in logs |
+| Answer `401` when the token is refused | The browser client then refreshes or signs the person out |
+
+
+## Moving a browser app to server rendering
+
+Applications often start as browser-only and add server rendering later.
+The move changes where the session lives, and doing it in order avoids signing everyone out.
+
+| Stage | Change |
+| --- | --- |
+| Start | Browser client with the session in `localStorage` |
+| Add server reads | Browser sends its access token to your server; server uses `asUser` |
+| Move the session to cookies | Server sign-in and refresh endpoints; browser client with `persistSession: false` |
+| Remove token passing | Server reads tokens from cookies; the browser no longer sends them |
+
+During the third stage, people who are signed in through `localStorage` keep that session until it ends.
+Let the browser client adopt the cookie-based flow at their next sign-in rather than forcing everyone out at once.
+
+A practical way to do that is a small migration endpoint.
+On page load, a browser that still holds a `localStorage` session sends its refresh token once to your server, which exchanges it for new tokens, sets the cookies, and answers with success.
+The browser then removes its stored session.
+Because the exchange rotates the refresh token, the browser must stop using its old session immediately after the call, or the next refresh from either side would present a consumed token and end the session.
+
+Remove the migration endpoint after a few weeks, when sessions older than the move have expired on their own.
+Keep an eye on the `401` rate after refresh during the move; a rise means two owners are still refreshing somewhere.
+
+| Signal during the move | Meaning |
+| --- | --- |
+| `SIGNED_OUT` events spike in browsers | The browser client is still refreshing a session the server now owns |
+| Migration endpoint errors with `401` | The browser sent a refresh token that was already rotated |
+| Pages render signed out for signed-in people | Cookies are not reaching the server: check their path and domain |
+
+Each of these points to a specific fix, and none requires signing everyone out.
+Watch them for a week after the move, then remove the migration code with the confidence that every session has a single owner.
+Write down the date of the move in the code that remains, so the next person knows why cookies and tokens are handled the way they are.
+
+
+## Debugging identity mix-ups
+
+When someone reports seeing data that is not theirs, or not seeing data that is, the question is which identity each request carried.
+
+| Step | How |
+| --- | --- |
+| Find the request | The Pawabase request id in your server's logs, from the `onResponse` hook |
+| See who it ran as | The request in **Project → Activity** shows the caller |
+| Compare with the person | If the caller differs, a client was shared or cached between requests |
+| Check caches | Any cache in front of per-person data must be keyed by person |
+
+Mix-ups almost always come from a shared `asUser` client, a module-level variable holding a token, or a cache keyed without the person.
+Each is visible in code review once you know to look for it.
+
+
+## Studio perspective
+
+| You want to | In Studio |
+| --- | --- |
+| Create keys for servers, CI and browsers separately | **Access → API keys**, **New key** |
+| Restrict a server key to your server's addresses | **Allowed IP ranges** on the key |
+| See test users and clean them up by hand | **Access → Users & auth → Users** |
+| See requests from a test run | **Project → Activity**, filtered by time or request id |
+| Keep the test environment's definitions current | Promote from development; see **Project → Settings** for environments |
+
+
+## Troubleshooting
+
+| Symptom | Cause | What to do |
+| --- | --- | --- |
+| One person sees another's data | An `asUser` client or its result was shared between requests, or cached | Create per request; cache per person |
+| `ConfigError` about secret keys in tests | The test environment defines `window` | Use a `node` environment for that test |
+| Server requests fail with `401` after a while | Per-request tokens expired and nobody refreshed them | Refresh in middleware |
+| Sessions end unexpectedly | The browser and the server both refresh | Choose one owner of the session |
+| `429` under load from a server | All traffic shares one key's budget | Separate keys for servers and jobs; spread work |
+| Edge functions time out | Client timeouts and retries exceed the platform limit | Lower `timeoutMs` and retries |
+| Tests leave users and records behind | Missing cleanup, or crashes before cleanup | `after` hooks plus a scheduled sweep |
+
+
+## Questions developers ask
+
+<AccordionGroup>
+  <Accordion title="Can my server verify a Pawabase access token itself?">
+    The client does not verify tokens; it forwards them, and Pawabase verifies them on every request.
+    A server that needs the person's identity before calling anything can call `asUser(token).auth.getUser()`, which fails with `401` for an invalid token.
+  </Accordion>
+  <Accordion title="Should my server use the person's token or a secret key?">
+    The person's token, through `asUser`, whenever the server acts for them.
+    Use a secret key only for work that is not on anyone's behalf, or for a privileged step after your own check.
+  </Accordion>
+  <Accordion title="Can I run integration tests against production?">
+    Do not.
+    Tests create and delete users and records, and a bug in a test can do real damage.
+    Use a test or preview environment with the same definitions.
+  </Accordion>
+  <Accordion title="How do I test MFA flows?">
+    Unit-test them with a fake server that answers `mfa_required`.
+    For integration tests, enroll a test user's authenticator with a known secret and compute codes in the test with a TOTP library.
+  </Accordion>
+  <Accordion title="Can tests share one signed-in person?">
+    Within one test file, yes, if the tests do not change that person's session.
+    Across parallel files, give each its own person, because a sign-out or MFA change in one would affect the others.
+  </Accordion>
+  <Accordion title="How do I test code that uses `manage()` or `admin()`?">
+    Unit-test it with the fake server, answering `/platform/v1/envs/<env>/…` paths.
+    Integration-test it only against environments that exist for testing, because these modules change configuration and users.
+  </Accordion>
+  <Accordion title="Do per-request clients share connections?">
+    Yes, through the runtime's `fetch`, which pools connections to the gateway across all clients in the process.
+  </Accordion>
+  <Accordion title="Can I use the client in a Node worker thread?">
+    Yes.
+    Each thread has its own clients and its own `fetch`; create them inside the worker.
+  </Accordion>
+</AccordionGroup>
+
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Client configuration" icon="sliders-horizontal" href="/clients/typescript/client-configuration/overview">Options for each runtime, including stateless clients.</Card>
+  <Card title="Authentication" icon="key-round" href="/clients/typescript/authentication/overview">Cookie sessions and the refresh rules.</Card>
+  <Card title="User administration" icon="users" href="/clients/typescript/user-administration/overview">Creating and removing test users.</Card>
+  <Card title="Environment management" icon="settings" href="/clients/typescript/management/overview">Preview environments and flow runs from CI.</Card>
+</CardGroup>

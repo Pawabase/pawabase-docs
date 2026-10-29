@@ -1,0 +1,259 @@
+---
+title: "The sign-in challenge"
+description: "When a user with MFA signs in, the credential check succeeds and no session is issued. Instead, a challenge comes back."
+icon: "shield-halved"
+---
+
+When a user with MFA signs in, the credential check succeeds and no session is issued. Instead, a challenge comes back.
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/token" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"grant_type": "password", "email": "ada@example.com", "password": "..."}'
+```
+
+```json
+{
+  "mfa_required": true,
+  "mfa_token": "...",
+  "factors": ["totp", "recovery_code"]
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `mfa_required` | Always `true` here. The signal to prompt for a code. |
+| `mfa_token` | A one-time token naming the user and the original sign-in method. |
+| `factors` | The methods that may satisfy it. Both a TOTP code and a recovery code. |
+
+<Warning>
+The response is not an error. It is a `200`, and the credentials were correct. A client that treats anything other than a token response as a failure will show a login error at the moment the user was most likely to succeed.
+</Warning>
+
+The `factors` list is the contract for what your prompt should accept. Because both methods are listed, one input field is enough: the user types either their six-digit authenticator code or one of their recovery codes, and the same endpoint handles both.
+
+### What the challenge token carries
+
+The `mfa_token` is a one-time token holding more than the user's identity:
+
+| Stored | Used for |
+| --- | --- |
+| The user | Whose codes to check. |
+| `method` | The sign-in method that started the flow, so the session records `password`, `magic_link` or `oauth:<provider>`. |
+| `org` | The organization named at sign-in, carried through to the issued session. |
+
+That `method` field is why an MFA-completed session still shows up correctly as a social or password session — the fact that a second factor was required does not overwrite how the person authenticated.
+
+The token is valid for **five minutes**. That is a deliberately tight window compared with the other one-time tokens, because it is not a link in an email that a person might find later — it is a challenge being answered right now.
+
+### Completing the challenge
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/token" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"grant_type": "mfa", "mfa_token": "...", "code": "123456"}'
+```
+
+The response is the standard token response, at `aal2`, with one extra field recording which method worked:
+
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "expires_at": 1750000000,
+  "session_id": "9f2c1ab4e7d84f0c9b3a5e61d2c4807f6a9e3b5c1d0f28496ab7c3e5d1f0a2b4c6",
+  "org": null,
+  "org_role": null,
+  "user": { },
+  "mfa_method": "totp"
+}
+```
+
+| Field | Values |
+| --- | --- |
+| `mfa_method` | `"totp"` or `"recovery_code"` — which one satisfied the challenge. |
+| `session_id` | The token family. Used to revoke this session later. |
+
+<Info>
+`mfa_method` is the only difference in shape from an ordinary token response, and it is worth surfacing in an audit log: knowing whether someone used their authenticator or burned a recovery code tells you something about their account's health that the session row alone does not.
+</Info>
+
+<Warning>
+A failed challenge counts toward the account's lockout, exactly as a wrong password does. There is no separate MFA attempt budget. A user fumbling their authenticator repeatedly can lock themselves out of the account exactly as they could by mistyping their password.
+</Warning>
+
+## Recovery codes
+
+Ten single-use codes that stand in for the authenticator when the phone is not to hand. They are generated, shown once, stored hashed, and spent one at a time.
+
+### What they are not
+
+They are not a backup of the TOTP secret. They do not reconstruct it, and having all ten of them does not let you generate future codes. Each one is an independent, single-use credential that will satisfy exactly one future challenge and then be worthless.
+
+That distinction matters when a user asks to "recover" their authenticator. Regenerating the set does not restore access to the old one — it produces an entirely new set of ten credentials and invalidates the old ones.
+
+### Generation
+
+Regenerating deletes every existing recovery code for the user and creates a fresh set of ten. It is a replacement, never an addition.
+
+| Aspect | Value |
+| --- | --- |
+| Count per generation | 10 |
+| Source of randomness | Five bytes per code, from the system CSPRNG. |
+| Rendered form | Ten hexadecimal characters, hyphenated in the middle. |
+| Stored as | SHA-256 of the normalised code. |
+| Returned as | A list of plain-text codes, once. |
+
+**The plain-text codes exist only in the response that generated them.** Once that response is discarded, they cannot be retrieved — not by an administrator, not from the database, not by any support procedure. The stored hashes are one-way.
+
+<Warning>
+This is the single most important thing to get right in a product built on this. If your user does not copy their recovery codes, the codes are gone and the only remaining path is the one you provide for a lost authenticator — which in most deployments is an administrator using the MFA reset action in Studio.
+</Warning>
+
+### Spending one
+
+A recovery code is checked by hashing the submitted value and looking for an unused row with that hash.
+
+```json
+{
+  "code_hash": "b1946ac92492d2347c6235b4d2611184...",
+  "used_at": null
+}
+```
+
+When one matches, the row is marked used **with a conditional update** — an update that only applies while `used_at` is still null. This is what makes it single-use even under a race: if two requests arrive with the same code simultaneously, only one update matches, and only that one succeeds. The other is treated as a failure.
+
+<Info>
+The conditional update is the same technique used for one-time email links, for the same reason: it closes the window where two concurrent requests both believe they consumed a single-use credential.
+</Info>
+
+### Counting what is left
+
+The remaining count is the number of rows for that user with no `used_at`. It is reported by the status endpoint and is worth showing to users, because a user on their last recovery code is a support ticket waiting to happen.
+
+```bash
+curl "https://api.example.com/auth/v1/mfa" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+```json
+{
+  "enabled": true,
+  "aal": "aal2",
+  "recovery_codes_remaining": 8
+}
+```
+
+### Regenerating, and why it needs a TOTP code
+
+Regenerating recovery codes requires a **current authenticator code specifically** — a recovery code will not do it.
+
+| Field | Requirement |
+| --- | --- |
+| Signed in | Yes. |
+| MFA already enabled | Yes. |
+| Code supplied | Must satisfy the challenge **as `totp`**. |
+
+The reasoning is sound: if someone has stolen a session, they cannot mint themselves a fresh set of durable fallback credentials. Requiring the authenticator means recovery codes can only be replaced by the person who actually holds the second factor.
+
+<Warning>
+A user who has lost their authenticator **and** their recovery codes cannot regenerate codes. That is not a gap to work around in the application — it is the situation the administrator MFA reset exists for.
+</Warning>
+
+## Enrolling
+
+Three requests: start, confirm, and optionally disable. The first returns the secret and a provisioning URI; the second proves the user can use them and issues the recovery codes.
+
+### Starting
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/totp/enroll" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT"
+```
+
+```json
+{
+  "factor_id": "01HQ8X4M2K9P7R3T6V0YB5ZCNDA",
+  "secret": "JBSWY3DPEHPK3PXP",
+  "otpauth_uri": "otpauth://totp/Acme:ada@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Acme"
+}
+```
+
+| Field | What to do with it |
+| --- | --- |
+| `secret` | The shared secret, if you render the code by hand. |
+| `otpauth_uri` | Render as a QR code, which is what most authenticator apps scan. |
+| `factor_id` | The new factor's identifier. Retained for your own tracking. |
+
+The issuer in the URI is the environment's project name, or the project slug when no display name is set — so the label a user sees in their authenticator app matches your product.
+
+<Warning>
+The secret is returned exactly once, by this call, and is the only time it exists outside the encrypted column. If you render it as text as well as a QR code, treat the page as sensitive: it is a credential that defeats the second factor, and anything that logs the page or the response leaks it permanently.
+</Warning>
+
+Calling this twice is safe. Unconfirmed factors are deleted first, so the user always ends up with exactly one pending secret and the one they just requested.
+
+### Confirming
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/totp/verify" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"code": "123456"}'
+```
+
+```json
+{
+  "enabled": true,
+  "recovery_codes": [
+    "a3f9c-2e1d4", "7b02e-9c8a1", "44d1f-6e0b3"
+  ]
+}
+```
+
+Confirmation does several things at once, which is why it is one request:
+
+| Effect | Consequence |
+| --- | --- |
+| Marks the factor confirmed. | It starts being used to verify codes. |
+| Deletes any other factors for the user. | An account ends up with exactly one. |
+| Sets `mfa_enabled` on the account. | Sign-ins are challenged from now on. |
+| Elevates the current session to `aal2`. | Your existing tokens refresh to the higher level. |
+| Generates ten recovery codes. | **Returned once, in this response, and never again.** |
+
+<Warning>
+The last row is the one to design your interface around. These codes are the only copy the user will ever have. Present them in a way that survives being dismissed — a modal they must acknowledge, or a page they must confirm they have saved, rather than a toast that disappears in four seconds.
+</Warning>
+### Disabling
+
+```bash
+curl -X POST "https://api.example.com/auth/v1/mfa/disable" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "X-Pawabase-Context: $CONTEXT" \
+  -H "content-type: application/json" \
+  -d '{"code": "123456"}'
+```
+
+Disabling requires a current code — either an authenticator code or a recovery code will do, since the point is to prove possession of a second factor rather than of the specific one.
+
+Turning MFA off deletes **both** the factor and every recovery code, then clears the flag. Nothing is left behind.
+
+| Response | Meaning |
+| --- | --- |
+| `{"enabled": false}` | MFA is now off. |
+| `{"enabled": false}` (returned early) | MFA was already off; no code was checked. |
+
+<Warning>
+This is irreversible with respect to the codes. There is no way to recover a deleted recovery code set, and the user will need to enrol again from scratch — producing a new secret, new codes, and a re-scan of the QR code.
+</Warning>
+
+<Info>
+Disabling does not revoke existing sessions or lower their assurance level. A session issued at `aal2` stays at `aal2` for its remaining life. If you need a user's access gone, revoke their sessions — see [Tokens and sessions](/auth/tokens-and-sessions).
+</Info>

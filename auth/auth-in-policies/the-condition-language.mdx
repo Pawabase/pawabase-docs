@@ -1,0 +1,261 @@
+---
+title: "The condition language"
+description: "A condition is one of three things:"
+icon: "code"
+---
+
+A condition is one of three things:
+
+- a boolean — `true` or `false`, taken literally;
+- a **mapping with exactly one key** — the operator and its argument;
+- anything else — rejected at validation time.
+
+```python
+Condition = Any  # bool | dict
+```
+
+That "exactly one key" rule is enforced up front, before a condition is ever stored:
+
+```python
+def validate_condition(condition: Condition, *, path: str = "condition") -> None:
+    """Refuse a malformed condition before it is stored.
+
+    Raises:
+        PolicyError: Naming where the condition is wrong.
+    """
+    if isinstance(condition, bool):
+        return
+    if not isinstance(condition, Mapping) or len(condition) != 1:
+        raise PolicyError(f"{path}: a condition is true, false, or an object with one key")
+    ((op, arg),) = condition.items()
+    if op in ("all", "any"):
+        if not isinstance(arg, list):
+            raise PolicyError(f"{path}.{op}: expected a list of conditions")
+        for index, child in enumerate(arg):
+            validate_condition(child, path=f"{path}.{op}[{index}]")
+    elif op == "not":
+        validate_condition(arg, path=f"{path}.not")
+    elif op in BINARY_OPS:
+        if not isinstance(arg, list) or len(arg) != 2:
+            raise PolicyError(f"{path}.{op}: expected [left, right]")
+        if op == "matches" and isinstance(arg[1], str) and not arg[1].startswith("$"):
+            try:
+                re.compile(arg[1])
+            except re.error as exc:
+                raise PolicyError(f"{path}.matches: invalid pattern: {exc}") from exc
+    elif op in UNARY or op in SHORTHANDS:
+        return
+    else:
+        raise PolicyError(f"{path}: unknown operator {op!r}")
+```
+
+Note that a *literal* `true` or `false` is a whole condition. `true` is how you write an unconditional allow; `false` is how you write an unconditional deny.
+
+### Operands: paths and literals
+
+```python
+def resolve(operand: Any, context: Mapping[str, Any]) -> Any:
+    """The value of an operand: a ``$path`` lookup, or the literal itself."""
+    if isinstance(operand, str) and operand.startswith("$"):
+        if operand.startswith("$$"):
+            return operand[1:]
+        return lookup(context, operand[1:])
+    return operand
+```
+
+- A string starting with a single `$` is a **path** into the context.
+- Anything else — numbers, booleans, lists, objects — is a **literal**.
+- `$$` escapes a literal dollar, so `"$$secret"` is the string `$secret`, not a lookup.
+
+Path lookup walks nested mappings, lists and objects:
+
+```python
+def lookup(context: Mapping[str, Any], path: str, default: Any = None) -> Any:
+    """Read ``a.b.0.c`` out of nested mappings, lists and objects."""
+    if path == "now":
+        return datetime.now(UTC)
+    current: Any = context
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, Mapping):
+            current = current.get(part, _MISSING)
+        elif isinstance(current, (list, tuple)) and part.isdigit():
+            index = int(part)
+            current = current[index] if index < len(current) else _MISSING
+        else:
+            current = getattr(current, part, _MISSING)
+        if current is _MISSING:
+            return default
+    return current
+```
+
+Three properties worth memorising:
+
+1. **A missing path is `None`, never an error.** Any policy referencing a field that does not exist evaluates that field as `null`. Nothing throws.
+2. **Numeric segments index into lists.** `$auth.claims.some_list.0` works; `.5` on a two-element list returns `None`.
+3. **`now` is a magic path** returning the current UTC `datetime`, useful with `gt`/`lt` for time-window rules.
+
+### The binary operators
+
+These are the exact names. There are no others:
+
+```python
+BINARY_OPS = {
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "in",
+    "not_in",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "matches",
+}
+```
+
+| Operator | Argument | Behaviour |
+| --- | --- | --- |
+| `eq` | `[left, right]` | Equal after normalisation |
+| `ne` | `[left, right]` | Not equal |
+| `gt` | `[left, right]` | `left > right`; false if either side is `None` |
+| `gte` | `[left, right]` | `left >= right`; false if either side is `None` |
+| `lt` | `[left, right]` | `left < right`; false if either side is `None` |
+| `lte` | `[left, right]` | `left <= right`; false if either side is `None` |
+| `in` | `[left, right]` | `left` is a member of the list `right` |
+| `not_in` | `[left, right]` | Not a member; true when `right` is `None` |
+| `contains` | `[left, right]` | Member if `left` is a collection; substring if `left` is a string |
+| `starts_with` | `[left, right]` | String prefix |
+| `ends_with` | `[left, right]` | String suffix |
+| `matches` | `[left, right]` | `re.search(pattern, text)` |
+
+The comparison itself:
+
+```python
+def _compare(op: str, left: Any, right: Any) -> bool:
+    try:
+        if op == "eq":
+            return _norm(left) == _norm(right)
+        if op == "ne":
+            return _norm(left) != _norm(right)
+        if op == "gt":
+            return left is not None and right is not None and left > right
+        ...
+        if op == "in":
+            return right is not None and _norm(left) in [_norm(v) for v in right]
+        if op == "not_in":
+            return right is None or _norm(left) not in [_norm(v) for v in right]
+        if op == "contains":
+            return (
+                left is not None and _norm(right) in [_norm(v) for v in left]
+                if isinstance(left, (list, tuple, set))
+                else (left is not None and str(right) in str(left))
+            )
+        ...
+    except TypeError:
+        return False
+    raise PolicyError(f"unknown operator {op!r}")
+```
+
+Five behaviours in that implementation are worth calling out, because each one has a policy implication.
+
+<AccordionGroup>
+  <Accordion title="Ids are normalised before comparison">
+    `eq` and `ne` run both sides through `_norm`, which stringifies integers:
+
+    ```python
+    def _norm(value: Any) -> Any:
+        # Ids arrive as ints from the database and as strings from tokens; a policy
+        # comparing them must not depend on which side happened to be which.
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int):
+            return str(value)
+        return value
+    ```
+
+    So `{"eq": ["$record.id", "$auth.user_id"]}` works whether the record's id came back as an integer or a string. Booleans and `None` are passed through untouched, so `True` never equals `1`.
+  </Accordion>
+  <Accordion title="Ordering operators refuse on `None`">
+    `gt`, `gte`, `lt` and `lte` are all `left is not None and right is not None and …`. A missing field makes them **false**, not an error. This is what makes `{"lt": ["$auth.claims.exp", "now"]}` safe to write even though the engine has no guarantee `exp` exists.
+  </Accordion>
+  <Accordion title="`not_in` is true when the list is `None`">
+    `return right is None or _norm(left) not in […]`. An absent list permits everything. If you are writing a *restriction*, prefer `in` or `eq`; if you are writing a *denylist*, `not_in` failing open on a missing list may not be what you want.
+  </Accordion>
+  <Accordion title="`contains` is polymorphic">
+    On a list it tests membership; on anything else it is a substring test, because the expression falls through to `str(right) in str(left)`. So `{"contains": ["$auth.roles", "admin"]}` tests list membership, while `{"contains": ["$auth.email", "@partner.com"]}` tests a suffix. Convenient, and easy to apply to the wrong operand by accident.
+  </Accordion>
+  <Accordion title="`TypeError` becomes `False`, not a 500">
+    The whole comparison is wrapped in `try: … except TypeError: return False`. Comparing a string to a number with `gt` refuses quietly instead of raising. A policy that is accidentally un-comparable fails closed.
+  </Accordion>
+</AccordionGroup>
+
+```json
+{ "contains": ["$auth.roles", "admin"] }
+{ "eq": ["$auth.org", "acme-hq"] }
+{ "in": ["$auth.org_role", ["owner", "admin"]] }
+{ "not_in": ["$auth.org", [null, ""]] }
+{ "starts_with": ["$auth.email", "ops@"] }
+{ "ends_with": ["$auth.email", "@acme.example"] }
+{ "matches": ["$auth.email", "^[a-z]+@.*\\.example$"] }
+{ "gt": ["$record.updated_at", "$input.since"] }
+```
+
+<Warning>
+`matches` compiles the pattern **at validation time** when the right operand is a literal string, so a malformed regex is rejected when you save the policy rather than at request time. If the right operand starts with `$`, it is resolved at evaluation time and no such check happens — which means a regex coming from `$auth.claims.…` is unvalidated.
+</Warning>
+
+### The unary operators
+
+```python
+UNARY = {"exists", "truthy", "empty"}
+```
+
+| Operator | Argument | True when |
+| --- | --- | --- |
+| `exists` | one operand | The resolved value is not `None` |
+| `truthy` | one operand | The resolved value is truthy in Python terms |
+| `empty` | one operand | The resolved value is falsy |
+
+```python
+if op == "exists":
+    return resolve(arg, context) is not None
+if op == "truthy":
+    return bool(resolve(arg, context))
+if op == "empty":
+    return not resolve(arg, context)
+```
+
+The distinction between `exists` and `truthy` matters for values that exist but are falsy. `{"exists": "$record.published_at"}` is true for a timestamp of `0` or an empty string; `{"truthy": "$record.published_at"}` would be false for the empty string. For "is this field set at all", use `exists`.
+
+### The combinators
+
+```python
+COMBINATORS = {"all", "any", "not"}
+```
+
+| Operator | Argument | Meaning |
+| --- | --- | --- |
+| `all` | list of conditions | Every one must hold |
+| `any` | list of conditions | At least one must hold |
+| `not` | one condition | Inverts it |
+
+```json
+{
+  "all": [
+    { "authenticated": true },
+    {
+      "any": [
+        { "role": "editor" },
+        { "role": "admin" },
+        { "owner": "owner_id" }
+      ]
+    }
+  ]
+}
+```
+
+There is no `all` of zero semantics to worry about: `all([])` is `True` and `any([])` is `False`, following Python. The validator accepts an empty list, so be deliberate about it.

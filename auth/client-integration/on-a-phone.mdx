@@ -1,0 +1,220 @@
+---
+title: "On a phone"
+description: "Mobile has one advantage over a browser — a real secure store — and one hazard that browser tabs do not have: background execution."
+icon: "plug"
+---
+
+Mobile has one advantage over a browser — a real secure store — and one hazard that browser tabs do not have: **background execution**.
+
+### Where to store
+
+| Platform | Store | Notes |
+| --- | --- | --- |
+| iOS | Keychain, `kSecClassInternetPassword` or `kSecClassGenericPassword` | Survives reinstall only if you set `kSecAttrAccessibleAfterFirstUnlock`; excluded from iCloud by default |
+| Android | `EncryptedSharedPreferences`, or `EncryptedFile` | Backed by the Android Keystore; invalidated if the user changes their lock screen |
+| Both | In-memory only | Fine for short sessions; the user signs in again after a cold start |
+
+The rule is the same as on the web but with a better substrate: **never `UserDefaults`, `SharedPreferences` in plain text, or a file in app storage.** Those are readable on a rooted or backed-up device. The system keystore-backed stores are not.
+
+```text
+import Security
+import Foundation
+
+enum Keychain {
+    static let service = "com.example.app.pawabase"
+
+    static func save(_ session: [String: Any]) throws {
+        guard let data = try? JSONSerialization.data(withJSONObject: session) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+        ]
+        SecItemDelete(query as CFDictionary)
+        var insert = query
+        insert[kSecValueData as String] = data
+        insert[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(insert as CFDictionary, nil)
+    }
+
+    static func load() -> [String: Any]? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let session = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return session
+    }
+
+    static func clear() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "session",
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+```
+
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` is the important attribute: it lets a background refresh work after a reboot, but keeps the item off iCloud and off other devices.
+
+### Background refresh is the hazard
+
+An iOS background fetch or an Android WorkManager job that wakes up and refreshes while the foreground app also refreshes will present the same refresh token twice — and sign the user out everywhere, including on their other devices.
+
+Two mitigations, and you want both:
+
+<Steps>
+  <Step title="Prefer the access token in the background">
+    If the stored access token has not expired, use it. Only fall back to a refresh when it has.
+  </Step>
+  <Step title="Never refresh from a background task at all if you can avoid it">
+    A background sync that needs fresh data can use the last known access token and let the foreground app refresh. If you must refresh in the background, take a cross-process lock — on iOS, a `dispatch_semaphore` around the refresh; on Android, a `Mutex` in a singleton repository.
+  </Step>
+  <Step title="Handle the 401 by signing out, not by retrying">
+    A `401 invalid refresh token` from a background task means the family is gone. Clear the store and let the UI prompt for sign-in.
+  </Step>
+</Steps>
+
+```text
+// One repository, one mutex, one refresh — for the whole process.
+class SessionRepository(private val store: SecureStore) {
+    private val mutex = Mutex()
+    @Volatile var session: Session? = store.load()
+
+    suspend fun accessToken(): String {
+        session?.takeIf { !it.isExpiringSoon() }?.let { return it.accessToken }
+        return mutex.withLock {
+            // Re-check inside the lock: someone may have refreshed while we waited.
+            session?.takeIf { !it.isExpiringSoon() }?.let { return@withLock it.accessToken }
+            val fresh = PawabaseApi.refresh(session!!.refreshToken)
+            session = fresh.also { store.save(it) }
+            fresh.accessToken
+        }
+    }
+}
+```
+
+
+## The BFF pattern
+
+If you have a backend of your own, the strongest arrangement is to keep both tokens off the client entirely: an httpOnly cookie holds the refresh token, your server holds nothing at all, and the browser only ever sees the access token in memory.
+
+```text
+// Browser: no tokens in storage at all.
+async function api(path: string, init: RequestInit = {}) {
+  const response = await fetch(path, {
+    ...init,
+    credentials: "include",          // send the httpOnly cookie
+    headers: { "content-type": "application/json", ...init.headers },
+  });
+  if (response.status === 401) {
+    // The cookie expired or was revoked. One refresh attempt, no token in JS.
+    await fetch("/auth/refresh", { method: "POST", credentials: "include" });
+    return fetch(path, { ...init, credentials: "include" });
+  }
+  return response;
+}
+```
+
+```python
+# Your server: exchanges the cookie's refresh token, sets a new cookie.
+@app.post("/auth/refresh")
+async def refresh(request: Request, response: Response):
+    token = request.cookies.get("pb_refresh")
+    if not token:
+        response.delete_cookie("pb_refresh")
+        raise HTTPException(401, "no session")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = await client.post(
+            f"{GATEWAY}/auth/v1/token",
+            headers={"apikey": PUBLISHABLE_KEY},
+            json={"grant_type": "refresh_token", "refresh_token": token},
+        )
+
+    if upstream.status_code == 401:
+        # The family is gone — revoked, or reuse was detected upstream.
+        response.delete_cookie("pb_refresh")
+        raise HTTPException(401, "session ended")
+
+    upstream.raise_for_status()
+    session = upstream.json()
+    response.set_cookie(
+        "pb_refresh",
+        session["refresh_token"],
+        httponly=True,          # not readable by JavaScript
+        secure=True,            # https only
+        samesite="lax",         # not sent on cross-site POSTs
+        max_age=60 * 60 * 24 * 7,
+        path="/auth",           # only sent to your auth routes
+    )
+    return {"user": session["user"], "org": session["org"], "org_role": session["org_role"]}
+```
+
+Why this is worth the extra hop:
+
+- An XSS payload cannot read the refresh token, so it cannot escalate a one-request compromise into a 30-day one.
+- Scoping the cookie to `path="/auth"` means it is not attached to every API call.
+- `SameSite=Lax` blocks the cookie from cross-site POSTs, which closes the CSRF hole that comes with cookie auth.
+- Your server can serialise refreshes per user, which is the only reliable place to do it when several tabs exist.
+
+<Warning>
+You are now holding the publishable key on your server and proxying, or using the secret key. Use the **publishable** key and forward the user's access token, so your policies still apply. A secret key here would make your backend a full-access service, and every request through it would bypass policies.
+</Warning>
+
+
+## CORS
+
+CORS applies only to **publishable** keys from a browser, where an `Origin` header is present. The gateway enforces it before your backend is reached:
+
+```python
+origins = (info or {}).get("cors_origins") or []
+origin = headers.get("origin")
+if context.role == "anon" and origins and origin and origin not in origins:
+    await _json(
+        send,
+        403,
+        {"error": "origin_not_allowed", "message": f"{origin} may not use this key."},
+    )
+    return
+```
+
+```json
+{ "error": "origin_not_allowed", "message": "https://evil.example may not use this key." }
+```
+
+with status `403`. Four details that matter:
+
+<AccordionGroup>
+  <Accordion title="Only when the list is non-empty">
+    `and origins` — an empty allow-list means no restriction. Convenient in development, worth tightening before you ship.
+  </Accordion>
+  <Accordion title="Only for `anon` role keys">
+    `context.role == "anon"` — a secret key is not checked, because a secret key is not a browser credential.
+  </Accordion>
+  <Accordion title="Only when an Origin is actually sent">
+    `and origin` — a server-side call with no `Origin` header passes through regardless of the list.
+  </Accordion>
+  <Accordion title="It is exact string matching">
+    `origin not in origins`. No wildcard handling, no subdomain suffix matching, no `*.example.com`. List each exact origin, including scheme and port.
+  </Accordion>
+</AccordionGroup>
+
+```json
+["http://localhost:5173", "https://app.yourapp.com"]
+```
+
+`https://app.yourapp.com` and `https://app.yourapp.com:443` are the same origin to a browser but different strings to this check. Use the form your browser sends.
+
+<Info>
+Nothing about CORS is configured client-side. The browser sends `Origin` automatically and the gateway's response headers decide whether the preflight succeeds. If your dev server runs on an unusual port, add that exact origin to the list rather than looking for a way to disable the check.
+</Info>

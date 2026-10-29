@@ -1,0 +1,285 @@
+---
+title: "Security model"
+description: "What Pawabase actually defends against, where the real boundaries are, and the checks worth making before production."
+icon: "shield-check"
+---
+
+Pawabase's authentication is layered, and almost every security question is
+answered by knowing which layer you are asking about. Three layers, three
+different jobs:
+
+| Layer | Owns | Security role |
+| --- | --- | --- |
+| **Akountz** | Users, passwords, identities, sessions, MFA, orgs, roles | The only layer that issues user tokens. Holds every credential. |
+| **The API** | Each environment's `auth` settings block | Owns policy configuration. Akountz reads it and never writes it. |
+| **Gateway / `pawabase_core`** | Verification at every other service | Issues nothing. Confirms tokens locally, with no network call. |
+
+Two consequences run through everything on this page.
+
+**Verification is local, so revocation is not immediate.** Services verify
+signatures with a key derived from the master secret. Nothing asks Akountz whether
+a token was revoked at request time. A revoked, disabled or deleted account keeps
+working against other services until its access token expires — which is why
+`access_ttl` is the most security-relevant number in your configuration.
+
+**A token is only valid for the environment that issued it.** Every user token
+carries its `project` and `env`, the signing key is derived per environment, and
+both claims are re-checked after the signature verifies. A staging token cannot be
+used against production even though the algorithm is identical.
+
+<CardGroup cols={3}>
+  <Card title="What is defended" icon="shield">Credential stuffing, brute force, replay, session theft, account enumeration and redirect abuse.</Card>
+  <Card title="What is not" icon="eye">XSS, a leaked service key, a compromised host, or a client that races its own refreshes.</Card>
+  <Card title="What you own" icon="list-check">Token storage, refresh discipline, redirect allowlists and secret management.</Card>
+</CardGroup>
+
+## Credential stuffing and password guessing
+
+Two attacks, two defences, and they are worth separating because they act at
+different layers.
+
+**Password guessing** is bounded by rate limiting and account lockout, both of
+which are real and neither of which is optional:
+
+| Control | Value | Where it lives |
+| --- | --- | --- |
+| Auth rate limit | 30 requests per 60 seconds, per IP | The `akz:auth` bucket, covering `/signup` and `/token` |
+| Link rate limit | 10 per 60 seconds, per IP | The `akz:links` bucket |
+| MFA rate limit | 10 per 60 seconds, per IP | The `akz:mfa` bucket |
+| Lockout threshold | 10 failed attempts (default) | Installation setting, not per-environment |
+| Lockout duration | 15 minutes (default) | Installation setting, not per-environment |
+
+The failed-attempt counter is **per user, per environment**; the threshold and
+duration that act on it are **global to the installation**. You cannot give
+staging a stricter lockout than production.
+
+**Credential stuffing** — replaying leaked username/password pairs at scale —
+is bounded less by lockout than by the password hash. Passwords are hashed with
+Sillo's hashing layer, which uses **bcrypt by default** and falls back to
+`pbkdf2_sha256` when bcrypt is not installed.
+
+<Warning>
+The bcrypt cost factor is a property of the hashing library's own defaults, not of
+anything Pawabase configures. There is no auth-config key for it, and no value to
+set in Studio. If you need a specific cost factor, it is set where the hashing
+library is configured, not in your environment's `auth` block.
+</Warning>
+
+Other schemes are supported by the hashing layer — argon2, scrypt, and pbkdf2 in
+both SHA-256 and SHA-512 variants — but only the default is selected
+automatically. Which one is in use is a deployment concern, not an auth-config
+concern.
+
+### The lockout behaviour that surprises people
+
+A locked account returns `429` **even when the password is correct**, because the
+lock check runs before the password check. A user whose password genuinely works
+will still be refused until the window passes.
+
+The counter resets on a successful sign-in, and also when an administrator unlocks
+the account or when the user completes a password reset. MFA failures increment
+the **same** counter, so a user fumbling their authenticator can lock themselves
+out of password sign-in too.
+
+### Unusable passwords are a real state
+
+An account created without a password — by an admin, or by an OAuth provider —
+has an **unusable password**, not an empty one. Password sign-in cannot succeed
+for such an account at all; it has to go through a recovery link to set one. This
+is the normal state for social-only accounts, and `has_password` in the admin
+user view tells you whether it applies.
+
+<Note>
+Because the password hash column still holds a value for an unusable password,
+"has a password" is a property of the model, not something you can infer from the
+row existing. The admin user view exposes it as `has_password`.
+</Note>
+
+
+## Account enumeration
+
+Enumeration is when an attacker learns which addresses have accounts, by watching
+responses differ. Pawabase defends this in four places, and all four matter.
+
+**Sign-in returns one message for two different failures.** An unknown email and a
+wrong password both produce `400 invalid email or password`. Nothing in the status
+code or body distinguishes them.
+
+**The emailed link flows always succeed.** Requesting a recovery link, a magic
+link or a verification link returns success whether or not the address exists.
+Sending a real email to a real owner and a silent no-op to everyone else is the
+whole defence — the attacker learns nothing from the response because there is
+nothing to learn.
+
+**One-time token failures are indistinguishable.** A token that is unknown,
+already used, expired, or signed for a different purpose all produce the same
+error: `the link is invalid or has expired`. There is no way to ask "was this link
+already clicked?" and get a different answer from "did this link ever exist?".
+
+**Organization slugs are not an oracle either.** Naming an organization you are
+not a member of, and naming one that does not exist, both produce `403 you are not
+a member of that organization`.
+
+### Where enumeration *is* visible, deliberately
+
+Two surfaces do tell you things, and both are administrative rather than public:
+
+The **Sign-in activity** tab distinguishes `unknown email` from `wrong password`
+in its Result column. That is for you, not for end users.
+
+The **`user_view` difference between self and admin** is real: the admin view
+includes `disabled`, `disabled_at`, `locked_until`, `last_sign_in_ip`,
+`has_password` and `permissions`. None of that is exposed to the signed-in user,
+who gets `GET /auth/v1/user`.
+
+<Warning>
+Rate limiting is not an enumeration defence. It bounds how fast an attacker can
+probe, but the responses are already uniform. Do not rely on the limit to
+compensate for a difference in your own error handling.
+</Warning>
+
+
+## Token replay and theft
+
+This is the area where Pawabase's design is strongest, and also where the
+sharpest edges are.
+
+### Rotation is single-use and not optional
+
+Every refresh token is consumed the first time it is presented. There is no
+setting to change this. A second presentation of the same token is treated as
+possible theft and **revokes the entire token family**.
+
+That single design decision is what bounds replay. A stolen refresh token is
+useful exactly once, and using it destroys the legitimate user's session in the
+process — which is the intended outcome, not a bug.
+
+<Warning>
+The failure mode to understand is that Pawabase cannot tell the thief from the
+real user, so it revokes for both. If your client ever presents a refresh token
+twice — through a retry, a double-submit, or two tabs refreshing simultaneously —
+the session dies. Clients must serialise refreshes and must never retry a failed
+refresh with the same token.
+</Warning>
+
+### Why families, not tokens
+
+Revocation operates on the **token family**, not on individual tokens. A family
+is created at sign-in and survives every rotation, so one operation kills every
+token ever issued under it — current, previous, and any that have not yet expired.
+
+The alternative would be revoking only the presented token, which leaves a
+legitimate client holding a token the attacker also holds. Killing the family is
+the only response that makes both unusable.
+
+### Theft detection is an event, not a flag
+
+When reuse is detected the server revokes the family, stamps the session's
+`revoked_at`, and emits `session.reuse_detected`. It does **not** email the user
+and does **not** disable the account.
+
+| What happens | What does not |
+| --- | --- |
+| Family revoked | No notification email |
+| Session row stamped | No account disablement |
+| `session.reuse_detected` emitted | No `theft_detected` flag to query |
+| Client gets a generic `401` | No distinction between theft and a bad token |
+
+To find out whether a session was compromised, read the login-event history for a
+theft message. The Studio **History** table per user shows exactly that, in its
+**OK** column.
+
+### The exposure window you cannot close
+
+Because access tokens verify locally:
+
+- Revoking a family does not un-issue access tokens already minted from it.
+- Disabling an account does not un-issue its tokens.
+- Deleting an account does not un-issue its tokens.
+
+Only the refresh path consults the database, which is why a revoked session is
+definitively dead even while its last access token still works. Your revocation
+latency against other services **is** `access_ttl`.
+
+| `access_ttl` | Revocation takes effect within |
+| --- | --- |
+| 300s | 5 minutes |
+| 900s (default) | 15 minutes |
+| 3600s | 1 hour |
+
+<Warning>
+This is the strongest argument for a shorter access lifetime and the strongest
+argument against a very long one. Fifteen minutes is a reasonable default for a
+sensitive application; an hour means a compromised account stays useful against
+every other service for an hour after you disable it.
+</Warning>
+
+
+## Redirects, CSRF and OAuth
+
+### Redirect allowlisting is the real control
+
+Any URL that will receive tokens must be validated against an allowlist before it
+is used. The environment's `site_url` plus any `redirect_urls` form that
+allowlist, and matching is **prefix-based**:
+
+- The URL equals an allowed base exactly, or
+- It begins with the base plus `/`, or
+- It begins with the base plus `?`
+
+That rule applies to the OAuth `redirect_to` parameter, the magic-link
+`redirect_to`, and the sign-up `redirect_to`. A URL that is not allowed is
+rejected — for OAuth it is a `400`, and for the sign-up path likewise.
+
+Where the OAuth flow starts, an unapproved `redirect_to` is a hard error. Where
+the callback resolves the target, an unapproved one is **silently replaced with
+nothing**, so the flow continues without a redirect target rather than leaking the
+tokens to an attacker's page.
+
+<Warning>
+The allowlist is checked against `site_url` and `redirect_urls` only. It is not
+influenced by `cors_origins`, which is a gateway setting for browser origins —
+different purpose, different scope. Confusing the two is a common cause of "why is
+my redirect being rejected".
+</Warning>
+
+### Where tokens travel in the OAuth flow
+
+Both the success payload and the errors travel in the **URL fragment**, not the
+query string:
+
+```
+redirect to https://app.example.com/callback#access_token=...&mfa_required=true
+redirect to https://app.example.com/callback#error=account_disabled
+```
+
+Fragments are not sent to servers and are not written to access logs on the
+redirect hop, so a token in a fragment is not captured by the redirecting server's
+logs. This is a genuine defence and it costs nothing.
+
+Error codes travel the same way. Without a redirect target, the flow raises
+`400 sign-in failed: {code}` instead.
+
+### CSRF in the OAuth flow itself
+
+The social sign-in flow uses a `state` value and PKCE, both provided by the
+underlying OAuth library. The `state` is what stops an attacker from feeding their
+own authorisation response into your callback.
+
+### CSRF for your own application
+
+This is worth being blunt about: **CSRF protection for your application is your
+job, not the auth service's.** If you hold the refresh token in a cookie, the
+browser attaches it to cross-site requests automatically and you must defend
+against that yourself — with `SameSite`, a CSRF token, or both.
+
+If you hold tokens in a header and send them from JavaScript, you are not exposed
+to classical CSRF, but you *are* exposed to XSS. That is the actual trade-off:
+cookies move the risk from CSRF to XSS-resistance, headers move it to XSS. Neither
+is free.
+
+<Info>
+Pawabase's own browser-facing routes use cookies for OAuth state. Your
+application's session storage is a separate decision, and the auth service has no
+opinion on it. `/auth/client-integration` covers the mechanics.
+</Info>
