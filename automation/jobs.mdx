@@ -1,47 +1,148 @@
 ---
 title: "Background jobs"
-description: "Run slow work in the background, read jobs in Studio, retry failures and replay a whole outage."
+description: "How background work runs in Pawabase: queues, job states and retries, starting your own background flows, reading jobs in Studio, retrying one failure, and replaying a whole outage safely."
 icon: "list-checks"
 ---
 
-A **job** is one unit of background work: a flow started by an event, a webhook delivery, an email. It runs outside the request, so the caller gets a fast answer and the slow work has its own status, attempts and record.
+A **job** is one piece of work done in the background, outside the request that asked for it. The caller gets a fast answer and the slow work gets its own status, retries and history.
 
-## Start background work
+You rarely create jobs directly. Pawabase makes one whenever work shouldn't hold up a request:
 
-In the flow editor (**Logic → Flows**), add a **Queue flow** block. It returns as soon as the job is stored.
-
-| Field | Meaning |
-| --- | --- |
-| **Flow** | What to run |
-| **Input** | Becomes the input of the dispatched work. Pass identifiers, not whole records |
-| **Queue** | A queue name; default `default`. Use a separate name for heavy work (`bulk`) so it can't hold up quick work |
-| **Delay** | Seconds before it may start (relative: "not before") |
-
-The block's output is the job's id. Events also run subscribed flows as jobs.
+| Work | Becomes a job on queue | Attempts |
+| --- | --- | --- |
+| A flow started by an [event](/automation/events), a [schedule](/automation/schedules), an [inbound hook](/automation/inbound-hooks) or the **Queue flow** block | `flows` | 1 |
+| An email from a flow or the sign-in system | `mail` | 3 |
+| An [outbound webhook](/automation/webhook-deliveries) delivery | `webhooks` | the endpoint's **Max attempts** (1 to 10, default 5) |
+| Routing an event to its consumers | `events` | retried until routed |
+| Processing a knowledge base document, and other platform work | `default` and others | varies |
 
 ## Job states
 
 | Status | Meaning |
 | --- | --- |
-| `queued` | Waiting, or waiting out a delay |
-| `active` | Running |
-| `retrying` | An attempt failed; another is scheduled |
-| `succeeded` | Finished |
-| `failed` | Gave up |
+| `queued` | Waiting for a worker, or waiting out a delay |
+| `active` | Running its first attempt |
+| `retrying` | An attempt failed and another is scheduled, or the retry is running |
+| `completed` | Finished successfully |
+| `failed` | Gave up: its last attempt failed |
 
-A job gets **one attempt** by default. Retrying arbitrary business logic could charge a card twice, so Pawabase doesn't guess. In the flow editor add a **Retry** block around the part that can fail for a passing reason (attempts and a first wait), and make anything with side effects safe to repeat: check a marker first (a `receipt_sent_at` column is best).
+Each job records its queue, what it runs (the flow, template or endpoint), where it came from (`event`, `schedule`, `webhook`, `api`…), its input, attempts, the error from the last attempt, when it started and finished, and how long it took. Jobs started by a request carry its **request id**, so you can follow them from [Requests](/activity/requests).
+
+## Why flows get one attempt
+
+A flow can do anything: charge a card, send an email, create records. Running it again after a failure might do some of that **twice**, so Pawabase doesn't retry flows automatically. Instead, you decide:
+
+- Wrap the part that can fail for a passing reason in a **Retry** block. It runs its `attempt` branch up to **Attempts** times (default 3, at most 10), waiting **Base delay** seconds (default 0.5) before the second try and doubling each time, up to 30 seconds between tries. When an attempt succeeds the flow continues from the Retry block's `next` exit.
+- Make steps **safe to repeat**: use unique keys, check whether something was already done, and pass the event id along.
+- Re-run what gave up from Studio, after fixing the cause (below).
+
+Mail and webhook jobs **are** retried automatically, because sending the same message again is safe and expected.
+
+## Start background work yourself
+
+In a flow, add the **Queue flow** block to run another flow as a job and continue at once:
+
+| Setting | Meaning |
+| --- | --- |
+| **Flow** | The flow to run |
+| **Input** | Its input. Pass ids and a little context, not whole records: the job should load fresh data when it runs. |
+| **Delay** | Seconds before it may start. "Not before", not "exactly at": it starts as soon as a worker is free after the delay. |
+| **Queue** | Leave empty. The job runs on the `flows` queue. Other queue names only run if your project's workers listen on them. |
+
+The block's output is `{ "job_id": "…" }`.
+
+Use it to:
+
+- **Answer fast.** A route accepts an upload and returns `202`, then queues the processing.
+- **Fan out.** Loop over a list and queue one job per item, so one bad item doesn't stop the rest.
+- **Wait a bit.** Queue a reminder with a delay of 3600 seconds.
+
+For work that must happen at a time of day, or keeps recurring, use a [schedule](/automation/schedules) instead of long delays.
 
 ## Read jobs in Studio
 
-**Project → Activity → Jobs.** You see queue depth and counts per queue, and a table of jobs with status, queue and time. Open a job for its input, attempts and the error from the last one. Steady, low depth is healthy; growing depth means work arrives faster than it finishes; growing with many `retrying` means a dependency is down.
+**Activity → Jobs** shows each queue's depth and counts, a chart of jobs over time, and a table of jobs, newest first. Filter by status and queue.
 
-## Failures and replay
+Open a job to see its input, attempts, result or error, and timing. A healthy project has queues that stay short; a queue that keeps growing means work arrives faster than it finishes, or something is failing and retrying.
 
-**Activity → Jobs → Failed.** For one job: read the error, then **Retry**. After an outage: filter (queue, kind, **since** minutes), use **Replay** with **Dry run** first to see the count, then run it. **Dismiss** removes a failure that needs no action. A retry reuses the original input and can't know how far the first attempt got: read the error before retrying, because a bug fails the same way again.
+**How failed work is retried** explains each kind's retry policy. Waits vary by about 20% so a burst of failures doesn't retry all at once.
 
-After an outage: read two or three errors, wait for recovery, dry-run the replay over the outage window, run it, then check again.
+## Fix and re-run failures
+
+### One job
+
+Open the failed job, read the error, fix the cause (a bad input, an expired key, a bug in a flow), then **Retry**. The job is queued again with the same input.
+
+### Many jobs after an outage
+
+When a partner API was down for an hour, every job that called it failed. **Replay** queues them again in one go:
+
+1. Read two or three of the errors to be sure they share a cause.
+2. Wait until the cause is fixed.
+3. Choose **Replay** and filter: status (`failed` by default), queue, job kind, and **since** a number of minutes.
+4. Use **Dry run** first. It tells you how many jobs would be queued, without queuing anything.
+5. Run it. Up to 1,000 jobs can be replayed at once (200 by default).
+6. Watch the queue drain, and check a few results.
+
+Replay re-runs each job with its **original input**. Because flows aren't automatically idempotent, replay only what you know is safe to run again, and prefer flows that check before they act.
+
+### Permanently failed jobs
+
+**Gave up after retrying** lists jobs that used every attempt. Retry them, or **dismiss** ones you've dealt with so the list stays useful.
+
+## From code
+
+<CodeGroup>
+```typescript TypeScript
+import { manage } from "@pawabase/client/manage";
+
+const m = manage(pawabase);
+const failed = await m.jobs.list({ status: "failed", queue: "flows", limit: 50 });
+
+// what would a replay of the last hour's failures do?
+const preview = await m.jobs.replay({ sinceMinutes: 60, dryRun: true });
+```
+
+```python Python
+failed = pb.manage.jobs.list(status="failed", queue="flows", limit=50)
+preview = pb.manage.jobs.replay(since_minutes=60, dry_run=True)
+```
+
+```bash curl
+curl -X POST "$PAWABASE_URL/platform/v1/envs/production/jobs/replay" \
+  -H "apikey: $PAWABASE_SECRET_KEY" -H "content-type: application/json" \
+  -d '{"status": "failed", "since_minutes": 60, "dry_run": true}'
+```
+</CodeGroup>
+
+| Endpoint | Does |
+| --- | --- |
+| `GET …/queues` | Queues with their depth and job counts |
+| `GET …/jobs` | Jobs, newest first; filter by `status` and `queue` |
+| `GET …/jobs/{id}` | One job |
+| `POST …/jobs/{id}/retry` | Queue a job again from its record |
+| `POST …/jobs/replay` | Queue many again: `ids`, or a filter of `status`, `queue`, `job`, `since_minutes`, with `limit` (1 to 1,000) and `dry_run` |
+| `GET …/failed-jobs` | Jobs that gave up |
+| `DELETE …/failed-jobs/{id}` | Dismiss one |
 
 ## Show progress to a person
 
-Keep the state in a **record** (`status: "preparing"` → `"ready"`) that the job updates, and let the app read it or listen to it ([Live records](/realtime/record-changes)). Don't poll jobs from the browser.
+Don't make a browser poll jobs. Keep progress in a **record** that the job updates (`status: "preparing"` → `"ready"`), and let the app read it or listen to it live with [record changes](/realtime/record-changes).
 
+## Limits
+
+| Limit | Value |
+| --- | --- |
+| A flow job's run time | The flow's own **timeout** (60 seconds by default, up to 900) |
+| Flow runs | Count towards your plan's monthly flow runs ([Plans and limits](/cloud/plans-and-limits)) |
+| Replay | Up to 1,000 jobs per call |
+
+## Troubleshooting
+
+| Problem | Check |
+| --- | --- |
+| Jobs stay `queued` | They have a delay, or every worker is busy. If it persists, a queue name nobody listens to may have been used in **Queue flow**: leave it empty. |
+| A queue keeps growing | Open a few jobs: are they all failing and retrying? Fix the cause. |
+| A flow failed once and never ran again | Flows get one attempt. Add a **Retry** block, or retry the job after fixing it. |
+| Replay ran things twice | Replay re-runs with the original input. Make the flow check before it acts. |
+| I can't find the job for a request | Search [Requests](/activity/requests) by request id, then follow its jobs. |

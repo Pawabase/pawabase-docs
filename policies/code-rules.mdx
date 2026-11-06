@@ -1,70 +1,92 @@
 ---
-title: "Code rules"
-description: "When the builder isn't enough: rules that look at other tables or call logic, how your team registers them, and how you use them by name."
-icon: "code"
+title: "Rules that need more data"
+description: "What the rule language can't see, such as other tables, counts and outside systems, and the patterns that cover those cases: data on the record, facts in the token, organizations, partial indexes and flows that check before they write."
+icon: "puzzle"
 ---
 
-The rule language covers most needs, but it only reads the facts it is given. It can't ask "is this person a member of the *project* this task belongs to?" because that needs another table. For those cases your team writes a **code rule**: a small function registered on the server and referred to **by name**, exactly like a saved rule.
+A rule decides from the facts it's given: who is calling (`$auth`), the record (`$record`), what's being sent (`$input`), the request, the key and the environment. That covers most needs, and it's what lets a rule run inside the database query for lists.
 
-## When you need one
+It **can't**:
 
-| Need | Why the builder can't |
+| Can't | Example |
 | --- | --- |
-| Membership in a list stored in another table | Rules read one record, not joins |
-| "At most 3 open items" | Needs a count of other rows |
-| An external check (a feature flag service, a billing status) | No network calls in rules |
-| Complex business logic you want tested as code | |
+| Look at another table | "Is this person a member of the *project* this task belongs to?" |
+| Count other rows | "At most 3 open tickets per customer" |
+| Call another system | "Is this customer's subscription active at our billing provider?" |
 
-First consider alternatives: copy the needed value onto the record, use a unique partial [index](/database/indexes#partial-indexes), or do the check in a [route](/logic/routes).
+This page shows how to handle each, without leaving the builder.
 
-## What it looks like
+## Pattern 1: put the fact on the record
 
-On the server side of your project, a code rule is a function that receives the same facts (`auth`, `record`, `input`, `request`, `credential`, `env`) and returns true or false:
+The most effective approach is usually to **store what the rule needs on the record itself**, and keep it up to date with a flow.
 
-```python
-from pawabase_server.policies import policy
+**Project members.** Give `tasks` a `member_ids` list (a JSON array of user ids) copied from the project. A flow subscribed to `project_members.created` and `.deleted` updates the tasks of that project. The rule becomes:
 
-@policy("project_member", description="Callers who belong to the record's project")
-async def project_member(context):
-    project_id = context["record"]["project_id"]
-    return await is_member(context["auth"]["user_id"], project_id)
+- **Compare values:** `$record.member_ids` **contains** `$auth.user_id`
+
+```json
+{ "contains": ["$record.member_ids", "$auth.user_id"] }
 ```
 
-It may be `async`, and may use your own data access. Keep it fast: it runs on the request path, and for list requests, possibly per row.
+It stays visible in Studio, works everywhere a rule is accepted, and needs no lookup at request time.
 
-## Use it
+Trade-off: a `contains` check on a list can't become a database filter, so lists of that table are checked row by row and `total` comes back empty. For large tables, prefer pattern 3 or a dedicated join table read by your app.
 
-Once registered, it appears alongside your saved rules. Refer to it by name anywhere:
+## Pattern 2: put the fact in the token
 
-<CodeGroup>
-```typescript TypeScript
-operations: {
-  list: { enabled: true, policy: "project_member" },
-  update: { enabled: true, policy: ["project_member", "role:editor"] },
-}
-```
+Facts about the **person** can travel in their access token, where every rule can read them under `$auth.claims`:
 
-```python Python
-"operations": {"list": {"enabled": True, "policy": "project_member"}}
-```
-</CodeGroup>
+| Fact | How it gets into the token |
+| --- | --- |
+| Plan, tier, region | A custom [attribute](/auth/sign-up-form-and-attributes) marked *include in the access token*, set from a server or a flow |
+| Roles and permissions | [Roles](/auth/roles): `$auth.roles`, `$auth.permissions` |
+| Company and role there | [Organizations](/auth/organizations): `$auth.org`, `$auth.org_role` |
+| Anything else for one integration | A [token profile](/auth/token-profiles) |
 
-In Studio it shows in the rule picker. A code rule can't be edited in the dashboard.
+Then: **Compare values** `$auth.claims.plan` **is one of** `pro`, `business`.
 
-## Rules for code rules
+When the fact changes (an upgrade), update the attribute; the next token carries it. Tokens are short-lived, so changes reach rules within minutes, or straight away when the person's session refreshes.
 
-- **Pure:** decide; never write data.
-- **Fast:** one indexed query at most.
-- **Safe on missing data:** treat a missing `record`/`auth` as "no".
-- **Tested:** unit-test with fake contexts, and include them in your [rule tests](/policies/testing).
-- **Named by meaning:** `project_member`, not `check2`.
-- **Remember lists:** a code rule can't become a database filter, so lists are checked per row and totals are `null`.
+## Pattern 3: organizations for group membership
 
-## A safer alternative for many cases
+If "members of X" means "people in the same company", use [organizations](/auth/organizations). Records carry an `org` column and the rule compares it with `$auth.org`, which **is** a database filter, so lists stay exact. See [Teams and organizations](/guides/organizations).
 
-Often the best "code rule" is **data**: add a `project_member_ids` list to the record (maintained by a flow when membership changes) and write *$record.project_member_ids contains $auth.user_id*. It stays visible in Studio and still works in JSON.
+## Pattern 4: let the database enforce counts and uniqueness
+
+"One open cart per customer" or "one vote per person per post" is a **unique index**, not a rule:
+
+| Rule you wanted | Use instead |
+| --- | --- |
+| One vote per person per post | A unique index on `(post_id, user_id)` |
+| One open cart per customer | A unique **partial** index on `customer_id` where `status = 'cart'` |
+| No two bookings for the same slot | A unique index on `(room_id, starts_at)` |
+
+A second attempt fails with `409 unique_violation`, whoever sends it. See [Indexes](/database/indexes#partial-indexes).
+
+## Pattern 5: a flow that checks, then writes
+
+When a write needs a real lookup or another system's answer, make it a [route](/logic/routes) or flow your app calls, and switch off the direct operation on the table:
+
+1. The table's **Add records** is off (or **Secret keys & Studio** only).
+2. A route `POST /tickets` runs a flow that:
+   - **Require sign-in**;
+   - **SQL query** counts the caller's open tickets; an **If** fails with `422` when there are 3 or more;
+   - or **HTTP request** asks your billing provider whether the subscription is active;
+   - **Create record** with the values it trusts.
+
+The flow runs with its own authority, so it can read what the rules language can't, and it decides exactly what's written. See [Rules on routes and flows](/policies/routes-and-functions).
+
+## Choosing
+
+| Situation | Pattern |
+| --- | --- |
+| A small, changing list of people per record | 1: data on the record |
+| A fact about the person | 2: the token |
+| "Same company" | 3: organizations |
+| "At most one", "no duplicates" | 4: a unique index |
+| Counts, other systems, complex logic | 5: a flow that checks, then writes |
 
 <CardGroup cols={2}>
-  <Card title="Named rules" icon="tag" href="/policies/named-rules">Saved rules.</Card>
+  <Card title="Named rules" icon="tag" href="/policies/named-rules">Save and reuse rules.</Card>
   <Card title="Common mistakes" icon="triangle-alert" href="/policies/common-mistakes">What to avoid.</Card>
 </CardGroup>
