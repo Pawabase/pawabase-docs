@@ -1,10 +1,19 @@
 ---
 title: "Bulk writes"
-description: "Create many records at once from your app, know which succeeded, control concurrency, and when to use import instead."
+description: "Create many records at once and know which succeeded, control concurrency, update or delete many, make several writes all-or-nothing with a transaction, show progress, and choose between the API, import and SQL for large loads."
 icon: "layers"
 ---
 
-## `createMany`
+There are three ways to write many records, for three different jobs:
+
+| You need | Use |
+| --- | --- |
+| Up to a few hundred records from your app, where some may fail | [`createMany`](#create-many) |
+| Several writes that must all succeed or all fail | A [transaction](#all-or-nothing-a-transaction) in a flow |
+| A file, thousands of rows, or upserts | [Import](/database/import-and-export) |
+| A one-time fix to many rows | The [SQL editor](/database/sql-editor), after a [backup](/backups/overview) |
+
+## Create many
 
 <CodeGroup>
 ```typescript TypeScript
@@ -13,35 +22,145 @@ const { created, failed } = await pawabase.from("tasks").createMany(
   { concurrency: 5, stopOnError: false },
 );
 
-created.length;      // 2
-for (const f of failed) console.log("row", f.index, "failed:", f.error);
+created.length;                      // 2, in the order you passed them
+for (const { index, error } of failed) {
+  console.warn(`row ${index} failed:`, error);
+}
 ```
 
 ```python Python
-result = pb.from_("tasks").create_many([{"title": "One"}, {"title": "Two"}, {"title": ""}], stop_on_error=False)
-result.created      # the saved records
-result.failed       # [{index, error}]
+result = pb.from_("tasks").create_many(
+    [{"title": "One"}, {"title": "Two"}, {"title": ""}],
+    stop_on_error=False,
+)
+result.created                      # the saved records, in input order
+for index, error in result.failed:  # (index, exception) pairs
+    print(f"row {index} failed:", error)
+
+# async client: rows go concurrently
+result = await apb.from_("tasks").create_many(rows, concurrency=5)
 ```
 </CodeGroup>
 
-It sends several creates in parallel and tells you which succeeded and which failed (with the row's position), so one bad row doesn't lose the rest. It is **not one transaction**: if you need all-or-nothing, see [below](#all-or-nothing-a-transaction).
+`createMany` sends one create per row and collects the answers, so one bad row doesn't lose the others. Each failure carries the row's **index** in your input and the error, so you can show "row 3: title is required".
 
-| Option | Meaning |
-| --- | --- |
-| `concurrency` | How many requests at once. Default 5 |
-| `stopOnError` (`stop_on_error`) | Stop sending more after the first failure |
+| Option | TypeScript | Python | Default | Meaning |
+| --- | --- | --- | --- | --- |
+| Concurrency | `concurrency` | `concurrency` (async client only) | 5 | Creates in flight at once. The blocking Python client sends rows one after another |
+| Stop on error | `stopOnError` | `stop_on_error` | `false` | Start no new create after the first failure. Creates already in flight finish |
+| Cancel | `signal` | | | Abort every create still to come |
 
-In Python the async client runs rows concurrently (`concurrency=` there); the sync client sends them in order.
+What it is **not**:
+
+- **Not atomic.** Some rows can be created while others fail. If a half-finished import is a problem, use a [transaction](#all-or-nothing-a-transaction).
+- **Not one request.** Each row is a request, checked by the `create` rule, counted against the rate limit, and emitting its own `created` event.
+- **Not retried.** A row that fails on a dropped connection is reported as failed, never sent twice, because the server may have saved it. Check before re-sending; see [duplicate-safe creates](/database/write#duplicate-safe-creates).
+
+### Show errors per row
+
+<CodeGroup>
+```typescript TypeScript
+import { ValidationError, ConflictError } from "@pawabase/client";
+
+const { created, failed } = await pawabase.from("contacts").createMany(rows);
+const problems = failed.map(({ index, error }) => ({
+  row: index + 2,   // +1 for 1-based, +1 for the header line of the CSV
+  reason:
+    error instanceof ValidationError ? Object.entries(error.byField()).map(([f, m]) => `${f}: ${m.join(", ")}`).join("; ")
+    : error instanceof ConflictError ? "already exists"
+    : String(error),
+}));
+```
+
+```python Python
+from pawabase.errors import ConflictError, ValidationError
+
+result = pb.from_("contacts").create_many(rows)
+problems = [
+    {"row": index + 2, "reason": "already exists" if isinstance(error, ConflictError) else error.message}
+    for index, error in result.failed
+]
+```
+</CodeGroup>
+
+### Choosing concurrency
+
+Higher concurrency finishes sooner until the environment's [rate limit](/database/caching-and-rate-limits) starts answering `429`. The SDK waits and retries after a `429`, so too high doesn't fail, it just stops getting faster. 5 to 10 suits most environments; lower it for tables with heavy event flows.
+
+## Progress
+
+`createMany` reports at the end. For a progress bar, send in chunks:
+
+<CodeGroup>
+```typescript TypeScript
+const failures: Array<{ index: number; error: unknown }> = [];
+for (let start = 0; start < rows.length; start += 50) {
+  const chunk = rows.slice(start, start + 50);
+  const { failed } = await pawabase.from("contacts").createMany(chunk, { concurrency: 5 });
+  failures.push(...failed.map((f) => ({ ...f, index: f.index + start })));
+  setProgress(Math.min(start + 50, rows.length) / rows.length);
+}
+```
+
+```python Python
+failures = []
+for start in range(0, len(rows), 50):
+    result = pb.from_("contacts").create_many(rows[start:start + 50])
+    failures += [(index + start, error) for index, error in result.failed]
+    print(f"{min(start + 50, len(rows))}/{len(rows)}")
+```
+</CodeGroup>
+
+Shift each chunk's indexes by its start, as above, so they point at the row in the whole input.
+
+## Update or delete many
+
+There's no "update where" call in the API: read the records, then write each one. Limit how many run at once:
+
+<CodeGroup>
+```typescript TypeScript
+async function inBatches<T>(items: T[], size: number, work: (item: T) => Promise<unknown>) {
+  for (let i = 0; i < items.length; i += size) {
+    await Promise.all(items.slice(i, i + size).map(work));
+  }
+}
+
+const done = await pawabase.from("tasks").is("done", true).lt("updated_at", cutoff).all({ maxRecords: 2000 });
+await inBatches(done, 20, (t) => pawabase.from("tasks").delete(t.id));
+
+const stale = await pawabase.from("tasks").eq("status", "open").lt("due_at", new Date()).all();
+await inBatches(stale, 20, (t) => pawabase.from("tasks").update(t.id, { status: "overdue" }));
+```
+
+```python Python
+import asyncio
+
+done = await apb.from_("tasks").is_("done", True).lt("updated_at", cutoff).all(max_records=2000)
+gate = asyncio.Semaphore(20)
+
+async def remove(task):
+    async with gate:
+        await apb.from_("tasks").delete(task["id"])
+
+await asyncio.gather(*(remove(t) for t in done))
+```
+</CodeGroup>
+
+Read everything first, then write. Deleting while you page shifts later pages, and you skip records.
+
+Each write is checked by the rule and emits its own event, which is usually what you want: webhooks and flows hear about every change. For thousands of rows, do the work on the server instead (a flow with a database query, or the SQL editor), where it is one statement.
 
 ## All or nothing: a transaction
 
-When several writes must succeed **together** (move stock and create the order, or neither), do them in a [flow](/logic/flows) with the **Transaction** block. Its `operations` is a list; either every write lands or none does:
+When several writes must succeed **together** (take the stock and create the order, or neither), put them in a [flow](/logic/flows) with the **Transaction** block. Either every write in its list lands, or none does.
+
+The block's `operations` setting is a list:
 
 ```json
 [
-  { "op": "update", "resource": "products", "id": "{{ input.product_id }}", "data": { "stock": "{{ vars.new_stock }}" } },
-  { "op": "create", "resource": "orders", "data": { "product_id": "{{ input.product_id }}", "customer_id": "{{ auth.user_id }}" } },
-  { "op": "delete", "resource": "cart_items", "id": "{{ input.cart_item_id }}" }
+  { "op": "update", "resource": "products", "id": "{{ input.body.product_id }}", "data": { "stock": "{{ vars.new_stock }}" } },
+  { "op": "create", "resource": "orders", "data": { "product_id": "{{ input.body.product_id }}", "customer_id": "{{ auth.user_id }}" } },
+  { "op": "delete", "resource": "cart_items", "id": "{{ input.body.cart_item_id }}" }
 ]
 ```
 
@@ -52,43 +171,80 @@ When several writes must succeed **together** (move stock and create the order, 
 | `id` | The record, for `update` and `delete` |
 | `data` | The fields, for `create` and `update` |
 
-The block outputs the results in order. An `update` of a record that doesn't exist fails the whole transaction with `not_found`, and nothing is written. Events for the records it created and updated are emitted only after the transaction has committed; deletes made in a transaction don't emit events. Call the flow from your app with `pawabase.flows.run(...)`, or make it a [route](/logic/routes).
+- The block's output is the results, in the same order.
+- An `update` of a record that doesn't exist fails the whole transaction with `not_found` (404), and nothing is written. A `delete` of a missing record doesn't fail it; its result is empty.
+- A unique or constraint error fails it the same way.
+- Events for the records it created and updated are sent only **after** it commits. Deletes made inside a transaction don't send events.
+- An empty list, or an unknown `op`, stops the flow with `bad_config` when it runs.
 
-The flow runs with its own authority, so check who's asking (a **Require sign-in** or **Check policy** block) before the transaction.
+The flow writes with **its own authority**: table rules don't apply inside it. Check who is asking first, with a **Require sign-in** or **Check policy** block, and validate the input.
 
-## Update or delete many
+### Call it from your app
 
-Query, then act on each:
+Give the flow an HTTP trigger with no path, and run it by name:
 
-```typescript
-const { data } = await pawabase.from("tasks").eq("done", true).lt("updated_at", cutoff).perPage(100);
-await Promise.all(data.map((t) => pawabase.from("tasks").delete(t.id)));
+<CodeGroup>
+```typescript TypeScript
+const result = await pawabase.flows.run("checkout", {
+  product_id: product.id,
+  cart_item_id: item.id,
+});
 ```
 
-Keep concurrency modest (batches of 20 to 50) so you don't hit your table's [rate limit](/database/caching-and-rate-limits). For thousands of rows, do it on a server (a flow, or [SQL](/database/sql-editor)) where it is one operation.
-
-## When to use import instead
-
-| You have | Use |
-| --- | --- |
-| Up to a few hundred rows from your app | `createMany` |
-| A file, or thousands of rows, with updates or duplicates | [Import](/database/import-and-export): validates, upserts, dry run, no events by default |
-| A large one-time fix | The [SQL editor](/database/sql-editor), after a backup |
-
-## Progress
-
-For a progress bar, chunk it yourself:
-
-```typescript
-for (let i = 0; i < rows.length; i += 50) {
-  const batch = rows.slice(i, i + 50);
-  const { failed } = await pawabase.from("tasks").createMany(batch);
-  setProgress(Math.min(i + 50, rows.length) / rows.length);
-  allFailures.push(...failed.map((f) => ({ ...f, index: f.index + i })));
-}
+```python Python
+result = pb.flows.invoke("checkout", product_id=product_id, cart_item_id=item_id)
 ```
+</CodeGroup>
+
+Or give it a path and call it as a route: `pawabase.routes.post("checkout", body)`. See [Flows](/logic/flows) and [Routes](/logic/routes).
+
+## Large loads
+
+| Load | Use | Why |
+| --- | --- | --- |
+| A CSV or JSON file | [Import](/database/import-and-export) in Studio | Validates every row first, can upsert on a unique column, has a dry run, and doesn't send an event per row unless you ask |
+| Records from another database | Import, or a script with a secret key and `createMany` | A secret key skips the rules, so the script can set owner fields |
+| A one-time change to many rows | The [SQL editor](/database/sql-editor) | One statement, seconds instead of minutes. Take a backup first |
+| A nightly job | A [scheduled flow](/automation/schedules) | Runs on the server, close to the data |
+
+A script with a secret key and `createMany`:
+
+<CodeGroup>
+```typescript TypeScript
+import { createClient } from "@pawabase/client";
+import { readFile } from "node:fs/promises";
+
+const admin = createClient({ url, apiKey: process.env.PAWABASE_SECRET_KEY!, environment });
+const rows = JSON.parse(await readFile("contacts.json", "utf8"));
+const { created, failed } = await admin.from("contacts").createMany(rows, { concurrency: 10 });
+console.log(`${created.length} created, ${failed.length} failed`);
+```
+
+```python Python
+import json, os
+from pawabase import Pawabase
+
+with Pawabase(url, os.environ["PAWABASE_SECRET_KEY"], environment=env) as admin:
+    rows = json.load(open("contacts.json"))
+    result = admin.from_("contacts").create_many(rows)
+    print(len(result.created), "created,", len(result.failed), "failed")
+```
+</CodeGroup>
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Many rows fail with `429` | Concurrency above the rate limit, for long enough that waiting ran out | Lower `concurrency` |
+| Some rows were created twice | The script was run again after a partial failure | Add a unique idempotency column, or import with upsert |
+| A transaction fails with `not_found` | An `update` names a missing record | Check the ids; nothing was written |
+| Deleting while paging skipped records | Pages shifted | Read everything first, then delete |
+| Flows ran for every row | Each create sends an event | Expected; for loads without events, use import |
+| Python `create_many` is slow | The blocking client sends rows one by one | Use `AsyncPawabase`, which runs `concurrency` at a time |
 
 <CardGroup cols={2}>
-  <Card title="Write records" icon="pencil" href="/database/write">Single writes.</Card>
-  <Card title="Import and export" icon="upload" href="/database/import-and-export">For files and large loads.</Card>
+  <Card title="Write records" icon="pencil" href="/database/write">Single writes and their errors.</Card>
+  <Card title="Import and export" icon="upload" href="/database/import-and-export">Files and large loads.</Card>
+  <Card title="Flows" icon="workflow" href="/logic/flows">Transactions and server-side work.</Card>
+  <Card title="Rate limits" icon="gauge" href="/database/caching-and-rate-limits">How fast you can write.</Card>
 </CardGroup>
