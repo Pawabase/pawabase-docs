@@ -1,25 +1,39 @@
 ---
 title: "Live records"
-description: "Turn on broadcasting for a table in Studio, then keep a list up to date as records change, sent only to people allowed to read each record."
+description: "Keep data on screen up to date without polling: subscribe to a table's changes, or open a live query that sends the whole result again whenever it changes. Turning it on, who hears what, reconnects, changes made outside the API, limits and React patterns."
 icon: "database"
 ---
 
-Instead of polling, subscribe to a table. When a record is created, updated or deleted, you hear about it on the channel `resource:<table>`.
+Two ways to show data that stays current, both sent only to people allowed to read it:
+
+| | Record changes | Live query |
+| --- | --- | --- |
+| You get | Each change: one record created, updated or deleted | The whole result of a list query, again whenever it changes |
+| You write | Code that applies each change to your list | Nothing: replace what you show with the new result |
+| Filters, sort, page | Your job | The same as `from(table)` reads |
+| Best for | Feeds, chats, logs, counters, anything append-heavy | Dashboards, "my open tasks", top-10 lists, small filtered lists |
+| Method | `realtime.channel("resource:<table>")` | `realtime.live("<table>", …)` |
+
+Both need the table's **Broadcast changes** switch on.
 
 ## Turn it on in Studio
 
-Two places do the same thing:
+Either of these does it:
 
-- **Data →** open the table **→ Settings → Behaviour →** switch **Broadcast changes** on (*push row changes to realtime subscribers*) and save.
-- **Services → Realtime → Subscriptions → Database changes:** the card lists your tables (*resources*) with a switch for each. *Two ways something outside a channel finds out about an event: database-change broadcasting, and webhooks.* If you have none yet it says **No resources defined yet.**
+- **Data →** open the table **→ Settings →** switch **Broadcast changes** on (*Push row changes to realtime subscribers, and keep live queries on this table up to date*) and save. Studio then shows a live query you can copy.
+- **Realtime → Subscriptions → Database changes:** the card lists your tables with a switch for each.
 
-Also check the table's **Access** tab: people receive changes only for rows their **See the list / Open one record** rule allows.
+Then check the table's **Access** tab: people receive changes, and live results, only for records their **list** and **get** rules allow.
 
-## Listen
+In infrastructure as code, it's `realtime=True` on the [table](/tools/iac/tables).
+
+## Record changes
+
+When a record is created, updated or deleted through the API, a message goes to the channel `resource:<table>`.
 
 <CodeGroup>
 ```typescript TypeScript
-const tasks = pawabase.realtime.channel("resource:tasks");
+const tasks = pawabase.realtime.channel<{ resource: string; change: string; record: Task }>("resource:tasks");
 
 tasks.on("message", ({ event, payload }) => {
   if (event === "created") list.add(payload.record);
@@ -31,19 +45,26 @@ await tasks.subscribe();
 ```
 
 ```python Python
-tasks = pb.realtime.channel("resource:tasks")
+from pawabase import AsyncPawabase
 
-def on_change(message):
-    record = message["payload"]["record"]
-    if message["event"] == "deleted":
-        remove(record["id"])
-    else:
-        upsert(record)
+async with AsyncPawabase(url, key, environment=env) as pb:
+    tasks = pb.realtime.channel("resource:tasks")
 
-tasks.on("message", on_change)
-await tasks.subscribe()
+    def on_change(message):
+        record = message["payload"]["record"]
+        if message["event"] == "deleted":
+            remove(record["id"])
+        else:
+            upsert(record)
+
+    tasks.on(None, on_change)          # None: every event; "updated" would hear only updates
+    await tasks.subscribe()
 ```
 </CodeGroup>
+
+<Note>
+In Python, `channel.on(event, handler)` filters by the message's **event name**. Record changes are named `created`, `updated` and `deleted`, so pass `None` to hear all three, or one name to hear only that kind. Live channels need the async client and `pip install "pawabase[realtime]"`.
+</Note>
 
 | `event` | When | `payload.record` |
 | --- | --- | --- |
@@ -51,18 +72,33 @@ await tasks.subscribe()
 | `updated` | A record changed | The record as it is now |
 | `deleted` | A record was removed | The record as it was |
 
-`payload` also carries `resource` and `change`.
+`payload` also carries `resource` (the table) and `change` (the same as `event`). A change captured from the database (see [below](#changes-made-outside-the-api)) adds which columns changed and that it came from the database.
 
-## Who hears what
+### Iterate instead of handlers
 
-You receive only changes to rows **your read rule allows**, checked against the row as it was and as it is now. Ada hears about her tasks, Bob about his, and neither learns the other's exist. Columns marked **Write only** are removed from the message. Nobody can publish to `resource:` channels except the platform.
+<CodeGroup>
+```typescript TypeScript
+const tasks = pawabase.realtime.channel("resource:tasks");
+await tasks.subscribe();
+for await (const { event, payload } of tasks) {
+  apply(event, payload.record);
+}
+```
 
-## A complete live list
+```python Python
+async for message in pb.realtime.channel("resource:tasks"):
+    apply(message["event"], message["payload"]["record"])
+```
+</CodeGroup>
 
-Load, then listen, then catch up after reconnects:
+The loop ends when you unsubscribe.
+
+### A complete live list
+
+Load first, then listen, then catch up after reconnects:
 
 ```typescript
-const { data } = await pawabase.from("tasks").order("created_at", "desc");
+const { data } = await pawabase.from("tasks").order("created_at", "desc").limit(100);
 const items = new Map(data.map((t) => [t.id, t]));
 
 const channel = pawabase.realtime.channel("resource:tasks", { replay: 100 });
@@ -74,21 +110,209 @@ channel.on("message", ({ event, payload }) => {
 await channel.subscribe();
 ```
 
-A `Map` keyed by id means a repeated message is harmless. `replay` fills in what happened while the connection was down.
+- A `Map` keyed by id makes a repeated message harmless.
+- `replay: 100` means: after a reconnect, fetch the last 100 messages and deliver the ones you missed. The client drops duplicates by message id.
+- Subscribe **before** you trust the loaded list for long. A change between your read and your subscribe can be missed; `replay` covers it on reconnects, and for the first load you can read again right after subscribing.
+- Your own writes come back as messages too. Merging by id keeps them from showing twice.
+
+Messages don't carry your filters: you hear about every record of the table you may read. Filter in the handler, or use a [live query](#live-queries).
+
+## Live queries
+
+A live query is a list read that **stays open**. You get its result, and then the whole result again each time a change in the table makes it different.
+
+<CodeGroup>
+```typescript TypeScript
+const open = pawabase.realtime.live<Task>("tasks", {
+  filter: { done: "is.false", project_id: projectId },
+  sort: "-created_at",
+  limit: 20,
+});
+
+open.onChange(({ data, total }) => render(data, total));
+open.onError((error) => showError(error.message));
+
+const first = await open.ready();   // the first result
+open.data;                          // the latest rows at any time
+open.total;                         // the latest total, or null
+
+// when the screen closes
+open.stop();
+```
+
+```python Python
+async with AsyncPawabase(url, key, environment=env) as pb:
+    async with pb.realtime.live(
+        "tasks",
+        filter={"done": "is.false", "project_id": project_id},
+        sort="-created_at",
+        limit=20,
+    ) as open_tasks:
+        print(open_tasks.data)                 # the first result
+        async for result in open_tasks:        # every later result
+            render(result["data"], result["total"])
+```
+</CodeGroup>
+
+### The options
+
+They are the same options as a list read, written the way the server takes them:
+
+| Option | Example | Meaning |
+| --- | --- | --- |
+| `filter` | `{ status: "eq.paid", total: "gte.1000" }` | One filter per column, as `operator.value`. A bare value means `eq` |
+| `sort` | `"-created_at,id"` | Columns, a leading `-` for descending |
+| `select` | `"id,title,done"` | The columns to return |
+| `q` | `"invoice"` | Full-text search, as with [`search()`](/database/filter#search) |
+| `limit` | `20` | Rows per result, 1 to 200. Default 20 |
+| `offset` | `40` | Rows to skip |
+
+Operators are the [filter operators](/database/filter#every-filter): `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in`, `nin`, `is`, `isnot`.
+
+<Warning>
+Filter booleans and nulls with `is`: `{ done: "is.false" }`, `{ deleted_at: "is.null" }`. Unlike `from(table).eq("done", false)`, which the SDK rewrites for you, a live query's filters are sent as written, and `eq.false` doesn't match boolean columns correctly.
+</Warning>
+
+### What you get
+
+Each result is `{ data, total }`: the rows, and the total that a list read would give (`null` when a per-row rule makes it unknown). A result is sent:
+
+- once, when the query opens;
+- again after a change to the table, only **if the result is different**. Writes that land close together (within a tenth of a second) are gathered into one re-run.
+
+A change to a record outside your query's rows doesn't send anything, because the result didn't change.
+
+### The methods
+
+| TypeScript | Python | Meaning |
+| --- | --- | --- |
+| `realtime.live(table, options, onChange?)` | `realtime.live(table, filter=, sort=, select=, q=, limit=, offset=)` | Open a live query. TypeScript starts it at once; Python on `start()`, `async with` or iteration |
+| `ready()` | `await start()` | The first result. Rejects / raises `RealtimeError` when the query is refused |
+| `data`, `total` | `data`, `total` | The latest result |
+| `onChange(handler)` | `on_change(handler)` | Called with every result. In TypeScript, also at once with the current result if there is one. Returns an unsubscribe function (TS) or the query, for chaining (Python) |
+| `onError(handler)` | `error` | The query was refused or closed |
+| | `async for result in live` | Every result, starting with the first |
+| `stop()` | `await stop()`, or leave `async with` | End it |
+
+Both SDKs reopen live queries by themselves after a reconnect.
+
+### When a live query ends
+
+The server closes a live query (TypeScript: `onError` with code `query_closed`, then it stops) when re-running it fails, for example because:
+
+- the caller **lost access** (their role changed, they left the organization);
+- the table no longer broadcasts changes;
+- a column the query uses was removed.
+
+A query that can't be opened at all is refused with `bad_request` (an unknown column, a `limit` outside 1 to 200, a table without **Broadcast changes**) or with a permission error when the caller may not list the table.
+
+### Limits
+
+| Limit | Value |
+| --- | --- |
+| Live queries per connection | 25 |
+| Rows per result | 1 to 200 |
+| Re-run delay after a change | about 0.1 s, gathering writes |
+
+Each open live query is re-run on the server after changes to its table, so keep them to what's on screen, and stop them when the screen closes.
+
+## Record changes or a live query?
+
+- A **feed** or a **chat** gets one new item at a time: record changes are cheaper, since a live query would resend the whole list each time.
+- A **filtered, sorted, short list** ("my 10 open tasks, newest first") is easier as a live query: you never have to work out whether a changed record now belongs in the list or where it goes.
+- A **large table** with frequent writes: record changes, with your own filtering, or a live query with a narrow filter and a small `limit`.
+
+## In React
+
+<CodeGroup>
+```tsx Live query
+function useLive<T>(table: string, options: LiveQueryOptions) {
+  const [rows, setRows] = useState<T[]>([]);
+  const [error, setError] = useState<RealtimeError | null>(null);
+  const key = JSON.stringify(options);
+
+  useEffect(() => {
+    const live = pawabase.realtime.live<T>(table, options);
+    const offChange = live.onChange(({ data }) => setRows(data));
+    const offError = live.onError(setError);
+    return () => { offChange(); offError(); live.stop(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [table, key]);
+
+  return { rows, error };
+}
+
+// const { rows } = useLive<Task>("tasks", { filter: { done: "is.false" }, sort: "-created_at", limit: 20 });
+```
+
+```tsx Record changes
+function useTasks() {
+  const [items, setItems] = useState(new Map<string, Task>());
+
+  useEffect(() => {
+    let alive = true;
+    const channel = pawabase.realtime.channel<{ record: Task }>("resource:tasks", { replay: 50 });
+    const off = channel.on("message", ({ event, payload }) =>
+      setItems((current) => {
+        const next = new Map(current);
+        if (event === "deleted") next.delete(payload.record.id);
+        else next.set(payload.record.id, payload.record);
+        return next;
+      }),
+    );
+    channel.subscribe().then(() =>
+      pawabase.from("tasks").order("created_at", "desc").limit(100).then(({ data }) => {
+        if (alive) setItems(new Map(data.map((t) => [t.id, t as Task])));
+      }),
+    );
+    return () => { alive = false; off(); channel.unsubscribe(); };
+  }, []);
+
+  return [...items.values()];
+}
+```
+</CodeGroup>
+
+Import `LiveQueryOptions` and `RealtimeError` from `@pawabase/client`.
+
+## Who hears what
+
+- You receive a change only for a record your **read rule** allows, checked for each subscriber, against the record as it was and as it is now. Ada hears about her tasks, Bob about his, and neither learns the other's exist.
+- A live query runs exactly like a list read by that person: the same rule, the same API key scope, the same columns.
+- Columns marked **Write only** are removed.
+- Nobody can publish to `resource:` channels; only the platform does.
 
 ## Changes made outside the API
 
-By default only writes through the API announce themselves. To include SQL, other services and migrations, switch on **Capture changes made outside the API** in the table's **Settings → Behaviour**. See [Events and realtime](/database/events-and-realtime).
+By default, only writes through the API (apps, flows, Studio's table editor) announce themselves. Writes from the SQL editor, migrations or other services that use the database directly don't.
+
+To include those, switch on **Capture changes made outside the API** in the table's **Settings**. Pawabase then reads changes from the database itself, using triggers, and both record changes and live queries see them. See [Events and realtime](/database/events-and-realtime).
 
 ## Watch it in Studio
 
-In **Realtime → Playground**, join `resource:tasks` and make a change in the table editor: the message appears. In **Overview**, the broadcast counts rise.
+In **Realtime → Playground**, join `resource:tasks` and change a record in the table editor: the message appears. **Realtime → Overview** shows broadcast counts and open live queries.
 
 ## Server-side reactions
 
-Live records are for connected apps. To run work when a record changes (an email, a webhook), use [events and subscriptions](/automation/events).
+Live records are for connected apps. To run work when a record changes (send an email, call a webhook), use [events](/automation/events): the same change is also the event `tasks.created`, `tasks.updated` or `tasks.deleted`.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Nothing arrives | **Broadcast changes** is off for the table | Turn it on in the table's settings |
+| Nothing arrives for some people | Their read rule hides those records | Check the table's **Access** rules |
+| Python handler never runs | `on("message", …)` filters by event name | Use `on(None, …)` |
+| Changes from the SQL editor don't arrive | Only API writes announce themselves | Turn on **Capture changes made outside the API** |
+| Live query refused with `bad_request` | An unknown column, `limit` over 200, or the table doesn't broadcast | Check the options and the switch |
+| A boolean live filter returns the wrong rows | `eq.false` | Use `is.false` |
+| A live query stops by itself | The caller lost access, or the table changed | Listen with `onError`, and open a new one if appropriate |
+| "at most 25 live queries" | Too many open on one connection | Stop queries for screens that closed |
+| Your own change shows twice | You added it and received it | Merge by id, or render only from messages |
 
 <CardGroup cols={2}>
+  <Card title="Channels" icon="hash" href="/realtime/channels">Subscribe, send, iterate.</Card>
+  <Card title="Connection" icon="plug" href="/realtime/connection">Reconnects and status.</Card>
   <Card title="Table settings" icon="settings" href="/database/table-settings">Where Broadcast lives.</Card>
-  <Card title="Playground" icon="play" href="/realtime/playground">Watch a channel.</Card>
+  <Card title="Events" icon="bolt" href="/automation/events">Server-side reactions.</Card>
 </CardGroup>
