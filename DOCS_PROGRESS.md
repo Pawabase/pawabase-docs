@@ -81,46 +81,46 @@ Tabs: **Guides** (welcome, concepts, quickstarts, tutorials) · **Products** (fe
 
 | Page | Lines | Status | Notes |
 | --- | --- | --- | --- |
-| `auth/account-recovery` | 136 | todo | |
+| `auth/account-recovery` | 136 | audited | reset link → /auth/callback?type=recovery, or built-in page without Site URL; reset clears lockout |
 | `auth/attack-protection` | 55 | rewritten | Lockout mechanics from routes/identity/auth.py (locked → 429 before password check; only password+MFA failures count; reset clears lock); 30/min per address on token/signup/email-code/magic-link/recover/verify |
-| `auth/auth-webhooks` | 83 | todo | |
-| `auth/authentication-flow` | 81 | todo | |
+| `auth/auth-webhooks` | 83 | audited | Event table completed from emitted names (invitation.*, machine.*, sso_*, token_profile.issued, data_exported/erased); removed false 'reuse warnings' claim |
+| `auth/authentication-flow` | 81 | rewritten | Map kept; settings() fields from routes/identity/auth.settings |
 | `auth/bot-protection` | 208 | todo | |
 | `auth/configuring-auth` | 84 | rewritten | Groups fixed; token lifetimes 900s/30d (identity/environment.py); Sign out everywhere / End session |
-| `auth/data-requests` | 89 | todo | |
+| `auth/data-requests` | 89 | rewritten | identity/privacy.py: full export/erase table incl. org audit, emails; what neither covers (own tables, files, events/runs/webhooks until retention, backups); record fields; REST; erase vs delete. Server fixes below |
 | `auth/devices` | 78 | rewritten | FACT: device key = x-device-id header / pb_device cookie / UA fingerprint (identity/devices.identify); SDKs send no x-device-id → remember-device never works without app-sent header; trusted-device sessions are aal1 (fail mfa rule + org require_mfa) |
-| `auth/email-and-password` | 204 | todo | |
-| `auth/email-codes` | 113 | todo | |
+| `auth/email-and-password` | 204 | rewritten | routes/identity/auth.check_password order (unknown→SSO→locked→wrong→disabled/verify/expired/MFA); identifiers username/phone; TS 400 = ValidationError; sign-up form problems are a string list (NOT byField); terms 422; 409 reveals existence; create-users fix |
+| `auth/email-codes` | 113 | rewritten | identity/codes.py: 10 min fixed, newest code only, 5 wrong tries per code, account made at verify (verified, default roles, restrictions), no lockout counting, captcha errors, code vs link table, full form with cooldown |
 | `auth/email-templates` | 47 | rewritten | identity/emails.py: 9 kinds + values per kind, common values (project, email, brand), fallback to default, text overrides keep layout, branding via settings |
-| `auth/email-verification` | 105 | todo | |
+| `auth/email-verification` | 105 | audited | flow fixed: link → /auth/callback?type=verify (or Pawabase page + fragment) |
 | `auth/enterprise-connections` | 267 | todo | |
 | `auth/enterprise-roles-and-access` | 152 | todo | |
 | `auth/enterprise-sign-in` | 228 | todo | |
-| `auth/guests` | 83 | todo | |
-| `auth/how-auth-works` | 235 | todo | |
+| `auth/guests` | 83 | rewritten | FIXED: guests have placeholder email guest-…@guest.invalid (old doc said none); detect via is_anonymous / $auth.claims.app.anonymous; upgrade always sends verify; purge = 30d after last sign-in (refresh doesn't count) → guests deleted ~30d after start |
+| `auth/how-auth-works` | 235 | audited | Fixed: revoked session keeps access token until expiry; passkey=aal2; refresh token renews. Added 'Verify tokens on your server' (HMAC access tokens can't be verified externally → /auth/v1/user, token profiles, routes) |
 | `auth/import-and-export` | 43 | rewritten | identity/backup.py: contents, merge-by-email vs replace (one transaction), ids kept when free, MFA box is installation key, dry run = Check the file; bcrypt/argon2/pbkdf2 hashes from other systems verify (tested) |
-| `auth/invitations` | 92 | todo | |
+| `auth/invitations` | 92 | audited | FACT: invite links need a Site URL (open_link handles only verify/magic/email_change/recovery) |
 | `auth/linked-accounts` | 74 | rewritten | Auto-link only on verified email (routes/identity/security.finish_federated), email_unverified_conflict, identity_already_linked, 409 last-method guard |
 | `auth/machines` | 269 | todo | |
 | `auth/organizations` | 402 | todo | |
 | `auth/overview` | 67 | rewritten | Studio map from lib/authNavigation.js (People/Sign-in/Protection/Access/Records + SSO, Bot protection) |
-| `auth/passkeys` | 107 | todo | |
-| `auth/password-policy` | 79 | todo | |
+| `auth/passkeys` | 107 | rewritten | identity/passkeys.py: rp_id default site_url host → public_url; allowed origins = site/public/redirect URLs on domain (Android apk origins refused); passkey sign-in is aal2 (routes/identity/passkeys.authenticate_verify); discoverable + UV required; ticket 300s; full failure table incl 409/501 |
+| `auth/password-policy` | 79 | rewritten | FIXED: failure = 422 {message, problems} (TS issues empty → read body.problems; Py error.problems); expired = 403 password_expired; 'strict' = Sillo validate_password character classes (NOT common-password list); where each check runs (accounts.set_password/create_account) |
 | `auth/protect-your-forms` | 188 | todo | |
 | `auth/react` | 127 | todo | |
 | `auth/redirect-urls` | 67 | rewritten | Now 'Redirect URLs and email links'. FACT: with Site URL, email links go to <site>/auth/callback?token&type (identity/links.py) → app finishes (verifyEmail/verifyMagicLink/confirmEmailChange/resetPassword/acceptInvitation); no Site URL → Pawabase link page → redirect_to#tokens. Matching = prefix at / or ? boundary (environment.redirect_allowed). Social fragments incl. errors (routes/identity/security.py) |
 | `auth/roles` | 73 | rewritten | Was truncated (Plan changes section empty) + wrong wildcard claim. FACT: permissions exact match or '*' only (core/principal.has_permission, engine _shorthand); role name ^[a-z][a-z0-9_:-]{0,62}$; roles+perms in token; role list ANY / permission list ALL |
-| `auth/sessions` | 151 | todo | |
-| `auth/sign-in-activity` | 108 | todo | |
-| `auth/sign-in-links` | 111 | todo | |
-| `auth/sign-up-form-and-attributes` | 96 | todo | |
+| `auth/sessions` | 151 | rewritten | Token anatomy, sliding refresh window, end-cause table, access tokens stateless (revoked session usable ≤ access_ttl), theft protection, admin revoke (sessions.list/revoke, users.revokeSessions), events, troubleshooting. FIXED: getSession may refresh; signOut others keeps this device; session.revoked not fired on expiry |
+| `auth/sign-in-activity` | 108 | rewritten | All LoginEvent kinds/methods/reasons from log_event calls (added refresh, mfa_verify, profile_updated, captcha); admin events/stats fields; retention 3/30/90/180/365 (seed.py; old doc said 7 Free); attack-pattern table. FIXED Studio: When column read created_at but API returns `at` (blank column) |
+| `auth/sign-in-links` | 111 | audited | Site URL vs no Site URL finish (verifyMagicLink in /auth/callback) |
+| `auth/sign-up-form-and-attributes` | 96 | rewritten | identity/signup_form.py: identifiers (username/phone required+unique, normalisation), standard attr keys+storage, custom (12, key rules, types, ask:false), validation table, FIXED: errors are a string list in `problems` (not byField); locked enforcement on profile update; token `meta` claim all/listed (user-editable, don't trust); data keys not on form are stored unchecked; form not public |
 | `auth/sign-up-restrictions` | 73 | rewritten | FIXED wrong error class (domain refusal is 403, not 422). Refusal table from routes/identity/auth.signup + accounts.create_account; admin create bypasses restrictions (enforce_restrictions=False) |
-| `auth/social-sign-in` | 133 | todo | |
-| `auth/token-profiles` | 111 | todo | |
-| `auth/two-step-verification` | 197 | todo | |
-| `auth/user-api-keys` | 82 | todo | |
-| `auth/user-profile` | 155 | todo | |
-| `auth/users` | 94 | todo | |
+| `auth/social-sign-in` | 133 | rewritten | routes/identity/security.finish_federated: account find/link/create table, email-vouching per provider (Microsoft/Facebook never → email_unverified_conflict), full #error code list incl sillo_oauth codes, provider-side errors go to Site URL, SSR fragment recipe, custom server subject keys. REMOVED exchangeCode flow (no server endpoint) |
+| `auth/token-profiles` | 111 | rewritten | identity/token_profiles.py: FIXED JWKS URL (/auth/v1/token-keys/{env}/jwks, not /auth/v1/jwks) and issuer (<api>/auth/v1/token-profiles/<full env>); all sources, reserved claims, limits (ttl 30–3600, 32 claims, 8KB resolved, 16KB profile, 50 profiles), refusal table, 60/min, no revocation, settings JSON. FIXED Studio snippet (called nonexistent auth.getToken) |
+| `auth/two-step-verification` | 197 | rewritten | identity/mfa.py + routes/identity/security.py: aal table (passkey=aal2, remembered device=aal1), strategies (one TOTP + email, ±1 step, no reuse, backup code format), enrol elevates session, recovery codes empty when some remain, challenge 5 min / setup 15 min, email-only auto-send, 10/min, admins = admin/owner/superadmin/staff/org owner|admin, grace from creation, disable accepts backup code but regenerate doesn't, reset recipe. FIXED server: /mfa/totp/enroll ignored the Authenticator-app switch (test added) |
+| `auth/user-api-keys` | 82 | rewritten | FIXED field: answer is `key` not `secret` (routes/identity/directory.make_key); scopes narrow perms not roles; ':*' scope wildcard; aal1; 45s revoke cache; key can't create keys |
+| `auth/user-profile` | 155 | rewritten | routes/identity/auth.update_me: shallow merge, null kept, partial form check + locked, 422 problems, limits, email change pending (409), current_password rules, API key can't change pwd/email (403), other sessions stay. FIXED server: password change while signed in never sent the Password changed email (now follows recovery.notify_change; test added; Studio label updated) |
+| `auth/users` | 94 | rewritten | routes/identity/admin.py: filters, create (verified by default, no email sent, bypass restrictions not policy), action table, metadata/roles REPLACE on update, no admin email change, refusals, timeline next_before, support recipes. Studio New-user hint fixed (implied an email is sent; none is) |
 
 ### database (28 pages, 3740 lines)
 
@@ -452,7 +452,31 @@ Tabs: **Guides** (welcome, concepts, quickstarts, tutorials) · **Products** (fe
 
 - SDKs don't send `x-device-id`: device tracking falls back to a UA fingerprint and remember-device never takes effect unless the app sets the header. Consider generating/persisting a device id in the SDKs.
 
+- Studio Password policy labels `strict` as "Also refuse common passwords", but `strict` runs Sillo's `validate_password` (upper+lower+digit+special); no common-password list exists.
+
+- TS `auth.apiKeys.create` return type says `secret`; the server answers the key as `key`.
+
+- Guest purge (identity/guests.purge) uses last_login, which refresh never updates → active guests are deleted 30 days after starting. Probably should use last refresh/session activity.
+
+- TS `auth.exchangeCode` / Python `auth.exchange_code` POST `/auth/v1/token/exchange`, which the server doesn't implement (no PKCE/code flow; social returns put tokens in the fragment). Dead API: remove from SDKs or implement on the server.
+
+- Invitation links have no Pawabase fallback page (routes/identity/recovery.open_link kinds exclude `invite`): without a Site URL invitations can't be accepted from the email.
+
+## Server fixes made during the audit (uncommitted in ~/sillo.build/pawabase)
+
+- **Refresh-token expiry was never enforced** (core/ulid_auth.UlidJWTUserMixin.refresh_token_pair): rotation used `verify_no_expire` and never checked the row's `expires_at`, and rotated pairs got a hardcoded 15m/7d instead of the environment's `access_ttl`/`refresh_ttl`. Now: expired rows are refused, and identity/sessions.refresh_session passes the env lifetimes (sliding window). Test: tests/identity/test_accounts.py::test_refresh_refuses_expired_tokens_and_slides_the_window. Same bug exists upstream in Sillo's JWTUserMixin.refresh_token_pair (report to Sillo).
+- **Any signed-in person could revoke another person's session by id** (identity/sessions.revoke_session revoked the JWT family without an owner check). Now checks the family belongs to the user. Test: test_a_person_cannot_revoke_someone_elses_session.
+- **Erasure left personal data behind**: uploaded avatar file stayed in the avatars bucket (delete-user too), and mail logs kept the address, body and template data. Now: routes/identity/admin.privacy_erase + delete remove the avatar file; identity/privacy.erase_user strips the address from MailLog.to (parseaddr match) and clears html/text/data/attachments (`result.emails`). Test extended in tests/identity/test_privacy.py.
+
+## Findings fixed outside auth
+
+- IaC PASSWORD_POLICIES was (basic, strong, custom); server only knows basic/strict → fixed to (basic, strict) in _split/python-iac/pawabase_iac/environment/settings.py. IaC conformance tests already failing before (new server kind; flows `tags` not sent): handle in IaC section.
+
+- cloud/plans-and-limits retention table was wrong (Free sign-in/audit 7→3, flow runs 3→1) and incomplete: replaced with all 10 kinds from pawabase-cloud/backend/pawacloud/seed.py; retention sweep runs daily (automation/scheduler TASKS).
+
 ## Log
+
+- 2026-11-19: auth/sessions rewritten; two server fixes (refresh expiry, cross-user session revoke) with tests; identity+edge suites 253 green.
 
 - 2026-11-19: Guides tab finished (tutorials audited: Studio paths, code names, SQL/scheduler facts).
 - 2026-11-19: all 5 quickstarts rewritten and checked against SDK source (fixed invented iterate(), accessToken, retry.attempts, error.details in drafts).
