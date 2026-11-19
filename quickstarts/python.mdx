@@ -1,119 +1,217 @@
 ---
 title: "Python"
-description: "Install the Python client, sign a user in, read and write data, with a synchronous or asyncio client."
+description: "Use Pawabase from Python: scripts and jobs with a secret key, a FastAPI or Flask server acting for each person, sync and asyncio clients, paging, files, flows and error handling."
 icon: "terminal"
 ---
 
-## Install
+The `pawabase` package is the Python client: the same API as the TypeScript client, in Python style, with a synchronous `Pawabase` and an asyncio `AsyncPawabase`. This quickstart covers the situations Python code usually runs in: a script or job, a web server handling requests for signed-in people, and async services.
+
+**You need:** Python 3.10 or later, a project, and its connection details from Studio → **Overview → Connect**: the service URL, the project id, and a key. For a table to try things on, do steps 1–2 of the [JavaScript quickstart](/quickstarts/javascript) (a `tasks` table where each person sees only their own records).
 
 ```bash
 pip install pawabase
+# with live channels (WebSockets):
+pip install "pawabase[realtime]"
 ```
 
-For live channels, add the realtime extra: `pip install "pawabase[realtime]"`.
-
-## Create the client
+## The client
 
 ```python
 from pawabase import Pawabase
 
-pb = Pawabase("https://api.example.com", "pb_pk_…", project="01JC4…", environment="production")
+pb = Pawabase(
+    "https://YOUR-SERVICE-URL",
+    "pb_sk_…",                 # or pb_pk_… (see below)
+    project="YOUR-PROJECT-ID",
+    environment="production",  # optional: the environment's name in the project; default is the project's default
+)
 ```
 
-<Warning>
-**Always pass `project`**, your project's ID (Studio → Overview → Connect). Pass `environment` with the environment's name in the project (`production`) when you mean one other than the project's default; a key that does not reach it is refused with `401 invalid_api_key` (*this key does not reach environment 'production'*).
-</Warning>
+- **`project` is required.** It's checked against the key, so a key from another project fails loudly instead of silently reaching the wrong backend.
+- **`environment`** names the environment; a key that doesn't reach it is refused with `401 invalid_api_key` ("this key does not reach environment 'production'"). See [Projects and environments](/concepts/projects-and-environments).
+- Other options: `timeout` (seconds per request, default 30), `retries` (extra attempts for reads after a connection error or `502`/`503`/`504`, default 2), `headers`, `session_store`, `access_token`.
 
-Use a **publishable key** (`pb_pk_…`) when acting for a user, and a **secret key** (`pb_sk_…`) from a trusted server only. A secret key bypasses your access rules.
+Create the client **once per process** and reuse it. It holds an HTTP connection pool; `Pawabase` can be used as a context manager (`with Pawabase(...) as pb:`) or closed with `pb.close()`.
 
-## Sign in
+### Which key
+
+| Your code | Key | Access rules |
+| --- | --- | --- |
+| A script, job, data import, webhook receiver acting for the whole project | **Secret** `pb_sk_…` | Passed (the `service` role) |
+| A server endpoint acting for the person who called it | **Publishable** `pb_pk_…` + the person's token | Applied exactly as in their app |
+| A script that signs in as one account | **Publishable** `pb_pk_…` | Applied as that account |
+
+A secret key passes every rule in the environments it reaches. Keep it in an environment variable or secret store, never in code.
+
+## A script or job
+
+```python jobs/close_overdue.py
+import os
+from datetime import datetime, timezone
+from pawabase import Pawabase
+
+with Pawabase(os.environ["PAWABASE_URL"], os.environ["PAWABASE_SECRET_KEY"],
+              project=os.environ["PAWABASE_PROJECT"], environment="production") as pb:
+    invoices = pb.from_("invoices")
+    overdue = invoices.eq("status", "sent").lt("due_at", datetime.now(timezone.utc))
+    for page in overdue.pages(page_size=200):
+        for invoice in page.data:
+            invoices.update(invoice["id"], status="overdue")
+        print(f"page {page.page}: {len(page.data)} closed")
+```
+
+- **`from_("invoices")`** starts a query (`from` is a Python keyword, hence the underscore). Filters chain: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `in_`, `is_`, then `order`, `page`, `per_page`.
+- **`execute()`** runs a query and returns one `Page` (`data`, `page`, `per_page`, `total`). **`pages()`** yields every page in turn; **`all()`** collects every row into a list (use it only when the result is small).
+- **`create(**fields)`**, **`update(id, **fields)`**, **`delete(id)`** and **`get(id)`** work on single records and return plain `dict`s.
 
 ```python
-result = pb.auth.sign_up(email="ada@example.com", password="a long passphrase")
-if result.verification_required:
-    print("Ask them to confirm their email first.")
-
-pb.auth.sign_in_with_password(email="ada@example.com", password="a long passphrase")
+task = pb.from_("tasks").create(title="Write the docs", done=False)   # → {'id': '01JD…', 'title': …, 'created_at': …}
+pb.from_("tasks").update(task["id"], done=True)                      # only the fields you pass change
+first_page = pb.from_("tasks").eq("done", False).order("created_at", "desc").per_page(50).execute()
+print(first_page.total, [t["title"] for t in first_page.data])
 ```
 
-The session is kept in memory. To keep it between runs of a script, give the client a file:
+## A web server acting for each person
+
+A server endpoint called by your app should do exactly what the calling person may do. Keep **one** client for the process (with the publishable key) and take a **view** per request that carries the person's token:
+
+```python app.py
+import os
+from fastapi import FastAPI, Header, HTTPException
+from pawabase import Pawabase, AuthenticationError, NotFoundError
+
+pb = Pawabase(os.environ["PAWABASE_URL"], os.environ["PAWABASE_PUBLISHABLE_KEY"], project=os.environ["PAWABASE_PROJECT"])
+app = FastAPI()
+
+
+def as_caller(authorization: str | None):
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    return pb.as_user(token)          # same connection pool, this person's token on every request
+
+
+@app.post("/tasks/{task_id}/share")
+def share(task_id: str, email: str, authorization: str | None = Header(default=None)):
+    caller = as_caller(authorization)
+    try:
+        me = caller.auth.get_user()                  # 401 if the token is missing, expired or forged
+        task = caller.from_("tasks").get(task_id)    # 404 if it isn't theirs: the access rule applies
+    except AuthenticationError:
+        raise HTTPException(401, "sign in")
+    except NotFoundError:
+        raise HTTPException(404, "no such task")
+    caller.from_("shares").create(task_id=task["id"], email=email, by=me["id"])
+    return {"ok": True}
+```
+
+- **`as_user(token)`** returns a view of the client that sends `Authorization: Bearer <token>` on every request. It doesn't refresh tokens (the person's app does that) and closing it closes nothing. One view per request means two people's requests never share credentials.
+- **`auth.get_user()`** is how you check a token on your server. Pawabase verifies it with the environment's signing key and confirms the account is still active. Don't decode the token and trust it yourself.
+- **Your server makes no access decisions.** The table's rules apply because the request reaches Pawabase as the person.
+
+The same works in Flask, Django or any framework: one module-level client, `pb.as_user(token)` inside the handler.
+
+When a handler must do something the person can't (write an audit row, charge them), use a separate client with a **secret key** for that part, after you've checked who they are, and validate their input yourself: that client passes every rule.
+
+## A script that signs in
 
 ```python
 from pawabase import Pawabase, FileSessionStore
 
-pb = Pawabase(url, key, project=project, session_store=FileSessionStore("~/.myapp/session.json"))
+pb = Pawabase(url, publishable_key, project=project,
+              session_store=FileSessionStore("~/.myapp/session.json"))   # optional: keep the session between runs
+
+result = pb.auth.sign_in_with_password(email="tester@example.com", password=os.environ["TESTER_PASSWORD"])
+if result.status == "mfa_required":
+    result.verify(input("Authenticator code: "))
+
+print(pb.from_("tasks").execute().total, "tasks visible to the tester")
 ```
 
-## Read and write data
+`sign_in_with_password` returns a `SignInResult`: `status` is `signed_in` (with `session`) or `mfa_required` (call `verify(code)`). The session refreshes itself before it expires. Without a `session_store` it lives in memory for the life of the process; `sign_out()` ends it on the server too.
+
+Creating accounts works the same way:
 
 ```python
-tasks = pb.from_("tasks").eq("done", False).order("title").execute().data
-
-task = pb.from_("tasks").create(title="Write the docs", done=False)
-pb.from_("tasks").update(task["id"], done=True)
+created = pb.auth.sign_up(email="ada@example.com", password="a long passphrase", name="Ada")
+if created.verification_required:
+    print("Ask them to confirm their email, then sign in.")   # only when the environment requires a verified email
 ```
-
-`from_` has a trailing underscore because `from` is a Python keyword.
 
 ## Async
 
-`AsyncPawabase` has the same methods, awaited:
+`AsyncPawabase` has the same methods; each returns an awaitable. Use it in asyncio services, async web frameworks and anything that needs realtime.
 
 ```python
 import asyncio
 from pawabase import AsyncPawabase
 
 async def main():
-    async with AsyncPawabase(url, key, project=project) as pb:
-        await pb.auth.sign_in_with_password(email="ada@example.com", password="…")
-        page = await pb.from_("tasks").eq("done", False).execute()
-        print(page.data)
+    async with AsyncPawabase(url, secret_key, project=project, environment="production") as pb:
+        tasks = pb.from_("tasks")
+        open_tasks, done_tasks = await asyncio.gather(
+            tasks.eq("done", False).execute(),
+            tasks.eq("done", True).execute(),
+        )
+        print(open_tasks.total, done_tasks.total)
+        async for page in tasks.pages(page_size=200):
+            ...
 
 asyncio.run(main())
 ```
 
-## Handle errors
-
-```python
-from pawabase import AuthenticationError, ForbiddenError, NotFoundError, ValidationError, PawabaseError
-
-try:
-    pb.from_("tasks").create(title="")
-except ValidationError as e:
-    print("Fix the input:", e.message)
-except (AuthenticationError, ForbiddenError):
-    print("Sign in, or you're not allowed to do that")
-except NotFoundError:
-    print("No such record, or you can't see it")
-except PawabaseError as e:
-    print(e.status_code, e.code, e.message, "request", e.request_id)
-```
-
-See [Errors](/reference/errors) for every code.
+Concurrent requests share the client's connection pool. Refreshing a signed-in session is serialised internally, so many concurrent requests never refresh twice.
 
 ## Files, flows and AI
 
 ```python
 avatars = pb.storage.from_("avatars")
-avatars.upload(f"{user_id}/me.png", open("me.png", "rb"))
+with open("me.png", "rb") as body:
+    avatars.upload(f"{user_id}/me.png", body, content_type="image/png")
 
-quote = pb.flows.invoke("price-quote", sku="A1", quantity=3)   # a flow with an HTTP trigger
+quote = pb.flows.invoke("price_quote", items=[{"sku": "A1", "quantity": 3}])   # a flow your app may call directly
 
-answer = pb.ai.chat("chat", "Summarise this ticket: …")          # a model your environment set up
+answer = pb.ai.chat("support", "Summarise this ticket: …")                      # a model your environment set up
 ```
 
-## On a server, for one person
+Each call is checked against its own rules (the bucket's upload rule, the flow's rule, the model's rule) with the identity of the client that makes it. See [Storage](/storage/overview), [Flows](/logic/flows) and [AI](/ai/overview).
 
-Act **for** a signed-in person with the publishable key and their tokens, so your access rules apply to them:
+## Errors
+
+Every failure raises a subclass of `PawabaseError`:
 
 ```python
-pb = Pawabase(url, PUBLISHABLE_KEY, project=project, environment="production")
-pb.auth.set_session(access_token=access_token, refresh_token=refresh_token)
+from pawabase import (PawabaseError, AuthenticationError, ForbiddenError, NotFoundError,
+                      ConflictError, ValidationError, RateLimitedError, NetworkError)
+
+try:
+    pb.from_("tasks").create(title="")
+except ValidationError as error:
+    print("Fix the input:", error.message, error.details)
+except ConflictError:
+    print("That value is already taken")
+except (AuthenticationError, ForbiddenError):
+    print("Sign in, or you're not allowed to do that")
+except RateLimitedError:
+    print("Too many requests for this key; slow down")
+except PawabaseError as error:
+    print(error.status_code, error.code, error.message, "request", error.request_id)
 ```
 
-Use a separate client with a **secret key** for admin work (`pb.admin`, `pb.manage`), never per request.
+| Exception | Status | Typical cause |
+| --- | --- | --- |
+| `AuthenticationError` | 401 | No key or a bad one; a missing or expired person's token |
+| `ForbiddenError` | 403 | An access rule, a key's scopes, a route limit |
+| `QuotaExceededError` (a `ForbiddenError`) | 403 | A plan quota inside the environment (`quota_exceeded`, e.g. storage or users) |
+| `NotFoundError` | 404 | No such record, or the rule hides it |
+| `ConflictError` | 409 | A unique value already exists |
+| `ValidationError` | 400 / 422 | A field is wrong or missing |
+| `RateLimitedError` | 429 | The key's rate limit, or the project's monthly request or bandwidth quota (`code` says which) |
+| `ServerError` | 5xx | A failure on Pawabase's side or in a flow |
+| `NetworkError` | — | No answer |
 
-<CardGroup cols={2}>
-  <Card title="Auth" icon="users" href="/auth/overview">Every way to sign users in.</Card>
-  <Card title="Database" icon="database" href="/database/overview">Query and write records.</Card>
-</CardGroup>
+Every error has `status_code`, `code`, `message`, the server's raw `detail`, and `request_id`. Log the request id: Studio's **Activity** finds the request, and everything it caused, by it. See [Errors](/reference/errors).
+
+## Next
+
+- [Node.js](/quickstarts/node): the same patterns in TypeScript.
+- [Admin client](/developers/admin-client): manage users and organizations with a secret key.
+- [Infrastructure as code](/iac/overview): define the whole backend in Python.

@@ -1,0 +1,491 @@
+---
+title: "Example: Sign in with Pawabase"
+description: "A complete web app that lets people connect their Pawabase organization, lists its projects and creates new ones, explained part by part."
+icon: "code"
+---
+
+This page walks through a small but complete web app, **Lumen**, that does what a real integration does:
+
+1. shows a **Sign in with Pawabase** button,
+2. sends the person through Pawabase's sign-in and consent screen,
+3. trades the code for tokens on its server,
+4. shows who is connected and to which organization,
+5. lists the organization's projects and creates new ones,
+6. refreshes the access token when it runs out,
+7. disconnects, ending the connection on Pawabase's side too.
+
+It's one file of plain Node (18 or later) with **no dependencies**, so every step is visible. The complete file is at the [end of this page](#the-whole-file).
+
+## Run it
+
+<Steps>
+  <Step title="Register the app">
+    In Pawabase, open **Settings → Integrations → Register app**. Name it "Lumen", keep **OAuth app**, and add the callback URL `http://127.0.0.1:4400/callback`. Copy the client id and the secret.
+  </Step>
+  <Step title="Configure it">
+    In the example's folder, copy `.env.example` to `.env`:
+
+    ```bash
+    PAWABASE_URL=https://dashboard.pawabase.com
+    PAWABASE_CLIENT_ID=pbc_…
+    PAWABASE_CLIENT_SECRET=pbs_…
+    PORT=4400
+    ```
+
+    `.env` is in `.gitignore`. Never commit it.
+  </Step>
+  <Step title="Start it">
+    ```bash
+    node server.mjs
+    ```
+
+    It prints `Lumen (Sign in with Pawabase example) on http://127.0.0.1:4400`.
+  </Step>
+  <Step title="Try it">
+    Open `http://127.0.0.1:4400`, click **Sign in with Pawabase**, sign in, pick an organization, click **Connect**. You land back on Lumen, connected.
+  </Step>
+</Steps>
+
+<Note>
+Use `127.0.0.1`, not `localhost`, in the browser. The session cookie is set for the host you use, and the callback URL is registered as `127.0.0.1`; mixing the two loses the session between leaving and coming back, and the sign-in fails with "That sign-in link was not started here."
+</Note>
+
+## Settings
+
+```javascript
+const PAWABASE = setting("PAWABASE_URL", "https://dashboard.pawabase.com").replace(/\/$/, "");
+const CLIENT_ID = setting("PAWABASE_CLIENT_ID");
+const CLIENT_SECRET = setting("PAWABASE_CLIENT_SECRET");
+const PORT = Number(setting("PORT", "4400"));
+const SELF = setting("APP_URL", `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
+const REDIRECT_URI = `${SELF}/callback`;
+const SCOPES = "organizations:read projects:read projects:write project:read";
+```
+
+`setting()` reads the environment first, then `.env`. `APP_URL` is where Lumen itself is reachable; in production it would be `https://lumen.example.com`, and the callback URL registered in Pawabase would be `https://lumen.example.com/callback`.
+
+Lumen asks for four scopes: it shows the organization, lists projects, creates them, and could read inside them. It doesn't ask for `project:write`, because it never changes what's inside a project. The consent screen shows exactly these four lines.
+
+## Sessions
+
+```javascript
+const sessions = new Map();
+
+function sessionOf(req, res) {
+  const id = /(?:^|;\s*)sid=([A-Za-z0-9_-]+)/.exec(req.headers.cookie || "")?.[1];
+  if (id && sessions.has(id)) return sessions.get(id);
+  const fresh = randomBytes(24).toString("base64url");
+  const session = { id: fresh };
+  sessions.set(fresh, session);
+  res.setHeader("set-cookie", `sid=${fresh}; HttpOnly; SameSite=Lax; Path=/${SELF.startsWith("https") ? "; Secure" : ""}`);
+  return session;
+}
+```
+
+The browser holds only a random session id in an `HttpOnly` cookie. Everything sensitive — the PKCE verifier, the state, the tokens — stays on the server in `sessions`.
+
+`SameSite=Lax` matters: the browser must send the cookie when Pawabase redirects back to `/callback`, which is a top-level navigation from another site. `Strict` would drop it and every sign-in would fail the state check.
+
+In production, keep sessions in your database or Redis instead of memory, so they survive restarts and are shared between servers.
+
+## Step 1: `/login`
+
+```javascript
+if (req.method === "GET" && url.pathname === "/login") {
+  session.verifier = b64url(randomBytes(48));
+  session.state = b64url(randomBytes(16));
+  const challenge = b64url(createHash("sha256").update(session.verifier).digest());
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: "code", scope: SCOPES, state: session.state,
+    code_challenge: challenge, code_challenge_method: "S256",
+  });
+  return redirect(res, `${PAWABASE}/oauth/authorize?${params}`);
+}
+```
+
+The button on the home page is a plain link to `/login`. Here Lumen:
+
+- makes a **verifier** (48 random bytes → 64 base64url characters) and keeps it,
+- makes a **state** and keeps it,
+- hashes the verifier into the **challenge**, which goes in the URL (the verifier never does),
+- redirects to `/oauth/authorize`.
+
+From here Pawabase takes over: the sign-in page if needed, then the consent card with the organization picker. See [What the person sees](/integrations/oauth-flow#what-the-person-sees).
+
+## Step 2: `/callback`
+
+```javascript
+if (req.method === "GET" && url.pathname === "/callback") {
+  const { code, state, error, error_description: why } = Object.fromEntries(url.searchParams);
+  if (error) return send(res, 200, signedOut(error === "access_denied" ? "You cancelled the connection." : why || error));
+  if (!state || state !== session.state) return send(res, 400, signedOut("That sign-in link was not started here. Try again."));
+  session.tokens = await tokenRequest({ grant_type: "authorization_code", code, redirect_uri: REDIRECT_URI, code_verifier: session.verifier });
+  delete session.verifier; delete session.state;
+  return redirect(res, "/");
+}
+```
+
+Three outcomes:
+
+| Query | Lumen does |
+| --- | --- |
+| `error=access_denied` | The person clicked **Cancel**: back to the home page with "You cancelled the connection." |
+| Another `error` | Shows Pawabase's `error_description` |
+| `code` and `state` | Checks `state`, trades the code, saves the tokens, goes home |
+
+The state check is what stops someone from tricking a person's browser into finishing a sign-in the attacker started (which would connect the attacker's organization to the victim's Lumen account). Never skip it.
+
+The verifier and state are deleted after use: each sign-in gets new ones.
+
+## Trading codes and refresh tokens
+
+```javascript
+async function tokenRequest(fields) {
+  const response = await fetch(`${PAWABASE}/oauth/token`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+    },
+    body: new URLSearchParams(fields),
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error_description || body.error || `token request failed (${response.status})`);
+  return { ...body, expires_at: Date.now() + (body.expires_in - 30) * 1000 };
+}
+```
+
+One function for both grants. The client id and secret go in a Basic header. `expires_at` is computed 30 seconds early, so a token is never sent just as it expires.
+
+The answer includes `organization`: the slug the person picked. Lumen doesn't need to store it separately because `/v1/token` returns it, but a real product would store it with the tokens, keyed by its own user id.
+
+## Calling the Management API
+
+```javascript
+async function pawabase(session, method, path, body) {
+  if (Date.now() > session.tokens.expires_at) {
+    session.tokens = await tokenRequest({ grant_type: "refresh_token", refresh_token: session.tokens.refresh_token });
+  }
+  const response = await fetch(`${PAWABASE}/v1${path}`, {
+    method,
+    headers: { authorization: `Bearer ${session.tokens.access_token}`, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => null);
+  if (response.status === 401) { delete session.tokens; throw new Error("The connection was removed in Pawabase. Connect again."); }
+  if (!response.ok) throw new Error(data?.message || `Pawabase answered ${response.status}`);
+  return data;
+}
+```
+
+Before each call, an expired access token is refreshed, and the **new** refresh token replaces the old one (they rotate).
+
+A `401` means the connection is gone: an admin disconnected Lumen, the person left the organization, or the refresh token expired. Lumen forgets the tokens so the home page shows **Sign in with Pawabase** again.
+
+<Warning>
+This example refreshes inside the request, without a lock. That's fine for one person in one browser tab. In a real product, two requests at once would both refresh, the second would reuse a spent refresh token, and Pawabase would end the connection. Serialise refreshes per connection; see [Reuse detection](/integrations/oauth-flow#reuse-detection).
+</Warning>
+
+## The home page
+
+```javascript
+async function home(session, notice) {
+  const [me, projects] = await Promise.all([pawabase(session, "GET", "/token"), pawabase(session, "GET", "/projects")]);
+  …
+}
+```
+
+Two calls, in parallel:
+
+- [`GET /v1/token`](/integrations/management-api#who-am-i): the person's name and email, the organization, their role, and the scopes. Shown in the "Connected to Pawabase" card.
+- [`GET /v1/projects`](/integrations/management-api#projects): each project's name, state and API address. Shown as a list.
+
+Every value from Pawabase is passed through `esc()` before it goes into HTML. Project names are written by people; treat them as untrusted text.
+
+## Creating a project
+
+```javascript
+if (req.method === "POST" && url.pathname === "/projects" && session.tokens) {
+  const { name } = await readForm(req);
+  const made = await pawabase(session, "POST", "/projects", { name });
+  session.notice = `Created "${made.name}". It is starting; refresh in a few seconds.`;
+  return redirect(res, "/");
+}
+```
+
+A plain HTML form posts the name. `POST /v1/projects` answers at once with the project in state `creating`; a few seconds later it's `running`, with its API address. Redirecting after the post (post/redirect/get) stops a browser refresh from creating it twice.
+
+The project records that Lumen created it (`integration: {"name": "Lumen", …}`), and the organization's activity shows `project.created` by the person.
+
+If the person is a viewer, this fails with `403` "This needs the member role or higher", and Lumen shows the message.
+
+## Disconnecting
+
+```javascript
+if (req.method === "POST" && url.pathname === "/logout") {
+  if (session.tokens) {
+    await fetch(`${PAWABASE}/oauth/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") },
+      body: new URLSearchParams({ token: session.tokens.refresh_token }),
+    }).catch(() => {});
+  }
+  sessions.delete(session.id);
+  return redirect(res, "/");
+}
+```
+
+Revoking the **refresh** token ends the whole connection in Pawabase: it disappears from the organization's **Connected apps**. Lumen then forgets the session.
+
+It's a `POST` from a form, not a link, so another site can't disconnect people by embedding an image that points at `/logout`.
+
+## From example to product
+
+What a real integration changes:
+
+| Example | Production |
+| --- | --- |
+| Sessions in a `Map` | Sessions in your database or Redis |
+| Tokens in the session | Tokens in your database, encrypted, keyed by your user id and the organization |
+| Refresh in the request | Refresh under a lock per connection |
+| `http://127.0.0.1:4400` | `https://your-domain`, with `Secure` cookies |
+| One organization per browser | A list of connected organizations per user, each with its own tokens |
+| Errors as text | Your product's error pages, with "Connect again" for `401` |
+| Polling by refreshing | Poll `GET /v1/projects/{ref}` until `running`, then continue automatically |
+
+The OAuth parts (`/login`, `/callback`, `tokenRequest`, revoke) stay the same.
+
+## Using a framework
+
+The same flow in any framework is four handlers:
+
+| Handler | Does |
+| --- | --- |
+| `GET /login` | Make state and verifier, store them, redirect to `/oauth/authorize` |
+| `GET /callback` | Check state, `POST /oauth/token`, store tokens |
+| Any page that needs Pawabase | Get a fresh access token, call `/v1/…` |
+| `POST /logout` | `POST /oauth/revoke`, forget tokens |
+
+OAuth libraries (Auth.js, Passport, Authlib, `oauthlib`, …) can do the first two for you with the settings in [Using an OAuth library](/integrations/oauth-flow#using-an-oauth-library). Configure them as plain OAuth 2.0 with PKCE, not OpenID Connect, and fetch the profile from `GET /v1/token`.
+
+Next: [Connected apps](/integrations/connected-apps).
+
+## The whole file
+
+<Accordion title="server.mjs">
+
+```javascript server.mjs
+// "Sign in with Pawabase": a small web app that lets people connect their Pawabase organization, then shows and creates projects in it.
+//
+// No dependencies: plain Node (18+). Run it with `node server.mjs` after filling in .env (see README.md).
+//
+// The flow (OAuth 2.0 authorization code + PKCE):
+//   1. /login       makes a PKCE verifier and a state, keeps them in the visitor's session, and sends the browser to Pawabase's /oauth/authorize.
+//   2. Pawabase     signs the person in (if needed), shows the consent screen, and they pick one of their organizations.
+//   3. /callback    checks the state, trades the code (with the verifier and the client secret) for tokens on the server, and keeps them in the session.
+//   4. /            calls Pawabase's Management API (/v1) with the access token; when it expires, the refresh token gets a new one.
+
+import { createServer } from "node:http";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+// ── settings (.env next to this file) ──────────────────────────────────────
+
+const env = Object.fromEntries(
+  (() => { try { return readFileSync(new URL(".env", import.meta.url), "utf8"); } catch { return ""; } })()
+    .split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && l.includes("="))
+    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]),
+);
+const setting = (name, fallback) => process.env[name] || env[name] || fallback;
+
+const PAWABASE = setting("PAWABASE_URL", "https://dashboard.pawabase.com").replace(/\/$/, "");
+const CLIENT_ID = setting("PAWABASE_CLIENT_ID");
+const CLIENT_SECRET = setting("PAWABASE_CLIENT_SECRET");
+const PORT = Number(setting("PORT", "4400"));
+const SELF = setting("APP_URL", `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
+const REDIRECT_URI = `${SELF}/callback`;
+const SCOPES = "organizations:read projects:read projects:write project:read";
+
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.error("Set PAWABASE_CLIENT_ID and PAWABASE_CLIENT_SECRET in .env (register the app in Pawabase: Settings → Integrations).");
+  process.exit(1);
+}
+
+// ── sessions: a random cookie → what we know about that visitor (in memory; use your own store in production) ──
+
+const sessions = new Map();
+
+function sessionOf(req, res) {
+  const id = /(?:^|;\s*)sid=([A-Za-z0-9_-]+)/.exec(req.headers.cookie || "")?.[1];
+  if (id && sessions.has(id)) return sessions.get(id);
+  const fresh = randomBytes(24).toString("base64url");
+  const session = { id: fresh };
+  sessions.set(fresh, session);
+  res.setHeader("set-cookie", `sid=${fresh}; HttpOnly; SameSite=Lax; Path=/${SELF.startsWith("https") ? "; Secure" : ""}`);
+  return session;
+}
+
+// ── talking to Pawabase ───────────────────────────────────────────────────
+
+const b64url = (buffer) => buffer.toString("base64url");
+
+async function tokenRequest(fields) {
+  const response = await fetch(`${PAWABASE}/oauth/token`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64"),
+    },
+    body: new URLSearchParams(fields),
+  });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error_description || body.error || `token request failed (${response.status})`);
+  return { ...body, expires_at: Date.now() + (body.expires_in - 30) * 1000 };
+}
+
+/** A Management API call as the connected organization. Refreshes the access token when it has run out. */
+async function pawabase(session, method, path, body) {
+  if (Date.now() > session.tokens.expires_at) {
+    session.tokens = await tokenRequest({ grant_type: "refresh_token", refresh_token: session.tokens.refresh_token });
+  }
+  const response = await fetch(`${PAWABASE}/v1${path}`, {
+    method,
+    headers: { authorization: `Bearer ${session.tokens.access_token}`, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => null);
+  if (response.status === 401) { delete session.tokens; throw new Error("The connection was removed in Pawabase. Connect again."); }
+  if (!response.ok) throw new Error(data?.message || `Pawabase answered ${response.status}`);
+  return data;
+}
+
+// ── pages ─────────────────────────────────────────────────────────────────
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+function page(body) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lumen · Sign in with Pawabase</title>
+<style>
+  :root { --bg:#0b0b0d; --card:#141417; --line:#26262b; --fg:#f4f1ee; --muted:#9a968f; --accent:#ff6a00; }
+  * { box-sizing: border-box; } body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, -apple-system, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 56px 16px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom: 40px; }
+  .brand { font-weight: 700; letter-spacing: -.02em; font-size: 20px; } .muted { color: var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:16px; }
+  h1 { font-size: 34px; letter-spacing: -.03em; margin: 0 0 8px; } h2 { font-size: 15px; margin: 0 0 12px; }
+  .btn { display:inline-flex; align-items:center; gap:10px; border:0; border-radius:10px; padding:12px 18px; font:600 15px system-ui; cursor:pointer; text-decoration:none; }
+  .primary { background:var(--accent); color:#111; } .ghost { background:transparent; color:var(--muted); border:1px solid var(--line); padding:8px 12px; font-size:13px; }
+  .mark { width:18px; height:18px; border-radius:6px 9px 9px 3px; background:#111; display:inline-block; }
+  table { width:100%; border-collapse: collapse; } td { padding:10px 0; border-top:1px solid var(--line); vertical-align: top; }
+  code { font: 12px ui-monospace, monospace; color: var(--muted); overflow-wrap: anywhere; }
+  form.inline { display:flex; gap:8px; } input { flex:1; min-width:0; background:#0b0b0d; color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font:inherit; }
+  .pill { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); }
+  .error { border-color:#7a2a12; color:#ffb38a; }
+</style></head><body><main>${body}</main></body></html>`;
+}
+
+function send(res, status, html, headers = {}) {
+  res.writeHead(status, { "content-type": "text/html; charset=utf-8", ...headers });
+  res.end(html);
+}
+
+const redirect = (res, to) => { res.writeHead(302, { location: to }); res.end(); };
+
+function signedOut(error) {
+  return page(`
+    <header><span class="brand">Lumen</span></header>
+    <h1>Build apps on your own backend.</h1>
+    <p class="muted">Lumen creates and edits projects in your Pawabase organization. Connect it once; you choose which organization.</p>
+    ${error ? `<div class="card error">${esc(error)}</div>` : ""}
+    <p><a class="btn primary" href="/login"><span class="mark"></span>Sign in with Pawabase</a></p>`);
+}
+
+async function home(session, notice) {
+  const [me, projects] = await Promise.all([pawabase(session, "GET", "/token"), pawabase(session, "GET", "/projects")]);
+  const rows = projects.map((p) => `<tr><td><b>${esc(p.name)}</b><br><code>${esc(p.endpoints?.api || "starting…")}</code></td>
+    <td style="text-align:right"><span class="pill">${esc(p.state)}</span></td></tr>`).join("");
+  return page(`
+    <header><span class="brand">Lumen</span>
+      <form method="post" action="/logout"><button class="btn ghost">Disconnect</button></form></header>
+    <div class="card">
+      <h2>Connected to Pawabase</h2>
+      <div>${esc(me.user?.name || me.user?.email)} <span class="muted">· ${esc(me.user?.email)}</span></div>
+      <div class="muted">Organization <b style="color:var(--fg)">${esc(me.organization)}</b> as ${esc(me.role)} · scopes: ${esc(me.scopes.join(", "))}</div>
+    </div>
+    ${notice ? `<div class="card">${esc(notice)}</div>` : ""}
+    <div class="card">
+      <h2>Projects in ${esc(me.organization)}</h2>
+      ${rows ? `<table>${rows}</table>` : `<p class="muted">No projects yet.</p>`}
+    </div>
+    <div class="card">
+      <h2>Create a project from Lumen</h2>
+      <form class="inline" method="post" action="/projects"><input name="name" placeholder="My new app" required maxlength="80"><button class="btn primary">Create</button></form>
+    </div>`);
+}
+
+async function readForm(req) {
+  let raw = "";
+  for await (const chunk of req) raw += chunk;
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+
+// ── routes ────────────────────────────────────────────────────────────────
+
+createServer(async (req, res) => {
+  const url = new URL(req.url, SELF);
+  const session = sessionOf(req, res);
+  try {
+    if (req.method === "GET" && url.pathname === "/login") {
+      session.verifier = b64url(randomBytes(48));
+      session.state = b64url(randomBytes(16));
+      const challenge = b64url(createHash("sha256").update(session.verifier).digest());
+      const params = new URLSearchParams({
+        client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: "code", scope: SCOPES, state: session.state,
+        code_challenge: challenge, code_challenge_method: "S256",
+      });
+      return redirect(res, `${PAWABASE}/oauth/authorize?${params}`);
+    }
+
+    if (req.method === "GET" && url.pathname === "/callback") {
+      const { code, state, error, error_description: why } = Object.fromEntries(url.searchParams);
+      if (error) return send(res, 200, signedOut(error === "access_denied" ? "You cancelled the connection." : why || error));
+      if (!state || state !== session.state) return send(res, 400, signedOut("That sign-in link was not started here. Try again."));
+      session.tokens = await tokenRequest({ grant_type: "authorization_code", code, redirect_uri: REDIRECT_URI, code_verifier: session.verifier });
+      delete session.verifier; delete session.state;
+      return redirect(res, "/");
+    }
+
+    if (req.method === "POST" && url.pathname === "/projects" && session.tokens) {
+      const { name } = await readForm(req);
+      const made = await pawabase(session, "POST", "/projects", { name });
+      session.notice = `Created “${made.name}”. It is starting; refresh in a few seconds.`;
+      return redirect(res, "/");
+    }
+
+    if (req.method === "POST" && url.pathname === "/logout") {
+      if (session.tokens) {  // end the connection in Pawabase too, not just here
+        await fetch(`${PAWABASE}/oauth/revoke`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded", authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") },
+          body: new URLSearchParams({ token: session.tokens.refresh_token }),
+        }).catch(() => {});
+      }
+      sessions.delete(session.id);
+      return redirect(res, "/");
+    }
+
+    if (req.method === "GET" && url.pathname === "/") {
+      if (!session.tokens) return send(res, 200, signedOut());
+      const notice = session.notice; delete session.notice;
+      return send(res, 200, await home(session, notice));
+    }
+
+    send(res, 404, page(`<p>Not found. <a href="/">Home</a></p>`));
+  } catch (error) {
+    send(res, 200, session.tokens ? page(`<div class="card error">${esc(error.message)}</div><p><a href="/">Back</a></p>`) : signedOut(error.message));
+  }
+}).listen(PORT, () => console.log(`Lumen (Sign in with Pawabase example) on ${SELF}  ·  Pawabase: ${PAWABASE}`));
+```
+
+</Accordion>

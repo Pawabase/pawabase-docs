@@ -1,17 +1,18 @@
 ---
 title: "Node.js"
-description: "Use Pawabase from a server or script: act as the project with a secret key, or on behalf of one signed-in user."
+description: "Use Pawabase from servers, jobs and scripts: act as the project with a secret key, act for one signed-in person in an API handler, administer users, run flows, and handle errors and retries."
 icon: "server"
 ---
 
-On a server there are two ways to use the client. Pick based on whose permissions the code should have.
+On a server, the question is always **whose permissions the code should have**. Pawabase gives you three answers, and picking the right one is most of what server-side use is about.
 
-| You want | Use |
-| --- | --- |
-| Admin work, jobs, scripts that act for the whole project | A **secret key** (`pb_sk_…`) |
-| Handle a request for one signed-in user | That user's **access token** |
+| The code is… | Credential | Access rules | Example |
+| --- | --- | --- | --- |
+| Acting as the **project** | Secret key (`pb_sk_…`) | Passed: the `service` role can do anything in the environments the key reaches | A nightly job, an admin script, a webhook receiver, seeding data |
+| Acting **for one signed-in person** | Their access token, with a publishable key | Applied exactly as in their browser | Your own API endpoint that the person's app calls |
+| A **script that signs in** as a particular account | Email and password, with a publishable key | Applied as that account | A test that checks what an ordinary user can see |
 
-## Install
+**You need:** Node.js 18 or later (for `fetch`), a project, and keys from Studio → **Overview → Connect**. For a working table to try these on, do steps 1–2 of the [JavaScript quickstart](/quickstarts/javascript).
 
 ```bash
 npm install @pawabase/client
@@ -19,58 +20,186 @@ npm install @pawabase/client
 
 ## Acting as the project
 
-A secret key bypasses your access rules. Keep it in an environment variable and never send it to a browser.
-
-```typescript
+```typescript jobs/overdue.ts
 import { createClient } from "@pawabase/client";
 
-const admin = createClient({
+const pawabase = createClient({
   url: process.env.PAWABASE_URL!,
   project: process.env.PAWABASE_PROJECT!,
-  apiKey: process.env.PAWABASE_SECRET_KEY!,
+  apiKey: process.env.PAWABASE_SECRET_KEY!,   // pb_sk_…
   environment: "production",
 });
 
-const { data: overdue } = await admin.from("invoices").eq("status", "overdue");
+// Every invoice that is past due, in pages of 200, whoever owns it.
+const overdue = pawabase.from("invoices").eq("status", "sent").lt("due_at", new Date());
+for await (const page of overdue.pages({ pageSize: 200 })) {
+  for (const invoice of page.data) {
+    await pawabase.from("invoices").update(invoice.id, { status: "overdue" });
+  }
+}
 ```
 
-Your API address, project ID and keys are in Studio → **Overview → Connect**. Add `environment` (its name in the project, such as `production`) to use an environment other than the project's default.
+What makes this different from browser code:
 
-## Acting for one user
+- A **secret key** acts with the `service` role and passes access rules, so it sees every person's invoices. Use it only for work that genuinely belongs to the whole project.
+- **Name the environment.** A job meant for production should say `environment: "production"`, and its key should reach only production. Then a misconfigured job can't touch the wrong data.
+- **`pages()`** walks through every matching record a page at a time (up to 200 per request), so a job doesn't load a million rows at once. `all()` collects them into one array when you know the result is small.
 
-When your server handles a request from a signed-in user, pass their token so your access rules apply to them exactly as they would in the browser.
+<Warning>
+Keep secret keys in environment variables or a secret store, never in code or a repository. The client refuses to start with a secret key in a browser; on a server nothing stops a leak but you. Make one key per job or service, so revoking one doesn't break the others. See [API keys](/environments/api-keys).
+</Warning>
 
-```typescript
+## Acting for one signed-in person
+
+Your app sometimes needs its own server endpoint: to call a payment provider, to combine data, to hide a third-party key. The endpoint should then do **exactly what the person may do**, no more. Pass their access token and use a publishable key:
+
+```typescript server.ts
 import express from "express";
-import { createClient } from "@pawabase/client";
+import { createClient, AuthenticationError, PermissionError } from "@pawabase/client";
 
 const app = express();
+app.use(express.json());
 
-app.get("/my-tasks", async (req, res) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  const pawabase = createClient({
+/** A client that acts as the person who sent this request. One per request: it holds no session and never refreshes. */
+function asCaller(req: express.Request) {
+  const header = req.headers.authorization ?? "";
+  return createClient({
     url: process.env.PAWABASE_URL!,
     project: process.env.PAWABASE_PROJECT!,
     apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
-    accessToken: token,
+    accessToken: header.startsWith("Bearer ") ? header.slice(7) : "",
   });
-  const { data } = await pawabase.from("tasks");
-  res.json(data);
+}
+
+app.post("/api/tasks/:id/share", async (req, res) => {
+  const pawabase = asCaller(req);
+  try {
+    const me = await pawabase.auth.getUser();                         // 401 if the token is missing, expired or forged
+    const task = await pawabase.from("tasks").get(req.params.id);      // 404 if it isn't theirs: the access rule applies
+    await pawabase.from("shares").create({ task_id: task.id, email: req.body.email, by: me.id });
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    if (error instanceof AuthenticationError) return res.status(401).json({ error: "sign in" });
+    if (error instanceof PermissionError) return res.status(403).json({ error: "not allowed" });
+    if ((error as { status?: number }).status === 404) return res.status(404).json({ error: "no such task" });
+    throw error;
+  }
+});
+
+app.listen(3000);
+```
+
+On the browser side, send the person's token with the request:
+
+```typescript
+const session = await pawabase.auth.getSession();
+await fetch(`/api/tasks/${id}/share`, {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: `Bearer ${session?.access_token}` },
+  body: JSON.stringify({ email }),
 });
 ```
 
-With `accessToken` set, the client keeps no session of its own and does not refresh, so make one per request.
+Why this design:
+
+- **Your server never decides access itself.** The same rules that guard the table guard this endpoint, because the request reaches Pawabase as the person.
+- **`auth.getUser()` is how you check a token on your server.** It asks Pawabase, which checks the token's signature with the environment's key and confirms the account is still active. Don't decode the token and trust it yourself: an expired, revoked or forged token must be refused.
+- **One client per request.** With `accessToken`, the client keeps no session and doesn't refresh. A shared client would mix people up.
+
+### A secret key for one person
+
+Sometimes the endpoint must do something the person can't do directly (write to an audit table, charge them), but should still record who they are. Check the person with their token, then do the privileged part with a secret-key client and pass their id explicitly:
+
+```typescript
+const me = await asCaller(req).auth.getUser();
+await service.from("audit").create({ user_id: me.id, action: "shared_task", task_id: req.params.id });
+```
+
+Be deliberate here: the secret-key client passes every rule, so validate everything the person sent yourself.
 
 ## A script that signs in
 
-For a script that runs as a particular user, sign in once; the session stays in memory for the life of the process.
+For tests and tools that must see the project the way one particular account does:
 
 ```typescript
-const pawabase = createClient({ url, project, apiKey: publishableKey, auth: { persistSession: false } });
-await pawabase.auth.signInWithPassword({ email, password });
+const pawabase = createClient({
+  url: process.env.PAWABASE_URL!,
+  project: process.env.PAWABASE_PROJECT!,
+  apiKey: process.env.PAWABASE_PUBLISHABLE_KEY!,
+  auth: { persistSession: false },   // keep the session in memory for this process only
+});
+
+const result = await pawabase.auth.signInWithPassword({ email: "tester@example.com", password: process.env.TESTER_PASSWORD! });
+if (result.status !== "signed_in") throw new Error("Use an account without two-step verification for scripts");
+
+const { data, total } = await pawabase.from("tasks");
+console.log(`tester sees ${total} tasks`);
+await pawabase.auth.signOut();
 ```
 
-<CardGroup cols={2}>
-  <Card title="Keys and security" icon="key" href="/reference/keys-and-security">Which key goes where.</Card>
-  <Card title="Python" icon="terminal" href="/quickstarts/python">The same in Python.</Card>
-</CardGroup>
+The session refreshes itself while the process runs. `signOut()` ends it on the server too.
+
+## Administering users
+
+The **admin client** manages your app's users, organizations and roles with a secret key: create and invite people, disable accounts, reset two-step verification, end sessions.
+
+```typescript
+import { createClient } from "@pawabase/client";
+import { admin } from "@pawabase/client/admin";
+
+const people = admin(createClient({ url, project, apiKey: process.env.PAWABASE_SECRET_KEY!, environment: "production" }));
+
+await people.users.create({ email: "ada@example.com", password: "a long passphrase", roles: ["editor"] });
+await people.users.update(userId, { disabled: true });
+```
+
+See [Admin client](/developers/admin-client) for every method.
+
+## Running flows and custom routes
+
+Server logic you build in Studio is callable from Node:
+
+```typescript
+// A flow your app may call directly (/flows/v1/<name>)
+const quote = await pawabase.flows.run("price_quote", { items: [{ sku: "A1", quantity: 3 }] });
+
+// A custom route (/rest/v1/x/...)
+const report = await pawabase.routes.get("/reports/monthly?month=2026-10");
+```
+
+Both are checked against their own access rules, with the identity of the client that calls them. See [Flows](/logic/flows) and [Routes](/logic/routes).
+
+## Errors and retries
+
+The client retries `429`, `502`, `503`, `504` and network failures by default (with backoff, honouring `Retry-After`), and gives up after a few attempts. Everything else throws immediately, as a class you can check:
+
+| Class | Status | Typical cause on a server |
+| --- | --- | --- |
+| `AuthenticationError` | 401 | Missing or expired person's token; a key that doesn't reach the environment |
+| `PermissionError` | 403 | An access rule refused the person; a key's scopes or route limits |
+| `NotFoundError` | 404 | No such record, or the person may not see it |
+| `ConflictError` | 409 | A unique value already exists |
+| `ValidationError` | 422 | A field is wrong or missing; `error.issues` lists them, `error.byField()` groups them |
+| `RateLimitError` | 429 | The key's rate limit, after retries |
+| `ServerError` | 5xx | A failure on Pawabase's side or in a flow, after retries |
+| `NetworkError`, `TimeoutError` | — | No answer, after retries |
+
+Every API error carries `status`, `code` and `requestId`. Log the request id: it finds the request, and everything it caused, in Studio's **Activity**.
+
+Tune or switch off retries per client:
+
+```typescript
+createClient({ /* … */, retry: { retries: 5 } });   // extra attempts after the first; default 2
+createClient({ /* … */, retry: false });        // e.g. inside a job runner that retries on its own
+createClient({ /* … */, timeoutMs: 10_000 });   // per attempt; default 30 s
+```
+
+## Rate limits on servers
+
+The rate limit is counted **per key**. A job that hammers the API with the same secret key your web servers use takes their budget. Give each job its own key, page through data instead of fetching records one by one, and spread big jobs out. See [The life of a request](/concepts/request-lifecycle#rate-limits-and-quotas).
+
+## Next
+
+- [Keys and security](/reference/keys-and-security): which key goes where, and scopes.
+- [Python](/quickstarts/python): the same patterns in Python.
+- [Management client](/developers/management-client): change definitions from scripts.
