@@ -1,10 +1,10 @@
 ---
 title: "Example: Connect Pawabase to a product"
-description: "A small web app that lets people connect their Pawabase organization, lists its projects, creates new ones and disconnects, built with the integration SDK."
+description: "A small web app that lets people connect their Pawabase organization, lists its projects, creates new ones and disconnects, with plain HTTP first and the client libraries after."
 icon: "code"
 ---
 
-This page builds the smallest useful product on the [integration SDK](/integrations/sdk): an app called **Acme Builder** that a person connects to their Pawabase organization, then uses to list and create projects. It has five routes, and each one maps onto one step of the [OAuth flow](/integrations/oauth-flow).
+This page builds the smallest useful product on the plain HTTP API, with no libraries beyond your web framework and an HTTP client: an app called **Acme Builder** that a person connects to their Pawabase organization, then uses to list and create projects. It has five routes, and each maps onto one step of the [OAuth flow](/integrations/oauth-flow).
 
 | Route | Does |
 | --- | --- |
@@ -25,16 +25,257 @@ export PAWABASE_CLIENT_SECRET=pbs_…
 export SESSION_SECRET=$(openssl rand -hex 32)
 ```
 
-3. Install the dependencies:
+3. Install the dependencies (`pip install flask httpx` for Python):
 
 ```bash
-npm install express express-session @pawabase/client
+npm install express express-session
 ```
 
 ## The app
 
 <CodeGroup>
-```typescript TypeScript (Express)
+```typescript TypeScript (fetch, Express)
+import { createHash, randomBytes } from "node:crypto";
+import express from "express";
+import session from "express-session";
+
+const BASE = process.env.APP_URL ?? "http://localhost:3000";
+const PAWABASE = "https://dashboard.pawabase.com";
+const CLIENT_ID = process.env.PAWABASE_CLIENT_ID!;
+const REDIRECT_URI = `${BASE}/oauth/pawabase/callback`;
+const basic = "Basic " + Buffer.from(`${CLIENT_ID}:${process.env.PAWABASE_CLIENT_SECRET}`).toString("base64");
+
+type Tokens = { access_token: string; refresh_token: string; expires_at: number; organization: string };
+declare module "express-session" {
+  interface SessionData { state?: string; verifier?: string; tokens?: Tokens; email?: string }
+}
+
+// POST /oauth/token: used for the code exchange and for refreshing. Form-encoded, client secret as HTTP Basic.
+async function token(form: Record<string, string>): Promise<Tokens> {
+  const response = await fetch(`${PAWABASE}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", authorization: basic },
+    body: new URLSearchParams(form),
+  });
+  const body = await response.json();
+  if (!response.ok) throw Object.assign(new Error(body.error_description), { code: body.error });
+  return { ...body, expires_at: Date.now() + (body.expires_in - 30) * 1000 };
+}
+
+// A call to the Management API with this person's access token, refreshed first if it is about to run out.
+async function api(req: express.Request, method: string, path: string, body?: unknown) {
+  const t = req.session.tokens!;
+  if (Date.now() >= t.expires_at) {
+    req.session.tokens = await token({ grant_type: "refresh_token", refresh_token: t.refresh_token }); // the old refresh token is dead now
+  }
+  const response = await fetch(`${PAWABASE}/v1${path}`, {
+    method,
+    headers: { authorization: `Bearer ${req.session.tokens!.access_token}`, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json();
+  if (!response.ok) throw Object.assign(new Error(data.message), { code: data.error, status: response.status });
+  return data;
+}
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+app.use(session({ secret: process.env.SESSION_SECRET!, resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: "lax" } }));
+const esc = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+app.get("/", async (req, res) => {
+  if (!req.session.tokens) return res.send(`<h1>Acme Builder</h1><a href="/connect">Connect Pawabase</a>`);
+  try {
+    const projects = await api(req, "GET", "/projects");
+    const rows = projects.map((p: any) => `<li>${esc(p.name)} <small>${p.state} ${esc(p.endpoints?.api ?? "")}</small></li>`).join("");
+    res.send(`<h1>${esc(req.session.tokens.organization)}</h1><p>Connected as ${esc(req.session.email ?? "")}</p><ul>${rows || "<li>No projects yet</li>"}</ul>
+      <form method="post" action="/projects"><input name="name" required><button>Create</button></form>
+      <form method="post" action="/disconnect"><button>Disconnect</button></form>`);
+  } catch (error: any) {
+    if (error.code === "invalid_grant") { req.session.tokens = undefined; return res.redirect("/"); } // the connection is gone
+    throw error;
+  }
+});
+
+// Step 1: a state and a PKCE pair, kept in the session; the browser goes to /oauth/authorize.
+app.get("/connect", (req, res) => {
+  req.session.state = randomBytes(16).toString("base64url");
+  req.session.verifier = randomBytes(48).toString("base64url");
+  const challenge = createHash("sha256").update(req.session.verifier).digest("base64url");
+  res.redirect(`${PAWABASE}/oauth/authorize?` + new URLSearchParams({
+    client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, response_type: "code",
+    scope: "organizations:read projects:read projects:write", state: req.session.state,
+    code_challenge: challenge, code_challenge_method: "S256",
+  }));
+});
+
+// Step 2: they come back with ?code=…&state=… (or ?error=access_denied). Check the state, then trade the code.
+app.get("/oauth/pawabase/callback", async (req, res) => {
+  const { state, verifier } = req.session;
+  req.session.state = req.session.verifier = undefined; // a sign-in is used once
+  if (req.query.error) return res.redirect("/"); // access_denied: they pressed Cancel
+  if (!state || req.query.state !== state) return res.status(400).send("This sign-in was not started here.");
+  try {
+    req.session.tokens = await token({ grant_type: "authorization_code", code: String(req.query.code), redirect_uri: REDIRECT_URI, code_verifier: verifier! });
+    req.session.email = (await api(req, "GET", "/token")).user?.email;
+    res.redirect("/");
+  } catch (error: any) {
+    res.status(400).send(`Could not connect: ${esc(error.message)}`);
+  }
+});
+
+app.post("/projects", async (req, res) => {
+  if (!req.session.tokens) return res.redirect("/");
+  let project = await api(req, "POST", "/projects", { name: String(req.body.name) });
+  while (project.state === "creating") { // poll no faster than every 2 s
+    await new Promise((r) => setTimeout(r, 2000));
+    project = await api(req, "GET", `/projects/${project.ref}`);
+  }
+  res.redirect("/");
+});
+
+// Step 4: end the connection on Pawabase's side too.
+app.post("/disconnect", async (req, res) => {
+  if (req.session.tokens) {
+    await fetch(`${PAWABASE}/oauth/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", authorization: basic },
+      body: new URLSearchParams({ token: req.session.tokens.refresh_token }),
+    });
+  }
+  req.session.tokens = undefined;
+  res.redirect("/");
+});
+
+app.listen(3000, () => console.log(`Acme Builder on ${BASE}`));
+```
+
+```python Python (httpx, Flask)
+import base64, hashlib, html, os, secrets, time
+from urllib.parse import urlencode
+
+import httpx
+from flask import Flask, redirect, request, session
+
+BASE = os.environ.get("APP_URL", "http://localhost:3000")
+PAWABASE = "https://dashboard.pawabase.com"
+CLIENT_ID = os.environ["PAWABASE_CLIENT_ID"]
+CLIENT_SECRET = os.environ["PAWABASE_CLIENT_SECRET"]
+REDIRECT_URI = f"{BASE}/oauth/pawabase/callback"
+
+app = Flask(__name__)
+app.secret_key = os.environ["SESSION_SECRET"]
+
+
+def token(**form) -> dict:
+    """POST /oauth/token: used for the code exchange and for refreshing. Form-encoded, client secret as HTTP Basic."""
+    response = httpx.post(f"{PAWABASE}/oauth/token", auth=(CLIENT_ID, CLIENT_SECRET), data=form)
+    body = response.json()
+    if response.status_code != 200:
+        raise RuntimeError(body.get("error", "error"), body.get("error_description"))
+    return {**body, "expires_at": time.time() + body["expires_in"] - 30}
+
+
+def api(method: str, path: str, body=None):
+    """A call to the Management API with this person's access token, refreshed first if it is about to run out."""
+    tokens = session["tokens"]
+    if time.time() >= tokens["expires_at"]:
+        tokens = session["tokens"] = token(grant_type="refresh_token", refresh_token=tokens["refresh_token"])  # the old one is dead now
+    response = httpx.request(method, f"{PAWABASE}/v1{path}", headers={"authorization": f"Bearer {tokens['access_token']}"}, json=body, timeout=130)
+    data = response.json()
+    if response.status_code >= 400:
+        raise RuntimeError(data.get("error", "error"), data.get("message"))
+    return data
+
+
+@app.get("/")
+def home():
+    if "tokens" not in session:
+        return '<h1>Acme Builder</h1><a href="/connect">Connect Pawabase</a>'
+    try:
+        projects = api("GET", "/projects")
+    except RuntimeError as error:
+        if error.args[0] == "invalid_grant":  # the connection is gone
+            session.pop("tokens", None)
+            return redirect("/")
+        raise
+    rows = "".join(f"<li>{html.escape(p['name'])} <small>{p['state']} {html.escape(p['endpoints'].get('api', ''))}</small></li>" for p in projects)
+    return f"""<h1>{html.escape(session['tokens']['organization'])}</h1><p>Connected as {html.escape(session.get('email', ''))}</p>
+      <ul>{rows or '<li>No projects yet</li>'}</ul>
+      <form method="post" action="/projects"><input name="name" required><button>Create</button></form>
+      <form method="post" action="/disconnect"><button>Disconnect</button></form>"""
+
+
+@app.get("/connect")  # Step 1: a state and a PKCE pair, kept in the session; the browser goes to /oauth/authorize.
+def connect():
+    session["state"], session["verifier"] = secrets.token_urlsafe(16), secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(session["verifier"].encode()).digest()).decode().rstrip("=")
+    return redirect(f"{PAWABASE}/oauth/authorize?" + urlencode({
+        "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "response_type": "code",
+        "scope": "organizations:read projects:read projects:write", "state": session["state"],
+        "code_challenge": challenge, "code_challenge_method": "S256",
+    }))
+
+
+@app.get("/oauth/pawabase/callback")  # Step 2: ?code=…&state=… (or ?error=access_denied). Check the state, then trade the code.
+def callback():
+    state, verifier = session.pop("state", None), session.pop("verifier", None)  # a sign-in is used once
+    if request.args.get("error"):
+        return redirect("/")  # access_denied: they pressed Cancel
+    if not state or request.args.get("state") != state:
+        return "This sign-in was not started here.", 400
+    try:
+        session["tokens"] = token(grant_type="authorization_code", code=request.args["code"], redirect_uri=REDIRECT_URI, code_verifier=verifier)
+        session["email"] = (api("GET", "/token").get("user") or {}).get("email", "")
+    except RuntimeError as error:
+        return f"Could not connect: {html.escape(str(error.args[-1]))}", 400
+    return redirect("/")
+
+
+@app.post("/projects")
+def create_project():
+    if "tokens" not in session:
+        return redirect("/")
+    project = api("POST", "/projects", {"name": request.form["name"]})
+    while project["state"] == "creating":  # poll no faster than every 2 s
+        time.sleep(2)
+        project = api("GET", f"/projects/{project['ref']}")
+    return redirect("/")
+
+
+@app.post("/disconnect")  # Step 4: end the connection on Pawabase's side too.
+def disconnect():
+    tokens = session.pop("tokens", None)
+    if tokens:
+        httpx.post(f"{PAWABASE}/oauth/revoke", auth=(CLIENT_ID, CLIENT_SECRET), data={"token": tokens["refresh_token"]})
+    return redirect("/")
+```
+</CodeGroup>
+
+Run it, open `http://localhost:3000`, click **Connect Pawabase**, pick an organization on the consent screen, and you land back on the app with that organization's projects listed.
+
+## What each part is doing
+
+**One client, one connection per person.** The client id and secret are read once from the environment and used in two places: the id in the address people are sent to, and id plus secret (HTTP Basic) on `POST /oauth/token` and `/oauth/revoke`. Each person's connection is only their saved tokens. See [Apps, clients and connections](/integrations/clients).
+
+**`/connect` makes the state and the PKCE pair.** `state` is random and checked on return, so a forged return is refused. The `code_verifier` is random, and its SHA-256 (base64url, no padding) is sent as the `code_challenge`; the verifier itself is sent only later, with the code, so a stolen code is useless without it. Both wait in the session while the person is on Pawabase.
+
+**The callback has three outcomes.** `?error=access_denied` means they pressed Cancel: nothing was connected. A `state` that doesn't match the saved one means the sign-in wasn't started here: refuse it. Otherwise `POST /oauth/token` with `grant_type=authorization_code`, the code, the same `redirect_uri` and the verifier returns `access_token`, `refresh_token`, `expires_in`, `scope` and `organization`. A code works once: don't retry that call on a network error.
+
+**Calls refresh first, if they must.** An access token lasts an hour. `api()` trades the refresh token (`grant_type=refresh_token`) for a new pair when the token is about to expire, and replaces *both* tokens, because the old refresh token is dead the moment the new one is issued.
+
+**`invalid_grant` means start over.** If the connection was removed (an admin disconnected it, or it sat unused for 30 days), refreshing fails with `invalid_grant`. Forget the tokens and ask them to connect again.
+
+**Project creation is asynchronous.** `POST /v1/projects` answers `201` at once with `state: "creating"`; the app polls `GET /v1/projects/{ref}` every two seconds until it is `running`.
+
+**Disconnect ends it on both sides.** `POST /oauth/revoke` with the refresh token removes the connection from the organization's **Connected apps** list, then the app forgets the tokens.
+
+## With the client libraries
+
+The same app with the optional [client libraries](/integrations/sdk). Install with `npm install @pawabase/client` or `pip install pawabase`. They send exactly the requests above; what disappears is the PKCE code, the state check, the refresh bookkeeping and the error parsing.
+
+<CodeGroup>
+```typescript TypeScript (SDK, Express)
 import express from "express";
 import session from "express-session";
 import { OAuthError, PawabaseCloud, PawabaseOAuth, type OAuthTokens } from "@pawabase/client/cloud";
@@ -131,7 +372,7 @@ const esc = (text: string) => text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(
 app.listen(3000, () => console.log(`Acme Builder on ${BASE}`));
 ```
 
-```python Python (Flask)
+```python Python (SDK, Flask)
 import html
 import os
 
@@ -221,20 +462,6 @@ def disconnect():
     return redirect("/")
 ```
 </CodeGroup>
-
-Run it, open `http://localhost:3000`, click **Connect Pawabase**, pick an organization on the consent screen, and you land back on the app with that organization's projects listed.
-
-## What each part is doing
-
-**One client, one connection per person.** `oauth` is created once at startup from the client id and secret. `connection(req)` is built per request from *that person's* tokens. See [Apps, clients and connections](/integrations/clients).
-
-**`state` and the PKCE verifier live in the session.** `authorize` makes both; they wait in `req.session.pending` while the person is on Pawabase. `callback` compares the returned `state` to the saved one and sends the verifier with the code, so a forged or stolen return does nothing. They are removed as soon as the return arrives.
-
-**The refresh is saved before it is used.** `onRefresh` runs with each new token pair before the new access token is handed to your call. Here that is one line, writing it back to the session. In a real product it writes to your database.
-
-**Cancel is not an error.** When the person presses Cancel, Pawabase redirects back with `error=access_denied`, which `callback` raises as an `OAuthError` with that code.
-
-**`invalid_grant` means start over.** If the connection was removed (an admin disconnected it, or it sat unused for 30 days), refreshing fails with `invalid_grant`. `needsReconnect` is true for exactly that case.
 
 ## From example to product
 
